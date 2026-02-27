@@ -22,3 +22,13 @@ python -m scripts.n3rHYBRID10 \
 ✅ Image chargée : input/image_128x3.png
 ✅ Image chargée : input/image_128x4.png
 ✅ Génération terminée.
+
+
+
+python -m scripts.n3rHYBRID11 \
+                         --pretrained-model-path "/mnt/62G/huggingface/miniSD" \
+                         --config configs/prompts/2_animate/256_quality.yaml \
+                         --device cuda \
+                         --vae-offload \
+                         --fp16
+
