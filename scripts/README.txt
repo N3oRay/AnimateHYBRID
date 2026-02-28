@@ -1,3 +1,12 @@
+python -m scripts.n3rHYBRID14 \
+                         --pretrained-model-path "/mnt/62G/huggingface/miniSD" \
+                         --config configs/prompts/2_animate/128.yaml \
+                         --device cuda \
+                         --vae-offload \
+                         --fp16
+
+
+
 # n3r_tiny.yaml
 W: 128
 H: 128
