@@ -16,7 +16,304 @@ import yaml
 import torch.nn.functional as F
 LATENT_SCALE = 0.18215
 
+import torchvision.transforms as T
+from transformers import CLIPTokenizer, CLIPTextModel
+
+
+
 def generate_latents_ai_5D_optimized(
+    latent_frame,         # [1,4,H,W]
+    pos_embeds,           # [1,77,768]
+    neg_embeds,           # [1,77,768]
+    unet,
+    scheduler,
+    motion_module=None,
+    device="cuda",
+    dtype=torch.float16,
+    guidance_scale=7.5,          # aligné robuste
+    init_image_scale=2.0,        # aligné robuste
+    creative_noise=0.0,
+    seed=42,
+    steps=40
+):
+    """
+    Version équivalente à generate_latents_robuste mais pour une seule frame.
+    Sortie: [1,4,H,W]
+    """
+
+    torch.manual_seed(seed)
+
+    # ---- Setup ----
+    latents = latent_frame.to(device=device, dtype=dtype)
+    init_latents = latents.clone()
+
+    scheduler.set_timesteps(steps, device=device)
+
+    for t in scheduler.timesteps:
+
+        # 🔹 Motion module
+        if motion_module is not None:
+            latents = motion_module(latents)
+
+        # 🔹 Creative noise (même endroit que robuste)
+        if creative_noise > 0:
+            latents = latents + torch.randn_like(latents) * creative_noise
+
+        # 🔹 Classifier-Free Guidance
+        latent_model_input = torch.cat([latents, latents], dim=0)
+        embeds = torch.cat([neg_embeds, pos_embeds], dim=0).to(device=device, dtype=dtype)
+
+        with torch.no_grad():
+            noise_pred = unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=embeds
+            ).sample
+
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+        # 🔹 Scheduler step (IMPORTANT: batch normal, pas latents[:1])
+        latents = scheduler.step(
+            noise_pred,
+            t,
+            latents
+        ).prev_sample
+
+        # 🔹 Réinjection identique à robuste
+        latents = latents + init_image_scale * (init_latents - latents)
+
+        # 🔹 Sécurité NaN / inf
+        if torch.isnan(latents).any() or torch.isinf(latents).any():
+            print(f"⚠ NaN/inf détecté à timestep {t}, correction légère")
+            latents = latents.clone()
+            latents = latents + torch.randn_like(latents) * 1e-3
+
+        # 🔹 Debug stabilité
+        mean_val = latents.abs().mean().item()
+        if math.isnan(mean_val) or mean_val < 1e-5:
+            print(f"⚠ Latent trop petit à timestep {t}, mean={mean_val:.6f}")
+
+    return latents
+
+
+
+# -------------------------
+# 🔹 Génération des latents
+# -------------------------
+
+def generate_latents_4Go(
+    latent_frame,          # [1,4,H,W]
+    pos_embeds,            # [1,77,768]
+    neg_embeds,            # [1,77,768]
+    unet,
+    scheduler,
+    motion_module=None,
+    device="cuda",
+    dtype=torch.float16,
+    guidance_scale=4.0,
+    init_image_scale=0.9,
+    steps=20,
+    seed=1234
+):
+    """
+    Génération de latents optimisée pour AnimateDiff avec Classifier-Free Guidance.
+    Corrige le mismatch batch entre UNet et embeddings.
+    """
+    torch.manual_seed(seed)
+
+    # 🔹 Mettre le latent sur le device
+    latents = latent_frame.to(device=device, dtype=dtype)
+
+    batch_size = latents.shape[0]  # normalement 1
+
+    # 🔹 Répliquer embeddings selon batch size
+    neg_embeds = neg_embeds.repeat(batch_size, 1, 1)
+    pos_embeds = pos_embeds.repeat(batch_size, 1, 1)
+
+    # 🔹 Embeddings C.F.G
+    embeds = torch.cat([neg_embeds, pos_embeds], dim=0).to(device=device, dtype=dtype)
+    # batch = 2 * batch_size
+
+    # 🔹 Scheduler
+    scheduler.set_timesteps(steps, device=device)
+
+    for t in scheduler.timesteps:
+
+        # 🔹 Input latent doublé pour C.F.G
+        latent_input = torch.cat([latents, latents], dim=0)
+
+        # 🔹 Motion module si utilisé
+        if motion_module is not None:
+            latent_input = motion_module(latent_input)
+
+        # 🔹 Blend avec latent original
+        latent_input = latent_input * init_image_scale + torch.cat([latents, latents], dim=0) * (1 - init_image_scale)
+
+        # 🔹 UNet forward
+        noise_pred = unet(latent_input, t, encoder_hidden_states=embeds).sample
+
+        # 🔹 Classifier-Free Guidance
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+        # 🔹 Scheduler step
+        latents = scheduler.step(noise_pred, t, latents).prev_sample
+
+        # 🔹 Clamp sécurité fp16
+        latents = latents.clamp(-1.5, 1.5)
+
+    return latents
+
+# -------------------------
+# 🔹 Génération des texts
+# -------------------------
+
+def encode_text_embeddings(
+    tokenizer: CLIPTokenizer,
+    text_encoder: CLIPTextModel,
+    prompt: str,
+    negative_prompt: str = "",
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float16,
+    max_length: int = 77
+):
+    """
+    Encode le texte en embeddings pour Classifier-Free Guidance.
+
+    Args:
+        tokenizer (CLIPTokenizer): tokenizer du modèle.
+        text_encoder (CLIPTextModel): text encoder du modèle.
+        prompt (str): texte positif.
+        negative_prompt (str): texte négatif (CFG).
+        device (str): "cuda" ou "cpu".
+        dtype (torch.dtype): torch.float16 ou torch.float32.
+        max_length (int): longueur max du tokenizer (77 pour SD).
+
+    Returns:
+        tuple: (pos_embeds, neg_embeds) chacun [1, max_length, 768]
+    """
+    # 🔹 Tokenisation texte positif
+    pos_tokens = tokenizer(
+        prompt,
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt"
+    ).to(device)
+
+    # 🔹 Tokenisation texte négatif
+    neg_tokens = tokenizer(
+        negative_prompt if negative_prompt else "",
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        # 🔹 Encodage en embeddings
+        pos_embeds = text_encoder(**pos_tokens).last_hidden_state.to(dtype)
+        neg_embeds = text_encoder(**neg_tokens).last_hidden_state.to(dtype)
+
+    return pos_embeds, neg_embeds
+
+def load_image_latent(image_path, vae, device="cuda", dtype=torch.float16, target_size=128):
+    """
+    Charge une image et la convertit en latent tensor pour le UNet.
+
+    Args:
+        image_path (str): Chemin vers l'image.
+        vae (AutoencoderKL): VAE du modèle.
+        device (str): "cuda" ou "cpu".
+        dtype (torch.dtype): torch.float16 ou torch.float32.
+        target_size (int): taille de l'image (carrée) pour le modèle.
+
+    Returns:
+        torch.Tensor: latent tensor [1, 4, H/8, W/8]
+    """
+    # 1️⃣ Charger et redimensionner
+    image = Image.open(image_path).convert("RGB")
+    transform = T.Compose([
+        T.Resize((target_size, target_size)),
+        T.ToTensor(),
+    ])
+    img_tensor = transform(image).unsqueeze(0).to(device=device, dtype=dtype)  # [1,3,H,W]
+
+    # 2️⃣ Normalisation pour VAE
+    img_tensor = img_tensor * 2.0 - 1.0  # [-1,1]
+
+    # 3️⃣ Encoder via VAE (no_grad pour économiser mémoire)
+    with torch.no_grad():
+        latent = vae.encode(img_tensor).latent_dist.sample()  # [1,4,H/8,W/8]
+
+    return latent
+
+
+# ------------------------------
+# 🔹 Fonction latents optimisée
+# ------------------------------
+
+def generate_latents_ai_5D_light(
+    latent_frame,
+    pos_embeds,
+    neg_embeds,
+    unet,
+    scheduler,
+    motion_module=None,
+    device="cuda",
+    dtype=torch.float16,
+    guidance_scale=4.0,
+    init_image_scale=0.9,
+    creative_noise=0.0,
+    seed=1234,
+    steps=25
+):
+    torch.manual_seed(seed)
+
+    latent_frame = latent_frame.to(device=device, dtype=dtype)
+    latents = latent_frame.repeat(2,1,1,1)  # batch=2 pour CFG une seule fois
+
+    if creative_noise > 0.0:
+        latents += torch.randn_like(latents) * creative_noise
+
+    # embeddings
+    embeds = torch.cat([neg_embeds, pos_embeds], dim=0).to(device=device, dtype=dtype)
+
+    scheduler.set_timesteps(steps, device=device)
+
+    for t in scheduler.timesteps:
+        latent_input = latents
+
+        if motion_module:
+            latent_input = motion_module(latent_input)
+
+        # blend avec image initiale
+        latent_input = latent_input * init_image_scale + latent_frame.repeat(2,1,1,1) * (1 - init_image_scale)
+
+        # UNet forward
+        noise_pred = unet(latent_input, t, encoder_hidden_states=embeds).sample
+
+        # guidance
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+        # scheduler step
+        latents_step = scheduler.step(noise_pred, t, latents[:1]).prev_sample
+
+        # clamp sécurité
+        latents_step = latents_step.clamp(-2.0, 2.0)
+
+        # préparer pour prochaine étape (reduplication batch=2)
+        latents = torch.cat([latents_step, latents_step], dim=0)
+
+    return latents[:1]
+
+# ------------------------------------------------------------
+# generate_latents_ai_5D_optimized_test - Anomalie sortie Frame Noir
+# ------------------------------------------------------------
+
+def generate_latents_ai_5D_optimized_test(
     latent_frame,         # [1,4,H,W]
     pos_embeds,           # [1,77,768]
     neg_embeds,           # [1,77,768]
@@ -464,6 +761,23 @@ def generate_latents_ai_5D_optimized_v1(
 
 
 def decode_latents_correct(latents, vae, latent_scale=0.18215):
+
+    vae_device = next(vae.parameters()).device
+    vae_dtype = next(vae.parameters()).dtype
+
+    # Move + rescale latents
+    latents = latents.to(device=vae_device, dtype=vae_dtype) / latent_scale
+
+    with torch.no_grad():
+        img = vae.decode(latents).sample
+
+        # ✅ Conversion SD correcte
+        img = (img / 2 + 0.5).clamp(0.0, 1.0)
+
+    return img.cpu()
+
+
+def decode_latents_correct_v1(latents, vae, latent_scale=0.18215):
     """
     Décodage correct des latents AnimateDiff.
     - latents: sortie UNet brute
@@ -1591,6 +1905,10 @@ def encode_images(input_images, vae):
 import torch
 import math
 
+
+#-------------------------------------------------------------------------------
+# VERY STABLE
+#-------------------------------------------------------------------------------
 def generate_latents_robuste(latents, pos_embeds, neg_embeds, unet, scheduler,
                              motion_module=None, device="cuda", dtype=torch.float16,
                              guidance_scale=7.5, init_image_scale=2.0,
