@@ -18,6 +18,46 @@ LATENT_SCALE = 0.18215
 # scripts/utils/vae_utils.py
 
 
+# -------------------------
+# Fonction pour charger un VAE et tester son décodage
+# -------------------------
+def safe_load_vae(vae_path, device="cuda", fp16=False, offload=False):
+    """
+    Charge un VAE (FP32 ou FP16), renvoie l'objet VAE prêt à l'emploi.
+    """
+    try:
+        # Chargement state_dict
+        state_dict = load_file(vae_path, device="cpu")
+        print("✅ State dict VAE chargé, clés:", list(state_dict.keys())[:5])
+
+        # Création d'un VAE compatible SD
+        vae = AutoencoderKL(
+            in_channels=3,
+            out_channels=3,
+            down_block_types=["DownEncoderBlock2D"]*4,
+            up_block_types=["UpDecoderBlock2D"]*4,
+            block_out_channels=[128, 256, 512, 512],
+            latent_channels=4,
+            sample_size=32  # à adapter selon le checkpoint
+        )
+
+        # Chargement des poids
+        vae.load_state_dict(state_dict, strict=False)
+
+        # Offload si demandé
+        if offload:
+            vae = vae.to("cpu")
+        else:
+            vae = vae.to(device)
+            if fp16:
+                vae = vae.half()
+
+        return vae
+
+    except Exception as e:
+        print(f"⚠ Erreur lors du chargement du VAE : {e}")
+        return None
+
 
 # -------------------------
 # Decode frame via VAE (compatible vae_offload)
@@ -318,45 +358,6 @@ def decode_latents_to_image_tiled4D(latents, vae, tile_size=128, overlap=64, dev
 
 
 
-# -------------------------
-# Fonction pour charger un VAE et tester son décodage
-# -------------------------
-def safe_load_vae(vae_path, device="cuda", fp16=False, offload=False):
-    """
-    Charge un VAE (FP32 ou FP16), renvoie l'objet VAE prêt à l'emploi.
-    """
-    try:
-        # Chargement state_dict
-        state_dict = load_file(vae_path, device="cpu")
-        print("✅ State dict VAE chargé, clés:", list(state_dict.keys())[:5])
-
-        # Création d'un VAE compatible SD
-        vae = AutoencoderKL(
-            in_channels=3,
-            out_channels=3,
-            down_block_types=["DownEncoderBlock2D"]*4,
-            up_block_types=["UpDecoderBlock2D"]*4,
-            block_out_channels=[128, 256, 512, 512],
-            latent_channels=4,
-            sample_size=32  # à adapter selon le checkpoint
-        )
-
-        # Chargement des poids
-        vae.load_state_dict(state_dict, strict=False)
-
-        # Offload si demandé
-        if offload:
-            vae = vae.to("cpu")
-        else:
-            vae = vae.to(device)
-            if fp16:
-                vae = vae.half()
-
-        return vae
-
-    except Exception as e:
-        print(f"⚠ Erreur lors du chargement du VAE : {e}")
-        return None
 
 
 # -------------------------
@@ -703,7 +704,7 @@ def safe_load_unet(model_path, device, fp16=False):
         return model.to(device)
     return None
 
-def safe_load_vae_old(model_path, device, fp16=False, offload=False):
+def safe_load_vae_stable(model_path, device, fp16=False, offload=False):
     folder = os.path.join(model_path, "vae")
     if os.path.exists(folder):
         model = AutoencoderKL.from_pretrained(folder)
