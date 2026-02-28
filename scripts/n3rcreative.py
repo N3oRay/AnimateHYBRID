@@ -12,7 +12,7 @@ import ffmpeg
 from transformers import CLIPTokenizerFast, CLIPTextModel
 
 from scripts.utils.config_loader import load_config
-from scripts.utils.vae_utils import safe_load_vae, safe_load_unet, safe_load_scheduler
+from scripts.utils.vae_utils import safe_load_vae_stable, safe_load_unet, safe_load_scheduler
 from scripts.utils.vae_utils import encode_images_to_latents, decode_latents_to_image_tiled
 from scripts.utils.motion_utils import load_motion_module, apply_motion_module
 from scripts.utils.safe_latent import ensure_valid
@@ -81,7 +81,7 @@ def main(args):
     # Load models
     # -------------------------
     unet = safe_load_unet(args.pretrained_model_path, device, fp16=args.fp16)
-    vae = safe_load_vae(args.pretrained_model_path, device, fp16=args.fp16, offload=args.vae_offload)
+    vae = safe_load_vae_stable(args.pretrained_model_path, device, fp16=args.fp16, offload=args.vae_offload)
     scheduler = safe_load_scheduler(args.pretrained_model_path)
     if not unet or not vae or not scheduler:
         print("❌ UNet, VAE ou Scheduler manquant.")
