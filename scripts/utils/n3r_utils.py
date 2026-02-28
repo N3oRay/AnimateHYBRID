@@ -20,6 +20,76 @@ import torchvision.transforms as T
 from transformers import CLIPTokenizer, CLIPTextModel
 
 
+import torch, math
+
+def generate_latents_ai_5D_stable(
+    latent_frame,         # [B,4,H,W] ou [1,4,H,W]
+    pos_embeds,           # [1,77,768]
+    neg_embeds,           # [1,77,768]
+    unet,
+    scheduler,
+    motion_module=None,
+    device="cuda",
+    dtype=torch.float16,
+    guidance_scale=7.5,
+    init_image_scale=0.7,
+    creative_noise=0.03,
+    seed=42,
+    steps=40
+):
+    """
+    Génération de latents ultra-stable avec :
+      - réinjection du latent initial pour stabilité
+      - creative_noise modéré
+      - support batch [B,4,H,W] ou frame unique [1,4,H,W]
+    Sortie : latents [B,4,H,W]
+    """
+
+    torch.manual_seed(seed)
+    B = latent_frame.shape[0]
+
+    latents = latent_frame.to(device=device, dtype=dtype)
+    init_latents = latents.clone()
+
+    scheduler.set_timesteps(steps, device=device)
+
+    for t in scheduler.timesteps:
+        # 🔹 Motion module
+        if motion_module is not None:
+            latents = motion_module(latents)
+
+        # 🔹 Creative noise
+        if creative_noise > 0:
+            latents = latents + torch.randn_like(latents) * creative_noise
+
+        # 🔹 Classifier-Free Guidance
+        latent_model_input = torch.cat([latents, latents], dim=0)
+        embeds = torch.cat([neg_embeds, pos_embeds], dim=0).to(device=device, dtype=dtype)
+
+        with torch.no_grad():
+            noise_pred = unet(latent_model_input, t, encoder_hidden_states=embeds).sample
+
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+        # 🔹 Scheduler step
+        latents = scheduler.step(noise_pred, t, latents).prev_sample
+
+        # 🔹 Réinjection du latent initial (stabilité couleur / contenu)
+        latents = latents + init_image_scale * (init_latents - latents)
+
+        # 🔹 Sécurité NaN / inf
+        if torch.isnan(latents).any() or torch.isinf(latents).any():
+            latents = latents + torch.randn_like(latents) * 1e-3
+
+        # 🔹 Debug
+        mean_val = latents.abs().mean().item()
+        if mean_val < 1e-5:
+            print(f"⚠ Latent trop petit à timestep {t}, mean={mean_val:.6f}")
+
+    return latents
+
+
 
 def generate_latents_ai_5D_optimized(
     latent_frame,         # [1,4,H,W]
