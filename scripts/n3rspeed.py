@@ -14,7 +14,7 @@ from torchvision.transforms import ToPILImage
 from transformers import CLIPTokenizerFast, CLIPTextModel
 
 from scripts.utils.config_loader import load_config
-from scripts.utils.vae_utils import safe_load_vae, safe_load_unet, safe_load_scheduler
+from scripts.utils.vae_utils import safe_load_vae_safetensors, safe_load_unet, safe_load_scheduler, safe_load_vae, safe_load_vae_stable
 from scripts.utils.vae_utils import decode_latents_to_image_tiled
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import generate_latents_robuste, load_image_file
@@ -96,10 +96,18 @@ def main(args):
     # Load models
     # -------------------------
     unet = safe_load_unet(args.pretrained_model_path, device, fp16=args.fp16)
-    vae = safe_load_vae(args.pretrained_model_path, device, fp16=args.fp16, offload=args.vae_offload)
+    vae = safe_load_vae_stable(args.pretrained_model_path, device, fp16=args.fp16, offload=args.vae_offload)
     scheduler = safe_load_scheduler(args.pretrained_model_path)
-    if not unet or not vae or not scheduler:
-        print("❌ UNet, VAE ou Scheduler manquant.")
+    if not vae :
+        print("❌ VAE manquant.")
+        return
+
+    if not scheduler:
+        print("❌ Scheduler manquant.")
+        return
+
+    if not unet :
+        print("❌ UNet manquant.")
         return
 
     motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
