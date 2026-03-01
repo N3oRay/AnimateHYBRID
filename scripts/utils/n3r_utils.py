@@ -20,7 +20,225 @@ from einops import rearrange
 from math import ceil
 
 
+# -------------------------
+# scripts/utils/n3r_utils.py
+# -------------------------
 
+def patchify_latents(latents, tile_size=128, overlap=32):
+    """
+    Découpe les latents en patches pour traitement patch-based.
+    Retourne une liste plate de patches + leurs positions.
+    """
+    _, C, H, W = latents.shape
+    patches = []
+    coords = []
+
+    stride = tile_size - overlap
+    for y in range(0, H, stride):
+        for x in range(0, W, stride):
+            y1 = min(y + tile_size, H)
+            x1 = min(x + tile_size, W)
+            y0 = y1 - tile_size if y1 - y < tile_size else y
+            x0 = x1 - tile_size if x1 - x < tile_size else x
+
+            patch = latents[:, :, y0:y1, x0:x1]
+            patches.append(patch)           # ✅ Patch est un Tensor
+            coords.append((y0, y1, x0, x1))  # ✅ Coordonnees patch
+
+    return patches, coords
+
+
+
+# -------------------------
+# Dépatchification sécurisée
+# -------------------------
+def unpatchify_latents(patches, coords, full_shape, device=None, dtype=None):
+    """
+    Recompose les latents à partir de la liste de patches.
+    """
+    B, C, H, W = full_shape
+    latents = torch.zeros(full_shape, device=device, dtype=dtype)
+
+    for patch, (y0, y1, x0, x1) in zip(patches, coords):
+        latents[:, :, y0:y1, x0:x1] = patch
+
+    return latents
+# -------------------------
+# Génération d’un frame patch-based v3
+# -------------------------
+# -------------------------
+# generate_frame_patched_v3
+# -------------------------
+def generate_frame_patched_v3(
+    input_image,
+    vae,
+    unet,
+    scheduler,
+    pos_emb,
+    neg_emb=None,
+    tile_size=128,
+    overlap=32,
+    steps=12,
+    guidance_scale=4.5,
+    init_image_scale=0.75,
+    creative_noise=0.0,
+    device="cuda",
+    dtype=torch.float16
+):
+    """
+    Génère un frame patch-based safe pour CPU/GPU.
+    """
+    # -------------------------
+    # Encode l'image en latents (toujours sur CPU pour VAE)
+    # -------------------------
+    with torch.no_grad():
+        latents = vae.encode(input_image.to(torch.float32)).latent_dist.sample() * LATENT_SCALE
+        latents = latents.to(device=device, dtype=dtype)
+
+    # -------------------------
+    # Patchify latents
+    # -------------------------
+    patches, patch_coords = patchify_latents(latents, tile_size=tile_size, overlap=overlap)
+
+    # -------------------------
+    # Scheduler timesteps
+    # -------------------------
+    for t in scheduler.timesteps[:steps]:
+        t_tensor = torch.tensor([t], device=device, dtype=dtype)
+        new_patches = []
+
+        for patch in patches:
+            patch = patch.to(device=device, dtype=dtype)
+
+            # Flatten 5D -> 4D si nécessaire (batch x channels x H x W)
+            if patch.dim() == 5:
+                B,C,D,H,W = patch.shape
+                patch = patch.view(B*C, D, H, W)
+
+            # UNet forward
+            noise_pred = unet(
+                patch,
+                timestep=t_tensor,
+                encoder_hidden_states=pos_emb
+            ).sample
+
+            # Guidance si neg_emb fourni
+            if neg_emb is not None:
+                noise_pred_neg = unet(
+                    patch,
+                    timestep=t_tensor,
+                    encoder_hidden_states=neg_emb
+                ).sample
+                noise_pred = noise_pred_neg + guidance_scale * (noise_pred - noise_pred_neg)
+
+            # Creative noise
+            if creative_noise > 0.0:
+                noise_pred += creative_noise * torch.randn_like(noise_pred)
+
+            new_patches.append(noise_pred)
+
+            # Libération GPU intermédiaire
+            del patch, noise_pred
+            torch.cuda.empty_cache()
+
+        patches = new_patches
+
+    # -------------------------
+    # Recomposition latents
+    # -------------------------
+    latents = unpatchify_latents(patches, patch_coords, latents.shape)
+
+    # -------------------------
+    # Décodage VAE
+    # -------------------------
+    with torch.no_grad():
+        frame_tensor = vae.decode(latents.to(torch.float32)).sample
+        frame_tensor = frame_tensor.to(device=device, dtype=dtype)
+
+    return frame_tensor
+# -------------------------
+# Génération d’un frame patch-based v1
+# -------------------------
+
+def generate_frame_patched(
+    input_image, vae, unet, scheduler,
+    pos_emb, neg_emb=None,
+    tile_size=128, overlap=32,
+    steps=12,
+    guidance_scale=4.5,
+    init_image_scale=0.75,
+    creative_noise=0.0,
+    device="cuda",
+    dtype=torch.float16
+):
+    """
+    Génère un frame en utilisant la logique patch-based safe pour CPU/GPU.
+    """
+    # -------------------------
+    # Encode l'image en latents (toujours sur CPU pour VAE)
+    # -------------------------
+    with torch.no_grad():
+        latents = vae.encode(input_image.to(torch.float32)).latent_dist.sample() * LATENT_SCALE
+        latents = latents.to(device=device, dtype=dtype)
+
+    # -------------------------
+    # Patchify
+    # -------------------------
+    patches, patch_coords = patchify_latents(latents, tile_size=tile_size, overlap=overlap)
+
+    # -------------------------
+    # Parcours des timesteps
+    # -------------------------
+    for t in scheduler.timesteps[:steps]:
+        t_tensor = torch.tensor([t], device=device, dtype=dtype)
+
+        new_patches = []
+        for patch in patches:
+            patch = patch.to(device=device, dtype=dtype)
+
+            # UNet call : timestep obligatoire + embeddings
+            noise_pred = unet(
+                patch,
+                timestep=t_tensor,
+                encoder_hidden_states=pos_emb
+            ).sample
+
+            # Guidance si négatif fourni
+            if neg_emb is not None:
+                noise_pred_neg = unet(
+                    patch,
+                    timestep=t_tensor,
+                    encoder_hidden_states=neg_emb
+                ).sample
+                noise_pred = noise_pred_neg + guidance_scale * (noise_pred - noise_pred_neg)
+
+            new_patches.append(noise_pred)
+
+        patches = new_patches
+
+        # Optionnel : ajouter un peu de noise créatif
+        if creative_noise > 0.0:
+            for i in range(len(patches)):
+                patches[i] += creative_noise * torch.randn_like(patches[i])
+
+    # -------------------------
+    # Unpatchify
+    # -------------------------
+    latents = unpatchify_latents(patches, patch_coords, latents.shape)
+
+    # -------------------------
+    # Décode en image
+    # -------------------------
+    with torch.no_grad():
+        frame_tensor = vae.decode(latents.to(torch.float32)).sample
+        frame_tensor = frame_tensor.to(dtype=dtype, device=device)
+
+    return frame_tensor
+
+
+# -------------------------
+# Génération split_image_into_patches
+# -------------------------
 
 def split_image_into_patches(img, patch_size=128, overlap=16):
     """Découpe l'image en patches avec overlap."""
