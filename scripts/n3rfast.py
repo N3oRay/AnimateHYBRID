@@ -173,51 +173,59 @@ def main(args):
                     latents_frame = None
                 else:
                     latents_frame = input_latents[:, :, f:f+1, :, :].clone()
-                    try:
-                        latents_frame = generate_latents_robuste(
-                            latents_frame,
-                            pos_embeds,
-                            neg_embeds,
-                            unet,
-                            scheduler,
-                            motion_module=motion_module,
-                            device=device,
-                            dtype=dtype,
-                            guidance_scale=guidance_scale,
-                            init_image_scale=init_image_scale,
-                            creative_noise=creative_noise,
-                            seed=frame_counter
-                        )
-                    except Exception as e:
-                        print(f"⚠ Erreur génération frame {frame_counter:05d}, reset avec petit bruit: {e}")
-                        latents_frame = input_latents[:, :, f:f+1, :, :] + torch.randn_like(input_latents[:, :, f:f+1, :, :]) * 0.05
-                        latents_frame = latents_frame.to(dtype=dtype)
 
-                    latents_frame = latents_frame.squeeze(2).clamp(-3.0, 3.0)
-                    frame_tensor = decode_latents_to_image_tiled(
-                        latents_frame, vae,
-                        tile_size=block_size,
-                        overlap=overlap
-                    ).clamp(0,1)
+                try:
+                    latents_frame = generate_latents_robuste(
+                        latents_frame,
+                        pos_embeds,
+                        neg_embeds,
+                        unet,
+                        scheduler,
+                        motion_module=motion_module,
+                        device=device,
+                        dtype=dtype,
+                        guidance_scale=guidance_scale,
+                        init_image_scale=init_image_scale,
+                        creative_noise=creative_noise,
+                        seed=frame_counter
+                    )
+                except Exception as e:
+                    print(f"⚠ Erreur génération frame {frame_counter:05d}, reset avec petit bruit: {e}")
+                    latents_frame = input_latents[:, :, f:f+1, :, :] + torch.randn_like(input_latents[:, :, f:f+1, :, :]) * 0.05
+                    latents_frame = latents_frame.to(dtype=dtype)
 
-                    if frame_tensor.ndim == 4 and frame_tensor.shape[0] == 1:
-                        frame_tensor = frame_tensor.squeeze(0)
+                # Clamp et decode tuilé
+                latents_frame = latents_frame.squeeze(2).clamp(-3.0, 3.0)
+                #frame_tensor = decode_latents_to_image_tiled(latents_frame, vae, tile_size=32, overlap=16).clamp(0,1)
 
-                # ------------------------- Sauvegarde commune
+                #------------------- NEW CODE -------------------------------------------
+                block_size = cfg.get("block_size", 64)
+                overlap = compute_overlap(cfg["W"], cfg["H"], block_size, max_overlap_ratio=0.6) # 0.6 ou 0.65 Max
+
+                frame_tensor = decode_latents_to_image_tiled(
+                    latents_frame, vae,
+                    tile_size=block_size,
+                    overlap=overlap
+                ).clamp(0,1)
+                #------------------------------------------------------------------------
+
+
+                if frame_tensor.ndim == 4 and frame_tensor.shape[0] == 1:
+                    frame_tensor = frame_tensor.squeeze(0)
+
                 frame_pil = to_pil(frame_tensor.cpu())
                 frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
-                frames_for_video.append(frame_pil)
 
-                # Incrémenter frame_counter **après** la sauvegarde de la frame
+                frames_for_video.append(frame_pil)
                 frame_counter += 1
                 pbar.update(1)
 
-                if latents_frame is not None:
-                    mean_lat = latents_frame.abs().mean().item()
-                    if math.isnan(mean_lat) or mean_lat < 1e-5:
-                        print(f"⚠ Frame {frame_counter:05d} contient NaN ou latent trop petit, réinitialisation")
-                    del latents_frame, frame_tensor
-                    torch.cuda.empty_cache()
+                mean_lat = latents_frame.abs().mean().item()
+                if math.isnan(mean_lat) or mean_lat < 1e-5:
+                    print(f"⚠ Frame {frame_counter:05d} contient NaN ou latent trop petit, réinitialisation")
+
+                del latents_frame, frame_tensor
+                torch.cuda.empty_cache()
 
     pbar.close()
     save_frames_as_video(frames_for_video, out_video, fps=fps)
