@@ -27,6 +27,8 @@ select CONFIG_CHOICE in \
     "256" \
     "256p" \
     "512" \
+    "512x640" \
+    "640" \
     "Quitter"
 do
     case $CONFIG_CHOICE in
@@ -35,6 +37,8 @@ do
         256)   CONFIG="configs/prompts/2_animate/256.yaml"; break ;;
         256p)  CONFIG="configs/prompts/1_animate/256p.yaml"; break ;;
         512)   CONFIG="configs/prompts/2_animate/512.yaml"; break ;;
+        512x640)   CONFIG="configs/prompts/2_animate/640x512.yaml"; break ;;
+        640)   CONFIG="configs/prompts/2_animate/640.yaml"; break ;;
         Quitter) exit 0 ;;
         *) echo "Choix invalide." ;;
     esac
@@ -43,6 +47,7 @@ done
 echo ""
 echo "Choisir le script :"
 select SCRIPT_CHOICE in \
+    "n3rfast" \
     "n3rspeed" \
     "n3rcreative" \
     "n3rHYBRID21" \
