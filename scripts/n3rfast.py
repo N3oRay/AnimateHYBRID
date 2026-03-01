@@ -23,6 +23,12 @@ from scripts.utils.n3r_utils import generate_latents_robuste, load_image_file
 
 LATENT_SCALE = 0.18215
 
+
+def normalize_frame(frame_tensor):
+    if frame_tensor.min() < 0:
+        frame_tensor = (frame_tensor + 1.0) / 2.0
+    return frame_tensor.clamp(0,1)
+
 # -------------------------
 def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
     overlap = int(block_size * max_overlap_ratio)
@@ -207,6 +213,8 @@ def main(args):
                     tile_size=block_size,
                     overlap=overlap
                 ).clamp(0,1)
+
+                frame_tensor = normalize_frame(frame_tensor) # A tester !
                 #------------------------------------------------------------------------
 
 
