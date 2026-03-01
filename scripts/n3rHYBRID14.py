@@ -121,7 +121,7 @@ def main(args):
     # OUTPUT
     # -------------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/hybrid_stable_{timestamp}")
+    output_dir = Path(f"./outputs/hybrid14_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     debug_dir = output_dir / "debug_frames"; debug_dir.mkdir(exist_ok=True)
     csv_file = output_dir / "generation_log.csv"

@@ -139,7 +139,7 @@ def main(args):
     # OUTPUT
     # -------------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/hybrid21_{timestamp}")
+    output_dir = Path(f"./outputs/hybrid22_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     debug_dir = output_dir / "debug_frames"
     debug_dir.mkdir(exist_ok=True)
@@ -197,6 +197,11 @@ def main(args):
                     decode_start = time.time()
                     if args.vae_offload:
                         vae.to(device)
+
+                    print("Latent stats:",
+                          float(batch_latents.min()),
+                          float(batch_latents.max()),
+                          float(batch_latents.mean()))
                     decoded_tile = decode_latents_to_image(batch_latents, vae)
                     decode_time = time.time() - decode_start
                     if args.vae_offload:
@@ -219,7 +224,15 @@ def main(args):
                 frame_warnings = log_rgb_stats(final_frame, step=f"frame{frame_counter}_final")
                 all_warnings.extend(frame_warnings)
 
-                frame_array = final_frame[0].clamp(0,1).permute(1,2,0).cpu().numpy()
+                #frame_array = final_frame[0].clamp(0,1).permute(1,2,0).cpu().numpy()
+
+                final_frame = final_frame.clamp(0.0,1.0)
+                print("After decode:",
+                      float(final_frame.min()),
+                      float(final_frame.max()))
+                frame_array = final_frame[0].permute(1,2,0).cpu().numpy()  # (H,W,C)
+
+
                 save_frame(frame_array, debug_dir / f"frame_{frame_counter:05d}.png")
 
                 if video is None:

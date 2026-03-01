@@ -130,7 +130,7 @@ def main(args):
         embeddings.append((pos_embeds.to(dtype), neg_embeds.to(dtype)))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/run_{timestamp}")
+    output_dir = Path(f"./outputs/speed_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
 
