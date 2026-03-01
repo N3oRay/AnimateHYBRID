@@ -5,7 +5,6 @@ from PIL import Image
 from pathlib import Path
 from torchvision.utils import save_image
 import ffmpeg
-
 import torch.nn as nn
 import math
 from tqdm import tqdm
@@ -15,12 +14,364 @@ import numpy as np
 import yaml
 import torch.nn.functional as F
 LATENT_SCALE = 0.18215
-
 import torchvision.transforms as T
 from transformers import CLIPTokenizer, CLIPTextModel
+from einops import rearrange
+from math import ceil
 
 
-import torch, math
+
+
+def split_image_into_patches(img, patch_size=128, overlap=16):
+    """Découpe l'image en patches avec overlap."""
+    _, C, H, W = img.shape
+    stride = patch_size - overlap
+    patches = []
+    positions = []
+
+    for y in range(0, H, stride):
+        for x in range(0, W, stride):
+            y0, x0 = y, x
+            y1, x1 = min(y+patch_size, H), min(x+patch_size, W)
+            patch = img[:, :, y0:y1, x0:x1]
+            patches.append(F.pad(patch, (0, patch_size-(x1-x0), 0, patch_size-(y1-y0))))
+            positions.append((y0, y1, x0, x1))
+    return torch.stack(patches), positions
+
+def reassemble_patches(patches, positions, H, W, overlap=16):
+    """Reconstitue l'image à partir des patches avec blending."""
+    device = patches.device
+    out = torch.zeros(1, 3, H, W, device=device)
+    count = torch.zeros(1, 1, H, W, device=device)
+
+    for patch, (y0, y1, x0, x1) in zip(patches, positions):
+        h, w = y1-y0, x1-x0
+        out[:, :, y0:y1, x0:x1] += patch[:, :, :h, :w]
+        count[:, :, y0:y1, x0:x1] += 1
+    return out / count
+
+
+
+
+def generate_frame_with_tiling(
+    input_image, vae, unet, scheduler, embeddings, motion_module=None,
+    tile_size=128, overlap=16, fp16=True,
+    guidance_scale=4.5, init_image_scale=0.75,
+    creative_noise=0.0, steps=12
+):
+    """
+    Génère une image à partir d'une input_image patchée, recomposée automatiquement.
+    Optimisé pour MiniSD/TinySD afin de réduire la VRAM et éviter OOM.
+    """
+
+    device = input_image.device
+    dtype = torch.float16 if fp16 else torch.float32
+    _, C, H, W = input_image.shape
+
+    # Calculer nombre de patches
+    stride = tile_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # Préparer canvas final
+    frame_latents = torch.zeros((1, C, H, W), device=device, dtype=dtype)
+    weight_map = torch.zeros((1, 1, H, W), device=device, dtype=dtype)
+
+    for y in y_positions:
+        for x in x_positions:
+            # Extraire patch
+            y0, y1 = y, min(y + tile_size, H)
+            x0, x1 = x, min(x + tile_size, W)
+            patch = input_image[:, :, y0:y1, x0:x1].to(dtype)
+
+            # --- Encoder en latents (VAE FP32-safe) ---
+            with torch.no_grad():
+                patch_latents = vae.encode(patch.float()).latent_dist.sample() * 0.18215
+                patch_latents = patch_latents.to(dtype)
+
+            # --- Motion module ---
+            if motion_module is not None:
+                patch_latents = motion_module(patch_latents)
+
+            # --- Scheduler / UNet ---
+            # Utiliser FP16 pour UNet si demandé
+            patch_latents = patch_latents.half() if fp16 else patch_latents.float()
+            for pos_embeds, neg_embeds in embeddings:
+                for t in scheduler.timesteps:
+                    with torch.no_grad():
+                        noise_pred = unet(
+                            patch_latents, timestep=t, encoder_hidden_states=pos_embeds
+                        ).sample
+                    # Guidance
+                    patch_latents = patch_latents + guidance_scale * (noise_pred - patch_latents)
+
+            # --- Décoder patch ---
+            with torch.no_grad():
+                patch_img = vae.decode(patch_latents.float()).sample  # toujours FP32 pour VAE
+                patch_img = patch_img.to(dtype)
+
+            # --- Ajouter au canvas final ---
+            frame_latents[:, :, y0:y1, x0:x1] += patch_img
+            weight_map[:, :, y0:y1, x0:x1] += 1.0
+
+            # Libérer mémoire GPU
+            torch.cuda.empty_cache()
+
+    # Normaliser par superposition
+    frame_latents /= weight_map
+    return frame_latents
+
+
+# -------------------------
+# encode_image_latents reste FP32 pour stabilité
+# -------------------------
+def encode_image_latents_fp32(image_tensor, vae, scale=LATENT_SCALE):
+    device = next(vae.parameters()).device
+    img = image_tensor.to(device=device, dtype=next(vae.parameters()).dtype)
+    with torch.no_grad():
+        latents = vae.encode(img).latent_dist.sample() * scale
+    return latents.unsqueeze(2)  # [B,C,1,H,W]
+
+
+# -------------------------
+# Génération patch par patch
+# -------------------------
+from scripts.modules.motion_module_tiny import MotionModuleTiny
+
+def generate_frame_with_tiling_v1(
+    input_image,
+    vae,
+    unet,
+    motion_module,
+    patch_size: int = 128,
+    overlap: int = 16,
+    fp16: bool = True,
+    **kwargs
+):
+    """
+    Découpe l'image en patches, encode, génère latents, puis recompose.
+    FP16-safe pour Mini/Tiny SD.
+    """
+    # Convertir en FP16 si demandé
+    dtype = torch.float16 if fp16 else torch.float32
+
+    _, h, w = input_image.shape
+    stride = patch_size - overlap
+    frame_tensor = torch.zeros_like(input_image, dtype=dtype)
+
+    # Eviter double passage de fp16
+    kwargs = dict(kwargs)
+    kwargs.pop("fp16", None)
+
+    for y in range(0, h, stride):
+        for x in range(0, w, stride):
+            y1, x1 = y, x
+            y2, x2 = min(y + patch_size, h), min(x + patch_size, w)
+            patch = input_image[:, y1:y2, x1:x2]
+
+            # Encoder le patch
+            patch_latents = encode_image_latents_fp32(patch, vae, fp16=fp16)
+
+            # Génération latents
+            patch_latents = generate_latents_ai_5D_optimized(
+                patch_latents,
+                unet,
+                motion_module,
+                fp16=fp16,
+                **kwargs
+            )
+
+            # Décodage patch
+            patch_frame = vae.decode(patch_latents).sample.to(dtype)
+
+            # Recomposer dans l'image finale
+            frame_tensor[:, y1:y2, x1:x2] = patch_frame
+
+    return frame_tensor
+
+
+# -------------------------
+# Génération et décodage sécurisée pour n3rHYBRID24
+# -------------------------
+def generate_and_decode(latent_frame, unet, scheduler, pos_embeds, neg_embeds,
+                        motion_module, vae, device="cuda", dtype=torch.float32,
+                        guidance_scale=4.5, init_image_scale=0.85, creative_noise=0.0,
+                        seed=42, steps=35, tile_size=128, overlap=32, vae_offload=False):
+    """
+    Génère les latents pour un frame et les décode en image finale,
+    avec gestion automatique des devices, FP16, offload et tiling.
+    """
+    import torch, time
+
+    torch.manual_seed(seed)
+
+    # -------------------------
+    # Déplacer latents et embeddings sur le bon device et dtype
+    # -------------------------
+    latent_frame = latent_frame.to(device=device, dtype=dtype)
+    pos_embeds = pos_embeds.to(device=device, dtype=dtype)
+    neg_embeds = neg_embeds.to(device=device, dtype=dtype)
+
+    # -------------------------
+    # Génération avec UNet + Scheduler
+    # -------------------------
+    gen_start = time.time()
+    batch_latents = generate_latents_ai_5D_optimized(
+        latent_frame=latent_frame,
+        scheduler=scheduler,
+        pos_embeds=pos_embeds,
+        neg_embeds=neg_embeds,
+        unet=unet,
+        motion_module=motion_module,
+        device=device,
+        dtype=dtype,
+        guidance_scale=guidance_scale,
+        init_image_scale=init_image_scale,
+        creative_noise=creative_noise,
+        seed=seed,
+        steps=steps
+    )
+    gen_time = time.time() - gen_start
+
+
+# -------------------------
+# Encode tile safe FP32
+# -------------------------
+def encode_tile_safe_fp32(vae, tile_np, device="cuda", vae_offload=False):
+    """
+    Encode une tile numpy [C,H,W] en latent VAE [1,4,H/8,W/8]
+    VRAM-safe, compatible FP32 VAE complet et offload
+    """
+    tile_tensor = torch.from_numpy(tile_np).unsqueeze(0).to(device=device, dtype=torch.float32)  # [1,3,H,W]
+    with torch.no_grad():
+        if vae_offload:
+            vae.to(device)  # mettre VAE sur le même device que le tile
+        latent = vae.encode(tile_tensor).latent_dist.sample() * LATENT_SCALE
+        if vae_offload:
+            vae.cpu()  # remettre VAE sur CPU pour économiser VRAM
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
+    return latent
+
+# -------------------------
+# Merge tiles FP32
+# -------------------------
+def merge_tiles_fp32(tile_list, positions, H, W, latent_scale=1.0):
+    """
+    Fusionne les tiles latents [1,C,th,tw] en image complète [1,C,H,W].
+    Supporte tiles de tailles différentes et bordures.
+    """
+    device = tile_list[0].device
+    C = tile_list[0].shape[1]
+
+    out = torch.zeros(1, C, H, W, dtype=tile_list[0].dtype, device=device)
+    count = torch.zeros(1, C, H, W, dtype=tile_list[0].dtype, device=device)
+
+    for tile, (y1, y2, x1, x2) in zip(tile_list, positions):
+        _, c, th, tw = tile.shape
+        h_len = y2 - y1
+        w_len = x2 - x1
+        th = min(th, h_len)
+        tw = min(tw, w_len)
+        out[:, :, y1:y1+th, x1:x1+tw] += tile[:, :, :th, :tw]
+        count[:, :, y1:y1+th, x1:x1+tw] += 1.0
+
+    count[count==0] = 1.0
+    out = out / count
+    return out
+
+def encode_tile_safe_latent(vae, tile, device, LATENT_SCALE=0.18215):
+    """
+    Encode une tuile en latent FP32 et pad si nécessaire.
+    tile: np.array (H,W,3) float32 0-1
+    return: torch tensor (1,4,H_latent_max,W_latent_max)
+    """
+    tile_tensor = torch.tensor(tile).permute(2,0,1).unsqueeze(0).to(device)
+    latent = vae.encode(tile_tensor).latent_dist.sample() * LATENT_SCALE
+    # Vérifier H,W du latent
+    H_lat, W_lat = latent.shape[2], latent.shape[3]
+    H_max = (tile.shape[0] + 7)//8  # VAE scale
+    W_max = (tile.shape[1] + 7)//8
+    if H_lat != H_max or W_lat != W_max:
+        padH = H_max - H_lat
+        padW = W_max - W_lat
+        latent = torch.nn.functional.pad(latent, (0,padW,0,padH))
+    return latent
+
+# --- Découper une image en tiles avec overlap ---
+def tile_image_128(image, tile_size=128, overlap=16):
+    """
+    Découpe une image (H,W,C ou C,H,W) en tiles avec overlap.
+    Retourne une liste de tiles (numpy arrays) et leurs positions (x1,y1,x2,y2).
+    """
+    # Assure shape [C,H,W]
+    if image.ndim == 3 and image.shape[2] in [1,3]:
+        # H,W,C -> C,H,W
+        image = image.transpose(2,0,1)
+    elif image.ndim != 3:
+        raise ValueError(f"Image doit être 3D, shape={image.shape}")
+
+    C,H,W = image.shape
+    stride = tile_size - overlap
+    tiles = []
+    positions = []
+
+    for y in range(0, H, stride):
+        for x in range(0, W, stride):
+            y1, y2 = y, min(y + tile_size, H)
+            x1, x2 = x, min(x + tile_size, W)
+            tile = image[:, y1:y2, x1:x2]
+            tiles.append(tile.astype(np.float32))   # reste numpy
+            positions.append((x1, y1, x2, y2))
+    return tiles, positions
+
+
+# --- Normalisation d'une tile ---
+def normalize_tile_128(img_array):
+    """
+    img_array: np.ndarray, shape [H,W,C] ou [C,H,W], valeurs 0-255
+    Retour: torch.Tensor [1,3,H,W] float32, valeurs 0-1
+    """
+    if img_array.ndim == 3 and img_array.shape[2] == 3:  # HWC
+        img_array = img_array.transpose(2,0,1)
+    img_tensor = torch.from_numpy(img_array).unsqueeze(0).float() / 255.0
+    return img_tensor
+
+
+
+
+# --- Merge tiles pour reconstruire l'image ---
+# -------------------------
+# Merge tiles
+# -------------------------
+def merge_tiles(tile_list, positions, H, W):
+    out = torch.zeros(1, 3, H, W, dtype=torch.float32)
+    count = torch.zeros(1, 3, H, W, dtype=torch.float32)
+
+    for tile, (y1, y2, x1, x2) in zip(tile_list, positions):
+        _, c, th, tw = tile.shape
+        out[:,:,y1:y2,x1:x2] += tile[:,:, :th, :tw]
+        count[:,:,y1:y2,x1:x2] += 1.0
+
+    count[count==0] = 1.0
+    out = out / count
+    return out
+
+
+def save_frame(img_array, filename):
+    img_array = np.clip(img_array, 0.0, 1.0)
+    img_uint8 = (img_array * 255).astype(np.uint8)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    Image.fromarray(img_uint8).save(filename)
+
+def encode_image_latents(image_tensor, vae, scale=LATENT_SCALE):
+    """Encode RGB -> latents 4 canaux"""
+    device = next(vae.parameters()).device
+    img = image_tensor.to(device=device, dtype=next(vae.parameters()).dtype)
+    with torch.no_grad():
+        latents = vae.encode(img).latent_dist.sample() * scale
+    return latents  # [B,4,H/8,W/8]
+
 
 def generate_latents_ai_5D_stable(
     latent_frame,         # [B,4,H,W] ou [1,4,H,W]

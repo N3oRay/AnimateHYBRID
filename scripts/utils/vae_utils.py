@@ -10,12 +10,411 @@ from safetensors.torch import load_file
 from torchvision.transforms import ToPILImage
 
 import torchvision.transforms as T
+import torch, numpy as np
 from PIL import Image
 
 
 LATENT_SCALE = 0.18215
 
+
+# -------------------------
+# Génération et décodage sécurisée pour n3rHYBRID24
+# -------------------------
+def generate_and_decode(latent_frame, unet, scheduler, pos_embeds, neg_embeds,
+                        motion_module, vae, device="cuda", dtype=torch.float32,
+                        guidance_scale=4.5, init_image_scale=0.85, creative_noise=0.0,
+                        seed=42, steps=35, tile_size=128, overlap=32, vae_offload=False):
+    """
+    Génère les latents pour un frame et les décode en image finale,
+    avec gestion automatique des devices, FP16, offload et tiling.
+    """
+    import torch, time
+
+    torch.manual_seed(seed)
+
+    # -------------------------
+    # Déplacer latents et embeddings sur le bon device et dtype
+    # -------------------------
+    latent_frame = latent_frame.to(device=device, dtype=dtype)
+    pos_embeds = pos_embeds.to(device=device, dtype=dtype)
+    neg_embeds = neg_embeds.to(device=device, dtype=dtype)
+
+    # -------------------------
+    # Génération avec UNet + Scheduler
+    # -------------------------
+    gen_start = time.time()
+    batch_latents = generate_latents_ai_5D_optimized(
+        latent_frame=latent_frame,
+        scheduler=scheduler,
+        pos_embeds=pos_embeds,
+        neg_embeds=neg_embeds,
+        unet=unet,
+        motion_module=motion_module,
+        device=device,
+        dtype=dtype,
+        guidance_scale=guidance_scale,
+        init_image_scale=init_image_scale,
+        creative_noise=creative_noise,
+        seed=seed,
+        steps=steps
+    )
+    gen_time = time.time() - gen_start
+
+    # -------------------------
+    # Gestion VAE offload / device
+    # -------------------------
+    vae_device = next(vae.parameters()).device
+    vae_dtype = next(vae.parameters()).dtype
+
+    if vae_offload:
+        vae.to(device)
+
+    # Assure correspondance latents / VAE
+    batch_latents = batch_latents.to(device=vae_device, dtype=vae_dtype)
+
+    # -------------------------
+    # Décodage avec tiling universel
+    # -------------------------
+    decode_start = time.time()
+    frame_tensor = decode_latents_to_image_tiled_universel(
+        batch_latents,
+        vae,
+        tile_size=tile_size,
+        overlap=overlap
+    )
+    decode_time = time.time() - decode_start
+
+    # Revenir en CPU si offload
+    if vae_offload:
+        vae.cpu()
+        torch.cuda.empty_cache()
+
+    # -------------------------
+    # Clamp final pour éviter NaN/inf
+    # -------------------------
+    frame_tensor = frame_tensor.clamp(0.0, 1.0)
+
+    return frame_tensor, batch_latents, gen_time, decode_time
+
+
+def decode_latents_to_image_tiled_universel(latents, vae, tile_size=64, overlap=16):
+    """
+    Decode latents 4D [B,C,H,W] ou 5D [B,C,T,H,W] en images [B,3,H*8,W*8].
+    Tiling avec blending sécurisé.
+    """
+    vae_dtype = next(vae.parameters()).dtype
+    device = vae.device
+
+    if latents.ndim == 5:
+        B,C,T,H,W = latents.shape
+        latents = latents.permute(0,2,1,3,4).reshape(B*T,C,H,W)
+    elif latents.ndim == 4:
+        B,C,H,W = latents.shape
+    else:
+        raise ValueError(f"Latents attendus 4D ou 5D, got {latents.shape}")
+
+    latents = latents.to(vae_dtype)
+    latents_scaled = latents / LATENT_SCALE
+
+    output = torch.zeros(B,3,H*8,W*8,device=device,dtype=torch.float32)
+    weight = torch.zeros_like(output)
+
+    stride = tile_size - overlap
+    y_positions = list(range(0,H-tile_size+1,stride)) or [0]
+    x_positions = list(range(0,W-tile_size+1,stride)) or [0]
+    if y_positions[-1] != H-tile_size: y_positions.append(H-tile_size)
+    if x_positions[-1] != W-tile_size: x_positions.append(W-tile_size)
+
+    for y in y_positions:
+        for x in x_positions:
+            y1 = y+tile_size
+            x1 = x+tile_size
+            tile = latents_scaled[:,:,y:y1,x:x1]
+
+            with torch.no_grad():
+                decoded = vae.decode(tile).sample.float()
+            decoded = (decoded/2 + 0.5).clamp(0,1)
+
+            iy0, ix0, iy1, ix1 = y*8, x*8, y1*8, x1*8
+            output[:,:,iy0:iy1,ix0:ix1] += decoded
+            weight[:,:,iy0:iy1,ix0:ix1] += 1.0
+
+    return output / weight.clamp(min=1e-6)
+
+
+def decode_latents_to_image_tiled128(latents, vae, tile_size=128, overlap=32, device="cuda"):
+    """
+    Decode les latents [B,4,H,W] ou [B,4,T,H,W] en RGB [B,3,H,W] ou [B,3,T,H,W]
+    avec tiling pour éviter OOM et blending correct.
+    """
+    vae_dtype = next(vae.parameters()).dtype
+    vae_device = next(vae.parameters()).device if device=="cuda" else device
+
+    # Support 5D
+    if latents.ndim == 5:
+        B, C, T, H, W = latents.shape
+        latents = latents.permute(0,2,1,3,4).reshape(B*T, C, H, W)
+        reshape_back = True
+    elif latents.ndim == 4:
+        B, C, H, W = latents.shape
+        reshape_back = False
+    else:
+        raise ValueError(f"Latents attendus 4D ou 5D, got {latents.shape}")
+
+    if C != 4:
+        raise ValueError(f"Latents doivent avoir 4 canaux, got {C}")
+
+    # Convert dtype & device
+    latents = latents.to(vae_device, vae_dtype)
+
+    stride = tile_size - overlap
+    out_H = H * 8
+    out_W = W * 8
+
+    output = torch.zeros(latents.shape[0], 3, out_H, out_W, device=vae_device, dtype=torch.float32)
+    weight = torch.zeros_like(output)
+
+    # Positions tuiles
+    y_positions = list(range(0, H - tile_size + 1, stride))
+    x_positions = list(range(0, W - tile_size + 1, stride))
+    if not y_positions: y_positions = [0]
+    if not x_positions: x_positions = [0]
+    if y_positions[-1] != H - tile_size: y_positions.append(H - tile_size)
+    if x_positions[-1] != W - tile_size: x_positions.append(W - tile_size)
+
+    for y in y_positions:
+        for x in x_positions:
+            y1 = y + tile_size
+            x1 = x + tile_size
+            tile = latents[:, :, y:y1, x:x1]
+
+            with torch.no_grad():
+                decoded = vae.decode(tile / LATENT_SCALE).sample
+
+            # Correction Stable Diffusion
+            decoded = (decoded / 2 + 0.5).clamp(0,1)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = y1*8, x1*8
+
+            output[:, :, iy0:iy1, ix0:ix1] += decoded
+            weight[:, :, iy0:iy1, ix0:ix1] += 1.0
+
+    output = output / weight.clamp(min=1e-6)
+
+    if reshape_back:
+        # Retour à [B,3,T,H,W]
+        output = output.reshape(B, T, 3, out_H, out_W).permute(0,2,1,3,4)
+
+    return output
+
+def log_rgb_stats(image_tensor, step=""):
+    """Enregistre les statistiques RGB et renvoie les warnings sous forme de liste."""
+    messages = []
+    R = image_tensor[0, 0].cpu().numpy()
+    G = image_tensor[0, 1].cpu().numpy()
+    B = image_tensor[0, 2].cpu().numpy()
+
+    R_min, R_max, R_mean = np.min(R), np.max(R), np.mean(R)
+    G_min, G_max, G_mean = np.min(G), np.max(G), np.mean(G)
+    B_min, B_max, B_mean = np.min(B), np.max(B), np.mean(B)
+
+    # Vérifications
+    if R_min < 0.0 or R_max > 1.0:
+        messages.append(f"{step}: canal R hors plage [{R_min:.3f},{R_max:.3f}]")
+    if G_min < 0.0 or G_max > 1.0:
+        messages.append(f"{step}: canal G hors plage [{G_min:.3f},{G_max:.3f}]")
+    if B_min < 0.0 or B_max > 1.0:
+        messages.append(f"{step}: canal B hors plage [{B_min:.3f},{B_max:.3f}]")
+
+    if abs(R_mean - G_mean) > 0.2 or abs(G_mean - B_mean) > 0.2:
+        messages.append(f"{step}: écart important entre R/G/B (R={R_mean:.3f}, G={G_mean:.3f}, B={B_mean:.3f})")
+
+    return messages
+
+def encode_tile_vae(tile_rgb, vae, fp16=False):
+    """Encode une tile RGB [1,3,H,W] -> latent [1,4,H/8,W/8]"""
+    device = next(vae.parameters()).device
+    dtype = torch.float16 if fp16 else torch.float32
+    tile_rgb = tile_rgb.to(device=device, dtype=dtype)
+    with torch.no_grad():
+        latent = vae.encode(tile_rgb).latent_dist.sample() * LATENT_SCALE
+    return latent
+
+def tile_image_vae(img_tensor, tile_size=128, overlap=32):
+    """Découpe un tensor [B,3,H,W] en tiles RGB"""
+    B,C,H,W = img_tensor.shape
+    stride = tile_size - overlap
+    tiles, positions = [], []
+    for y in range(0, H, stride):
+        for x in range(0, W, stride):
+            y1, y2 = y, min(y+tile_size,H)
+            x1, x2 = x, min(x+tile_size,W)
+            tile = img_tensor[:,:,y1:y2,x1:x2]
+            tiles.append(tile)
+            positions.append((y1,y2,x1,x2))
+    return tiles, positions
+
+def merge_tiles_vae(tiles, positions, H, W):
+    """Fusionne les tiles [1,3,h,w] en image finale [1,3,H,W]"""
+    device = tiles[0].device
+    out = torch.zeros((tiles[0].shape[0], 3, H, W), device=device)
+    count = torch.zeros((tiles[0].shape[0], 3, H, W), device=device)
+    for t,(y1,y2,x1,x2) in zip(tiles,positions):
+        th,tw = t.shape[2], t.shape[3]
+        out[:,:,y1:y1+th,x1:x1+tw] += t
+        count[:,:,y1:y1+th,x1:x1+tw] += 1.0
+    out /= count.clamp(min=1.0)
+    return out
+
+# --------------------------------------------
+# Vérification des tiles
+#-----------------------------------------------
+def clamp_and_warn_tile(tile_rgb, frame_idx, tile_idx, warnings_list):
+    """
+    Clamp chaque canal à [0,1] et détecte les écarts importants R/G/B
+    tile_rgb : tensor [1,3,H,W]
+    """
+    # Calcul stats
+    R, G, B = tile_rgb[0,0], tile_rgb[0,1], tile_rgb[0,2]
+    r_min, r_max, r_mean = R.min().item(), R.max().item(), R.mean().item()
+    g_min, g_max, g_mean = G.min().item(), G.max().item(), G.mean().item()
+    b_min, b_max, b_mean = B.min().item(), B.max().item(), B.mean().item()
+
+    # Warning si hors plage [0,1]
+    if r_min < 0 or r_max > 1:
+        warnings_list.append(f"Frame {frame_idx} - Tile {tile_idx}: canal R hors plage [{r_min:.3f},{r_max:.3f}]")
+    if g_min < 0 or g_max > 1:
+        warnings_list.append(f"Frame {frame_idx} - Tile {tile_idx}: canal G hors plage [{g_min:.3f},{g_max:.3f}]")
+    if b_min < 0 or b_max > 1:
+        warnings_list.append(f"Frame {frame_idx} - Tile {tile_idx}: canal B hors plage [{b_min:.3f},{b_max:.3f}]")
+
+    # Warning si écart important R/G/B
+    r_g_b = [r_mean, g_mean, b_mean]
+    if max(r_g_b) - min(r_g_b) > 0.3:  # seuil configurable
+        warnings_list.append(f"Frame {frame_idx} - Tile {tile_idx}: écart important entre R/G/B (R={r_mean:.3f}, G={g_mean:.3f}, B={b_mean:.3f})")
+
+    # Clamp pour éviter de propager l’erreur
+    tile_rgb = torch.clamp(tile_rgb, 0.0, 1.0)
+    return tile_rgb
+
 # scripts/utils/vae_utils.py
+
+# -------------------------
+# Encode tile safe FP32
+# -------------------------
+def encode_tile_safe_fp32(vae, tile_np, device="cuda", vae_offload=False):
+    """
+    Encode une tile numpy [C,H,W] en latent VAE [1,4,H/8,W/8]
+    VRAM-safe, compatible FP32 VAE complet et offload
+    """
+    tile_tensor = torch.from_numpy(tile_np).unsqueeze(0).to(device=device, dtype=torch.float32)  # [1,3,H,W]
+    with torch.no_grad():
+        if vae_offload:
+            vae.to(device)  # mettre VAE sur le même device que le tile
+        latent = vae.encode(tile_tensor).latent_dist.sample() * LATENT_SCALE
+        if vae_offload:
+            vae.cpu()  # remettre VAE sur CPU pour économiser VRAM
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
+    return latent
+
+# -------------------------
+# Merge tiles FP32
+# -------------------------
+def merge_tiles_fp32(tile_list, positions, H, W, latent_scale=1.0):
+    """
+    Fusionne les tiles latents [1,C,th,tw] en image complète [1,C,H,W].
+    Supporte tiles de tailles différentes et bordures.
+    """
+    device = tile_list[0].device
+    C = tile_list[0].shape[1]
+
+    out = torch.zeros(1, C, H, W, dtype=tile_list[0].dtype, device=device)
+    count = torch.zeros(1, C, H, W, dtype=tile_list[0].dtype, device=device)
+
+    for tile, (y1, y2, x1, x2) in zip(tile_list, positions):
+        _, c, th, tw = tile.shape
+        h_len = y2 - y1
+        w_len = x2 - x1
+        th = min(th, h_len)
+        tw = min(tw, w_len)
+        out[:, :, y1:y1+th, x1:x1+tw] += tile[:, :, :th, :tw]
+        count[:, :, y1:y1+th, x1:x1+tw] += 1.0
+
+    count[count==0] = 1.0
+    out = out / count
+    return out
+
+def encode_tile_safe_latent(vae, tile, device, LATENT_SCALE=0.18215):
+    """
+    Encode une tuile en latent FP32 et pad si nécessaire.
+    tile: np.array (H,W,3) float32 0-1
+    return: torch tensor (1,4,H_latent_max,W_latent_max)
+    """
+    tile_tensor = torch.tensor(tile).permute(2,0,1).unsqueeze(0).to(device)
+    latent = vae.encode(tile_tensor).latent_dist.sample() * LATENT_SCALE
+    # Vérifier H,W du latent
+    H_lat, W_lat = latent.shape[2], latent.shape[3]
+    H_max = (tile.shape[0] + 7)//8  # VAE scale
+    W_max = (tile.shape[1] + 7)//8
+    if H_lat != H_max or W_lat != W_max:
+        padH = H_max - H_lat
+        padW = W_max - W_lat
+        latent = torch.nn.functional.pad(latent, (0,padW,0,padH))
+    return latent
+
+# --- Découper une image en tiles avec overlap ---
+def tile_image_128(image, tile_size=128, overlap=16):
+    """
+    Découpe une image (H,W,C ou C,H,W) en tiles avec overlap.
+    Retourne une liste de tiles (numpy arrays) et leurs positions (x1,y1,x2,y2).
+    """
+    # Assure shape [C,H,W]
+    if image.ndim == 3 and image.shape[2] in [1,3]:
+        # H,W,C -> C,H,W
+        image = image.transpose(2,0,1)
+    elif image.ndim != 3:
+        raise ValueError(f"Image doit être 3D, shape={image.shape}")
+
+    C,H,W = image.shape
+    stride = tile_size - overlap
+    tiles = []
+    positions = []
+
+    for y in range(0, H, stride):
+        for x in range(0, W, stride):
+            y1, y2 = y, min(y + tile_size, H)
+            x1, x2 = x, min(x + tile_size, W)
+            tile = image[:, y1:y2, x1:x2]
+            tiles.append(tile.astype(np.float32))   # reste numpy
+            positions.append((x1, y1, x2, y2))
+    return tiles, positions
+
+
+# --- Normalisation d'une tile ---
+def normalize_tile_128(img_array):
+    """
+    img_array: np.ndarray, shape [H,W,C] ou [C,H,W], valeurs 0-255
+    Retour: torch.Tensor [1,3,H,W] float32, valeurs 0-1
+    """
+    if img_array.ndim == 3 and img_array.shape[2] == 3:  # HWC
+        img_array = img_array.transpose(2,0,1)
+    img_tensor = torch.from_numpy(img_array).unsqueeze(0).float() / 255.0
+    return img_tensor
+
+
+def decode_latents_correct(latents, vae):
+    """
+    Décodage des latents en image RGB float32
+    """
+    vae_device = next(vae.parameters()).device
+    latents = latents.to(device=vae_device, dtype=torch.float32)
+    with torch.no_grad():
+        decoded = vae.decode(latents).sample
+        decoded = torch.clamp(decoded, -1, 1)
+        decoded = (decoded + 1) / 2
+    return decoded
 
 
 # -------------------------
@@ -160,7 +559,11 @@ def encode_images_to_latents_ai(images, vae):
     latents = latents * LATENT_SCALE
     return latents
 
-def decode_latents_to_image_tiled128(latents, vae, tile_size=128, overlap=64, device="cuda"):
+# --------------------------------------------------------
+#---------- deprecated
+#---------------------------------------------------------
+
+def decode_latents_to_image_tiled128_old(latents, vae, tile_size=128, overlap=64, device="cuda"):
     """
     Decode les latents [B, 4, H, W] en images [B, 3, H, W] avec tiling pour éviter OOM.
     Supporte latents 5D [B, C, T, H, W] en reshaping automatique.
@@ -494,71 +897,6 @@ def safe_load_vae_safetensors(vae_path, device="cuda", fp16=False, offload=False
         print(f"⚠ Erreur lors du chargement du VAE : {e}")
         return None
 
-def decode_latents_to_image_tiled128_old(latents, vae, tile_size=128, overlap=64, device="cuda"):
-    """
-    Decode latents en images RGB [0,1] avec tiles pour éviter mosaïque.
-
-    Args:
-        latents: Tensor [B, C, H, W] ou [B, C, F, H, W]
-        vae: modèle VAE Stable Diffusion (FP32 recommandé)
-        tile_size: taille de la tile pour le décodage
-        overlap: recouvrement des tiles pour fusion lisse
-        device: 'cuda' ou 'cpu'
-
-    Returns:
-        Tensor [B, 3, H, W] ou [B, F, 3, H, W] avec valeurs [0,1]
-    """
-    if latents.ndim == 5:  # [B, C, F, H, W]
-        B, C, F, H, W = latents.shape
-        output = []
-        for f in range(F):
-            frame = decode_latents_to_image_tiled128(
-                latents[:, :, f, :, :], vae, tile_size=tile_size, overlap=overlap, device=device
-            )
-            output.append(frame.unsqueeze(1))  # garde dimension F
-        return torch.cat(output, dim=1)  # [B, F, 3, H, W]
-
-    B, C, H, W = latents.shape
-    device = latents.device if latents.is_cuda else device
-    latents = latents.to(device)
-
-    # Scale Tiny-SD
-    latents = latents / 0.18215
-
-    # output tensor
-    output_img = torch.zeros(B, 3, H, W, device=device, dtype=torch.float32)
-
-    # Compute number of tiles
-    y_steps = max((H - overlap) // (tile_size - overlap), 1)
-    x_steps = max((W - overlap) // (tile_size - overlap), 1)
-
-    for by in range(B):
-        img_accum = torch.zeros(3, H, W, device=device)
-        img_weight = torch.zeros(1, H, W, device=device)
-
-        for y in range(y_steps):
-            for x in range(x_steps):
-                y_start = y * (tile_size - overlap)
-                x_start = x * (tile_size - overlap)
-                y_end = min(y_start + tile_size, H)
-                x_end = min(x_start + tile_size, W)
-
-                y_start = max(y_end - tile_size, 0)
-                x_start = max(x_end - tile_size, 0)
-
-                latent_tile = latents[by:by+1, :, y_start:y_end, x_start:x_end]
-
-                with torch.no_grad():
-                    decoded_tile = vae.decode(latent_tile).sample
-                    decoded_tile = decoded_tile.clamp(0, 1)
-
-                # Weight mask pour fusion
-                weight = torch.ones(1, y_end - y_start, x_end - x_start, device=device)
-                img_accum[:, y_start:y_end, x_start:x_end] += decoded_tile[0]
-                img_weight[:, y_start:y_end, x_start:x_end] += weight
-
-        output_img[by] = img_accum / img_weight
-    return output_img.clamp(0, 1)
 
 
 # -------------------------
