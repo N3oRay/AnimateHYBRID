@@ -16,6 +16,8 @@ creative_noise: 0.15
 #guidance_scale: 4.5  # Valeur plus faible pour favoriser la créativité
 guidance_scale: 3.8
 
+upscale_factor: 2
+
 pretrained_model_path: "/mnt/62G/huggingface/miniSD"
 dtype: float16
 use_real_esrgan: true
@@ -37,7 +39,9 @@ vae_slicing: true
 vae_tiling: true
 dtype: float16 # VRAM safe FP16 pour 4Go
 
-motion_module: scripts/modules/motion_module_tiny.py
+#motion_module: scripts/modules/motion_module_tiny.py
+motion_module: scripts/modules/Motion_module_Masked.py
+motion_module: scripts/modules/Motion_module_Enhanced.py
 
 device: cuda
 offload_folder: /tmp/offload
