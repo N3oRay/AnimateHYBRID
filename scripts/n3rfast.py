@@ -23,6 +23,17 @@ from scripts.utils.n3r_utils import generate_latents_robuste, load_image_file
 
 LATENT_SCALE = 0.18215
 
+
+def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
+    """
+    Calcule un overlap pour le décodage tuilé proportionnel au block_size
+    et à la résolution de l'image. max_overlap_ratio = fraction max de block_size utilisé comme overlap
+    """
+    overlap = int(block_size * max_overlap_ratio)
+    # Cap overlap à 1/4 de la dimension minimale pour éviter OOM
+    overlap = min(overlap, min(W,H)//4)
+    return overlap
+
 # -------------------------
 # Load images utility
 # -------------------------
@@ -199,7 +210,19 @@ def main(args):
 
                 # Clamp et decode tuilé
                 latents_frame = latents_frame.squeeze(2).clamp(-3.0, 3.0)
-                frame_tensor = decode_latents_to_image_tiled(latents_frame, vae, tile_size=32, overlap=16).clamp(0,1)
+                #frame_tensor = decode_latents_to_image_tiled(latents_frame, vae, tile_size=32, overlap=16).clamp(0,1)
+
+                #------------------- NEW CODE -------------------------------------------
+                block_size = cfg.get("block_size", 64)
+                overlap = compute_overlap(cfg["W"], cfg["H"], block_size, max_overlap_ratio=0.6) # 0.6 ou 0.65 Max
+
+                frame_tensor = decode_latents_to_image_tiled(
+                    latents_frame, vae,
+                    tile_size=block_size,
+                    overlap=overlap
+                ).clamp(0,1)
+                #------------------------------------------------------------------------
+
 
                 if frame_tensor.ndim == 4 and frame_tensor.shape[0] == 1:
                     frame_tensor = frame_tensor.squeeze(0)
