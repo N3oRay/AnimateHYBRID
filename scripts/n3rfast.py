@@ -23,19 +23,12 @@ from scripts.utils.n3r_utils import generate_latents_robuste, load_image_file
 
 LATENT_SCALE = 0.18215
 
-
+# -------------------------
 def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
-    """
-    Calcule un overlap pour le décodage tuilé proportionnel au block_size
-    et à la résolution de l'image. max_overlap_ratio = fraction max de block_size utilisé comme overlap
-    """
     overlap = int(block_size * max_overlap_ratio)
-    # Cap overlap à 1/4 de la dimension minimale pour éviter OOM
     overlap = min(overlap, min(W,H)//4)
     return overlap
 
-# -------------------------
-# Load images utility
 # -------------------------
 def load_images(paths, W, H, device, dtype):
     all_tensors = []
@@ -45,15 +38,10 @@ def load_images(paths, W, H, device, dtype):
         all_tensors.append(t)
     return torch.stack(all_tensors, dim=0)
 
-
-# -------------------------------------------------
-# Optimisation backend
-# -------------------------------------------------
+# -------------------------
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
-# -------------------------
-# Video save
 # -------------------------
 def save_frames_as_video(frames, output_path, fps=12):
     import ffmpeg
@@ -71,11 +59,7 @@ def save_frames_as_video(frames, output_path, fps=12):
     )
     shutil.rmtree(temp_dir)
 
-
-
-# -------------------------------------------------
-# Encode images
-# -------------------------------------------------
+# -------------------------
 def encode_images_to_latents(images, vae):
     images = images.to(device=vae.device, dtype=torch.float32)
     with torch.inference_mode():
@@ -84,10 +68,7 @@ def encode_images_to_latents(images, vae):
         latents = latents.unsqueeze(2)
     return latents
 
-
-# -------------------------------------------------
-# Main
-# -------------------------------------------------
+# -------------------------
 def main(args):
     cfg = load_config(args.config)
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -116,8 +97,6 @@ def main(args):
     print(f"⏱ Durée totale estimée de la vidéo : {estimated_seconds:.1f}s")
 
     # -------------------------
-    # Load models
-    # -------------------------
     unet = safe_load_unet(args.pretrained_model_path, device, fp16=args.fp16)
     try:
         unet.enable_xformers_memory_efficient_attention()
@@ -127,19 +106,18 @@ def main(args):
         print("✅ xFormers memory efficient attention activé")
     except Exception:
         print("⚠ xFormers non disponible")
+
     vae = safe_load_vae_stable(args.pretrained_model_path, device, fp16=args.fp16, offload=args.vae_offload)
     scheduler = safe_load_scheduler(args.pretrained_model_path)
-    if not vae :
+
+    if not vae:
         print("❌ VAE manquant.")
         return
-
     if not scheduler:
         print("❌ Scheduler manquant.")
         return
-
-    #scheduler.set_timesteps(steps)
     scheduler.set_timesteps(steps, device=device)
-    if not unet :
+    if not unet:
         print("❌ UNet manquant.")
         return
 
@@ -170,83 +148,83 @@ def main(args):
     to_pil = ToPILImage()
     frames_for_video = []
     frame_counter = 0
-
     pbar = tqdm(total=total_frames, ncols=120)
 
-    # -------------------------
-    # Generation loop
     # -------------------------
     for img_idx, img_path in enumerate(input_paths):
 
         input_image = load_images([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
         input_latents = encode_images_to_latents(input_image, vae)
-        # Expand latents pour num_fraps_per_image
         input_latents = input_latents.expand(-1, -1, num_fraps_per_image, -1, -1).clone()
 
+        block_size = cfg.get("block_size", 64)
+        overlap = compute_overlap(cfg["W"], cfg["H"], block_size, max_overlap_ratio=0.65)
+
         for pos_embeds, neg_embeds in embeddings:
-
             for f in range(num_fraps_per_image):
-                latents_frame = input_latents[:, :, f:f+1, :, :].clone()
+                # ------------------------- Première frame
+                if frame_counter == 0:
+                    # Première frame = image input originale
+                    frame_tensor = input_image.squeeze(0)
+                    # Si le tenseur est normalisé [-1,1], le ramener à [0,1]
+                    frame_tensor = (frame_tensor + 1.0) / 2.0
+                    frame_tensor = frame_tensor.clamp(0,1)
+                    print(f"ℹ️ Frame {frame_counter:05d} = image input originale")
+                    latents_frame = None
+                else:
+                    latents_frame = input_latents[:, :, f:f+1, :, :].clone()
+                    try:
+                        latents_frame = generate_latents_robuste(
+                            latents_frame,
+                            pos_embeds,
+                            neg_embeds,
+                            unet,
+                            scheduler,
+                            motion_module=motion_module,
+                            device=device,
+                            dtype=dtype,
+                            guidance_scale=guidance_scale,
+                            init_image_scale=init_image_scale,
+                            creative_noise=creative_noise,
+                            seed=frame_counter
+                        )
+                    except Exception as e:
+                        print(f"⚠ Erreur génération frame {frame_counter:05d}, reset avec petit bruit: {e}")
+                        latents_frame = input_latents[:, :, f:f+1, :, :] + torch.randn_like(input_latents[:, :, f:f+1, :, :]) * 0.05
+                        latents_frame = latents_frame.to(dtype=dtype)
 
-                try:
-                    latents_frame = generate_latents_robuste(
-                        latents_frame,
-                        pos_embeds,
-                        neg_embeds,
-                        unet,
-                        scheduler,
-                        motion_module=motion_module,
-                        device=device,
-                        dtype=dtype,
-                        guidance_scale=guidance_scale,
-                        init_image_scale=init_image_scale,
-                        creative_noise=creative_noise,
-                        seed=frame_counter
-                    )
-                except Exception as e:
-                    print(f"⚠ Erreur génération frame {frame_counter:05d}, reset avec petit bruit: {e}")
-                    latents_frame = input_latents[:, :, f:f+1, :, :] + torch.randn_like(input_latents[:, :, f:f+1, :, :]) * 0.05
-                    latents_frame = latents_frame.to(dtype=dtype)
+                    latents_frame = latents_frame.squeeze(2).clamp(-3.0, 3.0)
+                    frame_tensor = decode_latents_to_image_tiled(
+                        latents_frame, vae,
+                        tile_size=block_size,
+                        overlap=overlap
+                    ).clamp(0,1)
 
-                # Clamp et decode tuilé
-                latents_frame = latents_frame.squeeze(2).clamp(-3.0, 3.0)
-                #frame_tensor = decode_latents_to_image_tiled(latents_frame, vae, tile_size=32, overlap=16).clamp(0,1)
+                    if frame_tensor.ndim == 4 and frame_tensor.shape[0] == 1:
+                        frame_tensor = frame_tensor.squeeze(0)
 
-                #------------------- NEW CODE -------------------------------------------
-                block_size = cfg.get("block_size", 64)
-                overlap = compute_overlap(cfg["W"], cfg["H"], block_size, max_overlap_ratio=0.6) # 0.6 ou 0.65 Max
-
-                frame_tensor = decode_latents_to_image_tiled(
-                    latents_frame, vae,
-                    tile_size=block_size,
-                    overlap=overlap
-                ).clamp(0,1)
-                #------------------------------------------------------------------------
-
-
-                if frame_tensor.ndim == 4 and frame_tensor.shape[0] == 1:
-                    frame_tensor = frame_tensor.squeeze(0)
-
+                # ------------------------- Sauvegarde commune
                 frame_pil = to_pil(frame_tensor.cpu())
                 frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
-
                 frames_for_video.append(frame_pil)
+
+                # Incrémenter frame_counter **après** la sauvegarde de la frame
                 frame_counter += 1
                 pbar.update(1)
 
-                mean_lat = latents_frame.abs().mean().item()
-                if math.isnan(mean_lat) or mean_lat < 1e-5:
-                    print(f"⚠ Frame {frame_counter:05d} contient NaN ou latent trop petit, réinitialisation")
-
-                del latents_frame, frame_tensor
-                torch.cuda.empty_cache()
+                if latents_frame is not None:
+                    mean_lat = latents_frame.abs().mean().item()
+                    if math.isnan(mean_lat) or mean_lat < 1e-5:
+                        print(f"⚠ Frame {frame_counter:05d} contient NaN ou latent trop petit, réinitialisation")
+                    del latents_frame, frame_tensor
+                    torch.cuda.empty_cache()
 
     pbar.close()
     save_frames_as_video(frames_for_video, out_video, fps=fps)
     print(f"🎬 Vidéo générée : {out_video}")
     print("✅ Pipeline terminé proprement.")
 
-# Entrée
+# -------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained-model-path", type=str, required=True)
@@ -256,4 +234,3 @@ if __name__ == "__main__":
     parser.add_argument("--vae-offload", action="store_true")
     args = parser.parse_args()
     main(args)
-
