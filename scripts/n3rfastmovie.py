@@ -186,7 +186,7 @@ def main(args):
                         motion_module=motion_module,
                         device=device,
                         dtype=dtype,
-                        guidance_scale=transition_guidance_scale,
+                        guidance_scale=guidance_scale,
                         init_image_scale=0.6,      # plus libre pendant morph
                         creative_noise=0.02,       # léger bruit artistique
                         seed=frame_counter
