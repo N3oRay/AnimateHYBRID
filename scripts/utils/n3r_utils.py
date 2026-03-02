@@ -20,6 +20,29 @@ from einops import rearrange
 from math import ceil
 
 
+def decode_latents_to_image_auto(latents, vae):
+    """
+    Décodage automatique du latent, quel que soit son format (3D, 4D, 5D),
+    retourne un tenseur [B, C, H, W].
+    """
+    # S'assurer que latents est 4D : [B, C, H, W]
+    if latents.ndim == 5:  # [B, C, T, H, W]
+        latents = latents.squeeze(2)
+    elif latents.ndim == 3:  # [C, H, W] -> [1, C, H, W]
+        latents = latents.unsqueeze(0)
+    elif latents.ndim != 4:
+        raise ValueError(f"Latents avec dimension inattendue {latents.shape}")
+
+    # Décodage avec VAE
+    with torch.no_grad():
+        images = vae.decode(latents / LATENT_SCALE).sample
+
+    # Normalisation 0-1
+    images = (images + 1.0) / 2.0
+    images = images.clamp(0, 1)
+    return images
+
+
 # -------------------------
 # scripts/utils/n3r_utils.py
 # -------------------------
