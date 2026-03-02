@@ -82,6 +82,7 @@ def main(args):
     dtype = torch.float16 if args.fp16 else torch.float32
 
     fps = cfg.get("fps", 12)
+    transition_zoom = cfg.get("transition_zoom", 0.0) # new param
     num_fraps_per_image = cfg.get("num_fraps_per_image", 12)
     transition_frames = cfg.get("transition_frames", 8)
 
