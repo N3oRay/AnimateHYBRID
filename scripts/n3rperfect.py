@@ -22,7 +22,7 @@ from scripts.utils.vae_utils import (
 )
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import generate_latents_robuste, load_image_file, decode_latents_to_image_auto
-import keyboard  # pip install keyboard
+#import keyboard  # pip install keyboard
 
 LATENT_SCALE = 0.18215
 
