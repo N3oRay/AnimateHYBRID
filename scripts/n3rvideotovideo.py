@@ -50,32 +50,6 @@ threading.Thread(target=wait_for_stop, daemon=True).start()
 # --------------------------------------------------------------
 # UTILS
 # --------------------------------------------------------------
-def remove_watermark_white(frame_pil, bbox, padding=2):
-    """
-    Remplace le watermark par un rectangle blanc.
-    bbox = (x, y, w, h)
-    """
-    if bbox is None:
-        return frame_pil
-
-    x, y, w, h = bbox
-
-    # Ajouter un petit padding pour couvrir les bords
-    x = max(0, x - padding)
-    y = max(0, y - padding)
-    w += padding * 2
-    h += padding * 2
-
-    img_w, img_h = frame_pil.size
-    w = min(w, img_w - x)
-    h = min(h, img_h - y)
-
-    # Créer rectangle blanc
-    from PIL import ImageDraw
-    draw = ImageDraw.Draw(frame_pil)
-    draw.rectangle([x, y, x + w, y + h], fill=(255, 255, 255))
-
-    return frame_pil
 # ---------------- TRACKING GLOBALS ----------------
 tracker = None
 tracking_initialized = False
@@ -86,73 +60,107 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 
-def remove_watermark_auto_blur(frame_pil, target_hex_list, tolerance=15,
-                               threshold=0.5, candidate_zones=None,
-                               blur_radius=20, show_mask=False):
-    """
-    Détecte automatiquement les zones du watermark et les floute.
 
-    - frame_pil : image PIL
-    - target_hex_list : liste des couleurs du watermark en hex
-    - tolerance : tolérance couleur
-    - threshold : proportion minimale de pixels correspondants pour appliquer
-    - candidate_zones : zones probables [(x,y,w,h), ...], sinon toute l'image
-    - blur_radius : rayon du flou gaussien
-    - show_mask : bool, afficher le masque de détection pour debug
-    """
+def remove_watermark_auto_blur(
+    frame_pil,
+    target_hex_list,
+    tolerance=26,
+    threshold=0.4,
+    candidate_zones=None,
+    blur_radius=10,
+    feather_radius=8,
+    overlay_text=None,
+    text_opacity=0.6,
+    text_scale=0.7,
+    text_color=(255, 255, 255)
+):
     import numpy as np
     import cv2
-    from PIL import Image, ImageFilter
+    from PIL import Image, ImageFilter, ImageDraw, ImageFont
 
     img_np = np.array(frame_pil).astype(np.int16)
     H, W, _ = img_np.shape
 
-    # Convertir hex en RGB
-    target_colors = np.array([[int(h[i:i+2],16) for i in (1,3,5)] for h in target_hex_list], dtype=np.int16)
+    target_colors = np.array(
+        [[int(h[i:i+2], 16) for i in (1, 3, 5)] for h in target_hex_list],
+        dtype=np.int16
+    )
 
     if candidate_zones is None:
         candidate_zones = [(0, 0, W, H)]
 
-    for idx, (x, y, w, h) in enumerate(candidate_zones):
+    for (x, y, w, h) in candidate_zones:
+
         patch = img_np[y:y+h, x:x+w]
         mask_total = np.zeros((h, w), dtype=np.uint8)
 
-        # Détection des pixels correspondant aux couleurs du watermark
-        for c_idx, color in enumerate(target_colors):
+        for color in target_colors:
             dist = np.linalg.norm(patch - color, axis=2)
             mask_total += (dist <= tolerance).astype(np.uint8)
-            if show_mask:
-                print(f"[DEBUG] Zone {idx}, Couleur {c_idx} match pixels: {(dist <= tolerance).sum()}")
 
-        ratio = mask_total.sum() / (w*h)
-        if show_mask:
-            print(f"[DEBUG] Zone {idx} ratio total: {ratio:.3f} (seuil={threshold})")
-            import matplotlib.pyplot as plt
-            plt.imshow(mask_total, cmap='gray')
-            plt.title(f"Zone {idx} mask")
-            plt.show()
+        ratio = mask_total.sum() / (w * h)
 
         if ratio >= threshold:
-            # Créer un masque binaire pour OpenCV
-            mask_uint8 = (mask_total > 0).astype(np.uint8) * 255
-            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            for cnt in contours:
-                bx, by, bw, bh = cv2.boundingRect(cnt)
-                left = x + bx
-                top = y + by
-                right = left + bw
-                bottom = top + bh
+            mask_binary = (mask_total > 0).astype(np.uint8) * 255
 
-                # Extraire la région et flouter
-                region = frame_pil.crop((left, top, right, bottom))
-                region_blur = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-                frame_pil.paste(region_blur, (left, top))
+            kernel = np.ones((3, 3), np.uint8)
+            mask_binary = cv2.dilate(mask_binary, kernel, iterations=1)
 
-            if show_mask:
-                print(f"[DEBUG] Zone {idx} floutée.")
+            mask_soft = cv2.GaussianBlur(mask_binary, (0, 0), feather_radius)
+            mask_soft = mask_soft.astype(np.float32) / 255.0
+            mask_soft = np.expand_dims(mask_soft, axis=2)
+
+            region = frame_pil.crop((x, y, x+w, y+h))
+            region_np = np.array(region).astype(np.float32)
+
+            region_blur = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+            region_blur_np = np.array(region_blur).astype(np.float32)
+
+            blended = region_np * (1 - mask_soft) + region_blur_np * mask_soft
+            blended = blended.astype(np.uint8)
+
+            blended_img = Image.fromarray(blended)
+
+            # ------------------ TEXT OVERLAY ------------------
+            if overlay_text is not None:
+
+                draw = ImageDraw.Draw(blended_img)
+
+                try:
+                    font_size = int(h * text_scale)
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except:
+                    font = ImageFont.load_default()
+
+                #text_w, text_h = draw.textsize(overlay_text, font=font)
+                bbox = draw.textbbox((0, 0), overlay_text, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+
+                tx = (w - text_w) // 2
+                ty = (h - text_h) // 2
+
+                text_layer = Image.new("RGBA", blended_img.size, (0,0,0,0))
+                text_draw = ImageDraw.Draw(text_layer)
+
+                text_draw.text(
+                    (tx, ty),
+                    overlay_text,
+                    font=font,
+                    fill=(*text_color, int(255 * text_opacity))
+                )
+
+                blended_img = Image.alpha_composite(
+                    blended_img.convert("RGBA"),
+                    text_layer
+                ).convert("RGB")
+
+            frame_pil.paste(blended_img, (x, y))
 
     return frame_pil
+
+
 #---------------------------------------------------------------------------------------
 def normalize_frame(frame_tensor):
     if frame_tensor.min() < 0:
@@ -199,44 +207,6 @@ def load_images_from_pil(pil_images, W, H, device, dtype, preproc_fn=None):
 
     return torch.stack(all_tensors, dim=0)
 
-def load_images_blur(paths, W, H, device, dtype, apply_wm_blur=True,
-                     colors=None, candidate_zones=None, blur_radius=20):
-    """
-    Charge les images depuis des chemins et applique éventuellement un flou watermark.
-    Retourne un tensor 4D [B, C, H, W] compatible VAE.
-
-    Arguments :
-        paths           : liste de chemins d'images
-        W, H            : dimensions de redimensionnement
-        device          : 'cuda' ou 'cpu'
-        dtype           : torch.float16 ou torch.float32
-        apply_wm_blur   : bool, appliquer flou watermark
-        colors          : liste des couleurs du watermark en hex
-        candidate_zones : zones probables [(x,y,w,h), ...] pour le watermark
-        blur_radius     : rayon du flou gaussien
-    """
-    pil_images = []
-
-    for p in paths:
-        frame_pil = Image.open(p).convert("RGB")
-
-        # Appliquer le flou sur le watermark si demandé
-        if apply_wm_blur and colors is not None and candidate_zones is not None:
-            frame_pil = remove_watermark_auto_blur(
-                frame_pil,
-                target_hex_list=colors,
-                tolerance=40,
-                threshold=1,
-                candidate_zones=candidate_zones,
-                blur_radius=blur_radius,
-                show_mask=False
-            )
-
-        pil_images.append(frame_pil)
-        print(f"✅ Image prête : {p}")
-
-    # Convertir toutes les images PIL en tensor 4D [B, C, H, W]
-    return load_images_from_pil(pil_images, W, H, device, dtype)
 
 def extract_frames_from_video(video_path, output_dir):
     output_dir = Path(output_dir)
@@ -394,8 +364,8 @@ def main(args):
                     "#F9F3EF", "#DDCAC6", "#DDCAC6", "#F3EBEB", "#FDF8F6",
                     "#FFFAFF", "#FDFCFB", "#FAF8F8", "#F9F4F7", "#222021"]
             candidate_zones = [
-                (22, 366, 128, 30),
-                (216, 375, 128, 30)
+                (21, 366, 123, 28),
+                (216, 375, 125, 28)
             ]
 
             def watermark_blur_preproc(img):
@@ -403,8 +373,9 @@ def main(args):
                     img,
                     target_hex_list=colors,
                     candidate_zones=candidate_zones,
-                    blur_radius=20,
-                    show_mask=True
+                    overlay_text="N3ORAY",
+                    text_opacity=0.9,
+                    text_scale=4.0
                 )
 
             # Chargement avec flou watermark appliqué **après resize**
