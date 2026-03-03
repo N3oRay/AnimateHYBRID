@@ -3397,3 +3397,154 @@ def upscale_video_cinematic_smooth(input_video_path, output_video_path, scale=4,
     shutil.rmtree(temp_dir)
     shutil.rmtree(temp_up_dir)
     print(f"✅ Vidéo finale x{scale} smooth cinematic générée : {output_video_path}")
+
+
+#---------------------------------------------------------------------------------------
+# -------------- Remove watermark fonction ---------------------------------------------
+#---------------------------------------------------------------------------------------
+
+def remove_watermark_auto_blur_v1(
+    frame_pil,
+    target_hex_list,
+    tolerance=40,
+    threshold=0.45,
+    candidate_zones=None,
+    blur_radius=10,
+    feather_radius=10,
+    show_mask=False
+):
+    """
+    Version ULTRA INVISIBLE PRO
+    - Détection couleur
+    - Masque progressif (feather)
+    - Fusion douce
+    """
+
+    import numpy as np
+    import cv2
+    from PIL import Image, ImageFilter
+
+    img_np = np.array(frame_pil).astype(np.int16)
+    H, W, _ = img_np.shape
+
+    # Convertir hex en RGB
+    target_colors = np.array(
+        [[int(h[i:i+2], 16) for i in (1, 3, 5)] for h in target_hex_list],
+        dtype=np.int16
+    )
+
+    if candidate_zones is None:
+        candidate_zones = [(0, 0, W, H)]
+
+    for idx, (x, y, w, h) in enumerate(candidate_zones):
+
+        patch = img_np[y:y+h, x:x+w]
+        mask_total = np.zeros((h, w), dtype=np.uint8)
+
+        # Détection couleur
+        for color in target_colors:
+            dist = np.linalg.norm(patch - color, axis=2)
+            mask_total += (dist <= tolerance).astype(np.uint8)
+
+        ratio = mask_total.sum() / (w * h)
+
+        if ratio >= threshold:
+
+            # Masque binaire
+            mask_binary = (mask_total > 0).astype(np.uint8) * 255
+
+            # Dilatation légère pour couvrir bordures
+            kernel = np.ones((3, 3), np.uint8)
+            mask_binary = cv2.dilate(mask_binary, kernel, iterations=1)
+
+            # Feather (adoucissement progressif)
+            mask_soft = cv2.GaussianBlur(mask_binary, (0, 0), feather_radius)
+
+            # Normaliser masque 0..1
+            mask_soft = mask_soft.astype(np.float32) / 255.0
+            mask_soft = np.expand_dims(mask_soft, axis=2)
+
+            # Extraire région
+            region = frame_pil.crop((x, y, x+w, y+h))
+            region_np = np.array(region).astype(np.float32)
+
+            # Blur léger naturel
+            region_blur = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+            region_blur_np = np.array(region_blur).astype(np.float32)
+
+            # Blend ultra doux
+            blended = region_np * (1 - mask_soft) + region_blur_np * mask_soft
+            blended = blended.astype(np.uint8)
+
+            # Replacer dans image
+            frame_pil.paste(Image.fromarray(blended), (x, y))
+
+    return frame_pil
+
+def remove_watermark_auto_blur_simple(frame_pil, target_hex_list, tolerance=15,
+                               threshold=0.5, candidate_zones=None,
+                               blur_radius=20, show_mask=False):
+    """
+    Détecte automatiquement les zones du watermark et les floute.
+
+    - frame_pil : image PIL
+    - target_hex_list : liste des couleurs du watermark en hex
+    - tolerance : tolérance couleur
+    - threshold : proportion minimale de pixels correspondants pour appliquer
+    - candidate_zones : zones probables [(x,y,w,h), ...], sinon toute l'image
+    - blur_radius : rayon du flou gaussien
+    - show_mask : bool, afficher le masque de détection pour debug
+    """
+    import numpy as np
+    import cv2
+    from PIL import Image, ImageFilter
+
+    img_np = np.array(frame_pil).astype(np.int16)
+    H, W, _ = img_np.shape
+
+    # Convertir hex en RGB
+    target_colors = np.array([[int(h[i:i+2],16) for i in (1,3,5)] for h in target_hex_list], dtype=np.int16)
+
+    if candidate_zones is None:
+        candidate_zones = [(0, 0, W, H)]
+
+    for idx, (x, y, w, h) in enumerate(candidate_zones):
+        patch = img_np[y:y+h, x:x+w]
+        mask_total = np.zeros((h, w), dtype=np.uint8)
+
+        # Détection des pixels correspondant aux couleurs du watermark
+        for c_idx, color in enumerate(target_colors):
+            dist = np.linalg.norm(patch - color, axis=2)
+            mask_total += (dist <= tolerance).astype(np.uint8)
+            if show_mask:
+                print(f"[DEBUG] Zone {idx}, Couleur {c_idx} match pixels: {(dist <= tolerance).sum()}")
+
+        ratio = mask_total.sum() / (w*h)
+        if show_mask:
+            print(f"[DEBUG] Zone {idx} ratio total: {ratio:.3f} (seuil={threshold})")
+            import matplotlib.pyplot as plt
+            plt.imshow(mask_total, cmap='gray')
+            plt.title(f"Zone {idx} mask")
+            plt.show()
+
+        if ratio >= threshold:
+            # Créer un masque binaire pour OpenCV
+            mask_uint8 = (mask_total > 0).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for cnt in contours:
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                left = x + bx
+                top = y + by
+                right = left + bw
+                bottom = top + bh
+
+                # Extraire la région et flouter
+                region = frame_pil.crop((left, top, right, bottom))
+                region_blur = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                frame_pil.paste(region_blur, (left, top))
+
+            if show_mask:
+                print(f"[DEBUG] Zone {idx} floutée.")
+
+    return frame_pil
