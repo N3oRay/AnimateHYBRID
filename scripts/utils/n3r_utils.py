@@ -3548,3 +3548,30 @@ def remove_watermark_auto_blur_simple(frame_pil, target_hex_list, tolerance=15,
                 print(f"[DEBUG] Zone {idx} floutée.")
 
     return frame_pil
+
+def remove_watermark_white(frame_pil, bbox, padding=2):
+    """
+    Remplace le watermark par un rectangle blanc.
+    bbox = (x, y, w, h)
+    """
+    if bbox is None:
+        return frame_pil
+
+    x, y, w, h = bbox
+
+    # Ajouter un petit padding pour couvrir les bords
+    x = max(0, x - padding)
+    y = max(0, y - padding)
+    w += padding * 2
+    h += padding * 2
+
+    img_w, img_h = frame_pil.size
+    w = min(w, img_w - x)
+    h = min(h, img_h - y)
+
+    # Créer rectangle blanc
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(frame_pil)
+    draw.rectangle([x, y, x + w, y + h], fill=(255, 255, 255))
+
+    return frame_pil
