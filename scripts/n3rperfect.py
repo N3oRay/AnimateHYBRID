@@ -22,10 +22,23 @@ from scripts.utils.vae_utils import (
 )
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import generate_latents_robuste, load_image_file, decode_latents_to_image_auto
+import keyboard  # pip install keyboard
 
 LATENT_SCALE = 0.18215
 
-# ---------------- UTILITIES ----------------
+import threading
+
+stop_generation = False
+
+def wait_for_stop():
+    global stop_generation
+    inp = input("Appuyez sur '²' + Entrée pour arrêter : ")
+    if inp.lower() == "²":
+        stop_generation = True
+
+# Lance le thread
+threading.Thread(target=wait_for_stop, daemon=True).start()
+
 def normalize_frame(frame_tensor):
     if frame_tensor.min() < 0:
         frame_tensor = (frame_tensor + 1.0) / 2.0
@@ -47,12 +60,18 @@ def load_images(paths, W, H, device, dtype):
 def save_frames_as_video_from_folder(folder_path, output_path, fps=12):
     import ffmpeg
     folder_path = Path(folder_path)
+    # Tri alphabétique de tous les fichiers commençant par "frame_"
     frame_files = sorted(folder_path.glob("frame_*.png"))
     if not frame_files:
         print("❌ Aucun frame trouvé dans le dossier")
         return
+
+    # ffmpeg peut utiliser un pattern, mais attention à l'ordre
+    first_frame = frame_files[0]
+    pattern = str(folder_path / "frame_*.png")
+
     (
-        ffmpeg.input(str(folder_path / "frame_%05d.png"), framerate=fps)
+        ffmpeg.input(pattern, framerate=fps, pattern_type='glob')
         .output(str(output_path), vcodec="libx264", pix_fmt="yuv420p")
         .overwrite_output()
         .run(quiet=True)
@@ -92,6 +111,7 @@ def main(args):
         + max(len(input_paths) - 1, 0) * transition_frames
     )
     print(f"🎞 Frames totales estimées : {total_frames}")
+    print("⏹ Touche '²' pour arrêter la génération et création de la vidéo directement...")
 
     # ---------------- LOAD MODELS ----------------
     unet = safe_load_unet(args.pretrained_model_path, device, fp16=args.fp16)
@@ -135,8 +155,13 @@ def main(args):
 
     previous_latent_single = None
 
+
+    stop_generation = False # option d'arret du script on passe la saugarde de la video'
     # ================= MAIN LOOP =================
     for img_idx, img_path in enumerate(input_paths):
+        if stop_generation:
+            break
+
         # Charge et encode l'image d'entrée
         input_image = load_images([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
         input_latents_single = encode_images_to_latents(input_image, vae)  # [B, C, 1, H/8, W/8]
@@ -151,6 +176,11 @@ def main(args):
         # --- Transition latente avec interpolation ---
         if previous_latent_single is not None and transition_frames > 0:
             for t in range(transition_frames):
+                if stop_generation:
+                    print("⏹ Arrêt demandé, création de la vidéo...")
+                    break
+
+                # ... génération normale des frames ...
                 alpha = 0.5 - 0.5 * math.cos(math.pi * t / (transition_frames - 1))
                 latent_interp = ((1 - alpha) * previous_latent_single + alpha * current_latent_single)
                 latent_interp = latent_interp.squeeze(2).clamp(-3.0, 3.0)
