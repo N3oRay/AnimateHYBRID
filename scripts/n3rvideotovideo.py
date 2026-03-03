@@ -365,7 +365,7 @@ def main(args):
                     "#FFFAFF", "#FDFCFB", "#FAF8F8", "#F9F4F7", "#222021"]
             candidate_zones = [
                 (21, 366, 123, 28),
-                (216, 375, 125, 28)
+                (421, 572, 125, 28)
             ]
 
             def watermark_blur_preproc(img):
