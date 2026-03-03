@@ -172,6 +172,72 @@ def load_images(paths, W, H, device, dtype):
         all_tensors.append(t)
     return torch.stack(all_tensors, dim=0)
 
+
+def load_images_from_pil(pil_images, W, H, device, dtype, preproc_fn=None):
+    """
+    Charge une liste de PIL.Images et retourne un tensor 4D [B, C, H, W].
+    - preproc_fn : fonction optionnelle à appliquer après resize et avant conversion tensor
+    """
+    all_tensors = []
+
+    for idx, img_pil in enumerate(pil_images):
+        # Redimensionner
+        img_resized = img_pil.resize((W, H), Image.LANCZOS)
+
+        # Appliquer un pré-traitement optionnel (ex: flou watermark)
+        if preproc_fn is not None:
+            img_resized = preproc_fn(img_resized)
+
+        # Convertir en numpy 0..1
+        img_np = np.array(img_resized).astype(np.float32) / 255.0
+        # Convertir en tensor torch [C, H, W]
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).to(device=device, dtype=dtype)
+        # Normaliser [-1, 1]
+        img_tensor = img_tensor * 2 - 1
+        all_tensors.append(img_tensor)
+        print(f"✅ Image chargée et préparée : {idx}")
+
+    return torch.stack(all_tensors, dim=0)
+
+def load_images_blur(paths, W, H, device, dtype, apply_wm_blur=True,
+                     colors=None, candidate_zones=None, blur_radius=20):
+    """
+    Charge les images depuis des chemins et applique éventuellement un flou watermark.
+    Retourne un tensor 4D [B, C, H, W] compatible VAE.
+
+    Arguments :
+        paths           : liste de chemins d'images
+        W, H            : dimensions de redimensionnement
+        device          : 'cuda' ou 'cpu'
+        dtype           : torch.float16 ou torch.float32
+        apply_wm_blur   : bool, appliquer flou watermark
+        colors          : liste des couleurs du watermark en hex
+        candidate_zones : zones probables [(x,y,w,h), ...] pour le watermark
+        blur_radius     : rayon du flou gaussien
+    """
+    pil_images = []
+
+    for p in paths:
+        frame_pil = Image.open(p).convert("RGB")
+
+        # Appliquer le flou sur le watermark si demandé
+        if apply_wm_blur and colors is not None and candidate_zones is not None:
+            frame_pil = remove_watermark_auto_blur(
+                frame_pil,
+                target_hex_list=colors,
+                tolerance=40,
+                threshold=1,
+                candidate_zones=candidate_zones,
+                blur_radius=blur_radius,
+                show_mask=False
+            )
+
+        pil_images.append(frame_pil)
+        print(f"✅ Image prête : {p}")
+
+    # Convertir toutes les images PIL en tensor 4D [B, C, H, W]
+    return load_images_from_pil(pil_images, W, H, device, dtype)
+
 def extract_frames_from_video(video_path, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -235,6 +301,7 @@ def main(args):
     upscale_factor = cfg.get("upscale_factor", 2)
     transition_frames = cfg.get("transition_frames", 8)
     num_fraps_per_image = cfg.get("num_fraps_per_image", 12)
+    rm_watermark = cfg.get("rm_watermark", True)
 
     steps = cfg.get("steps", 50)
     guidance_scale = cfg.get("guidance_scale", 4.5)
@@ -256,6 +323,9 @@ def main(args):
     negative_prompts = cfg.get("n_prompt", [])
 
     total_frames = len(input_paths) * max(len(prompts), 1) * num_fraps_per_image
+    if rm_watermark:
+        print(f"🎞 Remove Water Active")
+
     print(f"🎞 Frames estimées : {total_frames}")
     print("⏹ Appuyez sur '²' + Entrée pour stopper.")
 
@@ -317,7 +387,38 @@ def main(args):
         if stop_generation:
             break
 
-        input_image = load_images([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
+        #----------- fonction remove watermark auto
+        if rm_watermark:
+            colors = ["#EADBDE", "#FDF8F4", "#FFFAF9", "#F9EDEB", "#C5BABA",
+                    "#FBF8FA", "#FAF8F9", "#FBFAF5", "#ECE3E2", "#6D6C6B",
+                    "#F9F3EF", "#DDCAC6", "#DDCAC6", "#F3EBEB", "#FDF8F6",
+                    "#FFFAFF", "#FDFCFB", "#FAF8F8", "#F9F4F7", "#222021"]
+            candidate_zones = [
+                (22, 366, 128, 30),
+                (216, 375, 128, 30)
+            ]
+
+            def watermark_blur_preproc(img):
+                return remove_watermark_auto_blur(
+                    img,
+                    target_hex_list=colors,
+                    candidate_zones=candidate_zones,
+                    blur_radius=20,
+                    show_mask=True
+                )
+
+            # Chargement avec flou watermark appliqué **après resize**
+            input_image = load_images_from_pil(
+                [Image.open(img_path).convert("RGB")],
+                W=cfg["W"],
+                H=cfg["H"],
+                device=device,
+                dtype=dtype,
+                preproc_fn=watermark_blur_preproc
+            )
+        else:
+            input_image = load_images([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
+
         input_latents_single = encode_images_to_latents(input_image, vae)
         input_latents = input_latents_single.repeat(1, 1, num_fraps_per_image, 1, 1)
 
@@ -358,18 +459,6 @@ def main(args):
 
                 frame_pil = to_pil(frame_tensor.cpu()).filter(ImageFilter.GaussianBlur(radius=0.2))
 
-                # Appliquer le remove watermark ---------------------------------------------
-
-                colors = ["#EADBDE", "#FDF8F4", "#FFFAF9", "#F9EDEB", "#C5BABA",  "#FBF8FA", "#FAF8F9", "#FBFAF5", "#ECE3E2", "#6D6C6B",
-                        "#F9F3EF", "#DDCAC6", "#DDCAC6", "#F3EBEB", "#FDF8F6", "#FFFAFF", "#FDFCFB", "#FAF8F8", "#F9F4F7", "#222021"]
-
-                # Tu peux définir des zones probables si tu veux limiter la recherche
-                candidate_zones = [
-                    (22, 366, 128, 30),  # ZONE (1) OK
-                    (216, 375, 128, 30)  # Zone 2 : similaire à la zone 0, décalée légèrement
-                ]
-
-                frame_pil = remove_watermark_auto_blur(frame_pil, colors, tolerance=40, threshold=1, candidate_zones=candidate_zones, show_mask=True)
                 # -----------------------------------------------------------------------------
                 if upscale_factor > 1:
                     frame_pil = frame_pil.resize(
