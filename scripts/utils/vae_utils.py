@@ -12,9 +12,65 @@ from torchvision.transforms import ToPILImage
 import torchvision.transforms as T
 import torch, numpy as np
 from PIL import Image
+import math
 
 
 LATENT_SCALE = 0.18215
+
+
+
+def generate_latents_robuste_model(latents, pos_embeds, neg_embeds, unet, scheduler,
+                             motion_module=None, device="cuda", dtype=torch.float16,
+                             guidance_scale=4.5, init_image_scale=0.85,
+                             creative_noise=0.0, seed=42):
+    """
+    Génère des latents robustes avec protection NaN/inf
+    """
+    torch.manual_seed(seed)
+    B, C, T, H, W = latents.shape
+    latents = latents.to(device=device, dtype=dtype)
+    latents = latents.permute(0,2,1,3,4).reshape(B*T, C, H, W).contiguous()
+    init_latents = latents.clone()
+
+    for t_step in scheduler.timesteps:
+        # Motion module optionnel
+        if motion_module is not None:
+            latents = motion_module(latents)
+
+        # Bruit créatif
+        if creative_noise > 0:
+            latents = latents + torch.randn_like(latents) * creative_noise
+
+        # Classifier-free guidance
+        latent_model_input = torch.cat([latents, latents], dim=0)
+        embeds = torch.cat([neg_embeds, pos_embeds], dim=0)
+
+        # ⚡ Autocast pour FP16 stable
+        with torch.autocast(device_type=device, dtype=dtype):
+            with torch.no_grad():
+                noise_pred = unet(latent_model_input, t_step, encoder_hidden_states=embeds).sample
+
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+        # Scheduler step
+        latents = scheduler.step(noise_pred, t_step, latents).prev_sample
+
+        # Réinjection image initiale
+        latents = latents + init_image_scale * (init_latents - latents)
+
+        # Protection NaN / inf
+        if torch.isnan(latents).any() or torch.isinf(latents).any():
+            latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
+            latents = latents + torch.randn_like(latents) * 1e-2
+
+        # Vérification latents trop petits
+        mean_val = latents.abs().mean().item()
+        if math.isnan(mean_val) or mean_val < 1e-5:
+            latents = latents + torch.randn_like(latents) * 1e-2
+
+    latents = latents.reshape(B, T, C, H, W).permute(0,2,1,3,4).contiguous()
+    return latents
 
 
 # -------------------------
