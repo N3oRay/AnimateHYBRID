@@ -9,13 +9,18 @@ CONFIGS128P=("configs/prompts/2_animate/128p.yaml")
 CONFIGS256P=("configs/prompts/1_animate/256p.yaml")
 CONFIGS256=("configs/prompts/2_animate/256.yaml")
 CONFIGS512=("configs/prompts/2_animate/512.yaml")
+CONFIGS512x640=("configs/prompts/2_animate/640x512.yaml")
 
-SCRIPTS1=("n3rspeed") # 128 256 512 ok
-SCRIPTS2=("n3rcreative") # 128 256 512 ok
-SCRIPTS3=("n3rHYBRID21") # 128 256 512 ok
-SCRIPTS4=("n3rHYBRID22") # 128 256 512 ok
-SCRIPTS5=("n3rHYBRID26") #128 ok 256 ko
-SCRIPTS6=("n3rHYBRID14") #512 KO
+SCRIPTS0=("n3rperfect") #512 OK 640 OK
+SCRIPTS1=("n3rfast") #512 OK 640 OK
+SCRIPTS2=("n3rfastmovie") #512 OK 640 OK
+SCRIPTS3=("n3rfastinterpol") #512 OK 640 OK
+SCRIPTS4=("n3rspeed") # 128 256 512 ok
+SCRIPTS5=("n3rcreative") # 128 256 512 ok
+SCRIPTS6=("n3rHYBRID21") # 128 256 512 ok
+SCRIPTS7=("n3rHYBRID22") # 128 256 512 ok
+SCRIPTS8=("n3rHYBRID26") #128 ok 256 ko
+SCRIPTS9=("n3rHYBRID14") #512 KO
 
 
 run_batch () {
