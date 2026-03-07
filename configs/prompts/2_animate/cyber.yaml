@@ -1,0 +1,83 @@
+# -------------------------
+# Tiny-SD 256x256 VRAM-safe FP16 pour 5D AnimateDiff
+# Avec Motion Module Tiny et VAE offload
+# -------------------------
+
+# -------------------------
+# Modèles n3oray
+# -------------------------
+# Liste des modèles à utiliser (ordre = interpolation possible)
+
+n3oray_models:
+  cyberpunk_style_v3: "/mnt/62G/huggingface/cyber/cyberpunk style v3.safetensors"
+  cybersamurai_v2: "/mnt/62G/huggingface/cyber/cybersamuraiV2E12.safetensors"
+  cyber_skin: "/mnt/62G/huggingface/cyber/Cyber skin.safetensors"
+
+
+W: 647
+H: 752
+L: 4
+steps: 25
+
+fps: 25
+#init_image_scale: 0.25  # Moins de poids sur l'image d'entrée
+init_image_scale: 0.25  # Exploration maximale du latent 0.15
+creative_noise: 0.1  # Plus de bruit pour une exploration plus libre
+#creative_noise: 0.1 # 0.15
+guidance_scale: 4.0  # Valeur plus faible pour favoriser la créativité
+
+
+upscale_factor: 2
+
+pretrained_model_path: "/mnt/62G/huggingface/miniSD"
+dtype: float16
+use_real_esrgan: true
+
+scheduler:
+  #type: DDIMScheduler
+  type: PNDMScheduler
+  steps: 25
+  beta_start: 0.00085
+  beta_end: 0.012
+
+num_fraps_per_image: 10
+key_frames: 1
+inter_frames: 10
+
+
+block_size: 160 # 100 ou 110 ou 120 ou (128) ou 156 ou (160 MAX soit 160x0.6+160=256)
+overlap: 96   #60 ou 66 ou 72 ou 76 ou (80) ou 100 ou (96)
+vae_slicing: true
+vae_tiling: true
+dtype: float16 # VRAM safe FP16 pour 4Go
+
+#motion_module: scripts/modules/motion_module_tiny.py
+#motion_module: scripts/modules/Motion_module_Masked.py
+#motion_module: scripts/modules/Motion_module_Enhanced.py
+motion_module: scripts/modules/motion_module_lite.py
+
+device: cuda
+offload_folder: /tmp/offload
+accelerate: true
+low_cpu_mem_usage: true
+batch_size: 1  # chaque image traitée individuellement
+
+seed: 1234
+
+enable_xformers_memory_efficient_attention: true
+
+# VAE complet pour couleurs correctes
+vae_path: "/mnt/62G/huggingface/vae/vae-ft-mse-840000-ema-pruned.safetensors"
+
+
+
+
+prompt:
+  - "3D cartoon, psychedelic, dreamlike, ethereal, glitch art, best quality, 1 girl move, natural dynamic pose, arms swinging, legs mid-step, flowing hair, consistent outfit, outdoor spring, cherry blossoms, petals, smooth motion, vibrant colors, cinematic lighting, surrealistic, futuristic, abstract, colorful, alien landscape, floating islands, magical lighting, cosmic clouds, bioluminescent plants, vibrant abstract patterns, dreamlike, painterly, cubism, vaporwave aesthetics, neon reflections,glowing, luminous, iridescent, bioluminescent, neon, magical shimmer"
+
+n_prompt:
+  - "low quality, blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic"
+
+input_images:
+  - "input/647-752/1.png"
+  - "input/647-752/2.png"
