@@ -43,10 +43,17 @@ def wait_for_stop():
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
 # ---------------- Utils ----------------
-def normalize_frame(frame_tensor):
+def normalize_frame_ori(frame_tensor):
     if frame_tensor.min() < 0:
         frame_tensor = (frame_tensor + 1.0) / 2.0
     return frame_tensor.clamp(0, 1)
+
+def normalize_frame(frame_tensor):
+    min_val = frame_tensor.min()
+    max_val = frame_tensor.max()
+    if max_val > min_val:
+        frame_tensor = (frame_tensor - min_val) / (max_val - min_val)
+    return frame_tensor.clamp(0,1)
 
 def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
     overlap = int(block_size * max_overlap_ratio)
@@ -104,6 +111,42 @@ def decode_latents_to_image_auto_new(latents, vae):
     image = image.clamp(0,1)
 
     return image
+
+
+def decode_latents_to_image_bright_enhanced(latents, vae, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15):
+    """
+    Décodage des latents en image PIL avec :
+    - Correction gamma pour éclaircir
+    - Augmentation de luminosité, contraste et saturation pour un rendu plus vivant
+    """
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=4.0, neginf=-4.0)
+
+    if latents.ndim == 5:  # [B,C,T,H,W]
+        latents = latents[:, :, 0, :, :]
+
+    # Revenir à l'échelle attendue par le VAE
+    latents = latents / LATENT_SCALE
+
+    with torch.no_grad():
+        image = vae.decode(latents).sample  # float32 ou float16 selon VAE
+
+    # Normalisation [-1,1] -> [0,1]
+    image = (image + 1.0) / 2.0
+    image = image.clamp(0, 1)
+
+    # Correction gamma
+    image = image.pow(1.0 / gamma)
+
+    # Convertir en PIL pour post-processing
+    from torchvision.transforms import ToPILImage
+    pil_image = ToPILImage()(image.cpu().clamp(0, 1))
+
+    # Boost luminosité, contraste et saturation
+    pil_image = ImageEnhance.Brightness(pil_image).enhance(brightness)
+    pil_image = ImageEnhance.Contrast(pil_image).enhance(contrast)
+    pil_image = ImageEnhance.Color(pil_image).enhance(saturation)
+
+    return pil_image
 
 
 def tensor_to_pil(frame_tensor):
@@ -270,8 +313,15 @@ def main(args):
                     latents_frame = torch.nan_to_num(latents_frame, nan=0.0, posinf=5.0, neginf=-5.0)
                     latents_frame = latents_frame.clamp(-5.0,5.0)
 
-                    frame_tensor = decode_latents_to_image_auto_new(latents_frame, vae) # original
-                    frame_tensor = normalize_frame(frame_tensor)
+                    #frame_tensor = decode_latents_to_image_auto_new(latents_frame, vae) # original
+                    frame_tensor = decode_latents_to_image_bright_enhanced(
+                        latents_frame, vae,
+                        gamma=0.7,          # gamma <1 = plus lumineux
+                        brightness=1.2,     # luminosité globale
+                        contrast=1.1,       # léger boost contraste
+                        saturation=1.15     # couleurs plus saturées
+                    )
+                                        #frame_tensor = normalize_frame(frame_tensor)
                 # ***** Correctif dimension:
                 frame_tensor = prepare_frame_tensor(frame_tensor)
 
