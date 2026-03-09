@@ -16,9 +16,9 @@ from safetensors.torch import load_file
 from diffusers import StableDiffusionPipeline
 
 from scripts.utils.config_loader import load_config
-from scripts.utils.vae_utils import safe_load_unet, safe_load_scheduler, generate_latents_robuste_model
+from scripts.utils.vae_utils import safe_load_unet, safe_load_scheduler, generate_latents_robuste_model, decode_latents_to_image_vram_safe
 from scripts.utils.motion_utils import load_motion_module
-from scripts.utils.n3r_utils import generate_latents_robuste_safe, load_image_file, decode_latents_to_image_auto
+from scripts.utils.n3r_utils import generate_latents_robuste_safe_4go, load_image_file, decode_latents_to_image_auto, decode_latents_safe_vram
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -95,6 +95,9 @@ def encode_images_to_latents_old(images, vae):
     latents = latents.unsqueeze(2)
 
     return latents
+
+
+
 
 def encode_images_to_latents(images, vae, device="cuda", dtype=torch.float16):
 
@@ -214,6 +217,62 @@ def tensor_to_pil(frame_tensor):
 
     return T.ToPILImage()(frame_tensor.cpu())
 
+def build_scheduler(base_config, scheduler_name="dpm", steps=50, device="cuda"):
+    """
+    Crée un scheduler compatible avec différentes versions de diffusers
+    et sécurise DPMSolverMultistep pour éviter l'IndexError.
+
+    Args:
+        base_config: configuration de base du scheduler (diffusers config)
+        scheduler_name: "dpm", "euler", "pndm"
+        steps: nombre de steps à exécuter
+        device: "cuda" ou "cpu"
+
+    Returns:
+        scheduler: objet scheduler prêt à l'emploi
+    """
+    scheduler_name = scheduler_name.lower()
+    try:
+        if scheduler_name in ["dpm", "dpm++", "dpm_solver"]:
+            from diffusers import DPMSolverMultistepScheduler
+            scheduler = DPMSolverMultistepScheduler.from_config(
+                base_config,
+                algorithm_type="sde-dpmsolver++",
+                use_karras_sigmas=True
+            )
+            # 🔹 Sécurisation steps vs sigmas
+            max_safe_steps = max(len(scheduler.sigmas)-2, 1)
+            safe_steps = min(steps, max_safe_steps)
+            scheduler.set_timesteps(safe_steps, device=device)
+            print(f"✅ Scheduler DPMSolverMultistep utilisé avec steps={safe_steps}")
+
+        elif scheduler_name in ["euler"]:
+            from diffusers import EulerDiscreteScheduler
+            scheduler = EulerDiscreteScheduler.from_config(base_config)
+            scheduler.set_timesteps(steps, device=device)
+            print(f"✅ Scheduler EulerDiscreteScheduler utilisé avec steps={steps}")
+
+        elif scheduler_name in ["pndm"]:
+            from diffusers import PNDMScheduler
+            scheduler = PNDMScheduler.from_config(base_config)
+            scheduler.set_timesteps(steps, device=device)
+            print(f"✅ Scheduler PNDMScheduler utilisé avec steps={steps}")
+
+        else:
+            from diffusers import PNDMScheduler
+            scheduler = PNDMScheduler.from_config(base_config)
+            scheduler.set_timesteps(steps, device=device)
+            print("⚠️ Scheduler inconnu → fallback PNDM utilisé")
+
+        return scheduler
+
+    except Exception as e:
+        print("⚠️ Impossible de créer le scheduler demandé:", e)
+        from diffusers import PNDMScheduler
+        scheduler = PNDMScheduler.from_config(base_config)
+        scheduler.set_timesteps(min(steps, len(scheduler.sigmas)-2), device=device)
+        print("⚠️ Fallback scheduler : PNDMScheduler utilisé")
+        return scheduler
 
 # ---------------- MAIN ----------------
 def main(args):
@@ -233,30 +292,20 @@ def main(args):
     steps = max(cfg.get("steps", 50), MIN_STEPS)
 
     # ---------------- Scheduler ----------------
-    from diffusers import (
-        PNDMScheduler,
-        EulerDiscreteScheduler,
-        DDIMScheduler
+    # ---------------- Scheduler ----------------
+    from diffusers import PNDMScheduler
+
+    base_scheduler = PNDMScheduler(
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="scaled_linear",
+        num_train_timesteps=1000
     )
 
-    scheduler_cfg = cfg.get("scheduler", {})
-    scheduler_type = scheduler_cfg.get("type", "PNDMScheduler")
-
-    if scheduler_type == "PNDMScheduler":
-        scheduler = PNDMScheduler.from_pretrained(args.pretrained_model_path, subfolder="scheduler")
-
-    elif scheduler_type == "EulerDiscreteScheduler":
-        scheduler = EulerDiscreteScheduler.from_pretrained(args.pretrained_model_path, subfolder="scheduler")
-
-    elif scheduler_type == "DDIMScheduler":
-        scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_path, subfolder="scheduler")
-
-    else:
-        raise ValueError(f"Scheduler inconnu : {scheduler_type}")
-
+    scheduler = build_scheduler(base_scheduler.config, args.scheduler)
+    # 🔧 IMPORTANT
     scheduler.set_timesteps(steps, device=device)
-
-    print("✅ Scheduler utilisé :", scheduler.__class__.__name__)
+    # -------------------------------------------
 
     # -------------------------------------------
 
@@ -398,25 +447,21 @@ def main(args):
                 if f==0:
                     frame_tensor = (input_image.squeeze(0)+1.0)/2.0
                     frame_tensor = frame_tensor.clamp(0,1)
+                    frame_pil = to_pil(frame_tensor.cpu())
                 else:
+                    # 🔹 Génération latents safe 4Go
                     latents_frame = input_latents[:,:,f:f+1,:,:].clone()
-                    latents_frame = generate_latents_robuste_safe(
+                    latents_frame = generate_latents_robuste_safe_4go(
                         latents_frame, pos_embeds, neg_embeds, unet, scheduler,
                         motion_module, device, dtype,
                         guidance_scale, init_image_scale, creative_noise, seed=frame_counter
                     )
-                    # 🔹 Clamp / NaN après génération
+
+                    # 🔹 Clamp / NaN
                     latents_frame = torch.nan_to_num(latents_frame, nan=0.0, posinf=5.0, neginf=-5.0)
                     latents_frame = latents_frame.clamp(-5.0, 5.0)
 
-                    # 🔹 Correctif reshape automatique pour UNet channels
-                    if latents_frame.ndim == 5 and latents_frame.shape[2] != 4:
-                        B, _, T, H, W = latents_frame.shape
-                        C_real = latents_frame.shape[1]  # prend la vraie dimension
-                        latents_frame = latents_frame.reshape(B, T, C_real, H, W).permute(0,2,1,3,4).contiguous()
-
-                    # Décodage
-                    #frame_tensor = decode_latents_to_image_auto_new(latents_frame, vae) # original
+                    # 🔹 Décodage safe avec boost luminosité/contraste
                     frame_pil = decode_latents_to_image_bright_enhanced(
                         latents_frame, vae,
                         gamma=0.7,
@@ -424,23 +469,23 @@ def main(args):
                         contrast=1.1,
                         saturation=1.15
                     )
-                # ***** Correctif dimension:
-                #frame_tensor = prepare_frame_tensor(frame_tensor)
 
-                if f == 0:
-                    frame_pil = to_pil(frame_tensor.cpu())
-                else:
-                    frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(0.2))
+                # 🔹 Upscale si demandé
                 if upscale_factor>1:
-                    frame_pil = frame_pil.resize((frame_pil.width*upscale_factor, frame_pil.height*upscale_factor), Image.BICUBIC)
+                    frame_pil = frame_pil.resize(
+                        (frame_pil.width*upscale_factor, frame_pil.height*upscale_factor),
+                        Image.BICUBIC
+                    )
 
+                # 🔹 Sauvegarde frame
                 frame_path = output_dir / f"frame_{frame_counter:05d}.png"
                 frame_pil.save(frame_path)
 
                 frame_counter += 1
                 if f!=0: del latents_frame
-                if frame_counter%10==0: torch.cuda.empty_cache()
+                if frame_counter % 10 == 0: torch.cuda.empty_cache()
                 pbar.update(1)
+                # Génération frames
         previous_latent_single = current_latent_single.clone()
 
     pbar.close()
@@ -457,5 +502,6 @@ if __name__=="__main__":
     parser.add_argument("--fp16", action="store_true", default=True)
     parser.add_argument("--vae-offload", action="store_true")
     parser.add_argument("--n3_model", type=str, default="cyberpunk_style_v3") # cyber_skin ou cyberpunk_style_v3 ou cybersamurai_v2
+    parser.add_argument("--scheduler", type=str, default="dpm", help="Scheduler à utiliser: dpm, euler, pndm")
     args = parser.parse_args()
     main(args)
