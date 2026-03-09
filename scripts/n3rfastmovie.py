@@ -1,3 +1,7 @@
+#--------------------------------------------------------------
+# nr3fastmovie - INTERPOLATION cinema movie
+#--------------------------------------------------------------
+
 import argparse
 from pathlib import Path
 from tqdm import tqdm
@@ -140,7 +144,7 @@ def main(args):
 
     # ---------------- OUTPUT ----------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/fastinterpol_{timestamp}")
+    output_dir = Path(f"./outputs/fastmovie_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
 
