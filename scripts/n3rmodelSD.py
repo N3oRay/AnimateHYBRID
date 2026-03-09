@@ -233,8 +233,32 @@ def main(args):
     steps = max(cfg.get("steps", 50), MIN_STEPS)
 
     # ---------------- Scheduler ----------------
-    scheduler = safe_load_scheduler(args.pretrained_model_path)
+    from diffusers import (
+        PNDMScheduler,
+        EulerDiscreteScheduler,
+        DDIMScheduler
+    )
+
+    scheduler_cfg = cfg.get("scheduler", {})
+    scheduler_type = scheduler_cfg.get("type", "PNDMScheduler")
+
+    if scheduler_type == "PNDMScheduler":
+        scheduler = PNDMScheduler.from_pretrained(args.pretrained_model_path, subfolder="scheduler")
+
+    elif scheduler_type == "EulerDiscreteScheduler":
+        scheduler = EulerDiscreteScheduler.from_pretrained(args.pretrained_model_path, subfolder="scheduler")
+
+    elif scheduler_type == "DDIMScheduler":
+        scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_path, subfolder="scheduler")
+
+    else:
+        raise ValueError(f"Scheduler inconnu : {scheduler_type}")
+
     scheduler.set_timesteps(steps, device=device)
+
+    print("✅ Scheduler utilisé :", scheduler.__class__.__name__)
+
+    # -------------------------------------------
 
     guidance_scale = cfg.get("guidance_scale", 4.5)
     init_image_scale = cfg.get("init_image_scale", 0.85)
