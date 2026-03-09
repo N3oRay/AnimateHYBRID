@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime
 import torch
 from tqdm import tqdm
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageEnhance
 from torchvision.transforms import ToPILImage
 import argparse
 
@@ -84,7 +84,8 @@ def save_frames_as_video_from_folder(folder_path, output_path, fps=12):
 
 def encode_images_to_latents(images, vae):
 
-    images = images.to(device=vae.device, dtype=torch.float32)
+    #images = images.to(device=vae.device, dtype=torch.float32)
+    images = images.to(device=vae.device, dtype=vae.dtype)  # match dtype VAE
     images = images * 2 - 1
 
     with torch.inference_mode():
@@ -105,6 +106,8 @@ def decode_latents_to_image_auto_new(latents, vae):
     latents = latents / LATENT_SCALE
 
     with torch.no_grad():
+        # 🔹 S’assurer que les latents sont du même dtype que le VAE
+        latents = latents.to(vae.dtype)
         image = vae.decode(latents).sample
 
     image = (image + 1) / 2
@@ -128,7 +131,9 @@ def decode_latents_to_image_bright_enhanced(latents, vae, gamma=0.7, brightness=
     latents = latents / LATENT_SCALE
 
     with torch.no_grad():
-        image = vae.decode(latents).sample  # float32 ou float16 selon VAE
+        # 🔹 S’assurer que les latents sont du même dtype que le VAE
+        latents = latents.to(vae.dtype)
+        image = vae.decode(latents).sample
 
     # Normalisation [-1,1] -> [0,1]
     image = (image + 1.0) / 2.0
@@ -138,7 +143,9 @@ def decode_latents_to_image_bright_enhanced(latents, vae, gamma=0.7, brightness=
     image = image.pow(1.0 / gamma)
 
     # Convertir en PIL pour post-processing
-    from torchvision.transforms import ToPILImage
+
+
+    image = image[0]  # ✅ retire dimension batch
     pil_image = ToPILImage()(image.cpu().clamp(0, 1))
 
     # Boost luminosité, contraste et saturation
@@ -217,15 +224,19 @@ def main(args):
     text_encoder = text_encoder.half()
 
     # ---------------- VAE sur CPU ----------------
+    # ---------------- VAE ----------------
     vae_path = cfg.get("vae_path")
+    if not vae_path or not os.path.isfile(vae_path):
+        raise ValueError(f"Chemin VAE invalide : {vae_path}")
+
     vae = AutoencoderKL.from_single_file(
-    vae_path,
-        torch_dtype=torch.float32
+        vae_path,
+        torch_dtype=torch.float16 if args.fp16 else torch.float32
     )
 
-    vae.to("cpu")
+    vae.to(device)
     vae.enable_slicing()
-    print(f"✅ VAE chargé depuis : {vae_path}")
+    print(f"✅ VAE chargé depuis : {vae_path} avec dtype={'float16' if args.fp16 else 'float32'}")
 
     # ---------------- Embeddings ----------------
     prompts = cfg.get("prompt", [])
@@ -280,6 +291,7 @@ def main(args):
                 latent_interp = latent_interp.squeeze(2).clamp(-3.0, 3.0)
 
                 frame_tensor = decode_latents_to_image_auto_new(latent_interp, vae) # original
+                # Normalisation finale (optionnel)
                 frame_tensor = normalize_frame(frame_tensor)
 
                 # ***** Correctif dimension:
@@ -313,17 +325,17 @@ def main(args):
                     latents_frame = torch.nan_to_num(latents_frame, nan=0.0, posinf=5.0, neginf=-5.0)
                     latents_frame = latents_frame.clamp(-5.0,5.0)
 
+                    # Décodage
                     #frame_tensor = decode_latents_to_image_auto_new(latents_frame, vae) # original
-                    frame_tensor = decode_latents_to_image_bright_enhanced(
+                    frame_pil = decode_latents_to_image_bright_enhanced(
                         latents_frame, vae,
-                        gamma=0.7,          # gamma <1 = plus lumineux
-                        brightness=1.2,     # luminosité globale
-                        contrast=1.1,       # léger boost contraste
-                        saturation=1.15     # couleurs plus saturées
+                        gamma=0.7,
+                        brightness=1.2,
+                        contrast=1.1,
+                        saturation=1.15
                     )
-                                        #frame_tensor = normalize_frame(frame_tensor)
                 # ***** Correctif dimension:
-                frame_tensor = prepare_frame_tensor(frame_tensor)
+                #frame_tensor = prepare_frame_tensor(frame_tensor)
 
                 if f == 0:
                     frame_pil = to_pil(frame_tensor.cpu())
