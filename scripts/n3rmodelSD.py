@@ -18,7 +18,7 @@ from diffusers import StableDiffusionPipeline
 from scripts.utils.config_loader import load_config
 from scripts.utils.vae_utils import safe_load_unet, safe_load_scheduler, generate_latents_robuste_model
 from scripts.utils.motion_utils import load_motion_module
-from scripts.utils.n3r_utils import generate_latents_robuste, load_image_file, decode_latents_to_image_auto
+from scripts.utils.n3r_utils import generate_latents_robuste_safe, load_image_file, decode_latents_to_image_auto
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -82,7 +82,7 @@ def save_frames_as_video_from_folder(folder_path, output_path, fps=12):
         .run(quiet=True)
     )
 
-def encode_images_to_latents(images, vae):
+def encode_images_to_latents_old(images, vae):
 
     #images = images.to(device=vae.device, dtype=torch.float32)
     images = images.to(device=vae.device, dtype=vae.dtype)  # match dtype VAE
@@ -93,6 +93,54 @@ def encode_images_to_latents(images, vae):
 
     latents = latents * LATENT_SCALE
     latents = latents.unsqueeze(2)
+
+    return latents
+
+def encode_images_to_latents(images, vae, device="cuda", dtype=torch.float16):
+
+    import torch
+    import torchvision.transforms as T
+
+    LATENT_SCALE = 0.18215
+
+    if not isinstance(images, list):
+        images = [images]
+
+    transform = T.ToTensor()
+    processed = []
+
+    for img in images:
+
+        # PIL → Tensor
+        if not isinstance(img, torch.Tensor):
+            img = transform(img)
+
+        # enlever batch dimension éventuelle
+        if img.ndim == 4:
+            img = img.squeeze(0)
+
+        # grayscale H,W
+        if img.ndim == 2:
+            img = img.unsqueeze(0)
+
+        # grayscale 1,H,W → 3,H,W
+        if img.shape[0] == 1:
+            img = img.repeat(3,1,1)
+
+        img = img.clamp(0,1)
+
+        processed.append(img)
+
+    images = torch.stack(processed).to(device=device, dtype=dtype)
+
+    # [0,1] → [-1,1]
+    images = images * 2.0 - 1.0
+
+    with torch.no_grad():
+        latents = vae.encode(images).latent_dist.sample()
+
+    latents = latents * LATENT_SCALE
+    latents = torch.nan_to_num(latents)
 
     return latents
 
@@ -179,7 +227,15 @@ def main(args):
     upscale_factor = cfg.get("upscale_factor", 2)
     transition_frames = cfg.get("transition_frames", 8)
     num_fraps_per_image = cfg.get("num_fraps_per_image", 12)
-    steps = cfg.get("steps", 50)
+    # 🔹 Contrôle minimal pour éviter IndexError DPM-Solver
+    # Scheduler
+    MIN_STEPS = 25  # minimum sûr pour DPM-Solver
+    steps = max(cfg.get("steps", 50), MIN_STEPS)
+
+    # ---------------- Scheduler ----------------
+    scheduler = safe_load_scheduler(args.pretrained_model_path)
+    scheduler.set_timesteps(steps, device=device)
+
     guidance_scale = cfg.get("guidance_scale", 4.5)
     init_image_scale = cfg.get("init_image_scale", 0.85)
     creative_noise = cfg.get("creative_noise", 0.0)
@@ -201,18 +257,12 @@ def main(args):
         unet.enable_attention_slicing()
     print(f"✅ UNet N3 chargé correctement depuis {n3_model_path}")
 
-    # Charger le text_encoder séparément depuis le dossier du modèle SD
-    from transformers import CLIPTextModel
+    # Stabilisation diffusion
+    if hasattr(scheduler.config, "use_karras_sigmas"):
+        scheduler.config.use_karras_sigmas = True
 
-    text_encoder = CLIPTextModel.from_pretrained(
-        os.path.join(args.pretrained_model_path, "text_encoder")
-    ).to(device)
-    text_encoder = text_encoder.half() if args.fp16 else text_encoder.float()
-    print(f"✅ Text encoder chargé depuis {os.path.join(args.pretrained_model_path,'text_encoder')}")
-
-    # ---------------- Scheduler ----------------
-    scheduler = safe_load_scheduler(args.pretrained_model_path)
-    scheduler.set_timesteps(steps, device=device)
+    if hasattr(scheduler.config, "lower_order_final"):
+        scheduler.config.lower_order_final = True
 
     # ---------------- Motion module ----------------
     motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
@@ -221,7 +271,10 @@ def main(args):
     # ---------------- Tokenizer & Text Encoder ----------------
     tokenizer = CLIPTokenizerFast.from_pretrained(os.path.join(args.pretrained_model_path,"tokenizer"))
     text_encoder = CLIPTextModel.from_pretrained(os.path.join(args.pretrained_model_path,"text_encoder")).to(device)
-    text_encoder = text_encoder.half()
+    #text_encoder = text_encoder.half()
+    text_encoder = text_encoder.to(dtype)
+
+    print(f"✅ tokenizer - text_encoder module chargé")
 
     # ---------------- VAE sur CPU ----------------
     # ---------------- VAE ----------------
@@ -277,6 +330,9 @@ def main(args):
             break
         input_image = load_images([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
         input_latents_single = encode_images_to_latents(input_image, vae)
+        # 🔹 Sécurisation 1-channel
+        if input_latents_single.shape[1] == 1:
+            input_latents_single = input_latents_single.repeat(1, 4, 1, 1)
         input_latents = input_latents_single.repeat(1,1,num_fraps_per_image,1,1)
         current_latent_single = input_latents_single.clone()
         block_size = cfg.get("block_size",64)
@@ -289,6 +345,10 @@ def main(args):
                 alpha = 0.5 - 0.5*math.cos(math.pi*t/(transition_frames-1))
                 latent_interp = ((1 - alpha) * previous_latent_single + alpha * current_latent_single)
                 latent_interp = latent_interp.squeeze(2).clamp(-3.0, 3.0)
+
+                # 🔹 Correctif reshape automatique pour transition latente
+                if latent_interp.ndim == 4 and latent_interp.shape[0] != 4:
+                    latent_interp = latent_interp.repeat(1,4,1,1)
 
                 frame_tensor = decode_latents_to_image_auto_new(latent_interp, vae) # original
                 # Normalisation finale (optionnel)
@@ -316,14 +376,20 @@ def main(args):
                     frame_tensor = frame_tensor.clamp(0,1)
                 else:
                     latents_frame = input_latents[:,:,f:f+1,:,:].clone()
-                    latents_frame = generate_latents_robuste(
+                    latents_frame = generate_latents_robuste_safe(
                         latents_frame, pos_embeds, neg_embeds, unet, scheduler,
                         motion_module, device, dtype,
                         guidance_scale, init_image_scale, creative_noise, seed=frame_counter
                     )
-                    # 🔹 Nettoyage latents
+                    # 🔹 Clamp / NaN après génération
                     latents_frame = torch.nan_to_num(latents_frame, nan=0.0, posinf=5.0, neginf=-5.0)
-                    latents_frame = latents_frame.clamp(-5.0,5.0)
+                    latents_frame = latents_frame.clamp(-5.0, 5.0)
+
+                    # 🔹 Correctif reshape automatique pour UNet channels
+                    if latents_frame.ndim == 5 and latents_frame.shape[2] != 4:
+                        B, _, T, H, W = latents_frame.shape
+                        C_real = latents_frame.shape[1]  # prend la vraie dimension
+                        latents_frame = latents_frame.reshape(B, T, C_real, H, W).permute(0,2,1,3,4).contiguous()
 
                     # Décodage
                     #frame_tensor = decode_latents_to_image_auto_new(latents_frame, vae) # original
@@ -340,7 +406,7 @@ def main(args):
                 if f == 0:
                     frame_pil = to_pil(frame_tensor.cpu())
                 else:
-                    frame_pil = to_pil(frame_tensor.cpu()).filter(ImageFilter.GaussianBlur(0.2))
+                    frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(0.2))
                 if upscale_factor>1:
                     frame_pil = frame_pil.resize((frame_pil.width*upscale_factor, frame_pil.height*upscale_factor), Image.BICUBIC)
 
