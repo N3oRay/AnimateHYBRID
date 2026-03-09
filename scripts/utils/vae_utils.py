@@ -18,6 +18,63 @@ import math
 LATENT_SCALE = 0.18215
 
 
+def decode_latents_to_image_vram_safe(latents, vae, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15):
+    """
+    Décodage des latents en PIL.Image avec corrections gamma, luminosité, contraste et saturation,
+    optimisé pour faible VRAM (4Go). Utilise float32 pour la stabilité.
+
+    Args:
+        latents (torch.Tensor): [B,C,T,H,W] ou [B,C,H,W]
+        vae (AutoencoderKL): modèle VAE
+        gamma (float): correction gamma
+        brightness, contrast, saturation (float): boosts PIL.Image
+
+    Returns:
+        List[PIL.Image]: images décodées
+    """
+    from torchvision.transforms import ToPILImage
+    import torch
+    from PIL import ImageEnhance
+
+    # Sécurisation NaN / Inf
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=4.0, neginf=-4.0)
+
+    # Si [B,C,T,H,W] → on prend la première "T" pour l'instant
+    if latents.ndim == 5:
+        latents = latents[:,:,0,:,:]
+
+    # Revenir à l'échelle attendue par le VAE
+    latents = latents / LATENT_SCALE
+
+    # Décode en float32 pour éviter frames noires
+    latents = latents.to(dtype=torch.float32)
+
+    with torch.no_grad():
+        image_tensor = vae.decode(latents).sample
+
+    # Normalisation [-1,1] -> [0,1]
+    image_tensor = (image_tensor + 1.0) / 2.0
+    image_tensor = image_tensor.clamp(0,1)
+
+    # Correction gamma
+    image_tensor = image_tensor.pow(1.0 / gamma)
+
+    images = []
+    to_pil = ToPILImage()
+    for i in range(image_tensor.shape[0]):
+        img = image_tensor[i]
+        pil_img = to_pil(img.cpu())
+
+        # Boost luminosité / contraste / saturation
+        pil_img = ImageEnhance.Brightness(pil_img).enhance(brightness)
+        pil_img = ImageEnhance.Contrast(pil_img).enhance(contrast)
+        pil_img = ImageEnhance.Color(pil_img).enhance(saturation)
+
+        images.append(pil_img)
+
+    return images
+
+
 
 def generate_latents_robuste_model(latents, pos_embeds, neg_embeds, unet, scheduler,
                              motion_module=None, device="cuda", dtype=torch.float16,

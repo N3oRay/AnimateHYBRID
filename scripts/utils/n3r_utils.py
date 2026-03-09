@@ -20,6 +20,39 @@ from einops import rearrange
 from math import ceil
 
 
+# ---------------- Decode safe 4Go VRAM ----------------
+def decode_latents_safe_vram(latents, vae, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15):
+    from torchvision.transforms import ToPILImage
+    import torch
+    from PIL import ImageEnhance
+
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=4.0, neginf=-4.0)
+
+    # Si batch T multiple, on prend le 0 pour chaque frame
+    if latents.ndim == 5:
+        latents = latents[:, :, 0, :, :]
+
+    latents = latents / LATENT_SCALE
+    latents = latents.to(dtype=torch.float32, device="cpu")  # decode safe 4Go
+
+    with torch.no_grad():
+        image_tensor = vae.decode(latents).sample
+
+    image_tensor = ((image_tensor + 1) / 2).clamp(0, 1)
+    image_tensor = image_tensor.pow(1.0 / gamma)
+
+    images = []
+    to_pil = ToPILImage()
+    for i in range(image_tensor.shape[0]):
+        img = image_tensor[i]
+        pil_img = to_pil(img.cpu())
+        pil_img = ImageEnhance.Brightness(pil_img).enhance(brightness)
+        pil_img = ImageEnhance.Contrast(pil_img).enhance(contrast)
+        pil_img = ImageEnhance.Color(pil_img).enhance(saturation)
+        images.append(pil_img)
+    return images
+
+
 def decode_latents_to_image_auto(latents, vae):
     """
     Décodage automatique du latent, quel que soit son format (3D, 4D, 5D),
@@ -2568,20 +2601,34 @@ import torch
 import math
 
 
-def generate_latents_robuste_safe(latents, pos_embeds, neg_embeds, unet, scheduler,
-                                  motion_module=None, device="cuda", dtype=torch.float16,
-                                  guidance_scale=7.5, init_image_scale=2.0,
-                                  creative_noise=0.0, seed=42):
 
+
+def generate_latents_robuste_safe_4go(
+    latents, pos_embeds, neg_embeds, unet, scheduler,
+    motion_module=None, device="cuda", dtype=torch.float16,
+    guidance_scale=7.5, init_image_scale=2.0,
+    creative_noise=0.0, seed=42,
+    max_steps=25  # max steps pour 4Go VRAM
+):
+    """
+    Génération de latents robuste optimisée pour 4Go VRAM.
+    """
     B, C_orig, T, H, W = latents.shape
+
+    # Force fp16 pour UNet + latents pour réduire la VRAM
     latents = latents.to(device=device, dtype=dtype)
     latents = latents.permute(0,2,1,3,4).reshape(B*T, C_orig, H, W).contiguous()
     init_latents = latents.clone()
 
     torch.manual_seed(seed)
 
-    for t_step in scheduler.timesteps:
+    # Réduire steps si scheduler trop long
+    timesteps = scheduler.timesteps
+    if len(timesteps) > max_steps:
+        step_idx = torch.linspace(0, len(timesteps)-1, steps=max_steps).long()
+        timesteps = timesteps[step_idx]
 
+    for t_step in timesteps:
         # Motion
         if motion_module:
             latents = motion_module(latents)
@@ -2594,30 +2641,96 @@ def generate_latents_robuste_safe(latents, pos_embeds, neg_embeds, unet, schedul
         latent_model_input = torch.cat([latents, latents], dim=0)
 
         # 🔹 Sécurisation channels UNet
-        if latent_model_input.shape[1] == 1:
-            latent_model_input = latent_model_input.repeat(1, 4, 1, 1)
+        if latent_model_input.shape[1] != 4:
+            latent_model_input = latent_model_input.repeat(1, 4//latent_model_input.shape[1], 1, 1)
 
         embeds = torch.cat([neg_embeds, pos_embeds], dim=0)
+
         with torch.no_grad():
             noise_pred = unet(latent_model_input, t_step, encoder_hidden_states=embeds).sample
 
+        # Guidance
         noise_uncond, noise_text = noise_pred.chunk(2)
         noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
 
-        # Scheduler step (compatible toutes versions)
+        # Scheduler step
         step_output = scheduler.step(model_output=noise_pred, sample=latents, timestep=t_step)
         latents = getattr(step_output, "prev_sample", step_output)
 
-        # Réinjection image initiale
+        # Réinjection image initiale (init_image_scale)
         latents = latents + init_image_scale * (init_latents - latents)
 
         # Clamp / NaN
         latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
         latents = latents.clamp(-5.0, 5.0)
 
-    # 🔹 reshape final automatique avec C réel
-    C_final = latents.shape[1]  # prend la vraie dimension
+        # 🟢 Réduction de VRAM : libération intermédiaire
+        torch.cuda.empty_cache()
+
+    # Reshape final avec canaux réels
+    C_final = latents.shape[1]
     latents = latents.reshape(B, T, C_final, H, W).permute(0,2,1,3,4).contiguous()
+
+    return latents
+
+
+def generate_latents_robuste_safe(latents, pos_embeds, neg_embeds, unet, scheduler,
+                                  motion_module=None, device="cuda", dtype=torch.float16,
+                                  guidance_scale=7.5, init_image_scale=2.0,
+                                  creative_noise=0.0, seed=42):
+
+    B, C_orig, T, H, W = latents.shape
+    latents = latents.to(device=device, dtype=dtype)
+
+    latents = latents.permute(0,2,1,3,4).reshape(B*T, C_orig, H, W).contiguous()
+    init_latents = latents.clone()
+
+    torch.manual_seed(seed)
+
+    # 🔹 IMPORTANT pour DPMSolver
+    scheduler._step_index = None
+
+    for t_step in scheduler.timesteps:
+
+        if motion_module:
+            latents = motion_module(latents)
+
+        if creative_noise > 0:
+            latents = latents + torch.randn_like(latents) * creative_noise
+
+        latent_model_input = torch.cat([latents, latents], dim=0)
+
+        if latent_model_input.shape[1] == 1:
+            latent_model_input = latent_model_input.repeat(1,4,1,1)
+
+        embeds = torch.cat([neg_embeds, pos_embeds], dim=0)
+
+        with torch.no_grad():
+            noise_pred = unet(
+                latent_model_input,
+                t_step,
+                encoder_hidden_states=embeds
+            ).sample
+
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+        step_output = scheduler.step(
+            model_output=noise_pred,
+            timestep=t_step,
+            sample=latents
+        )
+
+        latents = getattr(step_output, "prev_sample", step_output)
+
+        latents = latents + init_image_scale * (init_latents - latents)
+
+        latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+        latents = latents.clamp(-5.0,5.0)
+
+    C_final = latents.shape[1]
+    latents = latents.reshape(B, T, C_final, H, W).permute(0,2,1,3,4).contiguous()
+
     return latents
 
 
