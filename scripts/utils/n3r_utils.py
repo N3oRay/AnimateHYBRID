@@ -2568,6 +2568,59 @@ import torch
 import math
 
 
+def generate_latents_robuste_safe(latents, pos_embeds, neg_embeds, unet, scheduler,
+                                  motion_module=None, device="cuda", dtype=torch.float16,
+                                  guidance_scale=7.5, init_image_scale=2.0,
+                                  creative_noise=0.0, seed=42):
+
+    B, C_orig, T, H, W = latents.shape
+    latents = latents.to(device=device, dtype=dtype)
+    latents = latents.permute(0,2,1,3,4).reshape(B*T, C_orig, H, W).contiguous()
+    init_latents = latents.clone()
+
+    torch.manual_seed(seed)
+
+    for t_step in scheduler.timesteps:
+
+        # Motion
+        if motion_module:
+            latents = motion_module(latents)
+
+        # Creative noise
+        if creative_noise > 0:
+            latents = latents + torch.randn_like(latents) * creative_noise
+
+        # Classifier-free guidance
+        latent_model_input = torch.cat([latents, latents], dim=0)
+
+        # 🔹 Sécurisation channels UNet
+        if latent_model_input.shape[1] == 1:
+            latent_model_input = latent_model_input.repeat(1, 4, 1, 1)
+
+        embeds = torch.cat([neg_embeds, pos_embeds], dim=0)
+        with torch.no_grad():
+            noise_pred = unet(latent_model_input, t_step, encoder_hidden_states=embeds).sample
+
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+        # Scheduler step (compatible toutes versions)
+        step_output = scheduler.step(model_output=noise_pred, sample=latents, timestep=t_step)
+        latents = getattr(step_output, "prev_sample", step_output)
+
+        # Réinjection image initiale
+        latents = latents + init_image_scale * (init_latents - latents)
+
+        # Clamp / NaN
+        latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+        latents = latents.clamp(-5.0, 5.0)
+
+    # 🔹 reshape final automatique avec C réel
+    C_final = latents.shape[1]  # prend la vraie dimension
+    latents = latents.reshape(B, T, C_final, H, W).permute(0,2,1,3,4).contiguous()
+    return latents
+
+
 #-------------------------------------------------------------------------------
 # VERY STABLE
 #-------------------------------------------------------------------------------
