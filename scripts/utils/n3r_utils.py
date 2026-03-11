@@ -18,6 +18,7 @@ import torchvision.transforms as T
 from transformers import CLIPTokenizer, CLIPTextModel
 from einops import rearrange
 from math import ceil
+import copy
 
 
 # ---------------- Decode safe 4Go VRAM ----------------
@@ -2597,81 +2598,119 @@ def encode_images(input_images, vae):
 # # Ajouter un peu de bruit créatif initial si demandé
 # # Reshape pour traitement UNet [B*T, C, H, W]
 #---------------------------------------------------------
+
+
+from functools import wraps
 import torch
-import math
+from contextlib import contextmanager
 
-
-
-
-def generate_latents_robuste_safe_4go(
-    latents, pos_embeds, neg_embeds, unet, scheduler,
-    motion_module=None, device="cuda", dtype=torch.float16,
-    guidance_scale=7.5, init_image_scale=2.0,
-    creative_noise=0.0, seed=42,
-    max_steps=25  # max steps pour 4Go VRAM
-):
+# 🔹 Context manager pour désactiver xFormers temporairement
+@contextmanager
+def disable_xformers(unet):
     """
-    Génération de latents robuste optimisée pour 4Go VRAM.
+    Désactive memory-efficient xFormers attention si disponible.
+    Utile pour éviter les erreurs FakeTensor pendant le safe encode/fallback.
     """
-    B, C_orig, T, H, W = latents.shape
+    orig = getattr(unet, "enable_xformers_memory_efficient_attention", None)
+    if callable(orig):
+        # Désactiver temporairement
+        unet.enable_xformers_memory_efficient_attention(False)
+    yield
+    if callable(orig):
+        # Réactiver
+        unet.enable_xformers_memory_efficient_attention(True)
 
-    # Force fp16 pour UNet + latents pour réduire la VRAM
-    latents = latents.to(device=device, dtype=dtype)
-    latents = latents.permute(0,2,1,3,4).reshape(B*T, C_orig, H, W).contiguous()
-    init_latents = latents.clone()
 
-    torch.manual_seed(seed)
+def generate_latents_safe_debug(unet, **kwargs):
+    """
+    Génération de latents avec UNet, FP16-safe et debug.
+    Affiche min/max à chaque étape pour détecter si les latents restent à zéro.
+    """
 
-    # Réduire steps si scheduler trop long
-    timesteps = scheduler.timesteps
-    if len(timesteps) > max_steps:
-        step_idx = torch.linspace(0, len(timesteps)-1, steps=max_steps).long()
-        timesteps = timesteps[step_idx]
+    # Arguments connus
+    known_kwargs = [
+        "scheduler", "input_latents", "embeddings", "motion_module",
+        "guidance_scale", "device", "fp16", "steps", "debug"
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in known_kwargs}
 
-    for t_step in timesteps:
-        # Motion
-        if motion_module:
+    # Required
+    input_latents = filtered_kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' doit être fourni")
+
+    device = filtered_kwargs.get("device", "cuda")
+    fp16 = filtered_kwargs.get("fp16", True)
+    debug = filtered_kwargs.get("debug", True)
+    motion_module = filtered_kwargs.get("motion_module", None)
+    scheduler = filtered_kwargs.get("scheduler", None)
+    steps = filtered_kwargs.get("steps", 20)
+    embeddings = filtered_kwargs.get("embeddings", None)
+
+    # Latents initiaux
+    latents = input_latents.clone().to(device=device, dtype=torch.float16 if fp16 else torch.float32)
+    is_video = latents.ndim == 5
+    steps_list = getattr(scheduler, "timesteps", range(steps))
+
+    if debug:
+        print(f"[DEBUG] Initial latents min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+
+    # Désactiver Dynamo/Inductor pour debug
+    torch._dynamo.reset()
+    torch._dynamo.disable()
+
+    for step_idx, t in enumerate(steps_list):
+        if motion_module is not None:
             latents = motion_module(latents)
+            latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
 
-        # Creative noise
-        if creative_noise > 0:
-            latents = latents + torch.randn_like(latents) * creative_noise
+        if is_video:
+            B, C, F, H, W = latents.shape
+            latents_unet = latents.permute(0, 2, 1, 3, 4).reshape(B*F, C, H, W)
+        else:
+            latents_unet = latents
 
-        # Classifier-free guidance
-        latent_model_input = torch.cat([latents, latents], dim=0)
+        # FP16 si demandé
+        latents_unet = latents_unet.half() if fp16 else latents_unet.float()
 
-        # 🔹 Sécurisation channels UNet
-        if latent_model_input.shape[1] != 4:
-            latent_model_input = latent_model_input.repeat(1, 4//latent_model_input.shape[1], 1, 1)
+        # 🔹 Forward UNet
+        try:
+            unet_out = unet(latents_unet, t, encoder_hidden_states=embeddings)
+            latents_out = unet_out["sample"]
+        except Exception as e:
+            print(f"⚠️ [UNet ERROR] step={step_idx} - {e}")
+            continue
 
-        embeds = torch.cat([neg_embeds, pos_embeds], dim=0)
+        # Reshape si vidéo
+        if is_video:
+            latents = latents_out.reshape(B, F, C, H, W).permute(0, 2, 1, 3, 4)
+        else:
+            latents = latents_out
 
-        with torch.no_grad():
-            noise_pred = unet(latent_model_input, t_step, encoder_hidden_states=embeds).sample
+        # Nettoyage et clamp
+        latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0).clamp(-5.0, 5.0)
 
-        # Guidance
-        noise_uncond, noise_text = noise_pred.chunk(2)
-        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+        if debug:
+            print(f"[DEBUG Step {step_idx}] latents min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
 
-        # Scheduler step
-        step_output = scheduler.step(model_output=noise_pred, sample=latents, timestep=t_step)
-        latents = getattr(step_output, "prev_sample", step_output)
-
-        # Réinjection image initiale (init_image_scale)
-        latents = latents + init_image_scale * (init_latents - latents)
-
-        # Clamp / NaN
-        latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
-        latents = latents.clamp(-5.0, 5.0)
-
-        # 🟢 Réduction de VRAM : libération intermédiaire
-        torch.cuda.empty_cache()
-
-    # Reshape final avec canaux réels
-    C_final = latents.shape[1]
-    latents = latents.reshape(B, T, C_final, H, W).permute(0,2,1,3,4).contiguous()
+    if debug:
+        print(f"[INFO] Finished latents generation, final min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
 
     return latents
+
+
+# 🔹 Wrapper général sûr
+def generate_latents_safe_wrapper(unet, **kwargs):
+    try:
+        return generate_latents_safe_debug(unet, **kwargs)
+    except TypeError as e:
+        if "meta__efficient_attention_backward() got multiple values for argument 'scale'" in str(e):
+            print("⚠️ [SAFE WRAPPER] Efficient attention error caught, returning input latents")
+            return kwargs.get("input_latents").clone()
+        else:
+            raise e
+
+# ---------------- SAFE WRAPPER ----------------
 
 
 def generate_latents_robuste_safe(latents, pos_embeds, neg_embeds, unet, scheduler,
@@ -3301,6 +3340,47 @@ def load_image_file(path, W, H, device, dtype):
 # -------------------------
 # Image utilities
 # -------------------------
+def load_images_test(paths, W, H, device, dtype):
+
+    all_tensors = []
+
+    for p in paths:
+
+        if p.lower().endswith(".gif"):
+
+            img = Image.open(p)
+
+            for f in ImageSequence.Iterator(img):
+
+                t = torch.tensor(np.array(f)).float() / 127.5 - 1.0
+
+                if t.ndim == 3:
+                    t = t.permute(2,0,1)
+
+                all_tensors.append(t)
+
+            print(f"✅ GIF chargé : {p}")
+
+        else:
+
+            t = load_image_file(p, W, H, device="cpu", dtype=torch.float32)
+
+            if t.ndim == 3 and t.shape[-1] == 3:
+                t = t.permute(2,0,1)
+
+            all_tensors.append(t)
+
+            print(f"✅ Image chargée : {p}")
+
+    imgs = torch.stack(all_tensors, dim=0)
+
+    print("IMAGE SHAPE:", imgs.shape)
+    print("IMAGE MIN/MAX:", imgs.min().item(), imgs.max().item())
+
+    return imgs.to(device=device, dtype=dtype)
+
+
+
 def load_images(paths, W, H, device, dtype):
     all_tensors = []
     for p in paths:

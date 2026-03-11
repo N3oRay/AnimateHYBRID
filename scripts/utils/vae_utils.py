@@ -18,6 +18,99 @@ import math
 LATENT_SCALE = 0.18215
 
 
+def decode_latents_to_image_bright_enhanced(latents, vae, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15):
+    """
+    Décodage des latents en image PIL avec :
+    - Correction gamma pour éclaircir
+    - Augmentation de luminosité, contraste et saturation pour un rendu plus vivant
+    """
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=4.0, neginf=-4.0)
+
+    if latents.ndim == 5:  # [B,C,T,H,W]
+        latents = latents[:, :, 0, :, :]
+
+    # Revenir à l'échelle attendue par le VAE
+    latents = latents / LATENT_SCALE
+
+    with torch.no_grad():
+        # 🔹 S’assurer que les latents sont du même dtype que le VAE
+        latents = latents.to(vae.dtype)
+        image = vae.decode(latents).sample
+
+    # Normalisation [-1,1] -> [0,1]
+    image = (image + 1.0) / 2.0
+    image = image.clamp(0, 1)
+
+    # Correction gamma
+    image = image.pow(1.0 / gamma)
+
+    # Convertir en PIL pour post-processing
+
+
+    image = image[0]  # ✅ retire dimension batch
+    pil_image = ToPILImage()(image.cpu().clamp(0, 1))
+
+    # Boost luminosité, contraste et saturation
+    pil_image = ImageEnhance.Brightness(pil_image).enhance(brightness)
+    pil_image = ImageEnhance.Contrast(pil_image).enhance(contrast)
+    pil_image = ImageEnhance.Color(pil_image).enhance(saturation)
+
+    return pil_image
+
+
+
+def decode_latents_ultrasafe(latents, vae, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15):
+    """
+    Décodage ultra-sécurisé des latents en image PIL.
+    Protège contre :
+    - NaN / inf
+    - latents trop grands ou trop petits
+    - mauvais dtype
+    - images trop sombres / noires
+    """
+    from torchvision.transforms import ToPILImage
+    import torch
+    from PIL import Image, ImageEnhance
+
+    # ---------------- sécurité latents ----------------
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+    if latents.ndim == 5:  # [B,C,T,H,W]
+        latents = latents[:, :, 0, :, :]  # retirer dimension temporelle
+
+    latents = latents / LATENT_SCALE  # remise à l'échelle attendue par le VAE
+
+    # Clamp très strict pour éviter valeurs extrêmes
+    latents = latents.clamp(-5.0, 5.0)
+
+    # Assurer le dtype correct
+    latents = latents.to(vae.dtype)
+
+    with torch.no_grad():
+        image = vae.decode(latents).sample  # [B,3,H,W]
+
+    # Normalisation [-1,1] -> [0,1]
+    image = (image + 1.0) / 2.0
+    image = image.clamp(0, 1)
+
+    # Correction gamma pour éclaircir
+    image = image.pow(1.0 / gamma)
+
+    # S'assurer qu'on a bien [3,H,W]
+    if image.ndim == 4:
+        image = image[0]  # retirer batch si présent
+
+    # Convertir en PIL
+    pil_image = ToPILImage()(image.cpu().clamp(0,1))
+
+    # Boost luminosité, contraste, saturation
+    pil_image = ImageEnhance.Brightness(pil_image).enhance(brightness)
+    pil_image = ImageEnhance.Contrast(pil_image).enhance(contrast)
+    pil_image = ImageEnhance.Color(pil_image).enhance(saturation)
+
+    return pil_image
+
+
 def decode_latents_to_image_vram_safe(latents, vae, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15):
     """
     Décodage des latents en PIL.Image avec corrections gamma, luminosité, contraste et saturation,
@@ -1143,10 +1236,57 @@ def decode_latents_to_image(latents, vae):
 # -------------------------
 # Model loaders
 # -------------------------
+
+def safe_load_unet(model_path, device, fp16=False):
+    """
+    Chargement sécurisé du UNet depuis un dossier local.
+    - supporte .safetensors ou .bin
+    - force strict=False pour éviter les mismatches
+    - affiche les poids non chargés
+    - support fp16/fp32
+    """
+
+    folder = os.path.join(model_path, "unet")
+    if not os.path.exists(folder):
+        raise FileNotFoundError(f"Le dossier UNet n'existe pas : {folder}")
+
+    print(f"🔄 Chargement UNet depuis {folder} ...")
+    model = UNet2DConditionModel.from_pretrained(folder)
+
+    # --- Chemins fichiers de poids ---
+    state_dict_path_safetensors = os.path.join(folder, "diffusion_pytorch_model.safetensors")
+    state_dict_path_bin = os.path.join(folder, "diffusion_pytorch_model.bin")
+
+    # --- Chargement des poids selon format ---
+    if os.path.exists(state_dict_path_safetensors):
+        print("✅ Chargement poids safetensors")
+        state_dict = load_file(state_dict_path_safetensors, device="cpu")
+    elif os.path.exists(state_dict_path_bin):
+        print("✅ Chargement poids bin")
+        state_dict = torch.load(state_dict_path_bin, map_location="cpu")
+    else:
+        raise FileNotFoundError("Aucun fichier de poids UNet trouvé (.safetensors ou .bin)")
+
+    # --- Charger dans le modèle avec strict=False ---
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        print(f"⚠️ Poids manquants : {missing}")
+        print(f"⚠️ Poids inattendus : {unexpected}")
+
+    # --- Convert dtype si demandé ---
+    if fp16:
+        model = model.half()
+
+    # --- Envoyer sur device ---
+    model = model.to(device)
+
+    print(f"✅ UNet chargé avec dtype={next(model.parameters()).dtype}, device={next(model.parameters()).device}")
+    return model
 # -------------------------
 # Model loaders
 # -------------------------
-def safe_load_unet(model_path, device, fp16=False):
+
+def safe_load_unet_ori(model_path, device, fp16=False):
     folder = os.path.join(model_path, "unet")
     if os.path.exists(folder):
         model = UNet2DConditionModel.from_pretrained(folder)
