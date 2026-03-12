@@ -22,13 +22,200 @@ from scripts.utils.tools_utils import (
 #from scripts.n3rmodelSD import encode_images_to_latents_safe
 
 # ------------------- DECODE ULTRA-SAFE GLOBAL -------------------
+#gamma = 1.0  # 1.2
+#brightness = 1.0 # 1.0
+#contrast = 1.3 # 1.2
+#saturation = 1.1 # 1.2
+
+
+
+def test_parameter_grid_with_boost(
+    latents_motion, vae, img_orig,
+    gammas=[1.0,1.1,1.2,1.5],
+    contrasts=[1.1,1.2,1.3,1.5],
+    saturations=[1.0,1.1,1.2,1.5],
+    brightnesses=[1.0],
+    epsilon=1e-5,
+    latent_scale_boost=5.71,  #[5.4, 5.5, 5.6, 5.7, 5.8]
+    device="cuda"
+):
+    results = []
+
+    # Convertir img_orig en tensor sur le device
+    if isinstance(img_orig, list) or isinstance(img_orig, tuple):
+        img_orig_tensor = img_orig[0]
+    else:
+        img_orig_tensor = img_orig
+    if isinstance(img_orig_tensor, Image.Image):
+        img_orig_tensor = torch.tensor(np.array(img_orig_tensor) / 255.0).permute(2,0,1)
+    img_orig_tensor = img_orig_tensor.to(device=device, dtype=torch.float32)
+
+    for gamma, contrast, saturation, brightness in itertools.product(gammas, contrasts, saturations, brightnesses):
+        # Décodage blockwise avec boost et epsilon
+        decoded_img = decode_latents_ultrasafe_blockwise(
+            latents_motion, vae,
+            gamma=gamma,
+            contrast=contrast,
+            saturation=saturation,
+            brightness=brightness,
+            device=device,
+            epsilon=epsilon,
+            latent_scale_boost=latent_scale_boost
+        )
+
+        # Si BATCH =1, assure tensor
+        if isinstance(decoded_img, list):
+            decoded_img = decoded_img[0]
+
+        # Redimensionner le décodé pour matcher l'original
+        decoded_img_resized = decoded_img.resize(
+            (img_orig_tensor.shape[2], img_orig_tensor.shape[1]), Image.BICUBIC
+        )
+
+        # Comparer
+        stats = compare_images_stats_v2(img_orig_tensor, decoded_img_resized, device=device)
+        stats.update({
+            "gamma": gamma,
+            "contrast": contrast,
+            "saturation": saturation,
+            "brightness": brightness,
+            "epsilon": epsilon,
+            "latent_scale_boost": latent_scale_boost
+        })
+        results.append(stats)
+
+    # Trier par meilleure fidélité (mean_diff_total)
+    results_sorted = sorted(results, key=lambda x: x["mean_diff_total"])
+    return results_sorted
+
+def compare_images_stats_v2(img_orig, img_decoded, threshold=0.05, device="cuda"):
+    """
+    Compare deux images PIL ou tensors et retourne les écarts statistiques.
+    - img_orig : tensor [C,H,W] ou [B,C,H,W] ou PIL
+    - img_decoded : tensor ou PIL
+    - threshold : seuil pour % de pixels différents
+    - device : 'cuda' ou 'cpu'
+    """
+
+    # --- Convertir PIL en tensor float [0,1] ---
+    if isinstance(img_orig, Image.Image):
+        img_orig = torch.tensor(np.array(img_orig) / 255.0).permute(2,0,1)
+    if isinstance(img_decoded, Image.Image):
+        img_decoded = torch.tensor(np.array(img_decoded) / 255.0).permute(2,0,1)
+
+    # --- Retirer batch si nécessaire ---
+    if img_orig.ndim == 4:  # [B,C,H,W]
+        img_orig = img_orig[0]
+    if img_decoded.ndim == 4:  # [B,C,H,W]
+        img_decoded = img_decoded[0]
+
+    # --- Redimensionner img_decoded pour matcher img_orig ---
+    C,H,W = img_orig.shape
+    if img_decoded.shape[1:] != (H,W):  # shape [C,H_dec,W_dec]
+        # torchvision functional resize attend [C,H,W] mais resize = (H,W)
+        img_decoded = F.resize(img_decoded, size=(H,W), antialias=True)
+
+    # --- Envoyer sur le device ---
+    img_orig = img_orig.to(device=device, dtype=torch.float32)
+    img_decoded = img_decoded.to(device=device, dtype=torch.float32)
+
+    # --- Calcul des différences ---
+    diff = torch.abs(img_orig - img_decoded)
+    mean_diff_per_channel = diff.view(3,-1).mean(dim=1).cpu().numpy()
+    mean_diff_total = diff.mean().item()
+    percent_diff = 100 * (diff.max(dim=0)[0] > threshold).sum().item() / (diff.shape[1]*diff.shape[2])
+
+    return {
+        "mean_diff_r": mean_diff_per_channel[0],
+        "mean_diff_g": mean_diff_per_channel[1],
+        "mean_diff_b": mean_diff_per_channel[2],
+        "mean_diff_total": mean_diff_total,
+        "percent_diff_pixels": percent_diff
+    }
+
+
+
+def compare_images_stats(img_orig, img_decoded, threshold=0.05, device="cuda"):
+    """Compare deux images PIL ou tensors et retourne les écarts statistiques"""
+    if isinstance(img_orig, Image.Image):
+        img_orig = torch.tensor(np.array(img_orig) / 255.0).permute(2,0,1).to(device)
+    if isinstance(img_decoded, Image.Image):
+        img_decoded = torch.tensor(np.array(img_decoded) / 255.0).permute(2,0,1).to(device)
+
+    assert img_orig.shape == img_decoded.shape, "Les images doivent avoir la même taille"
+
+    diff = torch.abs(img_orig - img_decoded)
+    mean_diff_per_channel = diff.view(3,-1).mean(dim=1).cpu().numpy()
+    mean_diff_total = diff.mean().item()
+    percent_diff = 100 * (diff.max(dim=0)[0] > threshold).sum().item() / (diff.shape[1]*diff.shape[2])
+
+    return {
+        "mean_diff_r": mean_diff_per_channel[0],
+        "mean_diff_g": mean_diff_per_channel[1],
+        "mean_diff_b": mean_diff_per_channel[2],
+        "mean_diff_total": mean_diff_total,
+        "percent_diff_pixels": percent_diff
+    }
+
+
+def test_parameter_grid_extended(latents_motion, vae, img_orig,
+                                 gammas=[1.0, 1.2, 1.5],
+                                 contrasts=[1.0, 1.2, 1.5],
+                                 saturations=[1.0, 1.2, 1.5],
+                                 brightnesses=[1.0],
+                                 device="cuda"):
+
+    results = []
+
+    # Convertir img_orig en tensor sur le device
+    if isinstance(img_orig, list) or isinstance(img_orig, tuple):
+        img_orig_tensor = img_orig[0]
+    else:
+        img_orig_tensor = img_orig
+    if isinstance(img_orig_tensor, Image.Image):
+        img_orig_tensor = torch.tensor(np.array(img_orig_tensor) / 255.0).permute(2,0,1)
+    img_orig_tensor = img_orig_tensor.to(device=device, dtype=torch.float32)
+
+    for gamma, contrast, saturation, brightness in itertools.product(gammas, contrasts, saturations, brightnesses):
+        # Décodage blockwise
+        decoded_img = decode_latents_ultrasafe_blockwise(
+            latents_motion, vae,
+            gamma=gamma,
+            contrast=contrast,
+            saturation=saturation,
+            brightness=brightness,
+            device=device
+        )
+
+        # Si BATCH =1, assure tensor
+        if isinstance(decoded_img, list):
+            decoded_img = decoded_img[0]
+
+        # Redimensionner le décodé pour matcher l'original
+        decoded_img_resized = decoded_img.resize(
+            (img_orig_tensor.shape[2], img_orig_tensor.shape[1]), Image.BICUBIC
+        )
+
+        # Comparer
+        stats = compare_images_stats(img_orig_tensor, decoded_img_resized, device=device)
+        stats.update({
+            "gamma": gamma,
+            "contrast": contrast,
+            "saturation": saturation,
+            "brightness": brightness
+        })
+        results.append(stats)
+
+    # Trier par meilleure fidélité (mean_diff_total)
+    results_sorted = sorted(results, key=lambda x: x["mean_diff_total"])
+    return results_sorted
 
 # -------------------------------------------------------------
 # Comparatif statistique intégré
 # -------------------------------------------------------------
 
 
-def compare_images_stats(img_orig, img_decoded, threshold=0.05):
+def compare_images_stats_v1(img_orig, img_decoded, threshold=0.05):
     """Compare deux images PIL ou tensors et retourne les écarts statistiques"""
     # Convertir en tensor CPU float [0,1]
     if isinstance(img_orig, Image.Image):
@@ -65,10 +252,10 @@ def apply_adjustments(img_pil, gamma=1.0, brightness=1.0, contrast=1.0, saturati
     return img
 
 def test_parameter_grid(latents_motion, vae, img_orig,
-                        gammas=[1.0,1.2,1.5],
-                        contrasts=[1.0,1.2,1.5],
-                        saturations=[1.0,1.2,1.5],
-                        brightnesses=[1.0]):
+                        gammas=[1.0,1.1,1.2,1.5],
+                        contrasts=[1.0,1.2,1.3,1.5],
+                        saturations=[1.0,1.2,1.3,1.5],
+                        brightnesses=[1.0, 1.1]):
 
     results = []
     for gamma, contrast, saturation, brightness in itertools.product(gammas, contrasts, saturations, brightnesses):
@@ -79,7 +266,7 @@ def test_parameter_grid(latents_motion, vae, img_orig,
             saturation=saturation,
             brightness=brightness
         )
-        stats = compare_images_stats(img_orig[0], decoded_img)
+        stats = compare_images_stats_v1(img_orig[0], decoded_img)
         stats.update({"gamma": gamma, "contrast": contrast, "saturation": saturation, "brightness": brightness})
         results.append(stats)
 
@@ -90,6 +277,65 @@ def test_parameter_grid(latents_motion, vae, img_orig,
 # --------------------------------------------------------------
 # decode_latents_ultrasafe_blockwise.py
 # --------------------------------------------------------------
+
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
+@torch.no_grad()
+def decode_latents_ultrasafe_blockwise_test(latents, vae, block_size=32, device='cuda', dtype=torch.float16):
+    """
+    Décodage des latents avec tiling et pondération cosinus pour éviter les artefacts de patch.
+
+    Args:
+        latents: Tensor [1, 4, H_latent, W_latent]
+        vae: modèle VAE (decode)
+        block_size: taille du patch latent (en latent space)
+        device: 'cuda' ou 'cpu'
+        dtype: torch.float16 pour accélérer sur GPU
+    """
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device, dtype=dtype)
+
+    # Taille de sortie image
+    out_h, out_w = H*8, W*8
+
+    output_rgb = torch.zeros((B, 3, out_h, out_w), device=device, dtype=dtype)
+    weight = torch.zeros_like(output_rgb)
+
+    # Préparer la pondération cosinus
+    yy = torch.linspace(-torch.pi/2, torch.pi/2, out_h, device=device)
+    xx = torch.linspace(-torch.pi/2, torch.pi/2, out_w, device=device)
+    wy = torch.cos(yy).clamp(min=0)
+    wx = torch.cos(xx).clamp(min=0)
+    weight_patch_full = torch.outer(wy, wx)[None, None, :, :]  # [1,1,H,W]
+
+    # Découper les latents en patchs
+    for y0 in range(0, H, block_size):
+        y1 = min(y0 + block_size, H)
+        for x0 in range(0, W, block_size):
+            x1 = min(x0 + block_size, W)
+
+            latent_patch = latents[:, :, y0:y1, x0:x1]
+
+            # Décoder le patch (VAE decode)
+            decoded = vae.decode(latent_patch).sample  # [B,3,H_patch*8,W_patch*8]
+            decoded = decoded.to(dtype=dtype)
+
+            # Pondération cosinus pour ce patch
+            ih0, ih1 = y0*8, y1*8
+            iw0, iw1 = x0*8, x1*8
+            weight_patch = weight_patch_full[:, :, ih0:ih1, iw0:iw1]
+
+            output_rgb[:, :, ih0:ih1, iw0:iw1] += decoded * weight_patch
+            weight[:, :, ih0:ih1, iw0:iw1] += weight_patch
+
+    # Normaliser
+    output_rgb /= weight
+    output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    return output_rgb
 
 
 
@@ -225,10 +471,10 @@ latents_motion = motion_module(latents.clone())
 # device = "cuda" ou "cpu"
 
 # Paramètres boostés
-gamma = 1.2
-brightness = 1.0
-contrast = 1.2
-saturation = 1.2
+gamma = 1.0  # 1.2
+brightness = 1.0 # 1.0
+contrast = 1.5 # 1.2
+saturation = 1.5 # 1.2
 upscale_factor = 2
 frame_counter = 0  # pour debug/log si nécessaire
 
@@ -244,8 +490,11 @@ frame_pil = decode_latents_ultrasafe_blockwise(
     frame_counter=frame_counter,
     output_dir=Path("."),
     epsilon=1e-5,
-    latent_scale_boost=5.5
+    latent_scale_boost=5.71
 )
+
+
+#frame_pil =  decode_latents_ultrasafe_blockwise_test(latents_motion, vae, block_size=32, device='cuda', dtype=torch.float16)
 
 # Upscale pour debug visuel
 if upscale_factor > 1:
@@ -261,8 +510,16 @@ frame_pil.show()
 # -------------------------------------------------------------
 # Exemple d'utilisation après ton décodage normal
 # -------------------------------------------------------------
-results = test_parameter_grid(latents_motion, vae, image)
+#results = test_parameter_grid(latents_motion, vae, image)
 
-print("Top 5 configurations les plus proches de l'image originale :")
+
+#print("Top 5 configurations les plus proches de l'image originale - test_parameter_grid :")
+#for r in results[:5]:
+#    print(r)
+
+results = test_parameter_grid_with_boost(latents_motion, vae, image)
+
+
+print("Top 5 configurations les plus proches de l'image originale - test_parameter_grid_with_boost:")
 for r in results[:5]:
     print(r)

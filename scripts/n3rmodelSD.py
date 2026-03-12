@@ -1,5 +1,5 @@
 # --------------------------------------------------------------
-# n3rmodelSD_vram2G.py - AnimateDiff pipeline ultra light ~2Go VRAM
+# n3rmodelSD.py - AnimateDiff pipeline ultra light ~2Go VRAM
 # --------------------------------------------------------------
 import os, math, threading
 from pathlib import Path
@@ -33,7 +33,7 @@ from scripts.utils.tools_utils import (
 from scripts.utils.config_loader import load_config
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.motion_utils import load_motion_module
-from scripts.utils.n3r_utils import load_images_test, generate_latents_safe_wrapper
+from scripts.utils.n3r_utils import load_images_test, generate_latents_safe_wrapper, encode_images_to_latents_safe, decode_latents_ultrasafe_blockwise_test
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -47,140 +47,113 @@ threading.Thread(target=wait_for_stop, daemon=True).start()
 
 
 # ------------------- ENCODE -------------------
-def encode_images_to_latents_safe(images, vae, device="cuda", epsilon=1e-5):
-    """
-    Encode des images en latents sûrs pour UNet.
-    Retourne toujours un tensor [B, 4, H_latent, W_latent], dtype=vae.dtype.
 
-    - epsilon : valeur minimale ajoutée aux latents nuls pour éviter frames noires
-    """
-    images_t = images.to(device=device, dtype=torch.float32)
-    original_dtype = next(vae.parameters()).dtype
 
-    vae = vae.to(device=device, dtype=torch.float32)  # safe pour l'encodage
+def encode_images_to_latents_nuanced(images, vae, device="cuda", latent_scale=LATENT_SCALE):
+    """
+    Encode une image en latents VAE tout en préservant le contraste et les nuances de couleur.
+    - Utilise la moyenne de la distribution latente
+    - Clamp minimal seulement pour sécurité
+    - Force 4 canaux si nécessaire
+    """
+
+    images = images.to(device=device, dtype=torch.float32)
+    vae = vae.to(device=device, dtype=torch.float32)
 
     with torch.no_grad():
-        latents = vae.encode(images_t).latent_dist.sample()
+        latents = vae.encode(images).latent_dist.mean  # moyenne pour plus de stabilité
 
-    print(f"[DEBUG encode] latents min/max après sample: {latents.min().item():.6f}/{latents.max().item():.6f}")
+    # Appliquer le scaling mais garder la dynamique
+    latents = latents * latent_scale
 
-    # Scaling
-    latents = latents * LATENT_SCALE
-    print(f"[DEBUG encode] latents min/max après LATENT_SCALE: {latents.min().item():.6f}/{latents.max().item():.6f}")
-
-    # Clamp NaN / Inf
+    # Sécurité NaN / Inf (mais pas normalisation globale)
     latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
 
-    # ✅ Remplir les latents entièrement nuls
-    if torch.all(latents == 0):
-        latents += epsilon
-
-    # Normalisation pour éviter overflow
-    max_abs = latents.abs().max()
-    if max_abs > 0:
-        latents = latents / max_abs
-
-    # Conversion en dtype final du VAE
-    latents = latents.to(original_dtype)
-
-    # ---------------- FORCE 4 CANAUX ----------------
+    # Forcer 4 canaux si nécessaire (VAE attend souvent 4)
     if latents.ndim == 4 and latents.shape[1] == 1:
         latents = latents.repeat(1, 4, 1, 1)
-    if latents.ndim == 5 and latents.shape[2] == 1:
-        latents = latents.repeat(1, 1, 4, 1, 1)
 
-    print(f"[DEBUG encode] shape finale latents: {latents.shape}, min/max: {latents.min().item():.6f}/{latents.max().item():.6f}")
     return latents
-
-
 # ------------------- DECODE -------------------
 
 def decode_latents_ultrasafe_blockwise(
     latents, vae,
     block_size=32, overlap=16,
-    gamma=1.0, brightness=1.0,
-    contrast=1.0, saturation=1.0,
+    gamma=1.2, brightness=1.0,
+    contrast=1.2, saturation=1.3,
     device="cuda", frame_counter=0, output_dir=Path("."),
-    epsilon=1e-5  # valeur minimale pour éviter patches nuls
+    epsilon=1e-6,
+    latent_scale_boost=1.1  # boost léger pour récupérer les nuances
 ):
     """
-    Décodage par blocs ultra-safe des latents en image PIL avec correction auto
-    et debug min/max pour chaque patch et image finale.
-
-    - latents: [B, 4, H, W] sur CPU ou GPU
-    - vae: VAE déjà chargé (fp16 ou fp32)
-    - block_size: taille des patches
-    - overlap: chevauchement
-    - gamma/brightness/contrast/saturation: correction finale
-    - device: device du VAE (cuda ou cpu)
-    - epsilon: valeur minimale pour patches nuls
+    Décodage ultra-safe par blocs des latents en image PIL.
+    Optimisé pour préserver les nuances de couleur et réduire l'effet "photocopie".
     """
-    vae_dtype = next(vae.parameters()).dtype
+
+    # 🔹 Correctif : forcer le VAE sur le bon device et en float32
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
     B, C, H, W = latents.shape
-    output_rgb = torch.zeros(B, 3, H * 8, W * 8, device=device, dtype=torch.float32)
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
 
-    y_steps = list(range(0, H, block_size - overlap))
-    x_steps = list(range(0, W, block_size - overlap))
+    # Dimensions finales
+    out_H = H * 8
+    out_W = W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
 
-    for y0 in y_steps:
-        y1 = min(y0 + block_size, H)
-        for x0 in x_steps:
-            x1 = min(x0 + block_size, W)
-            patch = latents[:, :, y0:y1, x0:x1].to(device=device, dtype=vae_dtype)
+    stride = block_size - overlap
 
-            # Debug avant VAE
-            print(f"[DEBUG] patch avant VAE ({y0},{x0}): shape={patch.shape}, "
-                  f"dtype={patch.dtype}, min={patch.min():.6f}, max={patch.max():.6f}")
+    # Calcul positions garanties pour full coverage
+    y_positions = list(range(0, H - block_size + 1, stride)) or [0]
+    x_positions = list(range(0, W - block_size + 1, stride)) or [0]
 
-            # ✅ Correction NaN / Inf et epsilon minimal
+    if y_positions[-1] != H - block_size:
+        y_positions.append(H - block_size)
+    if x_positions[-1] != W - block_size:
+        x_positions.append(W - block_size)
+
+    for y in y_positions:
+        for x in x_positions:
+            y1 = y + block_size
+            x1 = x + block_size
+
+            patch = latents[:, :, y:y1, x:x1]
+
+            # Sécurité : NaN / Inf / epsilon
             patch = torch.nan_to_num(patch, nan=0.0, posinf=5.0, neginf=-5.0)
             if torch.all(patch == 0):
                 patch += epsilon
 
-            # log patch
-            patch_idx = f"{y0}_{x0}"
-            log_patch_stats(frame_idx=frame_counter, patch_idx=patch_idx, patch=patch, csv_path=output_dir / "patch_stats.csv")
-
-            # Decode
+            # Décodage
             with torch.no_grad():
-                patch_decoded = vae.decode(patch).sample  # [B, 3, h*8, w*8]
-                patch_decoded = patch_decoded.to(torch.float32)
+                decoded = vae.decode(patch).sample.to(torch.float32)
 
-            # ✅ Recentrage automatique pour éviter frames sombres
-            min_val = patch_decoded.min()
-            max_val = patch_decoded.max()
-            if max_val - min_val > 1e-6:
-                patch_decoded = (patch_decoded - min_val) / (max_val - min_val)
+            # Intégration dans l'image finale
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = y1*8, x1*8
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded
+            weight[:, :, iy0:iy1, ix0:ix1] += 1.0
 
-            # Debug après VAE
-            log_patch_stats(frame_idx=frame_counter, patch_idx=patch_idx+"_decoded", patch=patch_decoded, csv_path=output_dir / "patch_stats.csv")
+    # Moyenne pour blending final
+    output_rgb = output_rgb / weight.clamp(min=1e-6)
+    output_rgb = output_rgb.clamp(-1.0, 1.0)
 
-            h_start, h_end = y0 * 8, y1 * 8
-            w_start, w_end = x0 * 8, x1 * 8
-            output_rgb[:, :, h_start:h_end, w_start:w_end] = patch_decoded
-
-    # Debug avant clamp
-    print(f"[DEBUG] output_rgb final avant clamp: shape={output_rgb.shape}, "
-          f"min={output_rgb.min():.6f}, max={output_rgb.max():.6f}")
-
-    output_rgb = output_rgb.clamp(0.0, 1.0)
-
-    # Correction gamma / contraste / luminosité / saturation
+    # Convertir en PIL et appliquer corrections gamma / contrast / saturation / brightness
     frame_pil_list = []
     for i in range(B):
-        img = F.to_pil_image(output_rgb[i])
+        img = F.to_pil_image((output_rgb[i] + 1) / 2)  # [-1,1] -> [0,1]
         img = ImageEnhance.Brightness(img).enhance(brightness)
         img = ImageEnhance.Contrast(img).enhance(contrast)
         img = ImageEnhance.Color(img).enhance(saturation)
-        img = img.point(lambda x: (x / 255) ** (1 / gamma) * 255)
+        if gamma != 1.0:
+            img = img.point(lambda x: 255 * ((x / 255) ** (1 / gamma)))
         frame_pil_list.append(img)
 
-        # Debug post-correction
-        pil_tensor = F.to_tensor(img)
-        print(f"[DEBUG] frame {i} après PIL correction: shape={pil_tensor.shape}, "
-              f"min={pil_tensor.min():.6f}, max={pil_tensor.max():.6f}")
-
     return frame_pil_list[0] if B == 1 else frame_pil_list
+
+
 
 
 # ---------------- MAIN ----------------
@@ -220,14 +193,14 @@ def main(args):
         raise ValueError("❌ Impossible de trouver 'cyber_skin' dans n3oray_models du YAML.")
 
     # Fonction utilitaire pour appliquer LoRA/n3oray
-    def apply_n3oray_to_unet(unet, n3oray_path, alpha=0.8):
+    def apply_n3oray_to_unet(unet, n3oray_path, alpha=0.5):
         from scripts.utils.lora_utils import apply_lora  # ton utilitaire LoRA/n3oray
         print(f"📌 Application du style n3oray : {n3oray_path} (alpha={alpha})")
         unet = apply_lora(unet, n3oray_path, alpha=alpha)
         return unet
 
     # Appliquer cyber_skin depuis le YAML
-    unet = apply_n3oray_to_unet(unet, cyber_skin_path, alpha=0.8)
+    unet = apply_n3oray_to_unet(unet, cyber_skin_path, alpha=0.5)
     # ----------------------------------------------------------------------------------- **********
 
     # Motion module
@@ -298,7 +271,8 @@ def main(args):
         input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
 
         # ---------------- 2️⃣ Encodage latents ----------------
-        input_latents_single = encode_images_to_latents_safe(input_image, vae, device=device, epsilon=1e-5)
+        #input_latents_single = encode_images_to_latents_safe(input_image, vae, device=device, epsilon=1e-5)
+        input_latents_single = encode_images_to_latents_nuanced(input_image, vae, device=device, latent_scale=LATENT_SCALE)
         input_latents_single = ensure_4_channels(input_latents_single)  # ✅ force 4 canaux
         current_latent_single = input_latents_single.clone()  # RESTE sur GPU / dtype correct
 
@@ -317,12 +291,33 @@ def main(args):
                 log_latent_stats(frame_counter, latent_interp, csv_path=output_dir / "latent_stats.csv")
 
                 print(f"[DEBUG INTERPOL] frame {frame_counter}: min/max latents={latent_interp.min().item():.6f}/{latent_interp.max().item():.6f}")
+                #frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=32, overlap=16, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15, device=device, frame_counter=frame_counter, output_dir=output_dir, epsilon=1e-5)
+
+                # Paramètres boostés
+                gamma = 1.0  # 1.2
+                brightness = 1.0 # 1.0
+                contrast = 1.5 # 1.2
+                saturation = 1.5 # 1.2
+                upscale_factor = 2
+                #frame_counter = 0  # pour debug/log si nécessaire
+
+                # Décodage ultra-safe (blockwise comme ton code)
+                vae = vae.to(device)  # <---- c'est le correctif
                 frame_pil = decode_latents_ultrasafe_blockwise(
                     latent_interp, vae,
-                    block_size=32, overlap=16,
-                    gamma=0.7, brightness=1.2,
-                    contrast=1.1, saturation=1.15,
-                    device=device, frame_counter=frame_counter, output_dir=output_dir, epsilon=1e-5)
+                    block_size=32, overlap=24,
+                    gamma=gamma,
+                    brightness=brightness,
+                    contrast=contrast,
+                    saturation=saturation,
+                    device=device,
+                    frame_counter=frame_counter,
+                    output_dir=Path("."),
+                    epsilon=1e-5,
+                    latent_scale_boost=5.71
+                )
+
+
                 if upscale_factor > 1:
                     frame_pil = frame_pil.resize(
                         (frame_pil.width * upscale_factor, frame_pil.height * upscale_factor),
@@ -388,12 +383,30 @@ def main(args):
 
                     # ---------------- Decode frame ----------------
                     print(f"[DEBUG Génération frames] frame {frame_counter}: min/max latents={latents.min().item():.6f}/{latents.max().item():.6f}")
+                    # Paramètres boostés
+                    gamma = 1.0  # 1.2
+                    brightness = 1.0 # 1.0
+                    contrast = 1.5 # 1.2
+                    saturation = 1.5 # 1.2
+                    upscale_factor = 2
+                    #frame_counter = 0  # pour debug/log si nécessaire
+
+                    # Décodage ultra-safe (blockwise comme ton code)
                     frame_pil = decode_latents_ultrasafe_blockwise(
                         latents, vae,
-                        block_size=32, overlap=16,
-                        gamma=0.7, brightness=1.2,
-                        contrast=1.1, saturation=1.15,
-                        device=device, frame_counter=frame_counter, output_dir=output_dir, epsilon=1e-5)
+                        block_size=32, overlap=24,
+                        gamma=gamma,
+                        brightness=brightness,
+                        contrast=contrast,
+                        saturation=saturation,
+                        device=device,
+                        frame_counter=frame_counter,
+                        output_dir=Path("."),
+                        epsilon=1e-5,
+                        latent_scale_boost=5.71
+                    )
+
+                    #frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=32, overlap=16, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15, device=device, frame_counter=frame_counter, output_dir=output_dir, epsilon=1e-5)
                     del latents
                     torch.cuda.empty_cache()
 
