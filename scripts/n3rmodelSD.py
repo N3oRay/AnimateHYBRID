@@ -249,16 +249,7 @@ def main(args):
                               beta_schedule="scaled_linear", num_train_timesteps=1000)
     scheduler.set_timesteps(steps, device=device)
 
-    total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
-    estimated_seconds = total_frames / fps
-    print("📌 Paramètres de génération :")
-    print(f"  fps                  : {fps}")
-    print(f"  num_fraps_per_image : {num_fraps_per_image}")
-    print(f"  steps                : {steps}")
-    print(f"  guidance_scale       : {guidance_scale}")
-    print(f"  init_image_scale     : {init_image_scale}")
-    print(f"  creative_noise       : {creative_noise}")
-    print(f"⏱ Durée totale estimée de la vidéo : {estimated_seconds:.1f}s")
+
 
     # UNet
     unet = safe_load_unet(args.pretrained_model_path, device=device, fp16=True)
@@ -301,6 +292,19 @@ def main(args):
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
     total_frames = len(input_paths)*num_fraps_per_image*max(len(prompts),1)
 
+    # statistique:
+    # --------------
+    total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
+    estimated_seconds = total_frames / fps
+    print("📌 Paramètres de génération :")
+    print(f"  fps                  : {fps}")
+    print(f"  num_fraps_per_image : {num_fraps_per_image}")
+    print(f"  steps                : {steps}")
+    print(f"  guidance_scale       : {guidance_scale}")
+    print(f"  init_image_scale     : {init_image_scale}")
+    print(f"  creative_noise       : {creative_noise}")
+    print(f"⏱ Durée totale estimée de la vidéo : {estimated_seconds:.1f}s")
+
     # Output
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(f"./outputs/model_{timestamp}")
@@ -318,25 +322,32 @@ def main(args):
         if stop_generation:
             break
 
-        # Chargement de l'image
+        # ---------------- 1️⃣ Chargement image ----------------
         input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
 
-        # Encodage en latents et forcage 4 canaux IMMÉDIATEMENT
+        # ---------------- 2️⃣ Encodage latents ----------------
         input_latents_single = encode_images_to_latents_safe(input_image, vae, device=device)
-        input_latents_single = ensure_4_channels(input_latents_single)  # ✅ 4 canaux forcés ici
-        current_latent_single = input_latents_single.clone().cpu()       # Latents sur CPU
+        input_latents_single = ensure_4_channels(input_latents_single)  # ✅ force 4 canaux
+        current_latent_single = input_latents_single.clone()  # RESTE sur GPU / dtype correct
 
         print(f"DEBUG: Shape latents après ensure_4_channels: {current_latent_single.shape}")
 
-        # ---------------- Transition frames ----------------
+        # ---------------- 3️⃣ Transition frames ----------------
         if previous_latent_single is not None and transition_frames > 0:
             for t in range(transition_frames):
                 if stop_generation:
                     break
                 alpha = 0.5 - 0.5 * math.cos(math.pi * t / (transition_frames - 1))
                 latent_interp = ((1 - alpha) * previous_latent_single + alpha * current_latent_single).clamp(-3, 3)
-                frame_tensor = prepare_frame_tensor(latent_interp)
-                frame_pil = to_pil(frame_tensor)
+                # Passage au GPU si VAE est sur GPU
+                latent_interp = latent_interp.to(device=device, dtype=dtype)
+                frame_pil = decode_latents_ultrasafe_blockwise(
+                    latent_interp, vae,
+                    block_size=32, overlap=16,
+                    gamma=0.7, brightness=1.2,
+                    contrast=1.1, saturation=1.15,
+                    device=device
+                )
                 if upscale_factor > 1:
                     frame_pil = frame_pil.resize(
                         (frame_pil.width * upscale_factor, frame_pil.height * upscale_factor),
@@ -346,8 +357,7 @@ def main(args):
                 frame_counter += 1
                 pbar.update(1)
 
-        # ---------------- Generation frames ----------------
-        # ---------------- Generation frames (corrigé) ----------------
+        # ---------------- 4️⃣ Génération frames ----------------
         for pos_embeds, neg_embeds in embeddings:
             for f in range(num_fraps_per_image):
                 if stop_generation:
@@ -357,26 +367,17 @@ def main(args):
                     # Première frame = image d'entrée
                     frame_tensor = (input_image.squeeze(0) + 1) / 2.0
                     frame_tensor = frame_tensor.clamp(0, 1)
-                    frame_pil_or_list = to_pil(frame_tensor.cpu())
+                    frame_pil = to_pil(frame_tensor.cpu())
                 else:
-                    # Latents frame -> CPU
-                    latents_frame = current_latent_single.clone().cpu()
-
-                    # Assure 4 canaux
+                    # Latents frame
+                    latents_frame = current_latent_single.clone()  # ✅ reste correct
                     latents_frame = ensure_4_channels(latents_frame)
 
-                    # Aplatir la dimension F si c'est 1
-                    if latents_frame.ndim == 5 and latents_frame.shape[2] == 1:
-                        latents_frame = latents_frame.squeeze(2)  # devient [B, C, H, W]
-
-                    # Passer sur GPU
-                    latents_frame = latents_frame.to(device="cuda", dtype=dtype)
-
-                    # Combiner embeddings positif/négatif
-                    combined_embeds = pos_embeds.to(device="cuda", dtype=dtype) + guidance_scale * (pos_embeds - neg_embeds)
+                    # Appliquer embeddings
+                    combined_embeds = pos_embeds.to(device=device, dtype=dtype) + guidance_scale * (pos_embeds - neg_embeds)
 
                     # UNet temporaire sur GPU
-                    unet = unet.to("cuda")
+                    unet = unet.to(device)
                     with torch.inference_mode():
                         latents = generate_latents_safe_wrapper(
                             unet=unet,
@@ -385,7 +386,7 @@ def main(args):
                             embeddings=combined_embeds,
                             motion_module=motion_module,
                             guidance_scale=guidance_scale,
-                            device="cuda",
+                            device=device,
                             fp16=True,
                             steps=steps,
                             init_image_scale=init_image_scale,
@@ -395,39 +396,28 @@ def main(args):
                     unet = unet.to("cpu")
                     torch.cuda.empty_cache()
 
-                    # Décodage frame par frame (mini VRAM)
-                    frame_pil_or_list = decode_latents_ultrasafe_blockwise(
-                        latents.cpu(), vae,
+                    # ---------------- Decode frame ----------------
+                    frame_pil = decode_latents_ultrasafe_blockwise(
+                        latents, vae,
                         block_size=32, overlap=16,
                         gamma=0.7, brightness=1.2,
-                        contrast=1.1, saturation=1.15
+                        contrast=1.1, saturation=1.15,
+                        device=device
                     )
                     del latents
                     torch.cuda.empty_cache()
 
                 # ---------------- Sauvegarde ----------------
-                if isinstance(frame_pil_or_list, list):
-                    for frame_pil in frame_pil_or_list:
-                        if upscale_factor > 1:
-                            frame_pil = frame_pil.resize(
-                                (frame_pil.width * upscale_factor, frame_pil.height * upscale_factor),
-                                Image.BICUBIC
-                            )
-                        frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
-                        frame_counter += 1
-                        pbar.update(1)
-                else:
-                    frame_pil = frame_pil_or_list
-                    if upscale_factor > 1:
-                        frame_pil = frame_pil.resize(
-                            (frame_pil.width * upscale_factor, frame_pil.height * upscale_factor),
-                            Image.BICUBIC
-                        )
-                    frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
-                    frame_counter += 1
-                    pbar.update(1)
+                if upscale_factor > 1:
+                    frame_pil = frame_pil.resize(
+                        (frame_pil.width * upscale_factor, frame_pil.height * upscale_factor),
+                        Image.BICUBIC
+                    )
+                frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
+                frame_counter += 1
+                pbar.update(1)
 
-        # Mémoriser le latent courant pour transitions
+        # ---------------- Mémoriser latent pour transitions ----------------
         previous_latent_single = current_latent_single
 
     pbar.close()
