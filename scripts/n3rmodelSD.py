@@ -17,10 +17,15 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 from safetensors.torch import load_file
 from PIL import Image, ImageEnhance
 
+from torchvision.transforms.functional import to_pil_image
+from torchvision.transforms import functional as F
+
 from scripts.utils.config_loader import load_config
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_safe_wrapper
+
+
 
 
 LATENT_SCALE = 0.18215
@@ -70,7 +75,52 @@ import torch
 LATENT_SCALE = 0.18215  # ajuste selon ton modèle si nécessaire
 
 # ------------------- ENCODE -------------------
-def encode_images_to_latents_safe(images, vae, device="cuda"):
+def encode_images_to_latents_safe(images, vae, device="cuda", epsilon=1e-5):
+    """
+    Encode des images en latents sûrs pour UNet.
+    Retourne toujours un tensor [B, 4, H_latent, W_latent], dtype=vae.dtype.
+
+    - epsilon : valeur minimale ajoutée aux latents nuls pour éviter frames noires
+    """
+    images_t = images.to(device=device, dtype=torch.float32)
+    original_dtype = next(vae.parameters()).dtype
+
+    vae = vae.to(device=device, dtype=torch.float32)  # safe pour l'encodage
+
+    with torch.no_grad():
+        latents = vae.encode(images_t).latent_dist.sample()
+
+    print(f"[DEBUG encode] latents min/max après sample: {latents.min().item():.6f}/{latents.max().item():.6f}")
+
+    # Scaling
+    latents = latents * LATENT_SCALE
+    print(f"[DEBUG encode] latents min/max après LATENT_SCALE: {latents.min().item():.6f}/{latents.max().item():.6f}")
+
+    # Clamp NaN / Inf
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+    # ✅ Remplir les latents entièrement nuls
+    if torch.all(latents == 0):
+        latents += epsilon
+
+    # Normalisation pour éviter overflow
+    max_abs = latents.abs().max()
+    if max_abs > 0:
+        latents = latents / max_abs
+
+    # Conversion en dtype final du VAE
+    latents = latents.to(original_dtype)
+
+    # ---------------- FORCE 4 CANAUX ----------------
+    if latents.ndim == 4 and latents.shape[1] == 1:
+        latents = latents.repeat(1, 4, 1, 1)
+    if latents.ndim == 5 and latents.shape[2] == 1:
+        latents = latents.repeat(1, 1, 4, 1, 1)
+
+    print(f"[DEBUG encode] shape finale latents: {latents.shape}, min/max: {latents.min().item():.6f}/{latents.max().item():.6f}")
+    return latents
+
+def encode_images_to_latents_safe_ori(images, vae, device="cuda"):
     """
     Encode des images en latents sûrs pour UNet.
     Retourne toujours un tensor [B, 4, H_latent, W_latent], dtype=vae.dtype.
@@ -114,18 +164,14 @@ def encode_images_to_latents_safe(images, vae, device="cuda"):
 
 # ------------------- DECODE -------------------
 
-from torchvision.transforms.functional import to_pil_image
-
-from torchvision.transforms import functional as F
-
-from PIL import Image, ImageEnhance
-
 def decode_latents_ultrasafe_blockwise(
     latents, vae,
     block_size=32, overlap=16,
     gamma=1.0, brightness=1.0,
     contrast=1.0, saturation=1.0,
-    device="cuda", frame_counter=0, output_dir=Path(".")):
+    device="cuda", frame_counter=0, output_dir=Path("."),
+    epsilon=1e-5  # valeur minimale pour éviter patches nuls
+):
     """
     Décodage par blocs ultra-safe des latents en image PIL avec correction auto
     et debug min/max pour chaque patch et image finale.
@@ -136,6 +182,7 @@ def decode_latents_ultrasafe_blockwise(
     - overlap: chevauchement
     - gamma/brightness/contrast/saturation: correction finale
     - device: device du VAE (cuda ou cpu)
+    - epsilon: valeur minimale pour patches nuls
     """
     vae_dtype = next(vae.parameters()).dtype
     B, C, H, W = latents.shape
@@ -154,24 +201,27 @@ def decode_latents_ultrasafe_blockwise(
             print(f"[DEBUG] patch avant VAE ({y0},{x0}): shape={patch.shape}, "
                   f"dtype={patch.dtype}, min={patch.min():.6f}, max={patch.max():.6f}")
 
-            # ✅ Correction NaN / Inf avant passage dans le VAE
-            if torch.isnan(patch).any() or torch.isinf(patch).any():
-                patch = torch.nan_to_num(patch, nan=0.0, posinf=5.0, neginf=-5.0)
+            # ✅ Correction NaN / Inf et epsilon minimal
+            patch = torch.nan_to_num(patch, nan=0.0, posinf=5.0, neginf=-5.0)
+            if torch.all(patch == 0):
+                patch += epsilon
 
             # log patch
             patch_idx = f"{y0}_{x0}"
             log_patch_stats(frame_idx=frame_counter, patch_idx=patch_idx, patch=patch, csv_path=output_dir / "patch_stats.csv")
 
+            # Decode
             with torch.no_grad():
                 patch_decoded = vae.decode(patch).sample  # [B, 3, h*8, w*8]
-                if patch.is_cuda:
-                    print(f"[DEBUG MEM] après decode: allocated={torch.cuda.memory_allocated()/1e6:.1f}MB, reserved={torch.cuda.memory_reserved()/1e6:.1f}MB")
                 patch_decoded = patch_decoded.to(torch.float32)
 
-            # Debug après VAE
-            print(f"[DEBUG] patch après VAE ({y0},{x0}): min={patch_decoded.min():.6f}, "
-                  f"max={patch_decoded.max():.6f}")
+            # ✅ Recentrage automatique pour éviter frames sombres
+            min_val = patch_decoded.min()
+            max_val = patch_decoded.max()
+            if max_val - min_val > 1e-6:
+                patch_decoded = (patch_decoded - min_val) / (max_val - min_val)
 
+            # Debug après VAE
             log_patch_stats(frame_idx=frame_counter, patch_idx=patch_idx+"_decoded", patch=patch_decoded, csv_path=output_dir / "patch_stats.csv")
 
             h_start, h_end = y0 * 8, y1 * 8
@@ -184,22 +234,14 @@ def decode_latents_ultrasafe_blockwise(
 
     output_rgb = output_rgb.clamp(0.0, 1.0)
 
-    # Debug après clamp
-    print(f"[DEBUG] output_rgb final après clamp: min={output_rgb.min():.6f}, max={output_rgb.max():.6f}")
-
-    # Correction auto
-    auto_gamma = gamma
-    auto_brightness = brightness
-    auto_contrast = contrast
-    auto_saturation = saturation
-
+    # Correction gamma / contraste / luminosité / saturation
     frame_pil_list = []
     for i in range(B):
         img = F.to_pil_image(output_rgb[i])
-        img = ImageEnhance.Brightness(img).enhance(auto_brightness)
-        img = ImageEnhance.Contrast(img).enhance(auto_contrast)
-        img = ImageEnhance.Color(img).enhance(auto_saturation)
-        img = img.point(lambda x: (x / 255) ** (1 / auto_gamma) * 255)
+        img = ImageEnhance.Brightness(img).enhance(brightness)
+        img = ImageEnhance.Contrast(img).enhance(contrast)
+        img = ImageEnhance.Color(img).enhance(saturation)
+        img = img.point(lambda x: (x / 255) ** (1 / gamma) * 255)
         frame_pil_list.append(img)
 
         # Debug post-correction
@@ -368,7 +410,7 @@ def main(args):
         input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
 
         # ---------------- 2️⃣ Encodage latents ----------------
-        input_latents_single = encode_images_to_latents_safe(input_image, vae, device=device)
+        input_latents_single = encode_images_to_latents_safe(input_image, vae, device=device, epsilon=1e-5)
         input_latents_single = ensure_4_channels(input_latents_single)  # ✅ force 4 canaux
         current_latent_single = input_latents_single.clone()  # RESTE sur GPU / dtype correct
 
@@ -392,7 +434,7 @@ def main(args):
                     block_size=32, overlap=16,
                     gamma=0.7, brightness=1.2,
                     contrast=1.1, saturation=1.15,
-                    device=device, frame_counter=frame_counter, output_dir=output_dir)
+                    device=device, frame_counter=frame_counter, output_dir=output_dir, epsilon=1e-5)
                 if upscale_factor > 1:
                     frame_pil = frame_pil.resize(
                         (frame_pil.width * upscale_factor, frame_pil.height * upscale_factor),
@@ -403,6 +445,7 @@ def main(args):
                 pbar.update(1)
 
         # ---------------- 4️⃣ Génération frames ----------------
+        # ---------------- 4️⃣ Génération frames (corrigé) ----------------
         for pos_embeds, neg_embeds in embeddings:
             for f in range(num_fraps_per_image):
                 if stop_generation:
@@ -417,6 +460,11 @@ def main(args):
                     # Latents frame
                     latents_frame = current_latent_single.clone()  # ✅ reste correct
                     latents_frame = ensure_4_channels(latents_frame)
+
+                    # ⚡ CORRIGER LES FRAMES NOIRS : si latents nuls, reprendre le précédent
+                    if previous_latent_single is not None:
+                        if torch.all(latents_frame == 0):
+                            latents_frame = previous_latent_single.clone()
 
                     # Appliquer embeddings
                     combined_embeds = pos_embeds.to(device=device, dtype=dtype) + guidance_scale * (pos_embeds - neg_embeds)
@@ -438,6 +486,12 @@ def main(args):
                             creative_noise=creative_noise,
                             debug=False
                         )
+
+                    # ⚡ CORRIGER LES FRAMES NOIRS : si latents générés nuls, reprendre le précédent
+                    if previous_latent_single is not None:
+                        if torch.all(latents == 0):
+                            latents = previous_latent_single.clone()
+
                     unet = unet.to("cpu")
                     torch.cuda.empty_cache()
 
@@ -451,7 +505,7 @@ def main(args):
                         block_size=32, overlap=16,
                         gamma=0.7, brightness=1.2,
                         contrast=1.1, saturation=1.15,
-                        device=device, frame_counter=frame_counter, output_dir=output_dir)
+                        device=device, frame_counter=frame_counter, output_dir=output_dir, epsilon=1e-5)
                     del latents
                     torch.cuda.empty_cache()
 
