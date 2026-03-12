@@ -17,16 +17,16 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 from safetensors.torch import load_file
 from PIL import Image, ImageEnhance
 
+
 from torchvision.transforms.functional import to_pil_image
 from torchvision.transforms import functional as F
+
+from scripts.utils.lora_utils import apply_lora  # ou ton utilitaire n3oray
 
 from scripts.utils.config_loader import load_config
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_safe_wrapper
-
-
-
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -70,10 +70,6 @@ def save_frames_as_video_from_folder(folder_path, output_path, fps=12):
         .run(quiet=True)
     )
 
-import torch
-
-LATENT_SCALE = 0.18215  # ajuste selon ton modèle si nécessaire
-
 # ------------------- ENCODE -------------------
 def encode_images_to_latents_safe(images, vae, device="cuda", epsilon=1e-5):
     """
@@ -107,47 +103,6 @@ def encode_images_to_latents_safe(images, vae, device="cuda", epsilon=1e-5):
     max_abs = latents.abs().max()
     if max_abs > 0:
         latents = latents / max_abs
-
-    # Conversion en dtype final du VAE
-    latents = latents.to(original_dtype)
-
-    # ---------------- FORCE 4 CANAUX ----------------
-    if latents.ndim == 4 and latents.shape[1] == 1:
-        latents = latents.repeat(1, 4, 1, 1)
-    if latents.ndim == 5 and latents.shape[2] == 1:
-        latents = latents.repeat(1, 1, 4, 1, 1)
-
-    print(f"[DEBUG encode] shape finale latents: {latents.shape}, min/max: {latents.min().item():.6f}/{latents.max().item():.6f}")
-    return latents
-
-def encode_images_to_latents_safe_ori(images, vae, device="cuda"):
-    """
-    Encode des images en latents sûrs pour UNet.
-    Retourne toujours un tensor [B, 4, H_latent, W_latent], dtype=vae.dtype.
-    """
-    images_t = images.to(device=device, dtype=torch.float32)
-    original_dtype = next(vae.parameters()).dtype
-
-    vae = vae.to(device=device, dtype=torch.float32)  # safe pour l'encodage
-
-    with torch.no_grad():
-        latents = vae.encode(images_t).latent_dist.sample()
-
-    print(f"[DEBUG encode] latents min/max après sample: {latents.min().item():.6f}/{latents.max().item():.6f}")
-
-    # Scaling
-    latents = latents * LATENT_SCALE
-    print(f"[DEBUG encode] latents min/max après LATENT_SCALE: {latents.min().item():.6f}/{latents.max().item():.6f}")
-
-    # Clamp NaN / Inf
-    latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
-    print(f"[DEBUG encode] any NaN/Inf? {torch.isnan(latents).any().item()}/{torch.isinf(latents).any().item()}")
-
-    # Normalisation pour éviter overflow
-    max_abs = latents.abs().max()
-    if max_abs > 0:
-        latents = latents / max_abs
-    print(f"[DEBUG encode] latents min/max après normalize: {latents.min().item():.6f}/{latents.max().item():.6f}")
 
     # Conversion en dtype final du VAE
     latents = latents.to(original_dtype)
@@ -319,6 +274,7 @@ def main(args):
     device = args.device if torch.cuda.is_available() else "cpu"
     dtype = torch.float16
 
+
     fps = cfg.get("fps",12)
     upscale_factor = cfg.get("upscale_factor",1)
     transition_frames = cfg.get("transition_frames",4)
@@ -341,6 +297,22 @@ def main(args):
     if hasattr(unet,"enable_xformers_memory_efficient_attention"):
         try: unet.enable_xformers_memory_efficient_attention(True)
         except: pass
+
+    # Récupération du path cyber_skin depuis le YAML ----------------------------------- **********
+    cyber_skin_path = cfg.get("n3oray_models", {}).get("cyber_skin")
+    if cyber_skin_path is None:
+        raise ValueError("❌ Impossible de trouver 'cyber_skin' dans n3oray_models du YAML.")
+
+    # Fonction utilitaire pour appliquer LoRA/n3oray
+    def apply_n3oray_to_unet(unet, n3oray_path, alpha=0.8):
+        from scripts.utils.lora_utils import apply_lora  # ton utilitaire LoRA/n3oray
+        print(f"📌 Application du style n3oray : {n3oray_path} (alpha={alpha})")
+        unet = apply_lora(unet, n3oray_path, alpha=alpha)
+        return unet
+
+    # Appliquer cyber_skin depuis le YAML
+    unet = apply_n3oray_to_unet(unet, cyber_skin_path, alpha=0.8)
+    # ----------------------------------------------------------------------------------- **********
 
     # Motion module
     motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
