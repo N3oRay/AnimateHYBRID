@@ -27,6 +27,7 @@ from tqdm import trange
 from concurrent.futures import ThreadPoolExecutor
 
 
+
 def generate_latents_safe_debug(unet, **kwargs):
     """
     Génération de latents avec UNet, FP16-safe et debug.
@@ -4199,3 +4200,138 @@ def remove_watermark_white(frame_pil, bbox, padding=2):
     draw.rectangle([x, y, x + w, y + h], fill=(255, 255, 255))
 
     return frame_pil
+
+
+def decode_latents_ultrasafe_blockwise_test(
+    latents, vae,
+    block_size=32, overlap=16,
+    gamma=1.0, brightness=1.0,
+    contrast=1.0, saturation=1.0,
+    device="cuda", frame_counter=0, output_dir=Path("."),
+    epsilon=1e-5  # valeur minimale pour éviter patches nuls
+):
+    """
+    Décodage par blocs ultra-safe des latents en image PIL avec correction auto
+    et debug min/max pour chaque patch et image finale.
+
+    - latents: [B, 4, H, W] sur CPU ou GPU
+    - vae: VAE déjà chargé (fp16 ou fp32)
+    - block_size: taille des patches
+    - overlap: chevauchement
+    - gamma/brightness/contrast/saturation: correction finale
+    - device: device du VAE (cuda ou cpu)
+    - epsilon: valeur minimale pour patches nuls
+    """
+    vae_dtype = next(vae.parameters()).dtype
+    B, C, H, W = latents.shape
+    output_rgb = torch.zeros(B, 3, H * 8, W * 8, device=device, dtype=torch.float32)
+
+    y_steps = list(range(0, H, block_size - overlap))
+    x_steps = list(range(0, W, block_size - overlap))
+
+    for y0 in y_steps:
+        y1 = min(y0 + block_size, H)
+        for x0 in x_steps:
+            x1 = min(x0 + block_size, W)
+            patch = latents[:, :, y0:y1, x0:x1].to(device=device, dtype=vae_dtype)
+
+            # Debug avant VAE
+            print(f"[DEBUG] patch avant VAE ({y0},{x0}): shape={patch.shape}, "
+                  f"dtype={patch.dtype}, min={patch.min():.6f}, max={patch.max():.6f}")
+
+            # ✅ Correction NaN / Inf et epsilon minimal
+            patch = torch.nan_to_num(patch, nan=0.0, posinf=5.0, neginf=-5.0)
+            if torch.all(patch == 0):
+                patch += epsilon
+
+            # log patch
+            patch_idx = f"{y0}_{x0}"
+            log_patch_stats(frame_idx=frame_counter, patch_idx=patch_idx, patch=patch, csv_path=output_dir / "patch_stats.csv")
+
+            # Decode
+            with torch.no_grad():
+                patch_decoded = vae.decode(patch).sample  # [B, 3, h*8, w*8]
+                patch_decoded = patch_decoded.to(torch.float32)
+
+            # ✅ Recentrage automatique pour éviter frames sombres
+            min_val = patch_decoded.min()
+            max_val = patch_decoded.max()
+            if max_val - min_val > 1e-6:
+                patch_decoded = (patch_decoded - min_val) / (max_val - min_val)
+
+            # Debug après VAE
+            log_patch_stats(frame_idx=frame_counter, patch_idx=patch_idx+"_decoded", patch=patch_decoded, csv_path=output_dir / "patch_stats.csv")
+
+            h_start, h_end = y0 * 8, y1 * 8
+            w_start, w_end = x0 * 8, x1 * 8
+            output_rgb[:, :, h_start:h_end, w_start:w_end] = patch_decoded
+
+    # Debug avant clamp
+    print(f"[DEBUG] output_rgb final avant clamp: shape={output_rgb.shape}, "
+          f"min={output_rgb.min():.6f}, max={output_rgb.max():.6f}")
+
+    output_rgb = output_rgb.clamp(0.0, 1.0)
+
+    # Correction gamma / contraste / luminosité / saturation
+    frame_pil_list = []
+    for i in range(B):
+        img = F.to_pil_image(output_rgb[i])
+        img = ImageEnhance.Brightness(img).enhance(brightness)
+        img = ImageEnhance.Contrast(img).enhance(contrast)
+        img = ImageEnhance.Color(img).enhance(saturation)
+        img = img.point(lambda x: (x / 255) ** (1 / gamma) * 255)
+        frame_pil_list.append(img)
+
+        # Debug post-correction
+        pil_tensor = F.to_tensor(img)
+        print(f"[DEBUG] frame {i} après PIL correction: shape={pil_tensor.shape}, "
+              f"min={pil_tensor.min():.6f}, max={pil_tensor.max():.6f}")
+
+    return frame_pil_list[0] if B == 1 else frame_pil_list
+
+
+
+def encode_images_to_latents_safe(images, vae, device="cuda", epsilon=1e-5):
+    """
+    Encode des images en latents sûrs pour UNet.
+    Retourne toujours un tensor [B, 4, H_latent, W_latent], dtype=vae.dtype.
+
+    - epsilon : valeur minimale ajoutée aux latents nuls pour éviter frames noires
+    """
+    images_t = images.to(device=device, dtype=torch.float32)
+    original_dtype = next(vae.parameters()).dtype
+
+    vae = vae.to(device=device, dtype=torch.float32)  # safe pour l'encodage
+
+    with torch.no_grad():
+        latents = vae.encode(images_t).latent_dist.sample()
+
+    print(f"[DEBUG encode] latents min/max après sample: {latents.min().item():.6f}/{latents.max().item():.6f}")
+
+    # Scaling
+    latents = latents * LATENT_SCALE
+    print(f"[DEBUG encode] latents min/max après LATENT_SCALE: {latents.min().item():.6f}/{latents.max().item():.6f}")
+
+    # Clamp NaN / Inf
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+    # ✅ Remplir les latents entièrement nuls
+    if torch.all(latents == 0):
+        latents += epsilon
+
+    # Normalisation pour éviter overflow
+    max_abs = latents.abs().max()
+    if max_abs > 0:
+        latents = latents / max_abs
+
+    # Conversion en dtype final du VAE
+    latents = latents.to(original_dtype)
+
+    # ---------------- FORCE 4 CANAUX ----------------
+    if latents.ndim == 4 and latents.shape[1] == 1:
+        latents = latents.repeat(1, 4, 1, 1)
+    if latents.ndim == 5 and latents.shape[2] == 1:
+        latents = latents.repeat(1, 1, 4, 1, 1)
+
+    print(f"[DEBUG encode] shape finale latents: {latents.shape}, min/max: {latents.min().item():.6f}/{latents.max().item():.6f}")
+    return latents
