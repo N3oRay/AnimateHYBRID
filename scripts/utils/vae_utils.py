@@ -18,6 +18,76 @@ import math
 LATENT_SCALE = 0.18215
 
 
+import torch
+from torchvision.transforms import ToPILImage
+
+to_pil = ToPILImage()
+
+# -------------------------
+# Decode frame via VAE (compatible vae_offload)
+# -------------------------
+def decode_latents_safe(latents, vae, device, tile_size=128, overlap=64):
+    """
+    Décodage sécurisé des latents en image PIL, compatible avec VAE sur CPU (vae_offload)
+    et avec latents sur GPU.
+    """
+    # Déplacer latents sur le device du VAE
+    vae_device = next(vae.parameters()).device
+    latents = latents.to(vae_device).float()
+
+    # Éviter NaN/Inf
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=0.0)
+
+    # Décodage en tiles pour VRAM limitée
+    frame_tensor = decode_latents_to_image_tiled128(
+        latents,
+        vae,
+        tile_size=tile_size,
+        overlap=overlap,
+        device=vae_device
+    ).clamp(0, 1)
+
+    # Renvoie un tensor CPU float32 pour sauvegarde
+    return frame_tensor.cpu()
+
+def decode_latents_safe_64(latents, vae, patch_size=64):
+    """
+    Decode latents into images safely on low VRAM by splitting into patches.
+    latents: [B, C, H, W]
+    """
+    B, C, H, W = latents.shape
+    decoded_imgs = []
+
+    for b in range(B):
+        latent = latents[b:b+1]  # [1,C,H,W]
+        img = torch.zeros(1, C, H, W, device=latent.device)
+
+        # Patch decoding
+        for i in range(0, H, patch_size):
+            for j in range(0, W, patch_size):
+                hi = min(i + patch_size, H)
+                wj = min(j + patch_size, W)
+                patch = latent[:, :, i:hi, j:wj]
+                decoded_patch = vae.decode(patch).sample
+                img[:, :, i:hi, j:wj] = decoded_patch
+
+        # Clamp et convertir en PIL
+        img = img.squeeze(0).clamp(0, 1)
+        img_pil = to_pil(img.cpu())
+        decoded_imgs.append(img_pil)
+
+        # Nettoyage VRAM
+        del latent, img
+        torch.cuda.empty_cache()
+
+    return decoded_imgs
+
+# Exemple dans ta boucle de génération
+# for frame_idx, frame_latents in enumerate(latents_list):
+#     frame_pil = decode_latents_safe(frame_latents, vae)[0]
+#     frame_pil.save(f"output/frame_{frame_idx:03d}.png")
+
+
 def decode_latents_to_image_bright_enhanced(latents, vae, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15):
     """
     Décodage des latents en image PIL avec :
@@ -664,32 +734,7 @@ def safe_load_vae(vae_path, device="cuda", fp16=False, offload=False):
         return None
 
 
-# -------------------------
-# Decode frame via VAE (compatible vae_offload)
-# -------------------------
-def decode_latents_safe(latents, vae, device, tile_size=128, overlap=64):
-    """
-    Décodage sécurisé des latents en image PIL, compatible avec VAE sur CPU (vae_offload)
-    et avec latents sur GPU.
-    """
-    # Déplacer latents sur le device du VAE
-    vae_device = next(vae.parameters()).device
-    latents = latents.to(vae_device).float()
 
-    # Éviter NaN/Inf
-    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=0.0)
-
-    # Décodage en tiles pour VRAM limitée
-    frame_tensor = decode_latents_to_image_tiled128(
-        latents,
-        vae,
-        tile_size=tile_size,
-        overlap=overlap,
-        device=vae_device
-    ).clamp(0, 1)
-
-    # Renvoie un tensor CPU float32 pour sauvegarde
-    return frame_tensor.cpu()
 
 
 # ---------------------------------

@@ -13,13 +13,391 @@ import os
 import numpy as np
 import yaml
 import torch.nn.functional as F
-LATENT_SCALE = 0.18215
 import torchvision.transforms as T
 from transformers import CLIPTokenizer, CLIPTextModel
 from einops import rearrange
 from math import ceil
 import copy
+from torchvision.transforms import ToPILImage
 
+LATENT_SCALE = 0.18215  # échelle typique pour SD/AnimateDiff
+
+# ---------------- Ultra-safe decode patchwise ----------------
+from tqdm import trange
+from concurrent.futures import ThreadPoolExecutor
+
+
+def generate_latents_safe_debug(unet, **kwargs):
+    """
+    Génération de latents avec UNet, FP16-safe et debug.
+    Version vidéo stable : toutes les frames sont conservées.
+    Affiche min/max à chaque étape pour détecter si les latents restent à zéro.
+    """
+
+    import torch
+
+    # Arguments connus
+    known_kwargs = [
+        "scheduler", "input_latents", "embeddings", "motion_module",
+        "guidance_scale", "device", "fp16", "steps", "debug"
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in known_kwargs}
+
+    # Required
+    input_latents = filtered_kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' doit être fourni")
+
+    device = filtered_kwargs.get("device", "cuda")
+    fp16 = filtered_kwargs.get("fp16", True)
+    debug = filtered_kwargs.get("debug", True)
+    motion_module = filtered_kwargs.get("motion_module", None)
+    scheduler = filtered_kwargs.get("scheduler", None)
+    steps = filtered_kwargs.get("steps", 20)
+    embeddings = filtered_kwargs.get("embeddings", None)
+
+    # Latents initiaux
+    latents = input_latents.clone().to(device=device, dtype=torch.float16 if fp16 else torch.float32)
+    is_video = latents.ndim == 5  # [B, C, F, H, W]
+    steps_list = getattr(scheduler, "timesteps", range(steps))
+
+    if debug:
+        print(f"[DEBUG] Initial latents min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+
+    # Désactiver Dynamo/Inductor pour debug
+    torch._dynamo.reset()
+    torch._dynamo.disable()
+
+    for step_idx, t in enumerate(steps_list):
+
+        # Motion module si présent
+        if motion_module is not None:
+            latents = motion_module(latents)
+            latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+        # Préparer latents pour UNet
+        if is_video:
+            B, C, F, H, W = latents.shape
+            # Pas de permute → batch = B*F, C, H, W
+            latents_unet = latents.reshape(B*F, C, H, W)
+        else:
+            latents_unet = latents
+
+        # FP16 si demandé
+        latents_unet = latents_unet.half() if fp16 else latents_unet.float()
+
+        # 🔹 Forward UNet
+        try:
+            unet_out = unet(latents_unet, t, encoder_hidden_states=embeddings)
+            latents_out = unet_out["sample"]
+        except Exception as e:
+            print(f"⚠️ [UNet ERROR] step={step_idx} - {e}")
+            continue
+
+        # Reshape si vidéo
+        if is_video:
+            latents = latents_out.reshape(B, F, C, H, W)  # ← plus de permute
+        else:
+            latents = latents_out
+
+        # Nettoyage et clamp
+        latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0).clamp(-5.0, 5.0)
+
+        if debug:
+            print(f"[DEBUG Step {step_idx}] latents min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+
+    if debug:
+        print(f"[INFO] Finished latents generation, final min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+
+    return latents
+
+
+
+def generate_latents_ultralight(
+    unet,
+    input_latents,
+    scheduler,
+    embeddings=None,
+    motion_module=None,
+    guidance_scale=1.0,
+    device="cuda",
+    fp16=True,
+    steps=20,
+    patch_size=32,
+    debug=False
+):
+    """
+    Génération de latents ultra-light, patch par patch pour GPU <4Go.
+    - input_latents: torch.Tensor [B,C,H,W] ou [B,C,F,H,W] pour vidéo
+    - motion_module: optionnel, appliqué à chaque step
+    - embeddings: CLIP embeddings
+    """
+    latents = input_latents.clone().to(device=device, dtype=torch.float16 if fp16 else torch.float32)
+    is_video = latents.ndim == 5
+    steps_list = getattr(scheduler, "timesteps", range(steps))
+
+    for step_idx, t in enumerate(steps_list):
+        if motion_module is not None:
+            latents = motion_module(latents)
+            latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+        # UNet patch par patch pour économiser la VRAM
+        if is_video:
+            B, C, F, H, W = latents.shape
+            latents_patch = latents.permute(0,2,1,3,4).reshape(B*F, C, H, W)
+        else:
+            latents_patch = latents
+
+        H, W = latents_patch.shape[-2:]
+        output = torch.zeros_like(latents_patch, device=latents_patch.device)
+
+        # Patch UNet
+        stride = patch_size
+        for y0 in range(0, H, stride):
+            for x0 in range(0, W, stride):
+                y1 = min(y0 + patch_size, H)
+                x1 = min(x0 + patch_size, W)
+
+                patch = latents_patch[:, :, y0:y1, x0:x1]
+                patch = patch.half() if fp16 else patch.float()
+
+                try:
+                    with torch.no_grad():
+                        patch_out = unet(patch, t, encoder_hidden_states=embeddings)["sample"]
+                except Exception as e:
+                    print(f"⚠ [UNet ERROR patch {y0},{x0}] {e}")
+                    patch_out = patch.clone()
+
+                # Clamp et cleanup
+                patch_out = torch.nan_to_num(patch_out, nan=0.0, posinf=5.0, neginf=-5.0).clamp(-5,5)
+                output[:, :, y0:y1, x0:x1] = patch_out
+                del patch, patch_out
+                torch.cuda.empty_cache()
+
+        if is_video:
+            latents = output.reshape(B, F, C, H, W).permute(0,2,1,3,4)
+        else:
+            latents = output
+
+        if debug:
+            print(f"[Step {step_idx}] latents min/max={latents.min():.4f}/{latents.max():.4f}")
+
+    return latents
+
+
+def generate_latents_safe_wrapper(unet, **kwargs):
+    input_latents = kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' must be provided")
+
+    # Arguments autorisés pour la version ultra-light
+    allowed_keys = [
+        "input_latents",
+        "scheduler",
+        "embeddings",
+        "motion_module",
+        "guidance_scale",
+        "device",
+        "fp16",
+        "steps",
+        "patch_size",
+        "debug",
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in allowed_keys}
+
+    try:
+        return generate_latents_safe_debug(unet, **filtered_kwargs)
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            print("⚠️ [SAFE WRAPPER] CUDA out of memory caught, returning input latents")
+            return input_latents.clone()
+        else:
+            raise e
+
+
+# --------------------------------------------------------------------------------------------------------
+
+
+def decode_latents_ultrasafe_cpu(latents, vae, block_size=160, overlap=96, debug=True, threaded=True):
+    """
+    Decode latents safely on CPU in patches, optionally threaded.
+    Supports 4D [B, C, H, W] and 5D [B, C, F, H, W] latents.
+    Logs min/max for debugging.
+    """
+    import threading
+
+    vae.to("cpu")
+    latents = latents.to("cpu")
+    is_5d = latents.dim() == 5
+    if is_5d:
+        B, C, F, H, W = latents.shape
+    else:
+        B, C, H, W = latents.shape
+        F = 1
+        latents = latents.unsqueeze(2)
+
+    frames = [None] * F
+
+    def decode_frame(f):
+        frame_latents = latents[:, :, f]
+        if debug:
+            print(f"[DEBUG] Decoding frame {f} latents shape: {frame_latents.shape} min/max: {frame_latents.min().item():.4f}/{frame_latents.max().item():.4f}")
+
+        H_idx = list(range(0, H, block_size - overlap))
+        W_idx = list(range(0, W, block_size - overlap))
+        decoded_frame = torch.zeros((B, 3, H, W), dtype=torch.float32)
+
+        for i, h_start in enumerate(H_idx):
+            h_end = min(h_start + block_size, H)
+            for j, w_start in enumerate(W_idx):
+                w_end = min(w_start + block_size, W)
+                patch = frame_latents[:, :, h_start:h_end, w_start:w_end]
+                with torch.no_grad():
+                    decoded_patch = vae.decode(patch).sample
+                decoded_frame[:, :, h_start:h_end, w_start:w_end] = decoded_patch
+
+        frames[f] = decoded_frame
+
+    if threaded:
+        threads = []
+        for f in range(F):
+            t = threading.Thread(target=decode_frame, args=(f,))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+    else:
+        for f in range(F):
+            decode_frame(f)
+
+    output = torch.stack(frames, dim=2) if is_5d else frames[0]
+    if debug:
+        print(f"[DEBUG] Final output shape: {output.shape} min/max: {output.min().item():.4f}/{output.max().item():.4f}")
+    return output
+
+
+# ---------------- Encodage images → latents safe ----------------
+def encode_images_to_latents_safe(images, vae, device="cuda", dtype=torch.float16):
+    # -- assure cohérence dtype/device --
+    vae = vae.to(device=device, dtype=dtype)
+    images_t = images.to(device=device, dtype=dtype)
+
+    # sauvegarde dtype original pour restore
+    original_dtype = next(vae.parameters()).dtype
+
+    with torch.no_grad():
+        latents = vae.encode(images_t).latent_dist.sample()
+
+    latents = latents * LATENT_SCALE
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+    # normalisation pour UNet / motion module
+    max_abs = latents.abs().max()
+    if max_abs > 0:
+        latents = latents / max_abs  # scale [-1,1]
+
+    # reshape pour pipeline [B,C,T,H,W]
+    if latents.ndim == 4:
+        latents = latents.unsqueeze(2)
+
+    print(
+        "[SAFE ENCODE]",
+        "min=", latents.min().item(),
+        "max=", latents.max().item(),
+        "std=", latents.std().item(),
+        "dtype=", latents.dtype,
+        "device=", latents.device,
+        "shape=", latents.shape
+    )
+
+    return latents
+
+def decode_latents_ultrasafe_blockwise_adapted(latents, vae, block_size=160, overlap=96, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0):
+    """
+    Décodage ultrasafe des latents en PIL.Image
+    Adapté pour accepter 4D [B,C,H,W] ou 5D [B,C,T,H,W].
+    Si 5D, retourne une liste de frames PIL.
+    """
+    # Convert 5D → list de frames 4D
+    if latents.ndim == 5:
+        B,C,T,H,W = latents.shape
+        frames_4d = [latents[:, :, t, :, :] for t in range(T)]
+    elif latents.ndim == 4:
+        frames_4d = [latents]
+    else:
+        raise ValueError(f"Latents doivent être 4D ou 5D, got {latents.shape}")
+
+    pil_frames = []
+    for fidx, latent_4d in enumerate(frames_4d):
+        # On décode par blocs (supposons que decode_latents_ultrasafe_blockwise existe)
+        frame_pil = decode_latents_ultrasafe_blockwise(latent_4d, vae, block_size=block_size, overlap=overlap,
+                                                        gamma=gamma, brightness=brightness, contrast=contrast,
+                                                        saturation=saturation)
+        pil_frames.append(frame_pil)
+
+    if len(pil_frames) == 1:
+        return pil_frames[0]
+    return pil_frames
+
+
+# ---------------- Décodage latents → image ultrasafe (blockwise) ----------------
+def decode_latents_ultrasafe_blockwise(latents, vae, block_size=160, overlap=96,
+                                       gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0):
+    """
+    Décodage sécurisé des latents en image PIL, bloc par bloc pour réduire VRAM.
+    Input:
+        latents : [B,C,H,W] ou [B,C,1,H,W]
+        vae : AutoencoderKL
+    """
+    if latents.ndim == 5:
+        latents = latents.squeeze(2)  # [B,C,H,W]
+
+    B, C, H, W = latents.shape
+    device = next(vae.parameters()).device
+
+    stride = block_size - overlap
+    h_steps = max(1, (H - overlap + stride - 1) // stride)
+    w_steps = max(1, (W - overlap + stride - 1) // stride)
+
+    output = torch.zeros(B, C, H, W, device="cpu")
+    weight_map = torch.zeros(B, 1, H, W, device="cpu")
+
+    for i in range(h_steps):
+        for j in range(w_steps):
+            y0 = i * stride
+            x0 = j * stride
+            y1 = min(y0 + block_size, H)
+            x1 = min(x0 + block_size, W)
+
+            patch = latents[:, :, y0:y1, x0:x1].to(device)
+            patch = torch.nan_to_num(patch, nan=0.0, posinf=5.0, neginf=-5.0)
+
+            with torch.no_grad():
+                patch_decoded = vae.decode(patch.to(vae.dtype)).sample
+                patch_decoded = ((patch_decoded + 1)/2).clamp(0,1).cpu()
+
+            # Weighted blend pour recouvrement
+            h_patch, w_patch = patch_decoded.shape[2], patch_decoded.shape[3]
+            mask = torch.ones(1, 1, h_patch, w_patch)
+            output[:, :, y0:y0+h_patch, x0:x0+w_patch] += patch_decoded * mask
+            weight_map[:, :, y0:y0+h_patch, x0:x0+w_patch] += mask
+
+            torch.cuda.empty_cache()
+
+    output = output / weight_map.clamp(min=1e-5)
+    frame_pil = ToPILImage()(output[0].clamp(0,1))
+
+    # Ajustements image
+    if gamma != 1.0:
+        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(gamma)
+    if brightness != 1.0:
+        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    if saturation != 1.0:
+        frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    return frame_pil
 
 # ---------------- Decode safe 4Go VRAM ----------------
 def decode_latents_safe_vram(latents, vae, gamma=0.7, brightness=1.2, contrast=1.1, saturation=1.15):
@@ -2621,7 +2999,7 @@ def disable_xformers(unet):
         unet.enable_xformers_memory_efficient_attention(True)
 
 
-def generate_latents_safe_debug(unet, **kwargs):
+def generate_latents_safe_test(unet, **kwargs):
     """
     Génération de latents avec UNet, FP16-safe et debug.
     Affiche min/max à chaque étape pour détecter si les latents restent à zéro.
@@ -2700,9 +3078,9 @@ def generate_latents_safe_debug(unet, **kwargs):
 
 
 # 🔹 Wrapper général sûr
-def generate_latents_safe_wrapper(unet, **kwargs):
+def generate_latents_safe_wrapper_test(unet, **kwargs):
     try:
-        return generate_latents_safe_debug(unet, **kwargs)
+        return generate_latents_safe_test(unet, **kwargs)
     except TypeError as e:
         if "meta__efficient_attention_backward() got multiple values for argument 'scale'" in str(e):
             print("⚠️ [SAFE WRAPPER] Efficient attention error caught, returning input latents")
@@ -3119,9 +3497,9 @@ def safe_load_scheduler(model_path):
     return DPMSolverMultistepScheduler.from_pretrained(os.path.join(model_path,"scheduler"))
 
 # -------------------------
-# Encode / Decode FP16 safe
+# Encode / Decode FP16 simple
 # -------------------------
-def encode_images_to_latents_safe(images, vae):
+def encode_images_to_latents_simple(images, vae):
     device = vae.device
     dtype = next(vae.parameters()).dtype  # prend fp16 si le VAE est en FP16
     images = images.to(device=device, dtype=dtype)
