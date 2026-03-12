@@ -1,7 +1,13 @@
 import torch
-from PIL import Image
+from PIL import Image, ImageEnhance
 from torchvision.transforms import ToTensor, ToPILImage
 from pathlib import Path
+from torchvision.transforms import functional as F
+import math
+import itertools
+import numpy as np
+
+
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3r_utils import load_images_test
 from scripts.modules.motion_ulta_lite_fix import MotionModuleUltraLiteFixComplete
@@ -16,15 +22,76 @@ from scripts.utils.tools_utils import (
 #from scripts.n3rmodelSD import encode_images_to_latents_safe
 
 # ------------------- DECODE ULTRA-SAFE GLOBAL -------------------
+
+# -------------------------------------------------------------
+# Comparatif statistique intégré
+# -------------------------------------------------------------
+
+
+def compare_images_stats(img_orig, img_decoded, threshold=0.05):
+    """Compare deux images PIL ou tensors et retourne les écarts statistiques"""
+    # Convertir en tensor CPU float [0,1]
+    if isinstance(img_orig, Image.Image):
+        img_orig = torch.tensor(np.array(img_orig) / 255.0).permute(2,0,1)
+    if isinstance(img_decoded, Image.Image):
+        img_decoded = torch.tensor(np.array(img_decoded) / 255.0).permute(2,0,1)
+
+    # Forcer CPU pour éviter le RuntimeError
+    img_orig = img_orig.cpu()
+    img_decoded = img_decoded.cpu()
+
+    # S’assurer que les tailles correspondent
+    assert img_orig.shape == img_decoded.shape, "Les images doivent avoir la même taille"
+
+    diff = torch.abs(img_orig - img_decoded)
+    mean_diff_per_channel = diff.view(3,-1).mean(dim=1).numpy()
+    mean_diff_total = diff.mean().item()
+    percent_diff = 100 * (diff.max(dim=0)[0] > threshold).sum().item() / (diff.shape[1]*diff.shape[2])
+
+    return {
+        "mean_diff_r": mean_diff_per_channel[0],
+        "mean_diff_g": mean_diff_per_channel[1],
+        "mean_diff_b": mean_diff_per_channel[2],
+        "mean_diff_total": mean_diff_total,
+        "percent_diff_pixels": percent_diff
+    }
+
+def apply_adjustments(img_pil, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0):
+    img = ImageEnhance.Brightness(img_pil).enhance(brightness)
+    img = ImageEnhance.Contrast(img).enhance(contrast)
+    img = ImageEnhance.Color(img).enhance(saturation)
+    if gamma != 1.0:
+        img = img.point(lambda x: 255 * ((x/255) ** (1/gamma)))
+    return img
+
+def test_parameter_grid(latents_motion, vae, img_orig,
+                        gammas=[1.0,1.2,1.5],
+                        contrasts=[1.0,1.2,1.5],
+                        saturations=[1.0,1.2,1.5],
+                        brightnesses=[1.0]):
+
+    results = []
+    for gamma, contrast, saturation, brightness in itertools.product(gammas, contrasts, saturations, brightnesses):
+        decoded_img = decode_latents_ultrasafe_blockwise(
+            latents_motion, vae,
+            gamma=gamma,
+            contrast=contrast,
+            saturation=saturation,
+            brightness=brightness
+        )
+        stats = compare_images_stats(img_orig[0], decoded_img)
+        stats.update({"gamma": gamma, "contrast": contrast, "saturation": saturation, "brightness": brightness})
+        results.append(stats)
+
+    # Trier par meilleure fidélité
+    results_sorted = sorted(results, key=lambda x: x["mean_diff_total"])
+    return results_sorted
 # ------------------- DECODE ULTRA-SAFE BLOCKWISE -------------------
 # --------------------------------------------------------------
 # decode_latents_ultrasafe_blockwise.py
 # --------------------------------------------------------------
 
-import torch
-from torchvision.transforms import functional as F
-from PIL import Image, ImageEnhance
-import math
+
 
 # Version précédente fonctionnel ********************************
 def decode_latents_ultrasafe_blockwise(
@@ -189,3 +256,13 @@ if upscale_factor > 1:
 
 # Affichage rapide
 frame_pil.show()
+
+
+# -------------------------------------------------------------
+# Exemple d'utilisation après ton décodage normal
+# -------------------------------------------------------------
+results = test_parameter_grid(latents_motion, vae, image)
+
+print("Top 5 configurations les plus proches de l'image originale :")
+for r in results[:5]:
+    print(r)
