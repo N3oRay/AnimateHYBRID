@@ -22,7 +22,7 @@ from torchvision.transforms.functional import to_pil_image
 from torchvision.transforms import functional as F
 
 from scripts.utils.lora_utils import apply_lora  # ou ton utilitaire n3oray
-
+from scripts.utils.logging_utils import log_latent_stats, log_patch_stats
 from scripts.utils.config_loader import load_config
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.motion_utils import load_motion_module
@@ -207,61 +207,6 @@ def decode_latents_ultrasafe_blockwise(
     return frame_pil_list[0] if B == 1 else frame_pil_list
 
 
-def log_latent_stats(frame_idx, latents, csv_path="latent_stats.csv"):
-    """Écrit les stats latentes dans un CSV"""
-    min_val = float(latents.min())
-    max_val = float(latents.max())
-    mean_val = float(latents.mean())
-    std_val = float(latents.std())
-
-    # Si le fichier n'existe pas, écrire l'en-tête
-    write_header = not os.path.exists(csv_path)
-
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.writer(f)
-        if write_header:
-            writer.writerow(["frame", "min", "max", "mean", "std"])
-        writer.writerow([frame_idx, min_val, max_val, mean_val, std_val])
-
-
-def log_patch_stats(frame_idx, patch_idx, patch, csv_path="patch_stats.csv"):
-    """
-    Écrit les stats de chaque patch VAE dans un CSV
-    """
-    min_val = float(patch.min())
-    max_val = float(patch.max())
-    mean_val = float(patch.mean())
-    std_val = float(patch.std())
-    shape_str = "x".join(map(str, patch.shape))
-    dtype_str = str(patch.dtype)
-    device_str = str(patch.device)
-    any_nan = int(torch.isnan(patch).any())
-    any_inf = int(torch.isinf(patch).any())
-
-    # Mémoire GPU (si sur CUDA)
-    if patch.is_cuda:
-        mem_alloc = torch.cuda.memory_allocated()
-        mem_reserved = torch.cuda.memory_reserved()
-    else:
-        mem_alloc = 0
-        mem_reserved = 0
-
-    write_header = not os.path.exists(csv_path)
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.writer(f)
-        if write_header:
-            writer.writerow([
-                "frame", "patch", "shape", "dtype", "device",
-                "min", "max", "mean", "std", "NaN", "Inf",
-                "gpu_alloc_bytes", "gpu_reserved_bytes"
-            ])
-        writer.writerow([
-            frame_idx, patch_idx, shape_str, dtype_str, device_str,
-            min_val, max_val, mean_val, std_val, any_nan, any_inf,
-            mem_alloc, mem_reserved
-        ])
-
-
 def ensure_4_channels(latents):
     if latents.shape[1] == 1:
         latents = latents.repeat(1, 4, 1, 1)
@@ -279,7 +224,7 @@ def main(args):
     upscale_factor = cfg.get("upscale_factor",1)
     transition_frames = cfg.get("transition_frames",4)
     num_fraps_per_image = cfg.get("num_fraps_per_image",4)
-    steps = max(cfg.get("steps",16),3)
+    steps = max(cfg.get("steps",16),4)
     guidance_scale = cfg.get("guidance_scale",4.0)
     init_image_scale = cfg.get("init_image_scale",0.85)
     creative_noise = cfg.get("creative_noise",0.0)
