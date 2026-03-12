@@ -23,6 +23,13 @@ from torchvision.transforms import functional as F
 
 from scripts.utils.lora_utils import apply_lora  # ou ton utilitaire n3oray
 from scripts.utils.logging_utils import log_latent_stats, log_patch_stats
+from scripts.utils.tools_utils import (
+    prepare_frame_tensor,
+    normalize_frame,
+    tensor_to_pil,
+    ensure_4_channels,
+    save_frames_as_video_from_folder
+)
 from scripts.utils.config_loader import load_config
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.motion_utils import load_motion_module
@@ -38,37 +45,6 @@ def wait_for_stop():
     if inp.lower() == "²": stop_generation = True
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
-# ---------------- Utils ----------------
-def prepare_frame_tensor(frame_tensor):
-    if frame_tensor.ndim == 5: frame_tensor = frame_tensor.squeeze(2)
-    if frame_tensor.ndim == 4: frame_tensor = frame_tensor.squeeze(0)
-    if frame_tensor.ndim == 3 and frame_tensor.shape[0] != 3: frame_tensor = frame_tensor.permute(2,0,1)
-    return frame_tensor.clamp(0,1)
-
-def normalize_frame(frame_tensor):
-    min_val = frame_tensor.min()
-    max_val = frame_tensor.max()
-    if max_val > min_val: frame_tensor = (frame_tensor - min_val)/(max_val-min_val)
-    return frame_tensor.clamp(0,1)
-
-def tensor_to_pil(frame_tensor):
-    if frame_tensor.ndim==4: frame_tensor=frame_tensor[0]
-    return T.ToPILImage()(frame_tensor.cpu().clamp(0,1))
-
-def save_frames_as_video_from_folder(folder_path, output_path, fps=12):
-    import ffmpeg
-    folder_path = Path(folder_path)
-    frame_files = sorted(folder_path.glob("frame_*.png"))
-    if not frame_files:
-        print("❌ Aucun frame trouvé")
-        return
-    pattern = str(folder_path / "frame_*.png")
-    (
-        ffmpeg.input(pattern, framerate=fps, pattern_type='glob')
-        .output(str(output_path), vcodec="libx264", pix_fmt="yuv420p")
-        .overwrite_output()
-        .run(quiet=True)
-    )
 
 # ------------------- ENCODE -------------------
 def encode_images_to_latents_safe(images, vae, device="cuda", epsilon=1e-5):
@@ -206,11 +182,6 @@ def decode_latents_ultrasafe_blockwise(
 
     return frame_pil_list[0] if B == 1 else frame_pil_list
 
-
-def ensure_4_channels(latents):
-    if latents.shape[1] == 1:
-        latents = latents.repeat(1, 4, 1, 1)
-    return latents
 
 # ---------------- MAIN ----------------
 def main(args):
