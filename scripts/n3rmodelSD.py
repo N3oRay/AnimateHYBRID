@@ -4,6 +4,7 @@
 import os, math, threading
 from pathlib import Path
 from datetime import datetime
+import csv  # <-- ajoute ça
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32,garbage_collection_threshold:0.6,expandable_segments:True"
 os.environ["PYTORCH_ALLOC_CONF"] = "garbage_collection_threshold:0.7,max_split_size_mb:64,expandable_segments:True"
 import torch
@@ -20,6 +21,7 @@ from scripts.utils.config_loader import load_config
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_safe_wrapper
+
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -111,74 +113,22 @@ def encode_images_to_latents_safe(images, vae, device="cuda"):
 
 
 # ------------------- DECODE -------------------
-import torch
+
 from torchvision.transforms.functional import to_pil_image
+
+from torchvision.transforms import functional as F
+
+from PIL import Image, ImageEnhance
 
 def decode_latents_ultrasafe_blockwise(
     latents, vae,
     block_size=32, overlap=16,
     gamma=1.0, brightness=1.0,
     contrast=1.0, saturation=1.0,
-    device="cuda"
-):
+    device="cuda", frame_counter=0, output_dir=Path(".")):
     """
-    Décodage par blocs ultra-safe des latents en image PIL avec debug complet.
-
-    Affiche min/max pour:
-    - latents globaux
-    - chaque patch avant VAE
-    - chaque patch après VAE
-    - image finale
-    """
-    vae_dtype = next(vae.parameters()).dtype
-    B, C, H, W = latents.shape
-    output_rgb = torch.zeros(B, 3, H * 8, W * 8, device=device, dtype=torch.float32)
-
-    # DEBUG: latents globaux
-    print(f"[DEBUG] latents globaux: shape={latents.shape}, min={latents.min().item():.6f}, max={latents.max().item():.6f}")
-
-    # Coordonnées patches
-    y_steps = list(range(0, H, block_size - overlap))
-    x_steps = list(range(0, W, block_size - overlap))
-
-    for y0 in y_steps:
-        y1 = min(y0 + block_size, H)
-        for x0 in x_steps:
-            x1 = min(x0 + block_size, W)
-            patch = latents[:, :, y0:y1, x0:x1].to(device=device, dtype=vae_dtype)
-
-            print(f"[DEBUG] patch avant VAE ({y0},{x0}): shape={patch.shape}, dtype={patch.dtype}, min={patch.min().item():.6f}, max={patch.max().item():.6f}")
-
-            with torch.no_grad():
-                patch_decoded = vae.decode(patch).sample  # [B, 3, h*8, w*8]
-                patch_decoded = patch_decoded.to(torch.float32)
-
-            print(f"[DEBUG] patch après VAE ({y0},{x0}): min={patch_decoded.min().item():.6f}, max={patch_decoded.max().item():.6f}")
-
-            # Placement dans image finale
-            h_start, h_end = y0 * 8, y1 * 8
-            w_start, w_end = x0 * 8, x1 * 8
-            output_rgb[:, :, h_start:h_end, w_start:w_end] = patch_decoded
-
-    # Clamp et correction gamma/simple
-    output_rgb = output_rgb.clamp(0.0, 1.0)
-
-    # DEBUG: image finale
-    print(f"[DEBUG] output_rgb final: shape={output_rgb.shape}, min={output_rgb.min().item():.6f}, max={output_rgb.max().item():.6f}")
-
-    # Conversion PIL
-    frame_pil_list = [to_pil_image(output_rgb[i]) for i in range(B)]
-    return frame_pil_list[0] if B == 1 else frame_pil_list
-
-def decode_latents_ultrasafe_blockwise_ori(
-    latents, vae,
-    block_size=32, overlap=16,
-    gamma=1.0, brightness=1.0,
-    contrast=1.0, saturation=1.0,
-    device="cuda"
-):
-    """
-    Décodage par blocs ultra-safe des latents en image PIL.
+    Décodage par blocs ultra-safe des latents en image PIL avec correction auto
+    et debug min/max pour chaque patch et image finale.
 
     - latents: [B, 4, H, W] sur CPU ou GPU
     - vae: VAE déjà chargé (fp16 ou fp32)
@@ -191,7 +141,6 @@ def decode_latents_ultrasafe_blockwise_ori(
     B, C, H, W = latents.shape
     output_rgb = torch.zeros(B, 3, H * 8, W * 8, device=device, dtype=torch.float32)
 
-    # Calculer les coordonnées des patches
     y_steps = list(range(0, H, block_size - overlap))
     x_steps = list(range(0, W, block_size - overlap))
 
@@ -201,26 +150,119 @@ def decode_latents_ultrasafe_blockwise_ori(
             x1 = min(x0 + block_size, W)
             patch = latents[:, :, y0:y1, x0:x1].to(device=device, dtype=vae_dtype)
 
-            # Debug min/max
-            print(f"[DEBUG decode before VAE] patch ({y0},{x0}) shape: {patch.shape}, "
-                  f"dtype: {patch.dtype}, min/max: {patch.min():.6f}/{patch.max():.6f}")
+            # Debug avant VAE
+            print(f"[DEBUG] patch avant VAE ({y0},{x0}): shape={patch.shape}, "
+                  f"dtype={patch.dtype}, min={patch.min():.6f}, max={patch.max():.6f}")
+
+            # ✅ Correction NaN / Inf avant passage dans le VAE
+            if torch.isnan(patch).any() or torch.isinf(patch).any():
+                patch = torch.nan_to_num(patch, nan=0.0, posinf=5.0, neginf=-5.0)
+
+            # log patch
+            patch_idx = f"{y0}_{x0}"
+            log_patch_stats(frame_idx=frame_counter, patch_idx=patch_idx, patch=patch, csv_path=output_dir / "patch_stats.csv")
 
             with torch.no_grad():
                 patch_decoded = vae.decode(patch).sample  # [B, 3, h*8, w*8]
+                if patch.is_cuda:
+                    print(f"[DEBUG MEM] après decode: allocated={torch.cuda.memory_allocated()/1e6:.1f}MB, reserved={torch.cuda.memory_reserved()/1e6:.1f}MB")
                 patch_decoded = patch_decoded.to(torch.float32)
 
-            # Placer dans la grande image
+            # Debug après VAE
+            print(f"[DEBUG] patch après VAE ({y0},{x0}): min={patch_decoded.min():.6f}, "
+                  f"max={patch_decoded.max():.6f}")
+
+            log_patch_stats(frame_idx=frame_counter, patch_idx=patch_idx+"_decoded", patch=patch_decoded, csv_path=output_dir / "patch_stats.csv")
+
             h_start, h_end = y0 * 8, y1 * 8
             w_start, w_end = x0 * 8, x1 * 8
             output_rgb[:, :, h_start:h_end, w_start:w_end] = patch_decoded
 
-    # Clamp et correction simple (gamma, brightness, contrast, saturation)
-    output_rgb = output_rgb.clamp(0.0, 1.0)
-    # Si besoin, tu peux ajouter torchvision.transforms.functional.adjust_* ici
+    # Debug avant clamp
+    print(f"[DEBUG] output_rgb final avant clamp: shape={output_rgb.shape}, "
+          f"min={output_rgb.min():.6f}, max={output_rgb.max():.6f}")
 
-    # Retour PIL.Image pour le pipeline
-    frame_pil_list = [to_pil_image(output_rgb[i]) for i in range(B)]
+    output_rgb = output_rgb.clamp(0.0, 1.0)
+
+    # Debug après clamp
+    print(f"[DEBUG] output_rgb final après clamp: min={output_rgb.min():.6f}, max={output_rgb.max():.6f}")
+
+    # Correction auto
+    auto_gamma = gamma
+    auto_brightness = brightness
+    auto_contrast = contrast
+    auto_saturation = saturation
+
+    frame_pil_list = []
+    for i in range(B):
+        img = F.to_pil_image(output_rgb[i])
+        img = ImageEnhance.Brightness(img).enhance(auto_brightness)
+        img = ImageEnhance.Contrast(img).enhance(auto_contrast)
+        img = ImageEnhance.Color(img).enhance(auto_saturation)
+        img = img.point(lambda x: (x / 255) ** (1 / auto_gamma) * 255)
+        frame_pil_list.append(img)
+
+        # Debug post-correction
+        pil_tensor = F.to_tensor(img)
+        print(f"[DEBUG] frame {i} après PIL correction: shape={pil_tensor.shape}, "
+              f"min={pil_tensor.min():.6f}, max={pil_tensor.max():.6f}")
+
     return frame_pil_list[0] if B == 1 else frame_pil_list
+
+
+def log_latent_stats(frame_idx, latents, csv_path="latent_stats.csv"):
+    """Écrit les stats latentes dans un CSV"""
+    min_val = float(latents.min())
+    max_val = float(latents.max())
+    mean_val = float(latents.mean())
+    std_val = float(latents.std())
+
+    # Si le fichier n'existe pas, écrire l'en-tête
+    write_header = not os.path.exists(csv_path)
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(["frame", "min", "max", "mean", "std"])
+        writer.writerow([frame_idx, min_val, max_val, mean_val, std_val])
+
+
+def log_patch_stats(frame_idx, patch_idx, patch, csv_path="patch_stats.csv"):
+    """
+    Écrit les stats de chaque patch VAE dans un CSV
+    """
+    min_val = float(patch.min())
+    max_val = float(patch.max())
+    mean_val = float(patch.mean())
+    std_val = float(patch.std())
+    shape_str = "x".join(map(str, patch.shape))
+    dtype_str = str(patch.dtype)
+    device_str = str(patch.device)
+    any_nan = int(torch.isnan(patch).any())
+    any_inf = int(torch.isinf(patch).any())
+
+    # Mémoire GPU (si sur CUDA)
+    if patch.is_cuda:
+        mem_alloc = torch.cuda.memory_allocated()
+        mem_reserved = torch.cuda.memory_reserved()
+    else:
+        mem_alloc = 0
+        mem_reserved = 0
+
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow([
+                "frame", "patch", "shape", "dtype", "device",
+                "min", "max", "mean", "std", "NaN", "Inf",
+                "gpu_alloc_bytes", "gpu_reserved_bytes"
+            ])
+        writer.writerow([
+            frame_idx, patch_idx, shape_str, dtype_str, device_str,
+            min_val, max_val, mean_val, std_val, any_nan, any_inf,
+            mem_alloc, mem_reserved
+        ])
 
 
 def ensure_4_channels(latents):
@@ -339,15 +381,18 @@ def main(args):
                     break
                 alpha = 0.5 - 0.5 * math.cos(math.pi * t / (transition_frames - 1))
                 latent_interp = ((1 - alpha) * previous_latent_single + alpha * current_latent_single).clamp(-3, 3)
-                # Passage au GPU si VAE est sur GPU
                 latent_interp = latent_interp.to(device=device, dtype=dtype)
+
+                # ⚡ Log stats latentes
+                log_latent_stats(frame_counter, latent_interp, csv_path=output_dir / "latent_stats.csv")
+
+                print(f"[DEBUG INTERPOL] frame {frame_counter}: min/max latents={latent_interp.min().item():.6f}/{latent_interp.max().item():.6f}")
                 frame_pil = decode_latents_ultrasafe_blockwise(
                     latent_interp, vae,
                     block_size=32, overlap=16,
                     gamma=0.7, brightness=1.2,
                     contrast=1.1, saturation=1.15,
-                    device=device
-                )
+                    device=device, frame_counter=frame_counter, output_dir=output_dir)
                 if upscale_factor > 1:
                     frame_pil = frame_pil.resize(
                         (frame_pil.width * upscale_factor, frame_pil.height * upscale_factor),
@@ -396,14 +441,17 @@ def main(args):
                     unet = unet.to("cpu")
                     torch.cuda.empty_cache()
 
+                    # ⚡ Log stats latentes
+                    log_latent_stats(frame_counter, latents, csv_path=output_dir / "latent_stats.csv")
+
                     # ---------------- Decode frame ----------------
+                    print(f"[DEBUG Génération frames] frame {frame_counter}: min/max latents={latents.min().item():.6f}/{latents.max().item():.6f}")
                     frame_pil = decode_latents_ultrasafe_blockwise(
                         latents, vae,
                         block_size=32, overlap=16,
                         gamma=0.7, brightness=1.2,
                         contrast=1.1, saturation=1.15,
-                        device=device
-                    )
+                        device=device, frame_counter=frame_counter, output_dir=output_dir)
                     del latents
                     torch.cuda.empty_cache()
 
