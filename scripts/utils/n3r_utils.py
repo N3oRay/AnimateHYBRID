@@ -111,7 +111,34 @@ def generate_latents_safe_debug(unet, **kwargs):
 
     return latents
 
+def generate_latents_safe_wrapper(unet, **kwargs):
+    input_latents = kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' must be provided")
 
+    # Arguments autorisés pour la version ultra-light
+    allowed_keys = [
+        "input_latents",
+        "scheduler",
+        "embeddings",
+        "motion_module",
+        "guidance_scale",
+        "device",
+        "fp16",
+        "steps",
+        "patch_size",
+        "debug",
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in allowed_keys}
+
+    try:
+        return generate_latents_safe_debug(unet, **filtered_kwargs)
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            print("⚠️ [SAFE WRAPPER] CUDA out of memory caught, returning input latents")
+            return input_latents.clone()
+        else:
+            raise e
 
 def generate_latents_ultralight(
     unet,
@@ -185,34 +212,7 @@ def generate_latents_ultralight(
     return latents
 
 
-def generate_latents_safe_wrapper(unet, **kwargs):
-    input_latents = kwargs.get("input_latents")
-    if input_latents is None:
-        raise ValueError("⚠️ 'input_latents' must be provided")
 
-    # Arguments autorisés pour la version ultra-light
-    allowed_keys = [
-        "input_latents",
-        "scheduler",
-        "embeddings",
-        "motion_module",
-        "guidance_scale",
-        "device",
-        "fp16",
-        "steps",
-        "patch_size",
-        "debug",
-    ]
-    filtered_kwargs = {k: v for k, v in kwargs.items() if k in allowed_keys}
-
-    try:
-        return generate_latents_safe_debug(unet, **filtered_kwargs)
-    except RuntimeError as e:
-        if "CUDA out of memory" in str(e):
-            print("⚠️ [SAFE WRAPPER] CUDA out of memory caught, returning input latents")
-            return input_latents.clone()
-        else:
-            raise e
 
 
 # --------------------------------------------------------------------------------------------------------
