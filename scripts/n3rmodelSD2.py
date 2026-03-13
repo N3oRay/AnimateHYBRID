@@ -14,13 +14,14 @@ from diffusers import AutoencoderKL, PNDMScheduler
 from transformers import CLIPTokenizerFast, CLIPTextModel
 
 from scripts.utils.lora_utils import apply_lora
+from scripts.utils.vae_config import load_vae
 from scripts.utils.tools_utils import (
     ensure_4_channels,
     save_frames_as_video_from_folder
 )
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
-from scripts.utils.n3r_utils import generate_latents_safe_wrapper_v2, load_images_test
+from scripts.utils.n3r_utils import generate_latents_safe_wrapper, load_images_test
 from scripts.utils.fx_utils import encode_images_to_latents_nuanced,decode_latents_ultrasafe_blockwise
 from scripts.utils.vae_utils import safe_load_unet
 
@@ -92,9 +93,7 @@ def main(args):
 
     # ---------------- VAE ----------------
     vae_path = cfg.get("vae_path")
-    vae = AutoencoderKL.from_single_file(vae_path, torch_dtype=dtype).to(device)
-    vae.enable_slicing()
-    vae.enable_tiling()
+    vae, vae_type, latent_channels, LATENT_SCALE = load_vae(vae_path, device=device, dtype=dtype)
 
     # ---------------- Embeddings ----------------
     prompts = cfg.get("prompt", [])
@@ -200,7 +199,7 @@ def main(args):
                     cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
 
                     # Génération latents
-                    latents = generate_latents_safe_wrapper_v2(
+                    latents = generate_latents_safe_wrapper(
                         unet=unet,
                         scheduler=scheduler,
                         input_latents=latents_frame,
