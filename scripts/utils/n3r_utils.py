@@ -27,7 +27,6 @@ from tqdm import trange
 from concurrent.futures import ThreadPoolExecutor
 
 
-
 def generate_latents_safe_debug(unet, **kwargs):
     """
     Génération de latents avec UNet, FP16-safe et debug.
@@ -79,6 +78,149 @@ def generate_latents_safe_debug(unet, **kwargs):
         # Préparer latents pour UNet
         if is_video:
             B, C, F, H, W = latents.shape
+            latents_unet = latents.reshape(B*F, C, H, W)
+        else:
+            latents_unet = latents
+
+        # FP16 si demandé
+        latents_unet = latents_unet.half() if fp16 else latents_unet.float()
+
+        # 🔹 Préparer embeddings
+        if isinstance(embeddings, tuple):
+            pos_embeds, neg_embeds = embeddings
+            encoder_states = torch.cat([neg_embeds.to(device), pos_embeds.to(device)], dim=0)
+        else:
+            encoder_states = embeddings
+
+        # 🔹 Forward UNet
+        try:
+            unet_out = unet(latents_unet, t, encoder_hidden_states=encoder_states)
+
+            # Détecter type de sortie UNet
+            if isinstance(unet_out, dict):
+                latents_out = unet_out["sample"]
+            elif isinstance(unet_out, (tuple, list)):
+                latents_out = unet_out[0]  # prendre la première valeur (sample)
+            else:
+                raise TypeError(f"Unexpected UNet output type: {type(unet_out)}")
+
+        except Exception as e:
+            print(f"⚠️ [UNet ERROR] step={step_idx} - {e}")
+            continue
+
+        # Reshape si vidéo
+        if is_video:
+            latents = latents_out.reshape(B, F, C, H, W)
+        else:
+            latents = latents_out
+
+        # Nettoyage et clamp
+        latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0).clamp(-5.0, 5.0)
+
+        if debug:
+            print(f"[DEBUG Step {step_idx}] latents min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+
+    if debug:
+        print(f"[INFO] Finished latents generation, final min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+
+    return latents
+
+
+def generate_latents_safe_wrapper(unet, **kwargs):
+    """
+    Wrapper ultra-safe pour générer les latents avec UNet.
+    - Gère CUDA OOM
+    - Prépare embeddings tuple pour classifier-free guidance
+    """
+
+    input_latents = kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' must be provided")
+
+    embeddings = kwargs.get("embeddings", None)
+
+    # Si embeddings est un tuple de (pos, neg), concat pour CF guidance
+    if isinstance(embeddings, tuple) and len(embeddings) == 2:
+        pos_embeds, neg_embeds = embeddings
+        kwargs["embeddings"] = torch.cat([neg_embeds.to(kwargs.get("device", "cuda")),
+                                          pos_embeds.to(kwargs.get("device", "cuda"))], dim=0)
+
+    # Arguments autorisés pour la version ultra-light
+    allowed_keys = [
+        "input_latents",
+        "scheduler",
+        "embeddings",
+        "motion_module",
+        "guidance_scale",
+        "device",
+        "fp16",
+        "steps",
+        "debug",
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in allowed_keys}
+
+    try:
+        return generate_latents_safe_debug(unet, **filtered_kwargs)
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            print("⚠️ [SAFE WRAPPER] CUDA out of memory caught, returning input latents")
+            return input_latents.clone()
+        else:
+            raise e
+
+def generate_latents_safe_debug_v1(unet, **kwargs):
+    """
+    Génération de latents avec UNet, FP16-safe et debug.
+    Version vidéo stable : toutes les frames sont conservées.
+    Affiche min/max à chaque étape pour détecter si les latents restent à zéro.
+    """
+
+    import torch
+
+    # Arguments connus
+    known_kwargs = [
+        "scheduler", "input_latents", "embeddings", "motion_module",
+        "guidance_scale", "device", "fp16", "steps", "debug"
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in known_kwargs}
+
+    # Required
+    input_latents = filtered_kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' doit être fourni")
+
+    device = filtered_kwargs.get("device", "cuda")
+    fp16 = filtered_kwargs.get("fp16", True)
+    debug = filtered_kwargs.get("debug", True)
+    motion_module = filtered_kwargs.get("motion_module", None)
+    scheduler = filtered_kwargs.get("scheduler", None)
+    steps = filtered_kwargs.get("steps", 20)
+    embeddings = filtered_kwargs.get("embeddings", None)
+
+    # Latents initiaux
+    latents = input_latents.clone().to(device=device, dtype=torch.float16 if fp16 else torch.float32)
+    is_video = latents.ndim == 5  # [B, C, F, H, W]
+    steps_list = getattr(scheduler, "timesteps", range(steps))
+
+    if debug:
+        print(f"[DEBUG] Initial latents min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+
+    # Désactiver Dynamo/Inductor pour debug
+    torch._dynamo.reset()
+    torch._dynamo.disable()
+
+    for step_idx, t in enumerate(steps_list):
+
+
+
+        # Motion module si présent
+        if motion_module is not None:
+            latents = motion_module(latents)
+            latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+        # Préparer latents pour UNet
+        if is_video:
+            B, C, F, H, W = latents.shape
             # Pas de permute → batch = B*F, C, H, W
             latents_unet = latents.reshape(B*F, C, H, W)
         else:
@@ -86,6 +228,14 @@ def generate_latents_safe_debug(unet, **kwargs):
 
         # FP16 si demandé
         latents_unet = latents_unet.half() if fp16 else latents_unet.float()
+
+
+        # 🔹 Préparer embeddings
+        if isinstance(embeddings, tuple):
+            pos_embeds, neg_embeds = embeddings
+            encoder_states = pos_embeds
+        else:
+            encoder_states = embeddings
 
         # 🔹 Forward UNet
         try:
@@ -112,7 +262,7 @@ def generate_latents_safe_debug(unet, **kwargs):
 
     return latents
 
-def generate_latents_safe_wrapper(unet, **kwargs):
+def generate_latents_safe_wrapper_v1(unet, **kwargs):
     input_latents = kwargs.get("input_latents")
     if input_latents is None:
         raise ValueError("⚠️ 'input_latents' must be provided")
