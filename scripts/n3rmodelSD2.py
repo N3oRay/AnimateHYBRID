@@ -20,7 +20,7 @@ from scripts.utils.tools_utils import (
 )
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
-from scripts.utils.n3r_utils import generate_latents_safe_wrapper, load_images_test
+from scripts.utils.n3r_utils import generate_latents_safe_wrapper_v2, load_images_test
 from scripts.utils.fx_utils import encode_images_to_latents_nuanced,decode_latents_ultrasafe_blockwise
 from scripts.utils.vae_utils import safe_load_unet
 
@@ -119,7 +119,7 @@ def main(args):
     total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/model_{timestamp}")
+    output_dir = Path(f"./outputs/modelSD2_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
 
@@ -155,7 +155,7 @@ def main(args):
                 gamma = 1.0  # 1.2
                 brightness = 1.0 # 1.0
                 contrast = 1.5 # 1.2
-                saturation = 1.5 # 1.2
+                saturation = 1.3 # 1.2
                 upscale_factor = 2
                 #frame_counter = 0  # pour debug/log si nécessaire
 
@@ -200,7 +200,7 @@ def main(args):
                     cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
 
                     # Génération latents
-                    latents = generate_latents_safe_wrapper(
+                    latents = generate_latents_safe_wrapper_v2(
                         unet=unet,
                         scheduler=scheduler,
                         input_latents=latents_frame,
@@ -222,7 +222,7 @@ def main(args):
                     gamma = 1.0  # 1.2
                     brightness = 1.0 # 1.0
                     contrast = 1.5 # 1.2
-                    saturation = 1.5 # 1.2
+                    saturation = 1.3 # 1.2
                     upscale_factor = 2
                     #frame_counter = 0  # pour debug/log si nécessaire
 
