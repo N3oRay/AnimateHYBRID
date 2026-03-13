@@ -149,7 +149,31 @@ def main(args):
                 latent_interp = latent_interp.clone()
                 if motion_module:
                     latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
-                frame_pil = decode_latents_ultrasafe_blockwise(latent_interp, vae, device=device)
+
+                # Décodage
+                # Paramètres boostés
+                gamma = 1.0  # 1.2
+                brightness = 1.0 # 1.0
+                contrast = 1.5 # 1.2
+                saturation = 1.5 # 1.2
+                upscale_factor = 2
+                #frame_counter = 0  # pour debug/log si nécessaire
+
+                # Décodage ultra-safe (blockwise comme ton code)
+                frame_pil = decode_latents_ultrasafe_blockwise(
+                    latent_interp, vae,
+                    block_size=32, overlap=24,
+                    gamma=gamma,
+                    brightness=brightness,
+                    contrast=contrast,
+                    saturation=saturation,
+                    device=device,
+                    frame_counter=frame_counter,
+                    output_dir=Path("."),
+                    epsilon=1e-5,
+                    latent_scale_boost=5.71
+                )
+                #frame_pil = decode_latents_ultrasafe_blockwise(latent_interp, vae, device=device)
                 if upscale_factor > 1:
                     frame_pil = frame_pil.resize((frame_pil.width*upscale_factor, frame_pil.height*upscale_factor), Image.BICUBIC)
                 frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
@@ -157,22 +181,30 @@ def main(args):
                 pbar.update(1)
 
         # Frames principales
+        # ---------------- Frames principales ----------------
         for pos_embeds, neg_embeds in embeddings:
             for f in range(num_fraps_per_image):
                 if stop_generation:
                     break
+
                 if f == 0:
+                    # Première frame = image d'origine
                     frame_tensor = (input_image.squeeze(0) + 1) / 2.0
                     frame_tensor = frame_tensor.clamp(0, 1)
                     frame_pil = to_pil_image(frame_tensor.cpu())
                 else:
                     latents_frame = current_latent_single.clone()
-                    cf_embeds = (pos_embeds, neg_embeds)  # tuple
+
+                    # ⚡ Créer embeddings concaténés pour CF guidance
+                    # Le wrapper attend un tuple (pos_embeds, neg_embeds)
+                    cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
+
+                    # Génération latents
                     latents = generate_latents_safe_wrapper(
                         unet=unet,
                         scheduler=scheduler,
                         input_latents=latents_frame,
-                        embeddings=cf_embeds,
+                        embeddings=cf_embeds,        # tuple CF guidance
                         motion_module=motion_module,
                         guidance_scale=guidance_scale,
                         device=device,
@@ -180,14 +212,46 @@ def main(args):
                         steps=steps,
                         debug=False
                     )
+
+                    # Motion safe
                     if motion_module:
                         latents, _ = apply_motion_safe(latents, motion_module)
-                    frame_pil = decode_latents_ultrasafe_blockwise(latents, vae, device=device)
+
+                    # Décodage
+                    # Paramètres boostés
+                    gamma = 1.0  # 1.2
+                    brightness = 1.0 # 1.0
+                    contrast = 1.5 # 1.2
+                    saturation = 1.5 # 1.2
+                    upscale_factor = 2
+                    #frame_counter = 0  # pour debug/log si nécessaire
+
+                    # Décodage ultra-safe (blockwise comme ton code)
+                    frame_pil = decode_latents_ultrasafe_blockwise(
+                        latents, vae,
+                        block_size=32, overlap=24,
+                        gamma=gamma,
+                        brightness=brightness,
+                        contrast=contrast,
+                        saturation=saturation,
+                        device=device,
+                        frame_counter=frame_counter,
+                        output_dir=Path("."),
+                        epsilon=1e-5,
+                        latent_scale_boost=5.71
+                    )
+
+                    #frame_pil = decode_latents_ultrasafe_blockwise(latents, vae, device=device)
                     if upscale_factor > 1:
-                        frame_pil = frame_pil.resize((frame_pil.width*upscale_factor, frame_pil.height*upscale_factor), Image.BICUBIC)
+                        frame_pil = frame_pil.resize(
+                            (frame_pil.width*upscale_factor, frame_pil.height*upscale_factor),
+                            Image.BICUBIC
+                        )
+
                     del latents
                     torch.cuda.empty_cache()
 
+                # Sauvegarde de la frame
                 frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                 frame_counter += 1
                 pbar.update(1)
