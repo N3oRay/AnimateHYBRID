@@ -1,5 +1,5 @@
 # --------------------------------------------------------------
-# n3rmodelSD.py - AnimateDiff pipeline ultra light ~2Go VRAM
+# n3rmodelSD_final.py - AnimateDiff ultra-light ~2Go VRAM
 # --------------------------------------------------------------
 import os, math, threading
 from pathlib import Path
@@ -7,7 +7,7 @@ from datetime import datetime
 import torch
 from tqdm import tqdm
 from torchvision.transforms.functional import to_pil_image
-from PIL import Image, ImageEnhance
+from PIL import Image
 import argparse
 
 from diffusers import PNDMScheduler
@@ -31,10 +31,9 @@ def wait_for_stop():
     inp = input("Appuyez sur '²' + Entrée pour arrêter : ")
     if inp.lower() == "²":
         stop_generation = True
-
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
-# ---------------- utilitaires ----------------
+# ---------------- Utilitaires ----------------
 def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
     overlap = int(block_size * max_overlap_ratio)
     return min(overlap, min(W,H)//4)
@@ -44,11 +43,16 @@ def apply_motion_safe(latents, motion_module, threshold=1e-2):
         return latents, False
     return motion_module(latents), True
 
-def prepare_embeddings_for_unet(pos_embeds, neg_embeds, target_dim):
+def adapt_embeddings_to_unet(pos_embeds, neg_embeds, target_dim):
+    """Adapte automatiquement les embeddings texte pour correspondre au cross_attention_dim du UNet."""
     current_dim = pos_embeds.shape[-1]
+    if current_dim == target_dim:
+        return pos_embeds, neg_embeds
+    # Troncature
     if current_dim > target_dim:
         pos_embeds = pos_embeds[..., :target_dim]
         neg_embeds = neg_embeds[..., :target_dim]
+    # Padding
     elif current_dim < target_dim:
         pad = target_dim - current_dim
         pos_embeds = torch.nn.functional.pad(pos_embeds, (0, pad))
@@ -74,8 +78,7 @@ def main(args):
 
     # ---------------- UNET ----------------
     unet = safe_load_unet(args.pretrained_model_path, device=device, fp16=True)
-    if hasattr(unet, "enable_attention_slicing"):
-        unet.enable_attention_slicing()
+    if hasattr(unet, "enable_attention_slicing"): unet.enable_attention_slicing()
     if hasattr(unet, "enable_xformers_memory_efficient_attention"):
         try: unet.enable_xformers_memory_efficient_attention(True)
         except: pass
@@ -105,18 +108,21 @@ def main(args):
     for prompt_item in prompts:
         prompt_text = " ".join(prompt_item) if isinstance(prompt_item, list) else str(prompt_item)
         neg_text = " ".join(negative_prompts) if isinstance(negative_prompts, list) else str(negative_prompts)
-        text_inputs = tokenizer(prompt_text, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
-        neg_inputs = tokenizer(neg_text, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
+        text_inputs = tokenizer(prompt_text, padding="max_length", truncation=True,
+                                max_length=tokenizer.model_max_length, return_tensors="pt")
+        neg_inputs = tokenizer(neg_text, padding="max_length", truncation=True,
+                               max_length=tokenizer.model_max_length, return_tensors="pt")
         with torch.no_grad():
             pos_embeds = text_encoder(text_inputs.input_ids.to(device)).last_hidden_state
             neg_embeds = text_encoder(neg_inputs.input_ids.to(device)).last_hidden_state
+        pos_embeds, neg_embeds = adapt_embeddings_to_unet(pos_embeds, neg_embeds, unet_cross_attention_dim)
         embeddings.append((pos_embeds, neg_embeds))
 
     # ---------------- Input images ----------------
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
     total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/modelSD_{timestamp}")
+    output_dir = Path(f"./outputs/modelSD2_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
 
@@ -143,10 +149,11 @@ def main(args):
                 if stop_generation: break
                 alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
                 latent_interp = (1-alpha)*previous_latent_single + alpha*current_latent_single
-                if motion_module:
-                    latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
-                frame_pil = decode_latents_ultrasafe_blockwise(latent_interp, vae, block_size=block_size, overlap=overlap,
-                                                               gamma=1.0, brightness=1.0, contrast=1.5, saturation=1.3,
+                if motion_module: latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
+                frame_pil = decode_latents_ultrasafe_blockwise(latent_interp, vae,
+                                                               block_size=block_size, overlap=overlap,
+                                                               gamma=1.0, brightness=1.0,
+                                                               contrast=1.5, saturation=1.3,
                                                                device=device, frame_counter=frame_counter,
                                                                latent_scale_boost=5.71)
                 frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
@@ -163,15 +170,19 @@ def main(args):
                 else:
                     latents_frame = current_latent_single.clone()
                     cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
-                    latents = generate_latents_safe_wrapper_v2(
-                        unet=unet, scheduler=scheduler, input_latents=latents_frame, embeddings=cf_embeds,
-                        motion_module=motion_module, guidance_scale=guidance_scale,
-                        device=device, fp16=True, steps=steps, debug=False
-                    )
-                    if motion_module:
-                        latents, _ = apply_motion_safe(latents, motion_module)
-                    frame_pil = decode_latents_ultrasafe_blockwise(latents, vae, block_size=block_size, overlap=overlap,
-                                                                   gamma=1.0, brightness=1.0, contrast=1.5, saturation=1.3,
+                    latents = generate_latents_safe_wrapper_v2(unet=unet,
+                                                               scheduler=scheduler,
+                                                               input_latents=latents_frame,
+                                                               embeddings=cf_embeds,
+                                                               motion_module=motion_module,
+                                                               guidance_scale=guidance_scale,
+                                                               device=device,
+                                                               fp16=True, steps=steps, debug=False)
+                    if motion_module: latents, _ = apply_motion_safe(latents, motion_module)
+                    frame_pil = decode_latents_ultrasafe_blockwise(latents, vae,
+                                                                   block_size=block_size, overlap=overlap,
+                                                                   gamma=1.0, brightness=1.0,
+                                                                   contrast=1.5, saturation=1.3,
                                                                    device=device, frame_counter=frame_counter,
                                                                    latent_scale_boost=5.71)
                     del latents
