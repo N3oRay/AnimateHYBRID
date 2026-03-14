@@ -96,23 +96,36 @@ def main(args):
         except:
             pass
 
-    # ---------------- LoRA ----------------
-    cyber_skin_path = cfg.get("n3oray_models", {}).get("cybersamurai_v2")  # cybersamurai_v2 ou cyber_skin ou cyber_skin_girl ou cyberpunk_style_v3
-    if cyber_skin_path is None:
-        raise ValueError("❌ Impossible de trouver '{cyber_skin_path}' dans n3oray_models du YAML.")
-
-    # Appliquer LoRA de manière intelligente
-    unet = apply_lora_smart(unet, cyber_skin_path, alpha=0.5, device=device, verbose=True)
-
-    unet_cross_attention_dim = None
-
-    print("[MODEL INFO]")
-    if hasattr(unet.config, "cross_attention_dim"):
-        unet_cross_attention_dim = unet.config.cross_attention_dim
+    # ---------------- LoRA intelligent ----------------
+    print("[INFO] Détection type UNet...")
+    unet_cross_attention_dim = getattr(unet.config, "cross_attention_dim", None)
+    if unet_cross_attention_dim is None:
+        print("⚠ Impossible de détecter cross_attention_dim du UNet. Valeur par défaut = 768")
+        unet_cross_attention_dim = 768
+    else:
         print(f"[INFO] UNet cross_attention_dim = {unet_cross_attention_dim}")
 
-    # ---------------- Motion module ----------------
-    motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
+    # Appliquer toutes les LoRA du YAML de manière intelligente
+    n3oray_models = cfg.get("n3oray_models", {})
+    for model_name, lora_path in n3oray_models.items():
+        applied = apply_lora_smart(
+            unet, lora_path,
+            alpha=0.5, device=device,
+            verbose=True
+        )
+        if not applied:
+            print(f"⚠ LoRA '{model_name}' ignorée (incompatible avec UNet)")
+
+    # ---------------- Motion Module safe ----------------
+    motion_module_path = cfg.get("motion_module")
+    motion_module = None
+    if motion_module_path:
+        motion_module = load_motion_module(motion_module_path, device=device)
+        # Vérification simple
+        if "ultra" in motion_module_path.lower() and unet_cross_attention_dim != 1024:
+            print(f"⚠ Motion Module '{motion_module_path}' pourrait être incompatible avec ce UNet")
+        else:
+            print(f"✅ Motion Module '{motion_module_path}' compatible")
 
     # ---------------- Tokenizer / Text encoder ----------------
     tokenizer = CLIPTokenizerFast.from_pretrained(os.path.join(args.pretrained_model_path,"tokenizer"))
