@@ -13,7 +13,8 @@ import argparse
 from diffusers import AutoencoderKL, PNDMScheduler
 from transformers import CLIPTokenizerFast, CLIPTextModel
 
-from scripts.utils.lora_utils import apply_lora
+from scripts.utils.lora_utils import apply_lora, apply_lora_smart
+from scripts.utils.vae_config import load_vae
 from scripts.utils.tools_utils import (
     ensure_4_channels,
     save_frames_as_video_from_folder
@@ -96,10 +97,12 @@ def main(args):
             pass
 
     # ---------------- LoRA ----------------
-    cyber_skin_path = cfg.get("n3oray_models", {}).get("cyber_skin")
+    cyber_skin_path = cfg.get("n3oray_models", {}).get("cybersamurai_v2")  # cybersamurai_v2 ou cyber_skin ou cyber_skin_girl ou cyberpunk_style_v3
     if cyber_skin_path is None:
-        raise ValueError("❌ Impossible de trouver 'cyber_skin' dans n3oray_models du YAML.")
-    unet = apply_lora(unet, cyber_skin_path, alpha=0.5)
+        raise ValueError("❌ Impossible de trouver '{cyber_skin_path}' dans n3oray_models du YAML.")
+
+    # Appliquer LoRA de manière intelligente
+    unet = apply_lora_smart(unet, cyber_skin_path, alpha=0.5, device=device, verbose=True)
 
     unet_cross_attention_dim = None
 
@@ -121,9 +124,8 @@ def main(args):
 
     # ---------------- VAE ----------------
     vae_path = cfg.get("vae_path")
-    vae = AutoencoderKL.from_single_file(vae_path, torch_dtype=dtype).to(device)
-    vae.enable_slicing()
-    vae.enable_tiling()
+    vae, vae_type, latent_channels, LATENT_SCALE = load_vae(vae_path, device=device, dtype=dtype)
+
 
     # ---------------- Embeddings ----------------
     prompts = cfg.get("prompt", [])
@@ -137,9 +139,20 @@ def main(args):
         text_inputs = tokenizer(prompt_text, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
         neg_inputs = tokenizer(neg_text, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
 
+        #with torch.no_grad():
+        #    pos_embeds = text_encoder(text_inputs.input_ids.to(device)).last_hidden_state
+        #    neg_embeds = text_encoder(neg_inputs.input_ids.to(device)).last_hidden_state
+
+        CLIP_SKIP = 2  # valeur recommandée par ton LoRA
+
         with torch.no_grad():
-            pos_embeds = text_encoder(text_inputs.input_ids.to(device)).last_hidden_state
-            neg_embeds = text_encoder(neg_inputs.input_ids.to(device)).last_hidden_state
+            # Obtenir toutes les hidden_states
+            pos_output = text_encoder(text_inputs.input_ids.to(device), output_hidden_states=True)
+            neg_output = text_encoder(neg_inputs.input_ids.to(device), output_hidden_states=True)
+
+            # Clip Skip = 2 → prendre la 2ème dernière couche
+            pos_embeds = pos_output.hidden_states[-CLIP_SKIP]
+            neg_embeds = neg_output.hidden_states[-CLIP_SKIP]
 
         # garder embeddings originaux
         pos_unet, neg_unet = prepare_embeddings_for_unet(
@@ -271,7 +284,7 @@ if __name__=="__main__":
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--fp16", action="store_true", default=True)
     parser.add_argument("--vae-offload", action="store_true")
-    parser.add_argument("--n3_model", type=str, default="cyber_skin")
+    parser.add_argument("--n3_model", type=str, default="cybersamurai_v2") # cybersamurai_v2 - cyber_skin
     parser.add_argument("--scheduler", type=str, default="pndm")
     args = parser.parse_args()
     main(args)
