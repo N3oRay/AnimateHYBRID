@@ -18,7 +18,7 @@ from scripts.utils.vae_config import load_vae
 from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
-from scripts.utils.n3r_utils import generate_latents_safe_wrapper_v2, load_images_test
+from scripts.utils.n3r_utils import generate_latents_safe_miniGPU, generate_latents_mini_gpu, load_images_test
 from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, save_frames_as_video_from_folder
 from scripts.utils.vae_utils import safe_load_unet
 
@@ -34,6 +34,7 @@ def wait_for_stop():
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
 # ---------------- Utilitaires ----------------
+
 def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
     overlap = int(block_size * max_overlap_ratio)
     return min(overlap, min(W,H)//4)
@@ -85,13 +86,17 @@ def main(args):
 
     # ---------------- LoRA ----------------
     unet_cross_attention_dim = getattr(unet.config, "cross_attention_dim", 768)
-    for model_name, lora_path in cfg.get("n3oray_models", {}).items():
-        applied = apply_lora_smart(unet, lora_path, alpha=0.5, device=device, verbose=True)
-        if not applied:
-            print(f"⚠ LoRA '{model_name}' ignorée (incompatible UNet)")
-
+    n3oray_models = cfg.get("n3oray_models")
+    if n3oray_models:
+        for model_name, lora_path in n3oray_models.items():
+            applied = apply_lora_smart(unet, lora_path, alpha=0.5, device=device, verbose=True)
+            if not applied:
+                print(f"⚠ LoRA '{model_name}' ignorée (incompatible UNet)")
+    else:
+        print("⚠ Aucun modèle LoRA n'est configuré, étape ignorée.")
     # ---------------- Motion module ----------------
-    motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
+    #motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
+    motion_module = None
 
     # ---------------- Tokenizer / Text encoder ----------------
     tokenizer = CLIPTokenizerFast.from_pretrained(os.path.join(args.pretrained_model_path,"tokenizer"))
@@ -170,7 +175,9 @@ def main(args):
                 else:
                     latents_frame = current_latent_single.clone()
                     cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
-                    latents = generate_latents_safe_wrapper_v2(unet=unet,
+                    print("DEBUG embeddings shape:", pos_embeds.shape, "neg shape:", neg_embeds.shape)
+                    print("DEBUG motion_module dim:", getattr(motion_module, "cross_attention_dim", "Unknown"))
+                    latents = generate_latents_mini_gpu(unet=unet,
                                                                scheduler=scheduler,
                                                                input_latents=latents_frame,
                                                                embeddings=cf_embeds,
@@ -178,7 +185,8 @@ def main(args):
                                                                guidance_scale=guidance_scale,
                                                                device=device,
                                                                fp16=True, steps=steps, debug=False)
-                    if motion_module: latents, _ = apply_motion_safe(latents, motion_module)
+                    if motion_module:
+                        latents, _ = apply_motion_safe(latents, motion_module)
                     frame_pil = decode_latents_ultrasafe_blockwise(latents, vae,
                                                                    block_size=block_size, overlap=overlap,
                                                                    gamma=1.0, brightness=1.0,
