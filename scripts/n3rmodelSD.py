@@ -16,13 +16,12 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 from scripts.utils.lora_utils import apply_lora, apply_lora_smart
 from scripts.utils.vae_config import load_vae
 from scripts.utils.tools_utils import (
-    ensure_4_channels,
-    save_frames_as_video_from_folder
+    ensure_4_channels
 )
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
-from scripts.utils.n3r_utils import generate_latents_safe_wrapper_v2, load_images_test
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced,decode_latents_ultrasafe_blockwise
+from scripts.utils.n3r_utils import generate_latents_safe_wrapper, load_images_test
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced,decode_latents_ultrasafe_blockwise, save_frames_as_video_from_folder
 from scripts.utils.vae_utils import safe_load_unet
 
 LATENT_SCALE = 0.18215
@@ -36,6 +35,13 @@ def wait_for_stop():
         stop_generation = True
 
 threading.Thread(target=wait_for_stop, daemon=True).start()
+
+
+# -------------------------
+def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
+    overlap = int(block_size * max_overlap_ratio)
+    overlap = min(overlap, min(W,H)//4)
+    return overlap
 
 # ---------------- Motion Module Safe ----------------
 def apply_motion_safe(latents, motion_module, threshold=1e-2):
@@ -80,6 +86,8 @@ def main(args):
     num_fraps_per_image = cfg.get("num_fraps_per_image", 2)
     steps = max(cfg.get("steps", 16), 4)
     guidance_scale = cfg.get("guidance_scale", 4.0)
+    init_image_scale = cfg.get("init_image_scale", 0.85)
+    creative_noise = cfg.get("creative_noise", 0.0)
 
     scheduler = PNDMScheduler(
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000
@@ -116,16 +124,8 @@ def main(args):
         if not applied:
             print(f"⚠ LoRA '{model_name}' ignorée (incompatible avec UNet)")
 
-    # ---------------- Motion Module safe ----------------
-    motion_module_path = cfg.get("motion_module")
-    motion_module = None
-    if motion_module_path:
-        motion_module = load_motion_module(motion_module_path, device=device)
-        # Vérification simple
-        if "ultra" in motion_module_path.lower() and unet_cross_attention_dim != 1024:
-            print(f"⚠ Motion Module '{motion_module_path}' pourrait être incompatible avec ce UNet")
-        else:
-            print(f"✅ Motion Module '{motion_module_path}' compatible")
+    # ---------------- Motion module ----------------
+    motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
 
     # ---------------- Tokenizer / Text encoder ----------------
     tokenizer = CLIPTokenizerFast.from_pretrained(os.path.join(args.pretrained_model_path,"tokenizer"))
@@ -152,31 +152,11 @@ def main(args):
         text_inputs = tokenizer(prompt_text, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
         neg_inputs = tokenizer(neg_text, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt")
 
-        #with torch.no_grad():
-        #    pos_embeds = text_encoder(text_inputs.input_ids.to(device)).last_hidden_state
-        #    neg_embeds = text_encoder(neg_inputs.input_ids.to(device)).last_hidden_state
-
-        CLIP_SKIP = 2  # valeur recommandée par ton LoRA
-
         with torch.no_grad():
-            # Obtenir toutes les hidden_states
-            pos_output = text_encoder(text_inputs.input_ids.to(device), output_hidden_states=True)
-            neg_output = text_encoder(neg_inputs.input_ids.to(device), output_hidden_states=True)
+            pos_embeds = text_encoder(text_inputs.input_ids.to(device)).last_hidden_state
+            neg_embeds = text_encoder(neg_inputs.input_ids.to(device)).last_hidden_state
 
-            # Clip Skip = 2 → prendre la 2ème dernière couche
-            pos_embeds = pos_output.hidden_states[-CLIP_SKIP]
-            neg_embeds = neg_output.hidden_states[-CLIP_SKIP]
-
-        # garder embeddings originaux
-        pos_unet, neg_unet = prepare_embeddings_for_unet(
-            pos_embeds,
-            neg_embeds,
-            unet_cross_attention_dim
-        )
-        print(f"[DEBUG] original embeds: {pos_embeds.shape}")
-
-        embeddings.append((pos_unet, neg_unet))
-        print(f"[DEBUG] UNet embeds: {pos_unet.shape}")
+        embeddings.append((pos_embeds, neg_embeds))  # ← tuple CF guidance
 
     # ---------------- Input images ----------------
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
@@ -189,6 +169,9 @@ def main(args):
 
     print("📌 Paramètres de génération :")
     print(f"fps: {fps}, frames/image: {num_fraps_per_image}, steps: {steps}, guidance_scale: {guidance_scale}")
+
+    block_size = cfg.get("block_size", 64)
+    overlap = compute_overlap(cfg["W"], cfg["H"], block_size, max_overlap_ratio=0.6)
 
     previous_latent_single = None
     frame_counter = 0
@@ -214,21 +197,34 @@ def main(args):
                 if motion_module:
                     latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
-                # Décodage ultra-safe
+                # Décodage
+                # Paramètres boostés
+                gamma = 1.0  # 1.2
+                brightness = 1.0 # 1.0
+                contrast = 1.5 # 1.2
+                saturation = 1.3 # 1.2
+                #frame_counter = 0  # pour debug/log si nécessaire
+
+                # Décodage ultra-safe (blockwise comme ton code)
                 frame_pil = decode_latents_ultrasafe_blockwise(
                     latent_interp, vae,
-                    block_size=32, overlap=24,
-                    gamma=1.0, brightness=1.0, contrast=1.5, saturation=1.3,
-                    device=device, frame_counter=frame_counter,
-                    output_dir=Path("."), epsilon=1e-5,
+                    block_size=block_size, overlap=overlap,
+                    gamma=gamma,
+                    brightness=brightness,
+                    contrast=contrast,
+                    saturation=saturation,
+                    device=device,
+                    frame_counter=frame_counter,
+                    output_dir=Path("."),
+                    epsilon=1e-5,
                     latent_scale_boost=5.71
                 )
-                if upscale_factor > 1:
-                    frame_pil = frame_pil.resize((frame_pil.width*upscale_factor, frame_pil.height*upscale_factor), Image.BICUBIC)
+
                 frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                 frame_counter += 1
                 pbar.update(1)
 
+        # Frames principales
         # ---------------- Frames principales ----------------
         for pos_embeds, neg_embeds in embeddings:
             for f in range(num_fraps_per_image):
@@ -242,14 +238,18 @@ def main(args):
                     frame_pil = to_pil_image(frame_tensor.cpu())
                 else:
                     latents_frame = current_latent_single.clone()
+
+                    # ⚡ Créer embeddings concaténés pour CF guidance
+                    # Le wrapper attend un tuple (pos_embeds, neg_embeds)
                     cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
 
-                    latents = generate_latents_safe_wrapper_v2(
+                    # Génération latents
+                    latents = generate_latents_safe_wrapper(
                         unet=unet,
                         scheduler=scheduler,
                         input_latents=latents_frame,
-                        embeddings=cf_embeds,
-                        motion_module=None,  # Motion module post-génération
+                        embeddings=cf_embeds,        # tuple CF guidance
+                        motion_module=motion_module,
                         guidance_scale=guidance_scale,
                         device=device,
                         fp16=True,
@@ -257,27 +257,38 @@ def main(args):
                         debug=False
                     )
 
+                    # Motion safe
                     if motion_module:
                         latents, _ = apply_motion_safe(latents, motion_module)
 
+                    # Décodage
+                    # Paramètres boostés
+                    gamma = 1.0  # 1.2
+                    brightness = 1.0 # 1.0
+                    contrast = 1.5 # 1.2
+                    saturation = 1.3 # 1.2
+                    #frame_counter = 0  # pour debug/log si nécessaire
+
+                    # Décodage ultra-safe (blockwise comme ton code)
                     frame_pil = decode_latents_ultrasafe_blockwise(
                         latents, vae,
-                        block_size=32, overlap=24,
-                        gamma=1.0, brightness=1.0, contrast=1.5, saturation=1.3,
-                        device=device, frame_counter=frame_counter,
-                        output_dir=Path("."), epsilon=1e-5,
+                        block_size=block_size, overlap=overlap,
+                        gamma=gamma,
+                        brightness=brightness,
+                        contrast=contrast,
+                        saturation=saturation,
+                        device=device,
+                        frame_counter=frame_counter,
+                        output_dir=Path("."),
+                        epsilon=1e-5,
                         latent_scale_boost=5.71
                     )
 
-                    if upscale_factor > 1:
-                        frame_pil = frame_pil.resize(
-                            (frame_pil.width*upscale_factor, frame_pil.height*upscale_factor),
-                            Image.BICUBIC
-                        )
 
                     del latents
                     torch.cuda.empty_cache()
 
+                # Sauvegarde de la frame
                 frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                 frame_counter += 1
                 pbar.update(1)
@@ -285,10 +296,9 @@ def main(args):
         previous_latent_single = current_latent_single
 
     pbar.close()
-    save_frames_as_video_from_folder(output_dir, out_video, fps=fps)
+    save_frames_as_video_from_folder(output_dir, out_video, fps=fps, upscale_factor=2)
     print(f"🎬 Vidéo générée : {out_video}")
     print("✅ Pipeline terminé avec motion module safe.")
-
 # ---------------- ENTRY ----------------
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
