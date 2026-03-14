@@ -1,9 +1,14 @@
 # motion_utils.py
-import torch
+
+from pathlib import Path
 import os
 import importlib.util
-from pathlib import Path
-import safetensors.torch
+import torch
+
+try:
+    import safetensors.torch
+except ImportError:
+    safetensors = None
 
 # -------------------------
 # Default motion module
@@ -101,47 +106,80 @@ def generate_latents_1(latents, pos_embeds, neg_embeds, unet, scheduler, motion_
 
     return latents
 
-# -------------------------
-# Load motion module
-# -------------------------
-def load_motion_module(module_path: str, device: str = "cuda", fp16: bool = True):
+
+
+def load_motion_module(module_path: str, device: str = "cuda", fp16: bool = True, verbose: bool = True):
+    """
+    Charge un motion module depuis un .py, .ckpt ou .safetensors
+    et applique un patch safe automatique pour éviter les frames trop faibles.
+    """
     if not os.path.exists(module_path):
         raise FileNotFoundError(f"Motion module not found: {module_path}")
 
     dtype = torch.float16 if fp16 else torch.float32
 
+    # ---------------- Module Python ----------------
     if module_path.endswith(".py"):
         spec = importlib.util.spec_from_file_location("motion_module", module_path)
         mm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mm)
 
-        # Cherche une classe MotionModule dans le module
+        # Cherche la première classe nn.Module
         cls_candidates = [v for v in mm.__dict__.values() if isinstance(v, type) and issubclass(v, torch.nn.Module)]
         if len(cls_candidates) == 0:
             raise ValueError(f"No nn.Module subclass found in {module_path}")
-        motion_module = cls_candidates[0]()   # instancier
+
+        motion_module_cls = cls_candidates[0]
+
+        motion_module = motion_module_cls()
         motion_module.to(device=device, dtype=dtype)
         motion_module.eval()
-        print(f"✅ Motion module (Python) loaded and instantiated: {module_path}")
+
+        # Patch safe: injecte un bruit minimal si frames trop faibles
+        if hasattr(motion_module, "forward"):
+            original_forward = motion_module.forward
+            def safe_forward(x):
+                frame_max = x.abs().max()
+                if frame_max < 1e-3:
+                    x = x + torch.randn_like(x)*1e-2
+                    if verbose:
+                        print(f"[SAFE DEBUG] Frame trop faible ({frame_max:.6f}) → bruit injecté")
+                return original_forward(x)
+            motion_module.forward = safe_forward
+
+        if verbose:
+            print(f"✅ Motion module (Python) loaded and patched safe: {module_path}")
         return motion_module
 
+    # ---------------- Checkpoint / safetensors ----------------
     elif module_path.endswith(".ckpt") or module_path.endswith(".safetensors"):
         try:
-            state_dict = torch.load(module_path, map_location="cpu")
-        except Exception:
-            state_dict = safetensors.torch.load_file(module_path, device="cpu")
+            if module_path.endswith(".ckpt"):
+                state_dict = torch.load(module_path, map_location="cpu")
+            else:
+                if safetensors is None:
+                    raise ImportError("safetensors not installed")
+                state_dict = safetensors.torch.load_file(module_path, device="cpu")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load checkpoint: {e}")
 
         class MotionModule(torch.nn.Module):
             def __init__(self, sd):
                 super().__init__()
                 self.sd = sd
             def forward(self, x):
+                # Safe patch minimal
+                frame_max = x.abs().max()
+                if frame_max < 1e-3 and verbose:
+                    print(f"[SAFE DEBUG] Frame trop faible ({frame_max:.6f}) → bruit injecté")
+                    x = x + torch.randn_like(x)*1e-2
                 return x
 
         motion_module = MotionModule(state_dict)
         motion_module.to(device=device, dtype=dtype)
         motion_module.eval()
-        print(f"✅ Motion module (checkpoint) loaded: {module_path}")
+        if verbose:
+            print(f"✅ Motion module (checkpoint) loaded safe: {module_path}")
         return motion_module
 
     else:
