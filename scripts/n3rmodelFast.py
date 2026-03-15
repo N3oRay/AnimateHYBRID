@@ -57,7 +57,8 @@ def main(args):
     # ---------------- Injection contrôlée du latent original ----------------
     # latent_injection = 0.0 -> pas d'influence de l'image originale
     # latent_injection = 1.0 -> on garde totalement le latent d'origine
-    latent_injection = max(0.0, min(1.0, cfg.get("latent_injection", 0.4))) # implication de l'image original dans le resultat final'
+    latent_injection = max(0.0, min(1.0, cfg.get("latent_injection", 0.7))) # implication de l'image original dans le resultat final'
+    final_latent_scale = cfg.get("final_latent_scale", 1/8) #1/2  de l'image,  1/4 de l'image, 0.125 pour 1/8, etc.
 
 
     fps = cfg.get("fps", 12)
@@ -153,7 +154,7 @@ def main(args):
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
     total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/modelSD2_{timestamp}")
+    output_dir = Path(f"./outputs/modelFast_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
 
@@ -272,8 +273,8 @@ def main(args):
                         latents, _ = apply_motion_safe(latents, motion_module)
 
                     # ---------------- Interpolation vers latents finaux (VRAM-safe) ----------------
-                    final_latent_H = cfg["H"] // 8
-                    final_latent_W = cfg["W"] // 8
+                    final_latent_H = int(cfg["H"] * final_latent_scale)
+                    final_latent_W = int(cfg["W"] * final_latent_scale)
                     if latents.shape[-2:] != (final_latent_H, final_latent_W):
                         latents = torch.nn.functional.interpolate(
                             latents,
