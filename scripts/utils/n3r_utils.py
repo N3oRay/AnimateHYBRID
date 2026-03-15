@@ -551,18 +551,23 @@ def run_diffusion_pipeline(unet, vae, scheduler, images, embeddings,
     return latents
 
 
-
 # ---------------- LATENTS GENERATION SAFE DEBUG ----------------
-def generate_latents_safe_debug_v4_old(unet, **kwargs):
+
+def generate_latents_safe_debug_v5(unet, **kwargs):
     """
     Génération de latents avec UNet, FP16-safe et debug.
+    Supporte init_image_scale et creative_noise.
     Logs détaillés : shape, min/max, cross_attention_dim, NaN/Inf.
     Compatible mini GPU.
     """
+    import torch
+    import torch.nn.functional as F
+
     # ---------------- Filtrage kwargs ----------------
     known_kwargs = [
         "scheduler", "input_latents", "embeddings", "motion_module",
-        "guidance_scale", "device", "fp16", "steps", "debug"
+        "guidance_scale", "device", "fp16", "steps", "debug",
+        "init_image_scale", "creative_noise"
     ]
     filtered_kwargs = {k: v for k, v in kwargs.items() if k in known_kwargs}
 
@@ -578,7 +583,11 @@ def generate_latents_safe_debug_v4_old(unet, **kwargs):
     steps = filtered_kwargs.get("steps", 20)
     embeddings = filtered_kwargs.get("embeddings", None)
 
+    init_image_scale = filtered_kwargs.get("init_image_scale", 1.0)
+    creative_noise = filtered_kwargs.get("creative_noise", 0.0)
+
     latents = input_latents.clone().to(device=device, dtype=torch.float16 if fp16 else torch.float32)
+    original_latents = latents.clone()
     is_video = latents.ndim == 5  # [B,C,F,H,W]
     steps_list = getattr(scheduler, "timesteps", range(steps))
 
@@ -623,10 +632,7 @@ def generate_latents_safe_debug_v4_old(unet, **kwargs):
         # ---------------- Préparer embeddings ----------------
         if isinstance(embeddings, tuple):
             pos_embeds, neg_embeds = embeddings
-            expected_dim = getattr(unet.config, "cross_attention_dim", pos_embeds.shape[-1])
-            if pos_embeds.shape[-1] != expected_dim:
-                print(f"⚠️ Embeddings cross_attention_dim mismatch: {pos_embeds.shape[-1]} vs UNet {expected_dim}")
-            encoder_states = torch.cat([neg_embeds.to(device), pos_embeds.to(device)], dim=0)
+            encoder_states = pos_embeds.to(device)  # ⚠ seulement pos_embeds
         else:
             encoder_states = embeddings
 
@@ -650,6 +656,17 @@ def generate_latents_safe_debug_v4_old(unet, **kwargs):
         # ---------------- Clamp & Nan/Inf ----------------
         latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0).clamp(-5.0, 5.0)
 
+        # ---------------- Ajout init_image_scale ----------------
+        if init_image_scale > 0.0:
+            # Redimension original_latents vers latents actuels
+            resized_orig = F.interpolate(original_latents, size=latents.shape[-2:], mode='bilinear', align_corners=False)
+            latents = init_image_scale * resized_orig + (1.0 - init_image_scale) * latents
+
+        # ---------------- Ajout creative_noise ----------------
+        if creative_noise > 0.0:
+            noise = torch.randn_like(latents) * creative_noise
+            latents = latents + noise
+
         if debug:
             nan_count = torch.isnan(latents).sum().item()
             inf_count = torch.isinf(latents).sum().item()
@@ -661,7 +678,9 @@ def generate_latents_safe_debug_v4_old(unet, **kwargs):
     return latents
 
 
-# ---------------- LATENTS GENERATION SAFE DEBUG ----------------
+
+# ---------------- LATENTS GENERATION SAFE DEBUG (avec init_image_scale & creative_noise) ----------------
+
 def generate_latents_safe_debug_v4(unet, **kwargs):
     """
     Génération de latents avec UNet, FP16-safe et debug.
@@ -777,6 +796,7 @@ def generate_latents_mini_gpu_320(unet, **kwargs):
     - Utilise generate_latents_safe_debug_v4
     - Forçage latents aux bonnes dimensions
     - Adaptation embeddings automatique
+    - Ajout : init_image_scale & creative_noise
     """
     import torch
     import torch.nn.functional as F
@@ -792,6 +812,10 @@ def generate_latents_mini_gpu_320(unet, **kwargs):
     guidance_scale = kwargs.get("guidance_scale", 1.0)
     steps = kwargs.get("steps", 20)
     debug = kwargs.get("debug", True)
+
+    # Nouveaux params
+    init_image_scale = kwargs.get("init_image_scale", 0.0)
+    creative_noise = kwargs.get("creative_noise", 0.0)
 
     # ---------------- FORCER LATENTS ----------------
     expected_channels = getattr(unet.config, "in_channels", 4)
@@ -819,6 +843,8 @@ def generate_latents_mini_gpu_320(unet, **kwargs):
         input_latents = F.interpolate(input_latents, size=(target_size, target_size), mode='nearest')
 
     kwargs["input_latents"] = input_latents
+    kwargs["init_image_scale"] = init_image_scale
+    kwargs["creative_noise"] = creative_noise
 
     # ---------------- Embeddings ----------------
     embeddings = kwargs.get("embeddings", None)
@@ -837,11 +863,11 @@ def generate_latents_mini_gpu_320(unet, **kwargs):
         for t in range(T):
             frame_latents = input_latents[:, :, t, :, :]
             kwargs["input_latents"] = frame_latents
-            frame_latents = generate_latents_safe_debug_v4(unet, **kwargs)
+            frame_latents = generate_latents_safe_debug_v5(unet, **kwargs)
             input_latents[:, :, t, :, :] = frame_latents
         return input_latents
     else:
-        return generate_latents_safe_debug_v4(unet, **kwargs)
+        return generate_latents_safe_debug_v5(unet, **kwargs)
 
 
 
