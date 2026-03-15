@@ -54,6 +54,7 @@ def main(args):
     dtype = torch.float16
 
     use_mini_gpu = cfg.get("use_mini_gpu", True) # True for <2 Go VRAM - False for <4 Go VRAM
+    latent_injection = cfg.get("latent_injection", 0.2) # implication de l'image original dans le resultat final'
 
     fps = cfg.get("fps", 12)
     upscale_factor = cfg.get("upscale_factor", 1)
@@ -247,6 +248,9 @@ def main(args):
                             steps=steps,
                             debug=True
                         )
+                        # Injection contrôlée du latent d'entrée depuis le cfg
+                        if latent_injection > 0.0:
+                            latents = latent_injection * current_latent_single + (1 - latent_injection) * latents
                     else:
                         latents_input = latents_frame[:, :3, :, :]
                         latents = run_diffusion_pipeline(
