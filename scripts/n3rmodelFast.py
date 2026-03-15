@@ -83,10 +83,10 @@ def main(args):
     else:
         print("⚠ Aucun modèle LoRA n'est configuré, étape ignorée.")
     # ---------------- Motion module ----------------
-    #motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
-    motion_module = None
+    motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
+    #motion_module = None
     if motion_module is not None:
-        print(f"[DEBUG] motion_module type: {type(motion_module)}, latents shape before motion: {latents.shape}")
+        print(f"[DEBUG] motion_module type: {type(motion_module)}")
 
 
     # ---------------- Tokenizer / Text encoder ----------------
