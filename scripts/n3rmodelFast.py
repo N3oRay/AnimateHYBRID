@@ -53,7 +53,7 @@ def main(args):
     device = args.device if torch.cuda.is_available() else "cpu"
     dtype = torch.float16
 
-    use_mini_gpu = cfg.get("use_mini_gpu", False) # True for <2 Go VRAM - False for <4 Go VRAM
+    use_mini_gpu = cfg.get("use_mini_gpu", True) # True for <2 Go VRAM - False for <4 Go VRAM
 
     fps = cfg.get("fps", 12)
     upscale_factor = cfg.get("upscale_factor", 1)
