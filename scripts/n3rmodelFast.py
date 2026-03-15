@@ -53,7 +53,7 @@ def main(args):
     device = args.device if torch.cuda.is_available() else "cpu"
     dtype = torch.float16
 
-    use_mini_gpu = cfg.get("use_mini_gpu", True) # True for <2 Go VRAM - False for <4 Go VRAM
+    use_mini_gpu = cfg.get("use_mini_gpu", False) # True for <2 Go VRAM - False for <4 Go VRAM
 
     fps = cfg.get("fps", 12)
     upscale_factor = cfg.get("upscale_factor", 1)
@@ -207,6 +207,7 @@ def main(args):
                 pbar.update(1)
 
         # ---------------- Frames principales ----------------
+        # ---------------- Frames principales ----------------
         for pos_embeds, neg_embeds in embeddings:
             for f in range(num_fraps_per_image):
                 if stop_generation: break
@@ -217,7 +218,7 @@ def main(args):
                 else:
                     latents_frame = current_latent_single.clone()
 
-                    # ---------------- Redimensionnement latents ----------------
+                    # ---------------- Redimensionnement latents pour UNet ----------------
                     unet_sample_size = getattr(unet.config, "sample_size", cfg["H"])  # ex: 320 ou 512
                     target_H = target_W = unet_sample_size // 8
                     if latents_frame.shape[-2:] != (target_H, target_W):
@@ -228,15 +229,12 @@ def main(args):
                             align_corners=False
                         )
 
-                    # ---------------- Assurer 4 canaux ----------------
+                    # Assurer 4 canaux
                     latents_frame = ensure_4_channels(latents_frame)
 
+                    # ---------------- Génération latents ----------------
                     cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
-                    print("[DEBUG] embeddings shape:", pos_embeds.shape, "neg shape:", neg_embeds.shape)
-                    print("[DEBUG] motion_module dim:", getattr(motion_module, "cross_attention_dim", "Unknown"))
-
                     if use_mini_gpu:
-                        # 1,5–2 Go VRAM, safe pour GPU <3 Go.
                         latents = generate_latents_mini_gpu_320(
                             unet=unet,
                             scheduler=scheduler,
@@ -250,8 +248,6 @@ def main(args):
                             debug=True
                         )
                     else:
-                        # Full pipeline (~2.5–3 Go minimum)
-                        # run_diffusion_pipeline attend 3 canaux
                         latents_input = latents_frame[:, :3, :, :]
                         latents = run_diffusion_pipeline(
                             unet=unet,
@@ -263,24 +259,43 @@ def main(args):
                             device=device
                         )
 
+                    # ---------------- Motion Module ----------------
                     if motion_module:
                         latents, _ = apply_motion_safe(latents, motion_module)
 
+                    # ---------------- Interpolation vers latents finaux (VRAM-safe) ----------------
+                    final_latent_H = cfg["H"] // 8
+                    final_latent_W = cfg["W"] // 8
+                    if latents.shape[-2:] != (final_latent_H, final_latent_W):
+                        latents = torch.nn.functional.interpolate(
+                            latents,
+                            size=(final_latent_H, final_latent_W),
+                            mode='bilinear',
+                            align_corners=False
+                        )
+
+                    # ---------------- Décodage bloc par bloc ----------------
                     frame_pil = decode_latents_ultrasafe_blockwise(
                         latents, vae,
-                        block_size=block_size, overlap=overlap,
-                        gamma=1.0, brightness=1.0,
-                        contrast=1.5, saturation=1.3,
-                        device=device, frame_counter=frame_counter,
+                        block_size=block_size,
+                        overlap=overlap,
+                        gamma=1.0,
+                        brightness=1.0,
+                        contrast=1.5,
+                        saturation=1.3,
+                        device=device,
+                        frame_counter=frame_counter,
                         latent_scale_boost=5.71
                     )
 
                     del latents
                     torch.cuda.empty_cache()
 
+                # ---------------- Sauvegarde ----------------
                 frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                 frame_counter += 1
                 pbar.update(1)
+
 
         previous_latent_single = current_latent_single
 
