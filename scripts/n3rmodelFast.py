@@ -58,7 +58,7 @@ def main(args):
     # latent_injection = 0.0 -> pas d'influence de l'image originale
     # latent_injection = 1.0 -> on garde totalement le latent d'origine
     latent_injection = max(0.0, min(1.0, cfg.get("latent_injection", 0.7))) # implication de l'image original dans le resultat final'
-    final_latent_scale = cfg.get("final_latent_scale", 1/8) #1/2  de l'image,  1/4 de l'image, 0.125 pour 1/8, etc.
+    final_latent_scale = cfg.get("final_latent_scale", 1/4) #1/2  de l'image,  1/4 de l'image, 0.125 pour 1/8, etc.
 
 
     fps = cfg.get("fps", 12)
@@ -223,9 +223,9 @@ def main(args):
                 else:
                     latents_frame = current_latent_single.clone()
 
-                    # ---------------- Redimensionnement latents pour UNet ----------------
-                    unet_sample_size = getattr(unet.config, "sample_size", cfg["H"])  # ex: 320 ou 512
-                    target_H = target_W = unet_sample_size // 8
+                    # ---------------- Redimension latents selon final_latent_scale avant UNet ----------------
+                    target_H = int(latents_frame.shape[-2] * final_latent_scale)
+                    target_W = int(latents_frame.shape[-1] * final_latent_scale)
                     if latents_frame.shape[-2:] != (target_H, target_W):
                         latents_frame = torch.nn.functional.interpolate(
                             latents_frame,
