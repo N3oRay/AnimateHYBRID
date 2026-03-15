@@ -25,6 +25,16 @@ from scripts.utils.vae_utils import safe_load_unet
 LATENT_SCALE = 0.18215
 stop_generation = False
 
+
+# ---------------- DEBUG UTILS ----------------
+def log_debug(message, level="INFO", verbose=True):
+    """
+    Affiche le message si verbose=True.
+    level: "INFO", "DEBUG", "WARNING"
+    """
+    if verbose:
+        print(f"[{level}] {message}")
+
 # ---------------- Thread stop ----------------
 def wait_for_stop():
     global stop_generation
@@ -52,6 +62,7 @@ def main(args):
     dtype = torch.float16
 
     use_mini_gpu = cfg.get("use_mini_gpu", True) # True for <2 Go VRAM - False for <4 Go VRAM
+    verbose = cfg.get("verbose", False) # True or False
     # ---------------- Injection contrôlée du latent original ----------------
     # latent_injection = 0.0 -> pas d'influence de l'image originale
     # latent_injection = 1.0 -> on garde totalement le latent d'origine
@@ -81,7 +92,7 @@ def main(args):
     n3oray_models = cfg.get("n3oray_models")
     if n3oray_models:
         for model_name, lora_path in n3oray_models.items():
-            applied = apply_lora_smart(unet, lora_path, alpha=0.5, device=device, verbose=True)
+            applied = apply_lora_smart(unet, lora_path, alpha=0.5, device=device, verbose=verbose)
             if not applied:
                 print(f"⚠ LoRA '{model_name}' ignorée (incompatible UNet)")
     else:
@@ -90,7 +101,7 @@ def main(args):
     motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
     #motion_module = None
     if motion_module is not None:
-        print(f"[DEBUG] motion_module type: {type(motion_module)}")
+        log_debug(f"motion_module type: {type(motion_module)}", level="INFO", verbose=cfg.get("verbose", True))
 
 
     # ---------------- Tokenizer / Text encoder ----------------
@@ -140,7 +151,7 @@ def main(args):
     for i, (pos, neg) in enumerate(embeddings):
         print(f"Embedding {i}: pos {pos.shape}, neg {neg.shape}")
         if pos.shape[-1] != unet_cross_attention_dim:
-            print(f"⚠ Attention : pos_embedding dim {pos.shape[-1]} != UNet {unet_cross_attention_dim}")
+            log_debug(f"Attention : pos_embedding dim {pos.shape[-1]} != UNet {unet_cross_attention_dim}", level="WARNING", verbose=verbose)
         if neg.shape[-1] != unet_cross_attention_dim:
             print(f"⚠ Attention : neg_embedding dim {neg.shape[-1]} != UNet {unet_cross_attention_dim}")
 
@@ -175,7 +186,7 @@ def main(args):
         # Encoder l'image en latents
         current_latent_single = encode_images_to_latents_safe(input_image, vae, device=device, latent_scale=LATENT_SCALE)
 
-        print(f"[DEBUG] Latents shape after encoding: {current_latent_single.shape}")
+        log_debug(f"Latents shape after encoding: {current_latent_single.shape}", level="DEBUG", verbose=verbose)
 
 
         # ---------------- Ajuster la taille des latents pour UNet ----------------
@@ -191,7 +202,7 @@ def main(args):
         # Assurer 4 channels (sécurité)
         current_latent_single = ensure_4_channels(current_latent_single)
 
-        print(f"DEBUG latents shape after interpolation: {current_latent_single.shape}")
+        log_debug(f"DEBUG latents shape after interpolation: {current_latent_single.shape}", level="DEBUG", verbose=verbose)
 
         # ---------------- Transition frames ----------------
         if previous_latent_single is not None and transition_frames > 0:
@@ -261,7 +272,7 @@ def main(args):
                             device=device,
                             fp16=True,
                             steps=steps,
-                            debug=True
+                            debug=verbose
                         )
                         # Injection contrôlée du latent d'entrée depuis le cfg
                         if latent_injection > 0.0:
