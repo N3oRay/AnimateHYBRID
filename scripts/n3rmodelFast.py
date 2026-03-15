@@ -210,7 +210,19 @@ def main(args):
                 if stop_generation: break
                 alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
                 latent_interp = (1-alpha)*previous_latent_single + alpha*current_latent_single
-                if motion_module: latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
+                if motion_module:
+                    latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
+
+                # ⚡ Forcer la taille finale (VRAM-safe), exactement comme les autres latents
+                final_latent_H = int(cfg["H"] * final_latent_scale)
+                final_latent_W = int(cfg["W"] * final_latent_scale)
+                if latent_interp.shape[-2:] != (final_latent_H, final_latent_W):
+                    latent_interp = torch.nn.functional.interpolate(
+                        latent_interp,
+                        size=(final_latent_H, final_latent_W),
+                        mode='bilinear',
+                        align_corners=False
+                    )
                 frame_pil = decode_latents_ultrasafe_blockwise(latent_interp, vae,
                                                                block_size=block_size, overlap=overlap,
                                                                gamma=1.0, brightness=1.0,
