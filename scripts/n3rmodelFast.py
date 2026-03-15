@@ -213,7 +213,6 @@ def main(args):
                 pbar.update(1)
 
         # ---------------- Frames principales ----------------
-        # ---------------- Frames principales ----------------
         for pos_embeds, neg_embeds in embeddings:
             for f in range(num_fraps_per_image):
                 if stop_generation: break
