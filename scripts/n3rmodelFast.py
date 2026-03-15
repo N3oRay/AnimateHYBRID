@@ -217,6 +217,19 @@ def main(args):
                 if f == 0:
                     # Frame initiale = image d'entrée
                     frame_tensor = torch.clamp((input_image.squeeze(0)+1)/2, 0, 1)
+
+                    # Upscale proportionnel à final_latent_scale
+                    # On multiplie par final_latent_scale > 0 pour correspondre à la taille des latents
+                    # Si final_latent_scale <1 → on agrandit légèrement, si >1 → on réduit légèrement
+                    upscale_H = int(frame_tensor.shape[-2] * final_latent_scale * 8)  # 8 = facteur latent->image
+                    upscale_W = int(frame_tensor.shape[-1] * final_latent_scale * 8)
+                    frame_tensor = torch.nn.functional.interpolate(
+                        frame_tensor.unsqueeze(0),
+                        size=(upscale_H, upscale_W),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0)
+
                     frame_pil = to_pil_image(frame_tensor)
                 else:
                     latents_frame = current_latent_single.clone()
