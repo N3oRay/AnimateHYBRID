@@ -353,8 +353,8 @@ def main(args):
                     del latents
                     torch.cuda.empty_cache()
 
-                    #frame_pil = to_pil(frame_tensor)
-                    #frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=0.2)) # Ajout flou sur le bord pour lisser l'overlap'
+                    # Appliquer un flou léger sur toute l'image
+                    frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=0.2))
 
                 # ---------------- Sauvegarde ----------------
                 frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")

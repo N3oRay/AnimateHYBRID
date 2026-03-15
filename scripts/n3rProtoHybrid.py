@@ -8,6 +8,7 @@ import torch
 from tqdm import tqdm
 from torchvision.transforms.functional import to_pil_image
 from PIL import Image
+from PIL import ImageFilter
 import argparse
 
 from diffusers import PNDMScheduler
@@ -284,6 +285,8 @@ def main(args):
                                                                    contrast=1.5, saturation=1.3,
                                                                    device=device, frame_counter=frame_counter,
                                                                    latent_scale_boost=latent_scale_boost)
+                    # Appliquer un flou léger sur toute l'image
+                    frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=0.2))
                     del latents
                     torch.cuda.empty_cache()
 
