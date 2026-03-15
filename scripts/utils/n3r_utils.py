@@ -22,6 +22,23 @@ from torchvision.transforms import ToPILImage
 
 LATENT_SCALE = 0.18215  # échelle typique pour SD/AnimateDiff
 
+
+def adapt_embeddings_to_unet(pos_embeds, neg_embeds, target_dim):
+    """Adapte automatiquement les embeddings texte pour correspondre au cross_attention_dim du UNet."""
+    current_dim = pos_embeds.shape[-1]
+    if current_dim == target_dim:
+        return pos_embeds, neg_embeds
+    # Troncature
+    if current_dim > target_dim:
+        pos_embeds = pos_embeds[..., :target_dim]
+        neg_embeds = neg_embeds[..., :target_dim]
+    # Padding
+    elif current_dim < target_dim:
+        pad = target_dim - current_dim
+        pos_embeds = torch.nn.functional.pad(pos_embeds, (0, pad))
+        neg_embeds = torch.nn.functional.pad(neg_embeds, (0, pad))
+    return pos_embeds, neg_embeds
+
 # -----n3r_utils----------- Ultra-safe embeddings pour UNet ----------------
 # 🔹 Projection embeddings pour UNet
 # Singleton pour la projection UNet
@@ -344,8 +361,6 @@ def generate_latents_safe_debug_v3(unet, **kwargs):
 
 
 
-
-
 def generate_latents_safe_debug_v2(unet, **kwargs):
     """
     Génération de latents avec UNet, FP16-safe et debug.
@@ -448,12 +463,398 @@ def generate_latents_safe_debug_v2(unet, **kwargs):
 # ---------------- Wrapper ultra-safe ----------------
 # ici  plus d'erreur cross_attention_dim mais génération reste incorrect: ⚠ [UNet ERROR] step=3 - The size of tensor a (2048) must match the size of tensor b (4096) at non-singleton dimension 1
 
-def generate_latents_mini_gpu(unet, **kwargs):
+import torch
+import torch.nn.functional as F
+
+# ---------------- SAFE UNET FORWARD ----------------
+def safe_forward_unet(unet, latents, t, encoder_hidden_states=None, device="cuda", fp16=True, debug=False):
     """
-    Wrapper ultra-safe pour GPU <4 Go.
+    Forward UNet sécurisé pour mini GPU.
+    - Ajuste automatiquement H/W si nécessaire
+    - Retourne toujours les latents (sample)
+    """
+    # Vérifie H/W selon sample_size du UNet
+    target_H = getattr(unet.config, "sample_size", latents.shape[2]*8) // 8
+    target_W = getattr(unet.config, "sample_size", latents.shape[3]*8) // 8
+    if (latents.shape[2], latents.shape[3]) != (target_H, target_W):
+        latents = F.interpolate(latents, size=(target_H, target_W),
+                                mode="bilinear", align_corners=False)
+        if debug:
+            print(f"[DEBUG] Latents resized to {latents.shape[2:]}")
+
+    # Mettre en fp16 si demandé
+    if fp16:
+        latents = latents.half()
+
+    # Forward UNet
+    out = unet(latents, t, encoder_hidden_states=encoder_hidden_states)
+    if isinstance(out, dict):
+        sample = out.get("sample", None)
+        if sample is None:
+            raise ValueError("UNet output dict does not contain 'sample'")
+        return sample
+    elif isinstance(out, (tuple, list)):
+        return out[0]
+    else:
+        raise TypeError(f"Unexpected UNet output type: {type(out)}")
+
+
+def run_diffusion_pipeline(unet, vae, scheduler, images, embeddings,
+                           timesteps, guidance_scale=4.0, device="cuda",
+                           fp16=True, debug=True):
+    """
+    Pipeline complet avec guidance scale :
+    - Encode les images en latents
+    - Forward UNet étape par étape (safe)
+    - Applique le guidance scale correctement
+    """
+    # Encoder les images en latents
+    latents = encode_images_to_latents_safe(images, vae, device=device)
+    latents = latents.to(device=device, dtype=torch.float16 if fp16 else torch.float32)
+
+    # Récupère les embeddings pos/neg
+    pos_embeds, neg_embeds = embeddings
+    # Duplique latents pour concat pos+neg
+    latents_input = torch.cat([latents, latents], dim=0)
+    # Concat embeddings
+    encoder_hidden_states = torch.cat([pos_embeds.to(device), neg_embeds.to(device)], dim=0)
+
+    for step, timestep in enumerate(timesteps):
+        if debug:
+            print(f"\n[INFO] Step {step}/{len(timesteps)-1} - timestep={timestep}")
+
+        # 🔹 Forward UNet sécurisé
+        noise_pred_all = safe_forward_unet(
+            unet=unet,
+            latents=latents_input,
+            t=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            device=device
+        )
+
+        # 🔹 Appliquer guidance scale
+        batch = latents.shape[0]
+        # Formula: noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        noise_pred = noise_pred_all[batch:] * guidance_scale + noise_pred_all[:batch] * (1 - guidance_scale)
+
+        # 🔹 Mise à jour des latents via scheduler
+        latents = scheduler.step(noise_pred, timestep, latents).prev_sample
+
+        # 🔹 Debug min/max pour NaN/Inf
+        if debug:
+            print(f"[DEBUG] Latents min/max: {latents.min().item():.4f}/{latents.max().item():.4f}")
+            nan_count = torch.isnan(latents).sum().item()
+            inf_count = torch.isinf(latents).sum().item()
+            if nan_count or inf_count:
+                print(f"⚠️ [DEBUG Step {step}] Found NaN: {nan_count}, Inf: {inf_count}")
+
+    return latents
+
+
+
+# ---------------- LATENTS GENERATION SAFE DEBUG ----------------
+def generate_latents_safe_debug_v4_old(unet, **kwargs):
+    """
+    Génération de latents avec UNet, FP16-safe et debug.
+    Logs détaillés : shape, min/max, cross_attention_dim, NaN/Inf.
+    Compatible mini GPU.
+    """
+    # ---------------- Filtrage kwargs ----------------
+    known_kwargs = [
+        "scheduler", "input_latents", "embeddings", "motion_module",
+        "guidance_scale", "device", "fp16", "steps", "debug"
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in known_kwargs}
+
+    input_latents = filtered_kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' doit être fourni")
+
+    device = filtered_kwargs.get("device", "cuda")
+    fp16 = filtered_kwargs.get("fp16", True)
+    debug = filtered_kwargs.get("debug", True)
+    motion_module = filtered_kwargs.get("motion_module", None)
+    scheduler = filtered_kwargs.get("scheduler", None)
+    steps = filtered_kwargs.get("steps", 20)
+    embeddings = filtered_kwargs.get("embeddings", None)
+
+    latents = input_latents.clone().to(device=device, dtype=torch.float16 if fp16 else torch.float32)
+    is_video = latents.ndim == 5  # [B,C,F,H,W]
+    steps_list = getattr(scheduler, "timesteps", range(steps))
+
+    if debug:
+        print(f"[DEBUG] Initial latents shape: {latents.shape}")
+        print(f"[DEBUG] Initial latents min/max: {latents.min().item():.4f}/{latents.max().item():.4f}")
+        if motion_module:
+            print(f"[DEBUG] Motion module detected: {motion_module}")
+        if embeddings:
+            if isinstance(embeddings, tuple):
+                print(f"[DEBUG] Embeddings shapes - pos: {embeddings[0].shape}, neg: {embeddings[1].shape}")
+            else:
+                print(f"[DEBUG] Embeddings shape: {embeddings.shape}")
+
+    # ---------------- Désactive Dynamo ----------------
+    torch._dynamo.reset()
+    torch._dynamo.disable()
+
+    # ---------------- Boucle de steps ----------------
+    for step_idx, t in enumerate(steps_list):
+        if debug:
+            print(f"\n[DEBUG] Step {step_idx}/{len(steps_list)} - timestep {t}")
+
+        # ---------------- Motion Module ----------------
+        if motion_module is not None:
+            latents_before_motion = latents.clone()
+            latents = motion_module(latents)
+            latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+            if debug:
+                diff = (latents - latents_before_motion).abs().max()
+                print(f"[DEBUG] Motion module diff max abs: {diff:.4f}")
+
+        # ---------------- Préparer latents pour UNet ----------------
+        if is_video:
+            B, C, F, H, W = latents.shape
+            latents_unet = latents.reshape(B*F, C, H, W)
+        else:
+            latents_unet = latents
+
+        latents_unet = latents_unet.half() if fp16 else latents_unet.float()
+
+        # ---------------- Préparer embeddings ----------------
+        if isinstance(embeddings, tuple):
+            pos_embeds, neg_embeds = embeddings
+            expected_dim = getattr(unet.config, "cross_attention_dim", pos_embeds.shape[-1])
+            if pos_embeds.shape[-1] != expected_dim:
+                print(f"⚠️ Embeddings cross_attention_dim mismatch: {pos_embeds.shape[-1]} vs UNet {expected_dim}")
+            encoder_states = torch.cat([neg_embeds.to(device), pos_embeds.to(device)], dim=0)
+        else:
+            encoder_states = embeddings
+
+        if debug:
+            print(f"[DEBUG] Latents input to UNet shape: {latents_unet.shape}")
+            if embeddings: print(f"[DEBUG] Encoder states shape: {encoder_states.shape}")
+
+        # ---------------- UNet SAFE FORWARD ----------------
+        try:
+            latents_out = safe_forward_unet(unet, latents_unet, t, encoder_hidden_states=encoder_states, device=device)
+        except Exception as e:
+            print(f"⚠️ [UNet ERROR] step={step_idx} - {e}")
+            continue
+
+        # ---------------- Reshape si vidéo ----------------
+        if is_video:
+            latents = latents_out.reshape(B, F, C, H, W)
+        else:
+            latents = latents_out
+
+        # ---------------- Clamp & Nan/Inf ----------------
+        latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0).clamp(-5.0, 5.0)
+
+        if debug:
+            nan_count = torch.isnan(latents).sum().item()
+            inf_count = torch.isinf(latents).sum().item()
+            print(f"[DEBUG Step {step_idx}] latents min/max={latents.min().item():.4f}/{latents.max().item():.4f}, NaN={nan_count}, Inf={inf_count}")
+
+    if debug:
+        print(f"\n[INFO] Finished latents generation, final shape={latents.shape}, min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+
+    return latents
+
+
+# ---------------- LATENTS GENERATION SAFE DEBUG ----------------
+def generate_latents_safe_debug_v4(unet, **kwargs):
+    """
+    Génération de latents avec UNet, FP16-safe et debug.
+    Logs détaillés : shape, min/max, cross_attention_dim, NaN/Inf.
+    Compatible mini GPU.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    # ---------------- Filtrage kwargs ----------------
+    known_kwargs = [
+        "scheduler", "input_latents", "embeddings", "motion_module",
+        "guidance_scale", "device", "fp16", "steps", "debug"
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in known_kwargs}
+
+    input_latents = filtered_kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' doit être fourni")
+
+    device = filtered_kwargs.get("device", "cuda")
+    fp16 = filtered_kwargs.get("fp16", True)
+    debug = filtered_kwargs.get("debug", True)
+    motion_module = filtered_kwargs.get("motion_module", None)
+    scheduler = filtered_kwargs.get("scheduler", None)
+    steps = filtered_kwargs.get("steps", 20)
+    embeddings = filtered_kwargs.get("embeddings", None)
+
+    latents = input_latents.clone().to(device=device, dtype=torch.float16 if fp16 else torch.float32)
+    is_video = latents.ndim == 5  # [B,C,F,H,W]
+    steps_list = getattr(scheduler, "timesteps", range(steps))
+
+    if debug:
+        print(f"[DEBUG] Initial latents shape: {latents.shape}")
+        print(f"[DEBUG] Initial latents min/max: {latents.min().item():.4f}/{latents.max().item():.4f}")
+        if motion_module:
+            print(f"[DEBUG] Motion module detected: {motion_module}")
+        if embeddings:
+            if isinstance(embeddings, tuple):
+                print(f"[DEBUG] Embeddings shapes - pos: {embeddings[0].shape}, neg: {embeddings[1].shape}")
+            else:
+                print(f"[DEBUG] Embeddings shape: {embeddings.shape}")
+
+    # ---------------- Désactive Dynamo ----------------
+    torch._dynamo.reset()
+    torch._dynamo.disable()
+
+    # ---------------- Boucle de steps ----------------
+    for step_idx, t in enumerate(steps_list):
+        if debug:
+            print(f"\n[DEBUG] Step {step_idx}/{len(steps_list)} - timestep {t}")
+
+        # ---------------- Motion Module ----------------
+        if motion_module is not None:
+            latents_before_motion = latents.clone()
+            latents = motion_module(latents)
+            latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+            if debug:
+                diff = (latents - latents_before_motion).abs().max()
+                print(f"[DEBUG] Motion module diff max abs: {diff:.4f}")
+
+        # ---------------- Préparer latents pour UNet ----------------
+        if is_video:
+            B, C, F, H, W = latents.shape
+            latents_unet = latents.reshape(B*F, C, H, W)
+        else:
+            latents_unet = latents
+
+        latents_unet = latents_unet.half() if fp16 else latents_unet.float()
+
+        # ---------------- Préparer embeddings ----------------
+        if isinstance(embeddings, tuple):
+            pos_embeds, neg_embeds = embeddings
+            encoder_states = pos_embeds.to(device)  # ⚠ seulement pos_embeds
+        else:
+            encoder_states = embeddings
+
+        if debug:
+            print(f"[DEBUG] Latents input to UNet shape: {latents_unet.shape}")
+            if embeddings: print(f"[DEBUG] Encoder states shape: {encoder_states.shape}")
+
+        # ---------------- UNet SAFE FORWARD ----------------
+        try:
+            latents_out = safe_forward_unet(unet, latents_unet, t, encoder_hidden_states=encoder_states, device=device)
+        except Exception as e:
+            print(f"⚠️ [UNet ERROR] step={step_idx} - {e}")
+            continue
+
+        # ---------------- Reshape si vidéo ----------------
+        if is_video:
+            latents = latents_out.reshape(B, F, C, H, W)
+        else:
+            latents = latents_out
+
+        # ---------------- Clamp & Nan/Inf ----------------
+        latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0).clamp(-5.0, 5.0)
+
+        if debug:
+            nan_count = torch.isnan(latents).sum().item()
+            inf_count = torch.isinf(latents).sum().item()
+            print(f"[DEBUG Step {step_idx}] latents min/max={latents.min().item():.4f}/{latents.max().item():.4f}, NaN={nan_count}, Inf={inf_count}")
+
+    if debug:
+        print(f"\n[INFO] Finished latents generation, final shape={latents.shape}, min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+
+    return latents
+
+
+# ---------------- MINI GPU SAFE 320 ----------------
+def generate_latents_mini_gpu_320(unet, **kwargs):
+    """
+    Wrapper ultra-safe pour GPU <4 Go et UNet miniSD 320-640-1280-1280.
+    - Utilise generate_latents_safe_debug_v4
+    - Forçage latents aux bonnes dimensions
+    - Adaptation embeddings automatique
+    """
+    import torch
+    import torch.nn.functional as F
+
+    input_latents = kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' must be fourni")
+
+    device = kwargs.get("device", "cuda")
+    fp16 = kwargs.get("fp16", True)
+    motion_module = kwargs.get("motion_module", None)
+    scheduler = kwargs.get("scheduler", None)
+    guidance_scale = kwargs.get("guidance_scale", 1.0)
+    steps = kwargs.get("steps", 20)
+    debug = kwargs.get("debug", True)
+
+    # ---------------- FORCER LATENTS ----------------
+    expected_channels = getattr(unet.config, "in_channels", 4)
+    if input_latents.shape[1] != expected_channels:
+        pad = expected_channels - input_latents.shape[1]
+        if pad > 0:
+            input_latents = F.pad(input_latents, (0,0,0,0,0,0,0,pad))
+        else:
+            input_latents = input_latents[:, :expected_channels]
+
+    # Adapter H/W si nécessaire
+    if input_latents.ndim == 4:  # B,C,H,W
+        H, W = input_latents.shape[2:]
+    elif input_latents.ndim == 5:  # B,C,T,H,W
+        T = input_latents.shape[2]
+        if T == 1:
+            input_latents = input_latents.squeeze(2)
+        H, W = input_latents.shape[2:]
+    else:
+        raise ValueError(f"[LATENT FIX] Shape inattendue: {input_latents.shape}")
+
+    # Mini GPU → forcer petite taille latents compatible UNet
+    target_size = min(getattr(unet.config, "sample_size", 320), 32)
+    if (H != target_size) or (W != target_size):
+        input_latents = F.interpolate(input_latents, size=(target_size, target_size), mode='nearest')
+
+    kwargs["input_latents"] = input_latents
+
+    # ---------------- Embeddings ----------------
+    embeddings = kwargs.get("embeddings", None)
+    if isinstance(embeddings, tuple) and len(embeddings) == 2:
+        pos_embeds, neg_embeds = embeddings
+        target_dim = getattr(unet.config, "cross_attention_dim", pos_embeds.shape[-1])
+        pos_embeds, neg_embeds = adapt_embeddings_to_unet(pos_embeds, neg_embeds, target_dim)
+        embeddings = (pos_embeds.to(device), neg_embeds.to(device))
+    elif embeddings is not None:
+        embeddings = embeddings.to(device)
+    kwargs["embeddings"] = embeddings
+
+    # ---------------- Génération safe ----------------
+    if motion_module is not None and input_latents.ndim == 5:  # B,C,T,H,W
+        B,C,T,H,W = input_latents.shape
+        for t in range(T):
+            frame_latents = input_latents[:, :, t, :, :]
+            kwargs["input_latents"] = frame_latents
+            frame_latents = generate_latents_safe_debug_v4(unet, **kwargs)
+            input_latents[:, :, t, :, :] = frame_latents
+        return input_latents
+    else:
+        return generate_latents_safe_debug_v4(unet, **kwargs)
+
+
+
+
+
+def generate_latents_mini_gpu_320_v1(unet, **kwargs):
+    """
+    Wrapper ultra-safe pour GPU <4 Go et UNet miniSD 320-640-1280-1280.
     - Pas de duplication batch pour CF guidance
     - Motion module appliqué frame par frame
-    - Forçage latents aux bonnes dimensions
+    - Forçage latents aux bonnes dimensions (miniGPU safe)
+    - Adaptation automatique des embeddings au cross_attention_dim du UNet
+    - Logs détaillés pour débogage
     - Gère CUDA OOM
     """
     input_latents = kwargs.get("input_latents")
@@ -464,7 +865,222 @@ def generate_latents_mini_gpu(unet, **kwargs):
     fp16 = kwargs.get("fp16", True)
     motion_module = kwargs.get("motion_module", None)
     scheduler = kwargs.get("scheduler", None)
-    guidance_scale = kwargs.get("guidance_scale", 1.0)  # mini GPU → 1.0
+    guidance_scale = kwargs.get("guidance_scale", 1.0)
+    steps = kwargs.get("steps", 20)
+    debug = kwargs.get("debug", True)
+
+    if debug: print(f"🔹 [DEBUG] input_latents.shape: {input_latents.shape}")
+
+    # ---------------- FORCER LATENTS ----------------
+    expected_channels = getattr(unet.config, "in_channels", 4)
+    if input_latents.shape[1] != expected_channels:
+        pad = expected_channels - input_latents.shape[1]
+        if pad > 0:
+            if debug: print(f"🔹 [DEBUG] Padding latents: +{pad} channels")
+            input_latents = F.pad(input_latents, (0,0,0,0,0,0,0,pad))
+        else:
+            if debug: print(f"🔹 [DEBUG] Troncature latents: {input_latents.shape[1]} -> {expected_channels}")
+            input_latents = input_latents[:, :expected_channels]
+
+    # Adapter H/W si nécessaire
+    if input_latents.ndim == 4:  # B,C,H,W
+        H, W = input_latents.shape[2:]
+    elif input_latents.ndim == 5:  # B,C,T,H,W
+        T = input_latents.shape[2]
+        if T == 1:
+            input_latents = input_latents.squeeze(2)
+        H, W = input_latents.shape[2:]
+    else:
+        raise ValueError(f"[LATENT FIX] Shape inattendue: {input_latents.shape}")
+
+    if debug: print(f"🔹 [DEBUG] Latents H/W: {H}x{W}, channels: {input_latents.shape[1]}")
+
+    # Mini GPU → forcer petite taille latents compatible UNet
+    target_size = getattr(unet.config, "sample_size", 32)  # SD2-1.5 → 64
+    if (H != target_size) or (W != target_size):
+        if debug: print(f"🔹 [DEBUG] Interpolation latents {H}x{W} -> {target_size}x{target_size}")
+        input_latents = F.interpolate(input_latents, size=(target_size, target_size), mode='nearest')
+
+    kwargs["input_latents"] = input_latents
+
+    # ---------------- Embeddings ----------------
+    embeddings = kwargs.get("embeddings", None)
+    if isinstance(embeddings, tuple) and len(embeddings) == 2:
+        pos_embeds, neg_embeds = embeddings
+        # Lecture du cross_attention_dim attendu par le UNet
+        target_dim = getattr(unet.config, "cross_attention_dim", pos_embeds.shape[-1])
+        if pos_embeds.shape[-1] != target_dim:
+            if debug: print(f"🔄 Projection embeddings {pos_embeds.shape[-1]} -> {target_dim}")
+            projection = torch.nn.Linear(pos_embeds.shape[-1], target_dim).to(pos_embeds.device).to(pos_embeds.dtype)
+            pos_embeds = projection(pos_embeds)
+            neg_embeds = projection(neg_embeds)
+        if debug:
+            print(f"🔹 [DEBUG] pos_embeds.shape: {pos_embeds.shape}, neg_embeds.shape: {neg_embeds.shape}")
+        embeddings = (pos_embeds.to(device), neg_embeds.to(device))
+    elif embeddings is not None:
+        embeddings = embeddings.to(device)
+    kwargs["embeddings"] = embeddings
+
+    # ---------------- Filtrage arguments ----------------
+    allowed_keys = [
+        "input_latents",
+        "scheduler",
+        "embeddings",
+        "motion_module",
+        "guidance_scale",
+        "device",
+        "fp16",
+        "steps",
+        "debug",
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in allowed_keys}
+
+    # ---------------- Génération safe ----------------
+    try:
+        if motion_module is not None:
+            latents = filtered_kwargs["input_latents"]
+            if latents.ndim == 5:  # B,C,T,H,W
+                B, C, T, H, W = latents.shape
+                if debug: print(f"🔹 [DEBUG] Motion module présent, latents shape: {latents.shape}")
+                for t in range(T):
+                    frame_latents = latents[:, :, t, :, :]
+                    filtered_kwargs["input_latents"] = frame_latents
+                    frame_latents = generate_latents_safe_debug_v4(unet, **filtered_kwargs)
+                    latents[:, :, t, :, :] = frame_latents
+                return latents
+            else:
+                if debug: print("🔹 [DEBUG] Motion module absent ou latents 4D")
+                return generate_latents_safe_debug_v4(unet, **filtered_kwargs)
+        else:
+            if debug: print("🔹 [DEBUG] Motion module absent, génération standard")
+            return generate_latents_safe_debug_v4(unet, **filtered_kwargs)
+
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            print("⚠️ [MINI GPU] CUDA OOM, retour des latents initiaux")
+            return input_latents.clone()
+        else:
+            raise e
+
+
+
+
+
+def generate_latents_mini_gpu_4go(unet, **kwargs):
+    """
+    Wrapper ultra-safe pour GPU <4 Go et UNet miniSD 320-640-1280-1280.
+    - Pas de duplication batch pour CF guidance
+    - Motion module appliqué frame par frame
+    - Forçage latents aux bonnes dimensions (miniGPU safe)
+    - Gère CUDA OOM
+    """
+    input_latents = kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' must be fourni")
+
+    device = kwargs.get("device", "cuda")
+    fp16 = kwargs.get("fp16", True)
+    motion_module = kwargs.get("motion_module", None)
+    scheduler = kwargs.get("scheduler", None)
+    guidance_scale = kwargs.get("guidance_scale", 1.0)
+    steps = kwargs.get("steps", 20)
+    debug = kwargs.get("debug", True)
+
+    # ---------------- FORCER LATENTS ----------------
+    expected_channels = getattr(unet.config, "in_channels", 4)
+    if input_latents.shape[1] != expected_channels:
+        pad = expected_channels - input_latents.shape[1]
+        if pad > 0:
+            input_latents = F.pad(input_latents, (0,0,0,0,0,0,0,pad))
+        else:
+            input_latents = input_latents[:, :expected_channels]
+
+    # Adapter H/W si nécessaire
+    if input_latents.ndim == 4:  # B,C,H,W
+        H, W = input_latents.shape[2:]
+    elif input_latents.ndim == 5:  # B,C,T,H,W
+        T = input_latents.shape[2]
+        if T == 1:
+            input_latents = input_latents.squeeze(2)
+        H, W = input_latents.shape[2:]
+    else:
+        raise ValueError(f"[LATENT FIX] Shape inattendue: {input_latents.shape}")
+
+    # Mini GPU → forcer petite taille latents compatible UNet 320-640-1280-1280
+    target_size = min(unet.sample_size, 32)
+    if (H != target_size) or (W != target_size):
+        input_latents = F.interpolate(
+            input_latents,
+            size=(target_size, target_size),
+            mode='nearest'
+        )
+
+    kwargs["input_latents"] = input_latents
+
+    # ---------------- Embeddings ----------------
+    embeddings = kwargs.get("embeddings", None)
+    if isinstance(embeddings, tuple) and len(embeddings) == 2:
+        pos_embeds, neg_embeds = embeddings
+        embeddings = (pos_embeds.to(device), neg_embeds.to(device))
+    elif embeddings is not None:
+        embeddings = embeddings.to(device)
+    kwargs["embeddings"] = embeddings
+
+    # ---------------- Filtrage arguments ----------------
+    allowed_keys = [
+        "input_latents",
+        "scheduler",
+        "embeddings",
+        "motion_module",
+        "guidance_scale",
+        "device",
+        "fp16",
+        "steps",
+        "debug",
+    ]
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in allowed_keys}
+
+    # ---------------- Génération safe ----------------
+    try:
+        if motion_module is not None:
+            latents = filtered_kwargs["input_latents"]
+            if latents.ndim == 5:  # B,C,T,H,W
+                B, C, T, H, W = latents.shape
+                for t in range(T):
+                    frame_latents = latents[:, :, t, :, :]
+                    filtered_kwargs["input_latents"] = frame_latents
+                    frame_latents = generate_latents_safe_debug_v2(unet, **filtered_kwargs)
+                    latents[:, :, t, :, :] = frame_latents
+                return latents
+            else:
+                return generate_latents_safe_debug_v2(unet, **filtered_kwargs)
+        else:
+            return generate_latents_safe_debug_v2(unet, **filtered_kwargs)
+
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            print("⚠️ [MINI GPU] CUDA OOM, retour des latents initiaux")
+            return input_latents.clone()
+        else:
+            raise e
+
+
+def generate_latents_mini_gpu(unet, **kwargs):
+    """
+    Wrapper ultra-safe pour GPU <4 Go.
+    - Forçage des latents aux dimensions attendues par le UNet
+    - Adaptation embeddings pour cross_attention_dim
+    - Gère CUDA OOM
+    """
+    input_latents = kwargs.get("input_latents")
+    if input_latents is None:
+        raise ValueError("⚠️ 'input_latents' must be fourni")
+
+    device = kwargs.get("device", "cuda")
+    fp16 = kwargs.get("fp16", True)
+    motion_module = kwargs.get("motion_module", None)  # peut être None
+    scheduler = kwargs.get("scheduler", None)
+    guidance_scale = kwargs.get("guidance_scale", 1.0)
     steps = kwargs.get("steps", 20)
     debug = kwargs.get("debug", True)
 
@@ -489,7 +1105,7 @@ def generate_latents_mini_gpu(unet, **kwargs):
         raise ValueError(f"[LATENT FIX] Shape inattendue: {input_latents.shape}")
 
     # Mini GPU → forcer petite taille latents
-    target_size = min(unet.sample_size, 32)
+    target_size = min(getattr(unet, "sample_size", 32), 32)
     if (H != target_size) or (W != target_size):
         input_latents = F.interpolate(
             input_latents,
@@ -501,9 +1117,18 @@ def generate_latents_mini_gpu(unet, **kwargs):
 
     # ---------------- Embeddings ----------------
     embeddings = kwargs.get("embeddings", None)
+    cross_dim = getattr(unet.config, "cross_attention_dim", 768)
     if isinstance(embeddings, tuple) and len(embeddings) == 2:
-        # Pas de concat pour mini GPU
         pos_embeds, neg_embeds = embeddings
+        # Pad / truncate embeddings pour correspondre au UNet
+        if pos_embeds.shape[-1] != cross_dim:
+            diff = cross_dim - pos_embeds.shape[-1]
+            if diff > 0:
+                pos_embeds = F.pad(pos_embeds, (0,diff))
+                neg_embeds = F.pad(neg_embeds, (0,diff))
+            else:
+                pos_embeds = pos_embeds[..., :cross_dim]
+                neg_embeds = neg_embeds[..., :cross_dim]
         embeddings = (pos_embeds.to(device), neg_embeds.to(device))
     elif embeddings is not None:
         embeddings = embeddings.to(device)
@@ -525,21 +1150,8 @@ def generate_latents_mini_gpu(unet, **kwargs):
 
     # ---------------- Génération safe ----------------
     try:
-        # Si motion_module existe, on applique frame par frame
-        if motion_module is not None:
-            latents = filtered_kwargs["input_latents"]
-            if latents.ndim == 5:  # B,C,T,H,W
-                B, C, T, H, W = latents.shape
-                for t in range(T):
-                    frame_latents = latents[:, :, t, :, :]
-                    filtered_kwargs["input_latents"] = frame_latents
-                    frame_latents = generate_latents_safe_debug_v2(unet, **filtered_kwargs)
-                    latents[:, :, t, :, :] = frame_latents
-                return latents
-            else:
-                return generate_latents_safe_debug_v2(unet, **filtered_kwargs)
-        else:
-            return generate_latents_safe_debug_v2(unet, **filtered_kwargs)
+        # Motion module désactivé pour miniSD / VRAM ultra-light
+        return generate_latents_safe_debug_v2(unet, **filtered_kwargs)
 
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
@@ -547,6 +1159,7 @@ def generate_latents_mini_gpu(unet, **kwargs):
             return input_latents.clone()
         else:
             raise e
+
 
 def generate_latents_safe_miniGPU(unet, **kwargs):
     """

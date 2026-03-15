@@ -4,12 +4,36 @@
 import os, math, threading
 from pathlib import Path
 from PIL import Image, ImageEnhance
-from torchvision.transforms import functional as F
+
 import torch
 import numpy as np
 import subprocess
-
+from torchvision.transforms import functional as F
+import torch.nn.functional as Fu
+import torch.nn.functional as TF
+import torch.nn.functional as FF
 LATENT_SCALE = 0.18215
+
+
+
+
+def encode_images_to_latents_safe(images, vae, device="cuda", latent_scale=0.18215):
+    """
+    Encode une image en latents VAE en gardant la stabilité et le contraste.
+    """
+    images = images.to(device=device, dtype=torch.float32)
+    vae = vae.to(device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        latents = vae.encode(images).latent_dist.mean  # moyenne pour stabilité
+
+    latents = latents * latent_scale
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+    if latents.ndim == 4 and latents.shape[1] == 1:
+        latents = latents.repeat(1, 4, 1, 1)
+
+    return latents
 
 
 def save_frames_as_video_from_folder(
@@ -62,7 +86,7 @@ def save_frames_as_video_from_folder(
     tmp_dir.rmdir()
 
 
-def encode_images_to_latents_nuanced(images, vae, device="cuda", latent_scale=LATENT_SCALE):
+def encode_images_to_latents_nuanced_v1(images, vae, device="cuda", latent_scale=LATENT_SCALE):
     """
     Encode une image en latents VAE tout en préservant le contraste et les nuances de couleur.
     - Utilise la moyenne de la distribution latente
@@ -87,6 +111,86 @@ def encode_images_to_latents_nuanced(images, vae, device="cuda", latent_scale=LA
         latents = latents.repeat(1, 4, 1, 1)
 
     return latents
+
+
+
+
+def encode_images_to_latents_nuanced(images, vae, unet, device="cuda", latent_scale=LATENT_SCALE):
+    """
+    Encode une image en latents VAE, en préservant nuances et contraste,
+    et redimensionne dynamiquement pour correspondre à la taille attendue par le UNet.
+    """
+    images = images.to(device=device, dtype=torch.float32)
+    vae = vae.to(device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        # Encoder l'image → latents
+        latents = vae.encode(images).latent_dist.mean  # moyenne pour stabilité
+
+    # Appliquer le scaling
+    latents = latents * latent_scale
+
+    # Sécurité NaN / Inf
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+    # Forcer 4 canaux si nécessaire
+    if latents.ndim == 4 and latents.shape[1] == 1:
+        latents = latents.repeat(1, 4, 1, 1)
+
+    # 🔹 Redimensionner dynamiquement pour correspondre au UNet
+    # On regarde la taille attendue à partir de l'UNet (ou ses skip connections)
+    # Supposons que le UNet a un module `config` avec "sample_size" ou attention_resolutions
+    try:
+        # Si UNet a `sample_size` ou autre attribut
+        target_H = getattr(unet.config, "sample_size", latents.shape[2])
+        target_W = getattr(unet.config, "sample_size", latents.shape[3])
+    except AttributeError:
+        # fallback : garder la taille actuelle
+        target_H, target_W = latents.shape[2], latents.shape[3]
+
+    # Interpolation bilinéaire pour adapter la taille
+    if (latents.shape[2], latents.shape[3]) != (target_H, target_W):
+        latents = TF.interpolate(latents, size=(target_H, target_W), mode="bilinear", align_corners=False)
+        print(f"[DEBUG] Latents resized to ({target_H}, {target_W})")
+
+    return latents
+
+# ------------------- ENCODE -------------------
+
+def encode_images_to_latents_target(images, vae, device="cuda", latent_scale=LATENT_SCALE, target_size=64):
+    """
+    Encode une image en latents VAE, compatible MiniSD/AnimateDiff ultra-light (~2Go VRAM)
+    - garde la dynamique et contraste
+    - clamp minimal pour sécurité
+    - force 4 canaux
+    - resize latents à target_size (MiniSD)
+    """
+    images = images.to(device=device, dtype=torch.float32)
+    vae = vae.to(device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        latents = vae.encode(images).latent_dist.mean  # moyenne pour plus de stabilité
+
+    # Appliquer le scaling
+    latents = latents * latent_scale
+
+    # Sécurité NaN / Inf
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
+
+    # Forcer 4 canaux si nécessaire
+    if latents.ndim == 4 and latents.shape[1] == 1:
+        latents = latents.repeat(1, 4, 1, 1)
+
+    # Redimensionner à target_size x target_size
+    if latents.shape[2] != target_size or latents.shape[3] != target_size:
+        latents = torch.nn.functional.interpolate(
+            latents, size=(target_size, target_size), mode="bilinear", align_corners=False
+        )
+
+    return latents
+
+
+
 # ------------------- DECODE -------------------
 
 
