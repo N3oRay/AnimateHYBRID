@@ -1,5 +1,5 @@
 # --------------------------------------------------------------
-# n3rmodelSD_final.py - AnimateDiff ultra-light ~2Go VRAM
+# n3rmodelFast.py - AnimateDiff ultra-light ~2Go VRAM
 # --------------------------------------------------------------
 import os, math, threading
 from pathlib import Path
@@ -43,8 +43,6 @@ def apply_motion_safe(latents, motion_module, threshold=1e-2):
     if latents.abs().max() < threshold:
         return latents, False
     return motion_module(latents), True
-
-
 
 # ---------------- MAIN ----------------
 def main(args):
