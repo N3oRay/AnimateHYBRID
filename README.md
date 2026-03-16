@@ -45,6 +45,14 @@ decode_latents_ultrasafe_blockwise → stable decoding with high-quality output.
 
 And yes… N3R did it for you! 🚀
 
+python -m scripts.n3rProtoBoost \
+                      --pretrained-model-path "/huggingface/miniSD" \
+                      --config "configs/prompts/2_animate/1080.yaml" \
+                      --device "cuda" \
+                      --vae-offload \
+                      --fp16
+
+
 
 # AnimateDiff
 
