@@ -1,3 +1,51 @@
+# AnimateHYBRID
+
+Mini-Guide: AnimateDiff <4 GB VRAM with N3R
+1️⃣ Pick the Right Model
+
+N3RModelOptimized → ~3.6 GB VRAM, full features, stable.
+
+Mini GPU Mode + generate_latents_mini_gpu_320 → ~2.1 GB VRAM, ultra-light for quick tests.
+
+2️⃣ VRAM-Friendly Settings
+
+final_latent_scale → reduces the final latent resolution to save memory.
+
+num_fraps_per_image → limit the number of frames per input image.
+
+block_size & overlap → tweak for streaming decoding efficiency.
+
+3️⃣ Adaptive N3R Fusion
+
+Channel-wise normalization to prevent artifacts.
+
+Strict clamping of latents: torch.clamp(latents, -1.0, 1.0).
+
+Controlled latent injection:
+
+fused_latents = latent_injection * latents_frame + (1 - latent_injection) * n3r_latents
+4️⃣ Motion / LoRA / VAE
+
+Motion modules and LoRA can be enabled, but watch VRAM usage → use attention slicing if needed.
+
+Light VAE + blockwise decoding ensures GPU stability.
+
+5️⃣ Pro Tips
+
+Free VRAM after each frame:
+
+del latents
+torch.cuda.empty_cache()
+
+Adaptive embeddings for UNet → avoids dimension mismatch errors.
+
+decode_latents_ultrasafe_blockwise → stable decoding with high-quality output.
+
+💡 Bottom Line: With these settings, AnimateDiff can run even on GPUs with 3–4 GB VRAM without sacrificing output quality.
+
+And yes… N3R did it for you! 🚀
+
+
 # AnimateDiff
 
 This repository is the official implementation of [AnimateDiff](https://arxiv.org/abs/2307.04725) [ICLR2024 Spotlight].
