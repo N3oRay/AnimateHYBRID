@@ -120,7 +120,7 @@ def main(args):
     use_mini_gpu = cfg.get("use_mini_gpu", True)
     verbose = cfg.get("verbose", False)
     latent_injection = max(0.0, min(1.0, cfg.get("latent_injection", 0.7)))
-    final_latent_scale = cfg.get("final_latent_scale", 1/8)
+    final_latent_scale = cfg.get("final_latent_scale", 1/8) # 1/8 speed, 1/4 moyen, 1/2 low
     fps = cfg.get("fps", 12)
     upscale_factor = cfg.get("upscale_factor", 1)
     transition_frames = cfg.get("transition_frames", 4)
@@ -140,6 +140,7 @@ def main(args):
     print(f"  init_image_scale     : {init_image_scale}")
     print(f"  creative_noise       : {creative_noise}")
     print(f"  latent_scale_boost   : {latent_scale_boost}")
+    print(f"  final_latent_scale   : {final_latent_scale}")
 
     scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012,
                               beta_schedule="scaled_linear", num_train_timesteps=1000)
@@ -403,7 +404,7 @@ def main(args):
                             frame_counter=frame_counter,
                             latent_scale_boost=latent_scale_boost
                         )
-                        frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
+                        frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
                         frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                         frame_counter += 1
                         pbar.update(1)
