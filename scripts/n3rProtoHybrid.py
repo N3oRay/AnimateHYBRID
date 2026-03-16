@@ -1,6 +1,9 @@
 # --------------------------------------------------------------
 # n3rmodelSD_final.py - AnimateDiff ultra-light ~2Go VRAM
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
+#Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅
+
+#Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM, un peu plus gourmand mais toujours raisonnable ✅
 # --------------------------------------------------------------
 import os, math, threading
 from pathlib import Path
@@ -227,7 +230,7 @@ def main(args):
     output_dir = Path(f"./outputs/ProtoHybrid_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
-    block_size = cfg.get("block_size", 64)
+    block_size = cfg.get("block_size", 160)
     overlap = compute_overlap(cfg["W"], cfg["H"], block_size)
 
     previous_latent_single = None
