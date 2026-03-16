@@ -31,36 +31,32 @@ stop_generation = False
 
 # ---------------- Fusion N3R/VAE adaptative ----------------
 
-def fuse_n3r_latents_adaptive(latents_frame, n3r_latents, latent_injection=0.7, clamp_val=1.0):
-    """
-    Fusion adaptative des latents N3R avec l'image actuelle, frame par frame.
-    Ajuste automatiquement l'injection selon les stats du N3R et du frame VAE.
-    """
+def fuse_n3r_latents_adaptive(latents_frame, n3r_latents, latent_injection=0.7, clamp_val=1.0, creative_noise=0.0):
     n3r_latents = n3r_latents.clone()
 
-    # Stats N3R
-    n3r_mean = n3r_latents.mean()
-    n3r_std  = n3r_latents.std()
+    # Normalisation **canal par canal**
+    for c in range(4):
+        n3r_c = n3r_latents[:,c:c+1,:,:]
+        frame_c = latents_frame[:,c:c+1,:,:]
+        mean, std = n3r_c.mean(), n3r_c.std()
+        n3r_c = (n3r_c - mean) / (std + 1e-6)  # centre / std
+        n3r_c = n3r_c * frame_c.std() + frame_c.mean()
+        n3r_latents[:,c:c+1,:,:] = n3r_c
 
-    # Ajustement automatique de l'injection
-    if n3r_mean.abs() > 0.2 or n3r_std > 1.5:
-        latent_injection_adj = max(latent_injection - 0.3, 0.1)
-    else:
-        latent_injection_adj = latent_injection
+    # Ajouter un bruit créatif léger si nécessaire
+    if creative_noise > 0.0:
+        noise = torch.randn_like(n3r_latents) * creative_noise
+        n3r_latents += noise
 
-    # Normalisation N3R sur l'image
-    n3r_latents = (n3r_latents - n3r_mean) / (n3r_std + 1e-6)
-    n3r_latents = n3r_latents * latents_frame.std() + latents_frame.mean()
-
-    # Clamp pour éviter débordements
-    n3r_latents = torch.clamp(n3r_latents, latents_frame.min(), latents_frame.max())
+    # Clamp stricte pour éviter débordement
+    n3r_latents = torch.clamp(n3r_latents, -clamp_val, clamp_val)
+    latents_frame = torch.clamp(latents_frame, -clamp_val, clamp_val)
 
     # Fusion finale
-    fused_latents = latent_injection_adj * latents_frame + (1 - latent_injection_adj) * n3r_latents
+    fused_latents = latent_injection * latents_frame + (1 - latent_injection) * n3r_latents
+    fused_latents = torch.clamp(fused_latents, -clamp_val, clamp_val)
 
-    # Debug
-    print(f"[N3R fusion frame] mean/std: {fused_latents.mean():.4f}/{fused_latents.std():.4f}, injection={latent_injection_adj:.2f}")
-
+    print(f"[N3R fusion frame] mean/std par canal: {fused_latents.mean(dim=(2,3))}, injection={latent_injection:.2f}")
     return fused_latents
 
 
@@ -111,6 +107,7 @@ def adapt_embeddings_to_unet(pos_embeds, neg_embeds, target_dim):
     return pos_embeds, neg_embeds
 
 # ---------------- MAIN ----------------
+# ---------------- MAIN FIABLE ----------------
 def main(args):
     global stop_generation
     cfg = load_config(args.config)
@@ -141,7 +138,8 @@ def main(args):
     print(f"  creative_noise       : {creative_noise}")
     print(f"  latent_scale_boost   : {latent_scale_boost}")
 
-    scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
+    scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012,
+                              beta_schedule="scaled_linear", num_train_timesteps=1000)
     scheduler.set_timesteps(steps, device=device)
 
     # ---------------- UNET ----------------
@@ -156,15 +154,14 @@ def main(args):
     if n3oray_models:
         for model_name, lora_path in n3oray_models.items():
             applied = apply_lora_smart(unet, lora_path, alpha=0.5, device=device, verbose=verbose)
-            if not applied:
-                print(f"⚠ LoRA '{model_name}' ignorée (incompatible UNet)")
+            if not applied: print(f"⚠ LoRA '{model_name}' ignorée (incompatible UNet)")
     else:
-        print("⚠ Aucun modèle LoRA n'est configuré, étape ignorée.")
+        print("⚠ Aucun modèle LoRA configuré, étape ignorée.")
 
     # ---------------- Motion module ----------------
     motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
-    if motion_module is not None:
-        log_debug(f"motion_module type: {type(motion_module)}", level="INFO", verbose=cfg.get("verbose", True))
+    if motion_module and verbose:
+        print(f"[INFO] motion_module type: {type(motion_module)}")
 
     # ---------------- Tokenizer / Text encoder ----------------
     tokenizer = CLIPTokenizerFast.from_pretrained(os.path.join(args.pretrained_model_path,"tokenizer"))
@@ -180,6 +177,17 @@ def main(args):
     negative_prompts = cfg.get("n_prompt", [])
     unet_cross_attention_dim = getattr(unet.config, "cross_attention_dim", 1024)
 
+    # --- Projection adaptative
+    text_inputs_sample = tokenizer("test", padding="max_length", truncation=True,
+                                max_length=tokenizer.model_max_length, return_tensors="pt")
+    with torch.no_grad():
+        sample_embeds = text_encoder(text_inputs_sample.input_ids.to(device)).last_hidden_state
+    current_dim = sample_embeds.shape[-1]
+    projection = None
+    if current_dim != unet_cross_attention_dim:
+        projection = torch.nn.Linear(current_dim, unet_cross_attention_dim).to(device).to(dtype)
+
+    # --- Pré-calcul des embeddings
     for prompt_item in prompts:
         prompt_text = " ".join(prompt_item) if isinstance(prompt_item, list) else str(prompt_item)
         neg_text = " ".join(negative_prompts) if isinstance(negative_prompts, list) else str(negative_prompts)
@@ -188,15 +196,11 @@ def main(args):
                                 max_length=tokenizer.model_max_length, return_tensors="pt")
         neg_inputs = tokenizer(neg_text, padding="max_length", truncation=True,
                             max_length=tokenizer.model_max_length, return_tensors="pt")
-
         with torch.no_grad():
             pos_embeds = text_encoder(text_inputs.input_ids.to(device)).last_hidden_state
             neg_embeds = text_encoder(neg_inputs.input_ids.to(device)).last_hidden_state
 
-        # Projection si nécessaire
-        current_dim = pos_embeds.shape[-1]
-        if current_dim != unet_cross_attention_dim:
-            projection = torch.nn.Linear(current_dim, unet_cross_attention_dim).to(device).to(dtype)
+        if projection is not None:
             pos_embeds = projection(pos_embeds)
             neg_embeds = projection(neg_embeds)
 
@@ -204,52 +208,17 @@ def main(args):
 
     # ---------------- N3RModelOptimized ----------------
     use_n3r_model = cfg.get("use_n3r_model", False)
+    n3r_model = None
     if use_n3r_model:
-        # Paramètres depuis la config, avec valeurs par défaut
-        L_low = cfg.get("n3r_L_low", 3)
-        L_high = cfg.get("n3r_L_high", 6)
-        N_samples = cfg.get("n3r_N_samples", 32)
-        tile_size = cfg.get("n3r_tile_size", 64)
-        cpu_offload = cfg.get("n3r_cpu_offload", True)
-
-        # Initialisation du modèle
         n3r_model = N3RModelOptimized(
-            L_low=L_low,
-            L_high=L_high,
-            N_samples=N_samples,
-            tile_size=tile_size,
-            cpu_offload=cpu_offload
-        ).to(device)  # GPU ou CPU selon ton --device
-
-        n3r_model.eval()  # mode evaluation pour pas de gradients
-
-        # ✅ Logs détaillés pour contrôle
-        print(f"✅ N3RModelOptimized initialisé:")
-        print(f"    L_low          : {L_low}")
-        print(f"    L_high         : {L_high}")
-        print(f"    N_samples      : {N_samples}")
-        print(f"    tile_size      : {tile_size}")
-        print(f"    cpu_offload    : {cpu_offload}")
-        print(f"    device         : {next(n3r_model.parameters()).device}")
-        print(f"    dtype          : {next(n3r_model.parameters()).dtype}")
-
-        # Contrôle des attributs critiques
-        required_attrs = ["L_low", "L_high", "N_samples", "tile_size"]
-        for attr in required_attrs:
-            if not hasattr(n3r_model, attr):
-                print(f"[N3R WARNING] Attribut manquant : {attr}")
-
-        # Test rapide de sortie
-        test_H, test_W = 16, 16  # petite taille pour test
-        coords_test = torch.zeros((test_H*test_W*N_samples, 3), device=device)
-        try:
-            with torch.no_grad():
-                latents_test = n3r_model(coords_test, test_H, test_W)
-            print(f"[N3R] Test latents OK, shape: {latents_test.shape}, min/max: {latents_test.min().item()}/{latents_test.max().item()}")
-        except Exception as e:
-            print(f"[N3R ERROR] Test latents a échoué : {e}")
-    else:
-        n3r_model = None
+            L_low=cfg.get("n3r_L_low",3),
+            L_high=cfg.get("n3r_L_high",6),
+            N_samples=cfg.get("n3r_N_samples",32),
+            tile_size=cfg.get("n3r_tile_size",64),
+            cpu_offload=cfg.get("n3r_cpu_offload",True)
+        ).to(device)
+        n3r_model.eval()
+        print(f"✅ N3RModelOptimized initialisé sur {device}")
 
     # ---------------- Input images ----------------
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
@@ -258,7 +227,6 @@ def main(args):
     output_dir = Path(f"./outputs/ProtoHybrid_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
-
     block_size = cfg.get("block_size", 64)
     overlap = compute_overlap(cfg["W"], cfg["H"], block_size)
 
@@ -266,151 +234,162 @@ def main(args):
     frame_counter = 0
     pbar = tqdm(total=total_frames, ncols=120)
 
+    # ---------------- Frames principales VRAM-safe ----------------
+    previous_latent_single = None
+    frame_counter = 0
+    pbar = tqdm(total=total_frames, ncols=120)
+
     for img_idx, img_path in enumerate(input_paths):
         if stop_generation: break
+        try:
+            # Charger et encoder l'image sur GPU, puis déplacer sur CPU pour stockage
+            input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
+            input_image = ensure_4_channels(input_image)
+            current_latent_single = encode_images_to_latents_safe(input_image, vae, device=device, latent_scale=LATENT_SCALE)
+            current_latent_single = torch.nn.functional.interpolate(
+                current_latent_single, size=(cfg["H"]//8, cfg["W"]//8),
+                mode='bilinear', align_corners=False
+            )
+            current_latent_single = ensure_4_channels(current_latent_single)
+            # Déplacer sur CPU dès que possible
+            current_latent_single = current_latent_single.to('cpu')
+            del input_image
+            torch.cuda.empty_cache()
 
-        # Charger et encoder l'image
-        input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
-        input_image = ensure_4_channels(input_image)
-        current_latent_single = encode_images_to_latents_safe(input_image, vae, device=device, latent_scale=LATENT_SCALE)
+            # ---------------- Transition frames ----------------
+            if previous_latent_single is not None and transition_frames > 0:
+                for t in range(transition_frames):
+                    if stop_generation: break
+                    alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
 
-        # Redimension pour UNet
-        target_H = getattr(unet.config, "sample_size", cfg["H"]) // 8
-        target_W = getattr(unet.config, "sample_size", cfg["W"]) // 8
-        current_latent_single = torch.nn.functional.interpolate(current_latent_single, size=(target_H, target_W), mode='bilinear', align_corners=False)
-        current_latent_single = ensure_4_channels(current_latent_single)
+                    # Interpolation sur GPU pour calcul
+                    with torch.no_grad():
+                        latent_interp = (1-alpha)*previous_latent_single.to(device) + alpha*current_latent_single.to(device)
+                        latent_interp = torch.clamp(latent_interp, -1.0, 1.0).contiguous()
 
-        # ---------------- Transition frames ----------------
-        if previous_latent_single is not None and transition_frames > 0:
-            for t in range(transition_frames):
-                if stop_generation: break
-                alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
-                latent_interp = (1-alpha)*previous_latent_single + alpha*current_latent_single
-                if motion_module:
-                    latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
-                final_latent_H = int(cfg["H"] * final_latent_scale)
-                final_latent_W = int(cfg["W"] * final_latent_scale)
-                if latent_interp.shape[-2:] != (final_latent_H, final_latent_W):
-                    latent_interp = torch.nn.functional.interpolate(latent_interp, size=(final_latent_H, final_latent_W), mode='bilinear', align_corners=False)
-                frame_pil = decode_latents_ultrasafe_blockwise(latent_interp, vae,
-                                                               block_size=block_size, overlap=overlap,
-                                                               gamma=1.0, brightness=1.0,
-                                                               contrast=1.5, saturation=1.3,
-                                                               device=device, frame_counter=frame_counter,
-                                                               latent_scale_boost=latent_scale_boost)
-                frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
-                frame_counter += 1
-                pbar.update(1)
+                        if motion_module:
+                            latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
-        # ---------------- Frames principales ----------------
-        for pos_embeds, neg_embeds in embeddings:
-            for f in range(num_fraps_per_image):
-                if stop_generation: break
-                # Frame initiale = image d'entrée
-                if f == 0:
-                    frame_tensor = torch.clamp((input_image.squeeze(0)+1)/2, 0, 1)
-                    upscale_H = int(frame_tensor.shape[-2] * final_latent_scale * 8)
-                    upscale_W = int(frame_tensor.shape[-1] * final_latent_scale * 8)
-                    frame_tensor = torch.nn.functional.interpolate(frame_tensor.unsqueeze(0), size=(upscale_H, upscale_W), mode='bilinear', align_corners=False).squeeze(0)
-                    frame_pil = to_pil_image(frame_tensor)
-                else:
-                    latents_frame = current_latent_single.clone()
-                    target_H = int(latents_frame.shape[-2] * final_latent_scale)
-                    target_W = int(latents_frame.shape[-1] * final_latent_scale)
-                    if latents_frame.shape[-2:] != (target_H, target_W):
-                        latents_frame = torch.nn.functional.interpolate(latents_frame, size=(target_H, target_W), mode='bilinear', align_corners=False)
-                    latents_frame = ensure_4_channels(latents_frame)
-                    cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
+                        # Resize pour VAE
+                        final_H, final_W = int(cfg["H"]*final_latent_scale), int(cfg["W"]*final_latent_scale)
+                        if latent_interp.shape[-2:] != (final_H, final_W):
+                            latent_interp = torch.nn.functional.interpolate(
+                                latent_interp, size=(final_H, final_W),
+                                mode='bilinear', align_corners=False
+                            ).contiguous()
 
-                    # ---------------- Génération ----------------
-                    # ---------------- Génération avec N3R corrigé ----------------
-                    latents = current_latent_single.clone()  # toujours défini
-                    n3r_latents = None  # initialisation sécurisée
+                        # Décodage en streaming vers CPU
+                        frame_pil = decode_latents_ultrasafe_blockwise(
+                            latent_interp, vae,
+                            block_size=block_size, overlap=overlap,
+                            gamma=1.0, brightness=1.0,
+                            contrast=1.5, saturation=1.3,
+                            device=device,  # GPU uniquement pour blocs, frame final vers CPU
+                            frame_counter=frame_counter,
+                            latent_scale_boost=latent_scale_boost
+                        )
 
-                    # ---------------- Génération avec N3R corrigé ----------------
-                    if use_n3r_model:
-                        try:
-                            H, W = cfg["H"], cfg["W"]
+                        frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
+                        frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
+                        frame_counter += 1
+                        pbar.update(1)
 
-                            # --- Créer coords pour N3R ---
-                            ys, xs, ss = torch.meshgrid(
-                                torch.arange(H, device=device),
-                                torch.arange(W, device=device),
-                                torch.arange(n3r_model.N_samples, device=device),
-                                indexing='ij'
-                            )
-                            coords = torch.stack([xs, ys, ss.float()], dim=-1).reshape(-1,3).float()  # (H*W*N_samples, 3)
-
-                            # --- Génération latents N3R ---
-                            n3r_latents_raw = n3r_model(coords, H, W)[:, :3]  # (H*W*N_samples, 3)
-
-                            # --- Reshape et moyenne sur N_samples pour chaque pixel ---
-                            n3r_latents = n3r_latents_raw.view(H, W, n3r_model.N_samples, 3)  # (H, W, N_samples, 3)
-                            n3r_latents = n3r_latents.mean(dim=2)  # moyenne sur N_samples → (H, W, 3)
-
-                            # --- Mettre au format [1, 3, H, W] et ajouter canal manquant ---
-                            n3r_latents = n3r_latents.permute(2,0,1).unsqueeze(0)  # (1, 3, H, W)
-                            n3r_latents = torch.cat([n3r_latents, torch.zeros_like(n3r_latents[:, :1])], dim=1)  # (1,4,H,W)
-
-                            # --- Interpolation si nécessaire pour matcher le latent VAE ---
-                            target_H = current_latent_single.shape[-2]
-                            target_W = current_latent_single.shape[-1]
-                            if n3r_latents.shape[-2:] != (target_H, target_W):
-                                n3r_latents = torch.nn.functional.interpolate(n3r_latents, size=(target_H, target_W),
-                                                                            mode='bilinear', align_corners=False)
-
-                            # --- Fusion avec le latent VAE ---
-                            latents = fuse_n3r_latents_adaptive(current_latent_single, n3r_latents, latent_injection=latent_injection)
-
-                            # --- Log pour debug ---
-                            print(f"[N3R fusion] shape: {latents.shape}, min/max/mean/std: "
-                                f"{latents.min().item():.4f}/{latents.max().item():.4f}/"
-                                f"{latents.mean().item():.4f}/{latents.std().item():.4f}")
-
-                        except Exception as e:
-                            print(f"[N3R ERROR] Génération latents N3R échouée : {e}")
-                    else:
-                        if use_mini_gpu:
-                            latents = generate_latents_mini_gpu_320(unet=unet, scheduler=scheduler, input_latents=latents_frame, embeddings=cf_embeds,
-                                                                     motion_module=motion_module, guidance_scale=guidance_scale, device=device,
-                                                                     fp16=True, steps=steps, debug=verbose, init_image_scale=init_image_scale, creative_noise=creative_noise)
-                            if latent_injection > 0.0:
-                                latents = latent_injection * current_latent_single + (1 - latent_injection) * latents
-                        else:
-                            latents_input = latents_frame[:, :3, :, :]
-                            latents = run_diffusion_pipeline(unet=unet, vae=vae, scheduler=scheduler, images=latents_input, embeddings=cf_embeds, timesteps=scheduler.timesteps, device=device)
-
-                    if motion_module:
-                        latents, _ = apply_motion_safe(latents, motion_module)
-                    final_latent_H = int(cfg["H"] * final_latent_scale)
-                    final_latent_W = int(cfg["W"] * final_latent_scale)
-                    if latents.shape[-2:] != (final_latent_H, final_latent_W):
-                        latents = torch.nn.functional.interpolate(latents, size=(final_latent_H, final_latent_W), mode='bilinear', align_corners=False)
-                    frame_pil = decode_latents_ultrasafe_blockwise(latents, vae,
-                                                                   block_size=block_size, overlap=overlap,
-                                                                   gamma=1.0, brightness=1.0,
-                                                                   contrast=1.5, saturation=1.3,
-                                                                   device=device, frame_counter=frame_counter,
-                                                                   latent_scale_boost=latent_scale_boost)
-                    # Appliquer un flou léger sur toute l'image
-                    #frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=0.2))
-                    # Appliquer un flou léger sur toute l'image
-                    # Effets post-decode
-                    frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
-
-                    del latents
+                    del latent_interp
                     torch.cuda.empty_cache()
 
-                frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
-                frame_counter += 1
-                pbar.update(1)
+            # ---------------- Frames principales ----------------
+            for pos_embeds, neg_embeds in embeddings:
+                for f in range(num_fraps_per_image):
+                    if stop_generation: break
 
-        previous_latent_single = current_latent_single
+                    with torch.no_grad():
+                        # Latent de base sur GPU pour calcul
+                        latents_frame = current_latent_single.to(device)
+                        cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
+                        latents = latents_frame.clone()
+                        n3r_latents = None
+
+                        # --- N3R ---
+                        if use_n3r_model:
+                            try:
+                                H, W = cfg["H"], cfg["W"]
+                                ys, xs, ss = torch.meshgrid(
+                                    torch.arange(H, device=device),
+                                    torch.arange(W, device=device),
+                                    torch.arange(n3r_model.N_samples, device=device),
+                                    indexing='ij'
+                                )
+                                coords = torch.stack([xs, ys, ss.float()], dim=-1).reshape(-1,3).float()
+                                n3r_latents_raw = n3r_model(coords, H, W)[:, :3]
+                                n3r_latents = n3r_latents_raw.view(H, W, n3r_model.N_samples, 3).mean(dim=2)
+                                n3r_latents = n3r_latents.permute(2,0,1).unsqueeze(0)
+                                if n3r_latents.shape[1] == 3:
+                                    n3r_latents = torch.cat([n3r_latents, torch.zeros_like(n3r_latents[:, :1, :, :])], dim=1)
+                                # Resize et clamp
+                                target_H, target_W = latents.shape[-2], latents.shape[-1]
+                                if n3r_latents.shape[-2:] != (target_H, target_W):
+                                    n3r_latents = torch.nn.functional.interpolate(
+                                        n3r_latents, size=(target_H, target_W),
+                                        mode='bilinear', align_corners=False
+                                    ).contiguous()
+                                n3r_latents = torch.clamp(n3r_latents, -1.0, 1.0)
+                                latents = fuse_n3r_latents_adaptive(latents, n3r_latents, latent_injection=latent_injection)
+                            except Exception as e:
+                                print(f"[N3R ERROR] {e}")
+
+                        # --- Mini GPU diffusion ---
+                        elif use_mini_gpu:
+                            latents = generate_latents_mini_gpu_320(
+                                unet=unet, scheduler=scheduler,
+                                input_latents=latents_frame, embeddings=cf_embeds,
+                                motion_module=motion_module, guidance_scale=guidance_scale,
+                                device=device, fp16=True, steps=steps,
+                                debug=verbose, init_image_scale=init_image_scale,
+                                creative_noise=creative_noise
+                            )
+                            if latent_injection > 0:
+                                latents = latent_injection*latents_frame + (1-latent_injection)*latents
+
+                        # Motion module
+                        if motion_module:
+                            latents, _ = apply_motion_safe(latents, motion_module)
+
+                        # Clamp et resize final
+                        latents = torch.clamp(latents, -1.0, 1.0)
+                        final_H, final_W = int(cfg["H"]*final_latent_scale), int(cfg["W"]*final_latent_scale)
+                        if latents.shape[-2:] != (final_H, final_W):
+                            latents = torch.nn.functional.interpolate(latents, size=(final_H, final_W),
+                                                                    mode='bilinear', align_corners=False).contiguous()
+
+                        # Décodage streaming vers CPU
+                        frame_pil = decode_latents_ultrasafe_blockwise(
+                            latents, vae,
+                            block_size=block_size, overlap=overlap,
+                            gamma=1.0, brightness=1.0,
+                            contrast=1.5, saturation=1.3,
+                            device=device,
+                            frame_counter=frame_counter,
+                            latent_scale_boost=latent_scale_boost
+                        )
+                        frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
+                        frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
+                        frame_counter += 1
+                        pbar.update(1)
+
+                        # Nettoyage VRAM
+                        del latents, latents_frame, cf_embeds, n3r_latents
+                        torch.cuda.empty_cache()
+
+            previous_latent_single = current_latent_single  # reste sur CPU
+
+        except Exception as e:
+            print(f"[FRAME ERROR] {img_path} : {e}")
+            continue
 
     pbar.close()
-    save_frames_as_video_from_folder(output_dir, out_video, fps=fps, upscale_factor=2)
+    save_frames_as_video_from_folder(output_dir, out_video, fps=fps, upscale_factor=upscale_factor)
     print(f"🎬 Vidéo générée : {out_video}")
-    print("✅ Pipeline terminé avec motion module safe et N3RModelFast4GB.")
+    print("✅ Pipeline terminé avec motion module safe et N3RModelOptimized.")
 
 # ---------------- ENTRY ----------------
 if __name__=="__main__":
