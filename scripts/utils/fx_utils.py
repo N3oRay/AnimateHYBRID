@@ -3,7 +3,7 @@
 
 import os, math, threading
 from pathlib import Path
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 
 import torch
 import numpy as np
@@ -13,6 +13,84 @@ import torch.nn.functional as Fu
 import torch.nn.functional as TF
 import torch.nn.functional as FF
 LATENT_SCALE = 0.18215
+
+
+def apply_post_processing(frame_pil,
+                          blur_radius=0.05,
+                          contrast=1.15,
+                          brightness=1.05,
+                          saturation=0.85,
+                          sharpen=False,
+                          sharpen_radius=1,
+                          sharpen_percent=90,
+                          sharpen_threshold=2):
+    """
+    Appliquer des effets post-decode sur une frame PIL.
+
+    Args:
+        frame_pil (PIL.Image): L'image décodée depuis les latents
+        blur_radius (float): Rayon du flou gaussien
+        contrast (float): Facteur de contraste (1.0 = inchangé)
+        brightness (float): Facteur de luminosité (1.0 = inchangé)
+        saturation (float): Facteur de saturation (1.0 = inchangé)
+        sharpen (bool): Appliquer un sharpen/unsharp mask si True
+        sharpen_radius (float): Rayon pour l'UnsharpMask
+        sharpen_percent (float): Intensité pour l'UnsharpMask
+        sharpen_threshold (float): Seuil pour l'UnsharpMask
+
+    Returns:
+        PIL.Image: Image modifiée
+    """
+    # GaussianBlur simple
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # Ajustements optionnels (contrast, brightness, saturation)
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    if brightness != 1.0:
+        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
+    if saturation != 1.0:
+        frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    # Sharp / UnsharpMask
+    if sharpen:
+        frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+            radius=sharpen_radius,
+            percent=sharpen_percent,
+            threshold=sharpen_threshold
+        ))
+
+    return frame_pil
+
+
+def apply_post_processing_blur(frame_pil, blur_radius=0.2, contrast=1.0, brightness=1.0, saturation=1.0):
+    """
+    Appliquer des effets post-decode sur une frame PIL.
+
+    Args:
+        frame_pil (PIL.Image): L'image décodée depuis les latents
+        blur_radius (float): Rayon du flou gaussien
+        contrast (float): Facteur de contraste (1.0 = inchangé)
+        brightness (float): Facteur de luminosité (1.0 = inchangé)
+        saturation (float): Facteur de saturation (1.0 = inchangé)
+
+    Returns:
+        PIL.Image: Image modifiée
+    """
+    # GaussianBlur simple
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # Ajustements optionnels (contrast, brightness, saturation)
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    if brightness != 1.0:
+        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
+    if saturation != 1.0:
+        frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    return frame_pil
 
 
 
