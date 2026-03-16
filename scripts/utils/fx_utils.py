@@ -93,7 +93,27 @@ def apply_post_processing_blur(frame_pil, blur_radius=0.2, contrast=1.0, brightn
     return frame_pil
 
 
+def encode_images_to_latents_hybrid(images, vae, device="cuda", latent_scale=LATENT_SCALE):
+    """
+    Encodage hybride pour conserver la fidélité et la richesse de détails.
+    - Utilise un échantillon de la distribution (plus vivant que mean)
+    - Clamp léger pour éviter débordements extrêmes mais garder micro-contrastes
+    - Assure 4 channels si nécessaire pour compatibilité UNet/N3R
+    """
+    images = images.to(device=device, dtype=torch.float32)
+    vae = vae.to(device=device, dtype=torch.float32)
 
+    with torch.no_grad():
+        latents = vae.encode(images).latent_dist.sample()  # <-- sample() pour micro-variations
+
+    latents = latents * latent_scale
+    latents = torch.clamp(latents, -5.0, 5.0)  # Clamp léger, pas de nan_to_num
+
+    # Assurer 4 channels si nécessaire
+    if latents.ndim == 4 and latents.shape[1] == 1:
+        latents = latents.repeat(1, 4, 1, 1)
+
+    return latents
 
 def encode_images_to_latents_safe(images, vae, device="cuda", latent_scale=0.18215):
     """

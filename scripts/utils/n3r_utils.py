@@ -99,7 +99,7 @@ def generate_latents_safe_debug(unet, **kwargs):
 
     device = filtered_kwargs.get("device", "cuda")
     fp16 = filtered_kwargs.get("fp16", True)
-    debug = filtered_kwargs.get("debug", True)
+    debug = filtered_kwargs.get("debug", False)
     motion_module = filtered_kwargs.get("motion_module", None)
     scheduler = filtered_kwargs.get("scheduler", None)
     steps = filtered_kwargs.get("steps", 20)
@@ -263,7 +263,7 @@ def generate_latents_safe_debug_v3(unet, **kwargs):
 
     device = filtered_kwargs.get("device", "cuda")
     fp16 = filtered_kwargs.get("fp16", True)
-    debug = filtered_kwargs.get("debug", True)
+    debug = filtered_kwargs.get("debug", False)
     motion_module = filtered_kwargs.get("motion_module", None)
     scheduler = filtered_kwargs.get("scheduler", None)
     steps = filtered_kwargs.get("steps", 20)
@@ -384,7 +384,7 @@ def generate_latents_safe_debug_v2(unet, **kwargs):
 
     device = filtered_kwargs.get("device", "cuda")
     fp16 = filtered_kwargs.get("fp16", True)
-    debug = filtered_kwargs.get("debug", True)
+    debug = filtered_kwargs.get("debug", False)
     motion_module = filtered_kwargs.get("motion_module", None)
     scheduler = filtered_kwargs.get("scheduler", None)
     steps = filtered_kwargs.get("steps", 20)
@@ -703,7 +703,7 @@ def generate_latents_safe_debug_v4(unet, **kwargs):
 
     device = filtered_kwargs.get("device", "cuda")
     fp16 = filtered_kwargs.get("fp16", True)
-    debug = filtered_kwargs.get("debug", True)
+    debug = filtered_kwargs.get("debug", False)
     motion_module = filtered_kwargs.get("motion_module", None)
     scheduler = filtered_kwargs.get("scheduler", None)
     steps = filtered_kwargs.get("steps", 20)
@@ -4308,7 +4308,7 @@ def generate_latents_safe_test(unet, **kwargs):
 
     device = filtered_kwargs.get("device", "cuda")
     fp16 = filtered_kwargs.get("fp16", True)
-    debug = filtered_kwargs.get("debug", True)
+    debug = filtered_kwargs.get("debug", False)
     motion_module = filtered_kwargs.get("motion_module", None)
     scheduler = filtered_kwargs.get("scheduler", None)
     steps = filtered_kwargs.get("steps", 20)
