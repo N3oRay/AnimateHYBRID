@@ -35,10 +35,10 @@ stop_generation = False
 
 # --- Sélection simple des embeddings prompts par frame ---
 def get_embeddings_for_frame(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
-                        """
-                        Retourne les embeddings du prompt correspondant à la frame_idx.
-                        Chaque prompt produit `frames_per_prompt` frames consécutives.
-                        """
+    """
+    Retourne les embeddings du prompt correspondant à la frame_idx.
+    Chaque prompt produit `frames_per_prompt` frames consécutives.
+    """
     num_prompts = len(pos_list)
     prompt_idx = min(frame_idx // frames_per_prompt, num_prompts - 1)
     return pos_list[prompt_idx].to(device), neg_list[prompt_idx].to(device)
