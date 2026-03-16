@@ -23,7 +23,7 @@ from scripts.utils.vae_config import load_vae
 from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
-from scripts.utils.n3r_utils import generate_latents_safe_miniGPU, generate_latents_mini_gpu, load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
+from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
 from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
@@ -280,7 +280,7 @@ def main(args):
                 mode='bilinear', align_corners=False
             )
 
-            # Génération initiale robuste (optionnel)
+            # Génération initiale robuste :
             try:
                 current_latent_single = generate_latents_robuste_4D(
                     latents=current_latent_single.to(device),
@@ -291,9 +291,9 @@ def main(args):
                     motion_module=None,
                     device=device,
                     dtype=dtype,
-                    guidance_scale=1.5,
-                    init_image_scale=0.85,
-                    creative_noise=0.0,
+                    guidance_scale=guidance_scale,
+                    init_image_scale=init_image_scale,
+                    creative_noise=creative_noise,
                     seed=42
                 )
             except Exception as e:
@@ -356,7 +356,9 @@ def main(args):
                     n3r_latents = None
                     latents = latents_frame.clone()
 
-                    if use_n3r_model:
+                    #if use_n3r_model:
+                    #if f % 2 == 0 and use_n3r_model:
+                    if f == 0 and use_n3r_model:
                         try:
                             H, W = cfg["H"], cfg["W"]
                             ys, xs, ss = torch.meshgrid(
@@ -383,6 +385,7 @@ def main(args):
                             print(f"[N3R ERROR] {e}")
 
                     elif use_mini_gpu:
+                        # Generation avec le prompt !
                         latents = generate_latents_mini_gpu_320(
                             unet=unet, scheduler=scheduler,
                             input_latents=latents_frame, embeddings=cf_embeds,
