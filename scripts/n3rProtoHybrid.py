@@ -348,6 +348,14 @@ def main(args):
                                 creative_noise=creative_noise
                             )
                             if latent_injection > 0:
+                                # ⚡ Adapter la taille avant fusion
+                                if latents.shape[-2:] != latents_frame.shape[-2:]:
+                                    latents = torch.nn.functional.interpolate(
+                                        latents,
+                                        size=latents_frame.shape[-2:],
+                                        mode='bilinear',
+                                        align_corners=False
+                                    ).contiguous()
                                 latents = latent_injection*latents_frame + (1-latent_injection)*latents
 
                         # Motion module
