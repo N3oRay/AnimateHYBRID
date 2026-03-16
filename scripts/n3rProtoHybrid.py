@@ -30,6 +30,7 @@ stop_generation = False
 
 
 # ---------------- Fusion N3R/VAE adaptative ----------------
+
 def fuse_n3r_latents_adaptive(latents_frame, n3r_latents, latent_injection=0.7, clamp_val=1.0):
     """
     Fusion adaptative des latents N3R avec l'image actuelle, frame par frame.
