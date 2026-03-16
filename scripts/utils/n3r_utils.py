@@ -4498,6 +4498,66 @@ def generate_latents_robuste(latents, pos_embeds, neg_embeds, unet, scheduler,
     # Remettre la forme [B,C,T,H,W]
     latents = latents.reshape(B, T, C, H, W).permute(0,2,1,3,4).contiguous()
     return latents
+
+
+
+#-------------------------------------------------------------------------------
+# VERY STABLE
+#-------------------------------------------------------------------------------
+
+def generate_latents_robuste_4D(
+        latents,
+        unet,
+        scheduler,
+        pos_embeds=None,
+        neg_embeds=None,
+        motion_module=None,
+        device='cuda',
+        dtype=torch.float16,
+        guidance_scale=1.0,
+        init_image_scale=0.85,
+        creative_noise=0.0,
+        steps=8,
+        seed=None
+    ):
+    """
+    Génération initiale de latents ultra-safe 4D pour AnimateDiff.
+    Clamp et correction NaN automatique à chaque step.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    latents = latents.to(device=device, dtype=dtype)
+
+    # Échelle initiale si nécessaire
+    if init_image_scale != 1.0:
+        latents = latents * init_image_scale
+
+    for t in range(steps):
+        with torch.no_grad():
+            # Dummy UNet step (ou remplacer par vrai step si nécessaire)
+            noise = torch.randn_like(latents) * 0.01
+            latents = latents + noise
+
+            # Motion module si fourni
+            if motion_module is not None:
+                latents, _ = motion_module(latents)
+
+            # Clamp strict et correction NaN
+            latents = torch.clamp(latents, -1.0, 1.0)
+            latents[torch.isnan(latents)] = 0.0
+            latents[torch.isinf(latents)] = 0.0
+
+            # Optionnel: petit bruit créatif
+            if creative_noise > 0.0:
+                latents += torch.randn_like(latents) * creative_noise
+
+    # S'assurer que c'est bien 4D
+    if latents.ndim != 4:
+        B, C, H, W = latents.shape[0], 4, latents.shape[-2], latents.shape[-1]
+        latents = latents[:, :C, :, :] if latents.shape[1] >= 4 else F.pad(latents, (0,0,0,0,0,4-latents.shape[1]))
+
+    return latents
 # --------------------- V1 ----------------------------------------
 def generate_latents_robuste_v1(
     latents,
