@@ -1,5 +1,6 @@
 # --------------------------------------------------------------
 # n3rmodelSD_final.py - AnimateDiff ultra-light ~2Go VRAM
+# Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
 # --------------------------------------------------------------
 import os, math, threading
 from pathlib import Path
@@ -20,12 +21,48 @@ from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import generate_latents_safe_miniGPU, generate_latents_mini_gpu, load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, save_frames_as_video_from_folder, encode_images_to_latents_safe
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing
 from scripts.utils.vae_utils import safe_load_unet
-from scripts.utils.n3rModelFast4Go import N3RModelFast4GB
+from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 
 LATENT_SCALE = 0.18215
 stop_generation = False
+
+
+# ---------------- Fusion N3R/VAE adaptative ----------------
+def fuse_n3r_latents_adaptive(latents_frame, n3r_latents, latent_injection=0.7, clamp_val=1.0):
+    """
+    Fusion adaptative des latents N3R avec l'image actuelle, frame par frame.
+    Ajuste automatiquement l'injection selon les stats du N3R et du frame VAE.
+    """
+    n3r_latents = n3r_latents.clone()
+
+    # Stats N3R
+    n3r_mean = n3r_latents.mean()
+    n3r_std  = n3r_latents.std()
+
+    # Ajustement automatique de l'injection
+    if n3r_mean.abs() > 0.2 or n3r_std > 1.5:
+        latent_injection_adj = max(latent_injection - 0.3, 0.1)
+    else:
+        latent_injection_adj = latent_injection
+
+    # Normalisation N3R sur l'image
+    n3r_latents = (n3r_latents - n3r_mean) / (n3r_std + 1e-6)
+    n3r_latents = n3r_latents * latents_frame.std() + latents_frame.mean()
+
+    # Clamp pour éviter débordements
+    n3r_latents = torch.clamp(n3r_latents, latents_frame.min(), latents_frame.max())
+
+    # Fusion finale
+    fused_latents = latent_injection_adj * latents_frame + (1 - latent_injection_adj) * n3r_latents
+
+    # Debug
+    print(f"[N3R fusion frame] mean/std: {fused_latents.mean():.4f}/{fused_latents.std():.4f}, injection={latent_injection_adj:.2f}")
+
+    return fused_latents
+
+
 
 # ---------------- DEBUG UTILS ----------------
 def log_debug(message, level="INFO", verbose=True):
@@ -51,7 +88,7 @@ def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
     overlap = int(block_size * max_overlap_ratio)
     return min(overlap, min(W,H)//4)
 
-def apply_motion_safe(latents, motion_module, threshold=1e-2):
+def apply_motion_safe(latents, motion_module, threshold=1e-3):
     if latents.abs().max() < threshold:
         return latents, False
     return motion_module(latents), True
@@ -164,14 +201,52 @@ def main(args):
 
         embeddings.append((pos_embeds, neg_embeds))
 
-    # ---------------- N3RModelFast4GB ----------------
+    # ---------------- N3RModelOptimized ----------------
     use_n3r_model = cfg.get("use_n3r_model", False)
     if use_n3r_model:
-        L = cfg.get("n3r_L", 6)
+        # Paramètres depuis la config, avec valeurs par défaut
+        L_low = cfg.get("n3r_L_low", 3)
+        L_high = cfg.get("n3r_L_high", 6)
         N_samples = cfg.get("n3r_N_samples", 32)
-        n3r_model = N3RModelFast4GB(L=L, N_samples=N_samples).to(device)
-        n3r_model.eval()
-        print(f"✅ N3RModelFast4GB initialisé: L={L}, N_samples={N_samples}")
+        tile_size = cfg.get("n3r_tile_size", 64)
+        cpu_offload = cfg.get("n3r_cpu_offload", True)
+
+        # Initialisation du modèle
+        n3r_model = N3RModelOptimized(
+            L_low=L_low,
+            L_high=L_high,
+            N_samples=N_samples,
+            tile_size=tile_size,
+            cpu_offload=cpu_offload
+        ).to(device)  # GPU ou CPU selon ton --device
+
+        n3r_model.eval()  # mode evaluation pour pas de gradients
+
+        # ✅ Logs détaillés pour contrôle
+        print(f"✅ N3RModelOptimized initialisé:")
+        print(f"    L_low          : {L_low}")
+        print(f"    L_high         : {L_high}")
+        print(f"    N_samples      : {N_samples}")
+        print(f"    tile_size      : {tile_size}")
+        print(f"    cpu_offload    : {cpu_offload}")
+        print(f"    device         : {next(n3r_model.parameters()).device}")
+        print(f"    dtype          : {next(n3r_model.parameters()).dtype}")
+
+        # Contrôle des attributs critiques
+        required_attrs = ["L_low", "L_high", "N_samples", "tile_size"]
+        for attr in required_attrs:
+            if not hasattr(n3r_model, attr):
+                print(f"[N3R WARNING] Attribut manquant : {attr}")
+
+        # Test rapide de sortie
+        test_H, test_W = 16, 16  # petite taille pour test
+        coords_test = torch.zeros((test_H*test_W*N_samples, 3), device=device)
+        try:
+            with torch.no_grad():
+                latents_test = n3r_model(coords_test, test_H, test_W)
+            print(f"[N3R] Test latents OK, shape: {latents_test.shape}, min/max: {latents_test.min().item()}/{latents_test.max().item()}")
+        except Exception as e:
+            print(f"[N3R ERROR] Test latents a échoué : {e}")
     else:
         n3r_model = None
 
@@ -247,21 +322,52 @@ def main(args):
                     cf_embeds = (pos_embeds.to(device), neg_embeds.to(device))
 
                     # ---------------- Génération ----------------
+                    # ---------------- Génération avec N3R corrigé ----------------
+                    latents = current_latent_single.clone()  # toujours défini
+                    n3r_latents = None  # initialisation sécurisée
+
+                    # ---------------- Génération avec N3R corrigé ----------------
                     if use_n3r_model:
-                        # --- Créer coords pour N3R ---
-                        H, W = cfg["H"], cfg["W"]
-                        ys, xs, ss = torch.meshgrid(
-                            torch.arange(H, device=device),
-                            torch.arange(W, device=device),
-                            torch.arange(n3r_model.N_samples, device=device),
-                            indexing='ij'
-                        )
-                        coords = torch.stack([xs, ys, ss.float()], dim=-1).reshape(-1,3).float()
-                        #n3r_latents = n3r_model(coords, H, W, tile_size=cfg.get("tile_size",128))[:, :3]
-                        n3r_latents = n3r_model(coords, H, W)[:, :3]
-                        n3r_latents = n3r_latents.permute(1,0).unsqueeze(0)  # ajuster pour torch (1,4,H,W)
-                        # Fusion latents N3R + UNet/VAE
-                        latents = latent_injection * latents_frame + (1-latent_injection) * n3r_latents
+                        try:
+                            H, W = cfg["H"], cfg["W"]
+
+                            # --- Créer coords pour N3R ---
+                            ys, xs, ss = torch.meshgrid(
+                                torch.arange(H, device=device),
+                                torch.arange(W, device=device),
+                                torch.arange(n3r_model.N_samples, device=device),
+                                indexing='ij'
+                            )
+                            coords = torch.stack([xs, ys, ss.float()], dim=-1).reshape(-1,3).float()  # (H*W*N_samples, 3)
+
+                            # --- Génération latents N3R ---
+                            n3r_latents_raw = n3r_model(coords, H, W)[:, :3]  # (H*W*N_samples, 3)
+
+                            # --- Reshape et moyenne sur N_samples pour chaque pixel ---
+                            n3r_latents = n3r_latents_raw.view(H, W, n3r_model.N_samples, 3)  # (H, W, N_samples, 3)
+                            n3r_latents = n3r_latents.mean(dim=2)  # moyenne sur N_samples → (H, W, 3)
+
+                            # --- Mettre au format [1, 3, H, W] et ajouter canal manquant ---
+                            n3r_latents = n3r_latents.permute(2,0,1).unsqueeze(0)  # (1, 3, H, W)
+                            n3r_latents = torch.cat([n3r_latents, torch.zeros_like(n3r_latents[:, :1])], dim=1)  # (1,4,H,W)
+
+                            # --- Interpolation si nécessaire pour matcher le latent VAE ---
+                            target_H = current_latent_single.shape[-2]
+                            target_W = current_latent_single.shape[-1]
+                            if n3r_latents.shape[-2:] != (target_H, target_W):
+                                n3r_latents = torch.nn.functional.interpolate(n3r_latents, size=(target_H, target_W),
+                                                                            mode='bilinear', align_corners=False)
+
+                            # --- Fusion avec le latent VAE ---
+                            latents = fuse_n3r_latents_adaptive(current_latent_single, n3r_latents, latent_injection=latent_injection)
+
+                            # --- Log pour debug ---
+                            print(f"[N3R fusion] shape: {latents.shape}, min/max/mean/std: "
+                                f"{latents.min().item():.4f}/{latents.max().item():.4f}/"
+                                f"{latents.mean().item():.4f}/{latents.std().item():.4f}")
+
+                        except Exception as e:
+                            print(f"[N3R ERROR] Génération latents N3R échouée : {e}")
                     else:
                         if use_mini_gpu:
                             latents = generate_latents_mini_gpu_320(unet=unet, scheduler=scheduler, input_latents=latents_frame, embeddings=cf_embeds,
@@ -286,7 +392,11 @@ def main(args):
                                                                    device=device, frame_counter=frame_counter,
                                                                    latent_scale_boost=latent_scale_boost)
                     # Appliquer un flou léger sur toute l'image
-                    frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=0.2))
+                    #frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=0.2))
+                    # Appliquer un flou léger sur toute l'image
+                    # Effets post-decode
+                    frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
+
                     del latents
                     torch.cuda.empty_cache()
 
