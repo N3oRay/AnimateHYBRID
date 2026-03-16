@@ -23,7 +23,7 @@ from scripts.utils.vae_config import load_vae
 from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
-from scripts.utils.n3r_utils import generate_latents_safe_miniGPU, generate_latents_mini_gpu, load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline
+from scripts.utils.n3r_utils import generate_latents_safe_miniGPU, generate_latents_mini_gpu, load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
 from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
@@ -253,6 +253,27 @@ def main(args):
                 current_latent_single, size=(cfg["H"]//8, cfg["W"]//8),
                 mode='bilinear', align_corners=False
             )
+
+            # ------------------- NOUVEAU -------------------
+            # Génération robuste des latents initiaux (optionnel, steps réduits pour VRAM)
+            try:
+                current_latent_single = generate_latents_robuste_4D(
+                    latents=current_latent_single.to(device),  # <-- nom correct
+                    pos_embeds=None,  # pas encore de prompt, ou embeddings neutres
+                    neg_embeds=None,
+                    unet=unet,
+                    scheduler=scheduler,
+                    motion_module=None,
+                    device=device,
+                    dtype=dtype,
+                    guidance_scale=1.5,   # plus safe pour init
+                    init_image_scale=0.85,  # pas 1.0 pour ne pas amplifier NaN
+                    creative_noise=0.0,   # pour init, on peut désactiver
+                    seed=42
+                )
+            except Exception as e:
+                print(f"[Robuste INIT ERROR] {e}")
+            # -----------------------------------------------
             current_latent_single = ensure_4_channels(current_latent_single)
             # Déplacer sur CPU dès que possible
             current_latent_single = current_latent_single.to('cpu')
