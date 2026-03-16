@@ -24,7 +24,7 @@ from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing, encode_images_to_latents_hybrid
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 
@@ -50,11 +50,11 @@ def fuse_n3r_latents_adaptive(latents_frame, n3r_latents, latent_injection=0.7, 
     n3r_latents = n3r_latents.clone()
 
     # Normalisation **canal par canal**
-    for c in range(4):
+    for c in range(3):  # RGB uniquement
         n3r_c = n3r_latents[:,c:c+1,:,:]
         frame_c = latents_frame[:,c:c+1,:,:]
         mean, std = n3r_c.mean(), n3r_c.std()
-        n3r_c = (n3r_c - mean) / (std + 1e-6)  # centre / std
+        n3r_c = (n3r_c - mean) / (std + 1e-6)
         n3r_c = n3r_c * frame_c.std() + frame_c.mean()
         n3r_latents[:,c:c+1,:,:] = n3r_c
 
@@ -274,13 +274,20 @@ def main(args):
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
             input_image = ensure_4_channels(input_image)
-            current_latent_single = encode_images_to_latents_safe(input_image, vae, device=device, latent_scale=LATENT_SCALE)
+            #current_latent_single = encode_images_to_latents_safe(input_image, vae, device=device, latent_scale=LATENT_SCALE) # origine
+
+            current_latent_single = encode_images_to_latents_hybrid(input_image, vae, device=device, latent_scale=LATENT_SCALE)
             current_latent_single = torch.nn.functional.interpolate(
                 current_latent_single, size=(cfg["H"]//8, cfg["W"]//8),
                 mode='bilinear', align_corners=False
             )
 
             # Génération initiale robuste :
+            #42	Classique, beaucoup de tests communautaires utilisent ce seed.
+            #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
+            #5555	Fidélité à l’image initiale (ton choix actuel)
+            #2026	Léger changement dans la texture ou la posture, subtil mais prévisible
+            #9876	Variation un peu plus visible, garde la structure globale
             try:
                 current_latent_single = generate_latents_robuste_4D(
                     latents=current_latent_single.to(device),
@@ -291,10 +298,10 @@ def main(args):
                     motion_module=None,
                     device=device,
                     dtype=dtype,
-                    guidance_scale=guidance_scale,
-                    init_image_scale=init_image_scale,
-                    creative_noise=creative_noise,
-                    seed=42
+                    guidance_scale=1.5,  #guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte
+                    init_image_scale=0.95, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
+                    creative_noise=0.0, # creative_noise: 0.08    # moins de liberté, plus de cohérence
+                    seed=5555  # 42, 1234, 2026, 5555
                 )
             except Exception as e:
                 print(f"[Robuste INIT ERROR] {e}")
@@ -332,7 +339,7 @@ def main(args):
                             contrast=1.5, saturation=1.3,
                             device=device,
                             frame_counter=frame_counter,
-                            latent_scale_boost=latent_scale_boost
+                            latent_scale_boost=LATENT_SCALE
                         )
                         frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
                         frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
@@ -385,7 +392,6 @@ def main(args):
                             print(f"[N3R ERROR] {e}")
 
                     elif use_mini_gpu:
-                        # Generation avec le prompt !
                         latents = generate_latents_mini_gpu_320(
                             unet=unet, scheduler=scheduler,
                             input_latents=latents_frame, embeddings=cf_embeds,
@@ -404,8 +410,16 @@ def main(args):
                             latents = latent_injection*latents_frame + (1-latent_injection)*latents
 
                     # --- Motion module ---
-                    if motion_module:
-                        latents, _ = apply_motion_safe(latents, motion_module)
+                    #if motion_module:
+                    #    latents, _ = apply_motion_safe(latents, motion_module)
+
+                    if motion_module is not None:
+                        latents = latents.unsqueeze(2)  # [B,C,F,H,W], F=1
+                        latents = motion_module(latents)  # juste les latents
+                        latents = latents.squeeze(2)      # revenir à [B,C,H,W]
+
+                    previous_latent_single = latents.detach().cpu()
+
 
                     # Clamp et resize final
                     latents = torch.clamp(latents, -1.0, 1.0)
@@ -415,18 +429,20 @@ def main(args):
                                                                 mode='bilinear', align_corners=False).contiguous()
 
                     # Décodage streaming
+                    latents = latents / LATENT_SCALE  # “rescale” avant décodage
                     frame_pil = decode_latents_ultrasafe_blockwise(
                         latents, vae,
                         block_size=block_size, overlap=overlap,
                         gamma=1.0, brightness=1.0,
-                        contrast=1.5, saturation=1.3,
+                        contrast=1.0, saturation=1.0,  # contrast=1.5, saturation=1.3,
                         device=device,
                         frame_counter=frame_counter,
-                        latent_scale_boost=latent_scale_boost
+                        latent_scale_boost=1.0  # Si latent_scale_boost = 5.71 image ok, si latent_scale_boost =  LATENT_SCALE = 0.18215  Image Blur
                     )
-                    frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05,
-                                                    saturation=0.85, sharpen=True, sharpen_radius=1,
-                                                    sharpen_percent=90, sharpen_threshold=2)
+                    frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
+                    # Post-processing léger pour lisser les overlaps, sans écraser les détails
+                    #frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=0.1))
+
                     frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                     frame_counter += 1
                     pbar.update(1)
