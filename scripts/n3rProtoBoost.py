@@ -141,7 +141,7 @@ def main(args):
     guidance_scale = cfg.get("guidance_scale", 4.5)
     init_image_scale = cfg.get("init_image_scale", 0.85)
     creative_noise = cfg.get("creative_noise", 0.0)
-    latent_scale_boost = cfg.get("latent_scale_boost", 5.71)
+    latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 3)  # nombre de frames par prompt
 
     print("📌 Paramètres de génération :")
@@ -323,7 +323,6 @@ def main(args):
                         if motion_module:
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
-
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         frame_pil = decode_latents_ultrasafe_blockwise(
@@ -333,7 +332,7 @@ def main(args):
                             contrast=1.0, saturation=1.0,
                             device=device,
                             frame_counter=frame_counter,
-                            latent_scale_boost=1.0
+                            latent_scale_boost=latent_scale_boost
                         )
                         #frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
                         frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
@@ -359,8 +358,8 @@ def main(args):
                     latents = latents_frame.clone()
 
                     #if use_n3r_model:
-                    #if f % 2 == 0 and use_n3r_model:
-                    if f == 0 and use_n3r_model:
+                    #if f == 0 and use_n3r_model:
+                    if f % 2 == 0 and use_n3r_model:
                         try:
                             H, W = cfg["H"], cfg["W"]
                             ys, xs, ss = torch.meshgrid(
@@ -428,7 +427,7 @@ def main(args):
                         contrast=1.0, saturation=1.0,  # contrast=1.5, saturation=1.3,
                         device=device,
                         frame_counter=frame_counter,
-                        latent_scale_boost=1.0  # Si latent_scale_boost = 5.71 image ok, si latent_scale_boost =  LATENT_SCALE = 0.18215  Image Blur
+                        latent_scale_boost=latent_scale_boost  #  Recommmander 1.0
                     )
                     frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
                     # Post-processing léger pour lisser les overlaps, sans écraser les détails
