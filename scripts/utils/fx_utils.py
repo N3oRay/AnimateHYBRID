@@ -3,7 +3,7 @@
 
 import os, math, threading
 from pathlib import Path
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageFilter, ImageEnhance, ImageChops
 
 import torch
 import numpy as np
@@ -13,6 +13,367 @@ import torch.nn.functional as Fu
 import torch.nn.functional as TF
 import torch.nn.functional as FF
 LATENT_SCALE = 0.18215
+
+
+
+
+def apply_post_processing_cinematic(frame_pil,
+                                    contrast=1.2,
+                                    brightness=1.02,
+                                    saturation=0.95,
+                                    vibrance_base=1.03,
+                                    vibrance_max=1.12,
+                                    edge_strength=1.3,
+                                    simplify_radius=0.45,
+                                    smooth_radius_global=0.08,
+                                    smooth_radius_local=0.05,
+                                    sharpen=True,
+                                    sharpen_radius=0.8,
+                                    sharpen_percent=60,
+                                    white_threshold=245):
+    """
+    Version cinématique ultra-pro:
+    - lissage adaptatif par luminosité / teinte
+    - relief accentué
+    - vibrance dynamique
+    - suppression des points blancs / artifacts crispy
+    """
+
+    # ---------------- 1️⃣ Lissage global léger
+    if smooth_radius_global > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=smooth_radius_global))
+
+    # ---------------- 2️⃣ Effet Unreal / relief / bord
+    frame_pil = apply_post_processing_unreal_safe(
+        frame_pil,
+        contrast=contrast,
+        vibrance=vibrance_base,
+        edge_strength=edge_strength,
+        simplify_radius=simplify_radius
+    )
+
+    # ---------------- 3️⃣ Vibrance adaptative
+    frame_hsv = frame_pil.convert("HSV")
+    h, s, v = frame_hsv.split()
+    s = s.point(lambda i: min(255, int(i * vibrance_max) if i < 128 else i))
+    frame_pil = Image.merge("HSV", (h, s, v)).convert("RGB")
+
+    # ---------------- 4️⃣ Lissage adaptatif des points blancs / crispy
+    frame_np = np.array(frame_pil).astype(np.uint8)
+    lum = np.mean(frame_np, axis=2)
+    mask_white = lum >= white_threshold
+    if mask_white.any():
+        blurred = frame_pil.filter(ImageFilter.GaussianBlur(radius=smooth_radius_local))
+        frame_np[mask_white] = np.array(blurred)[mask_white]
+        frame_pil = Image.fromarray(frame_np)
+
+    # ---------------- 5️⃣ Accentuation finale légère
+    if sharpen:
+        frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+            radius=sharpen_radius,
+            percent=sharpen_percent,
+            threshold=2
+        ))
+
+    # ---------------- 6️⃣ Ajustements finaux
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    if brightness != 1.0:
+        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
+    if saturation != 1.0:
+        frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    return frame_pil
+
+def apply_post_processing_unreal_smooth_pro(frame_pil,
+                                            contrast=1.1,
+                                            brightness=1.02,
+                                            saturation=0.95,
+                                            vibrance_base=1.03,
+                                            vibrance_max=1.1,
+                                            edge_strength=1.2,
+                                            simplify_radius=0.5,
+                                            smooth_radius_global=0.08,
+                                            smooth_radius_local=0.05,
+                                            sharpen=True,
+                                            sharpen_radius=0.8,
+                                            sharpen_percent=60,
+                                            white_threshold=245):
+    """
+    Version PRO du post-processing Unreal + lissage.
+    - smooth_radius_global : lissage léger général
+    - smooth_radius_local  : lissage ciblé pour points blancs / crispy
+    - vibrance_base / vibrance_max : vibrance contrôlée
+    - edge_strength : intensité des contours / volume
+    """
+
+    # ---------------------------------------------------------
+    # 1️⃣ Lissage global léger
+    if smooth_radius_global > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=smooth_radius_global))
+
+    # ---------------------------------------------------------
+    # 2️⃣ Accent volume / edge / simplification textures
+    frame_pil = apply_post_processing_unreal_safe(
+        frame_pil,
+        contrast=contrast,
+        vibrance=vibrance_base,
+        edge_strength=edge_strength,
+        simplify_radius=simplify_radius
+    )
+
+    # ---------------------------------------------------------
+    # 3️⃣ Vibrance adaptative
+    if vibrance_max != 1.0:
+        frame_hsv = frame_pil.convert("HSV")
+        h, s, v = frame_hsv.split()
+        s = s.point(lambda i: min(255, int(i * vibrance_max) if i < 128 else i))
+        frame_pil = Image.merge("HSV", (h, s, v)).convert("RGB")
+
+    # ---------------------------------------------------------
+    # 4️⃣ Suppression des points blancs / parasites
+    frame_np = np.array(frame_pil).astype(np.uint8)
+    mask_white = np.all(frame_np >= white_threshold, axis=2)
+    if mask_white.any():
+        # Blur léger seulement sur les pixels blancs
+        blurred = frame_pil.filter(ImageFilter.GaussianBlur(radius=smooth_radius_local))
+        frame_np[mask_white] = np.array(blurred)[mask_white]
+        frame_pil = Image.fromarray(frame_np)
+
+    # ---------------------------------------------------------
+    # 5️⃣ Accentuation finale légère
+    if sharpen:
+        frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+            radius=sharpen_radius,
+            percent=sharpen_percent,
+            threshold=2
+        ))
+
+    # ---------------------------------------------------------
+    # 6️⃣ Ajustement contrast / brightness / saturation final
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    if brightness != 1.0:
+        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
+    if saturation != 1.0:
+        frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    return frame_pil
+
+
+def remove_white_noise(frame_pil, threshold=245, blur_radius=0.6):
+    """
+    Atténue les pixels trop blancs (artefacts) par lissage local.
+    threshold : valeur RGB au-dessus de laquelle un pixel est considéré bruit
+    blur_radius : rayon du lissage local
+    """
+    frame_rgb = frame_pil.convert("RGB")
+    # créer un masque des pixels trop blancs
+    mask = frame_rgb.point(lambda i: 255 if i > threshold else 0)
+    mask = mask.convert("L")
+    # flouter la zone bruyante
+    blurred = frame_rgb.filter(ImageFilter.GaussianBlur(blur_radius))
+    # fusionner uniquement sur le masque
+    cleaned = Image.composite(blurred, frame_rgb, mask)
+    return cleaned
+
+def apply_post_processing_unreal_smooth_pil(frame_pil,
+                                             contrast=1.10,
+                                             vibrance=1.03,
+                                             edge_strength=1.2,
+                                             simplify_radius=0.5,
+                                             smooth_radius=0.12,
+                                             sharpen=True,
+                                             sharpen_radius=0.8,
+                                             sharpen_percent=60,
+                                             white_threshold=245,
+                                             white_blur=1.0):
+    # 1️⃣ Lissage global doux pour réduire le bruit blanc
+    if smooth_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=smooth_radius))
+
+    # 2️⃣ Effets Unreal (volume / bord / simplification)
+    frame_pil = apply_post_processing_unreal_safe(
+        frame_pil,
+        contrast=contrast,
+        vibrance=vibrance,
+        edge_strength=edge_strength,
+        simplify_radius=simplify_radius,
+        sharpen_percent=sharpen_percent
+    )
+
+    # 3️⃣ Supprimer les pixels blancs résiduels avant le sharp
+    frame_pil = remove_white_noise(frame_pil, threshold=white_threshold, blur_radius=white_blur)
+
+    # 4️⃣ Accentuation légère finale
+    if sharpen:
+        frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+            radius=sharpen_radius,
+            percent=sharpen_percent,
+            threshold=2
+        ))
+
+    return frame_pil
+
+
+def apply_post_processing_unreal_smooth(frame_pil,
+                                        contrast=1.15,
+                                        vibrance=1.05,
+                                        edge_strength=1.5,
+                                        simplify_radius=0.8,
+                                        smooth_radius=0.05,
+                                        sharpen_percent=70):
+    # 1️⃣ Unreal (volume + bords)
+    frame_pil = apply_post_processing_unreal_safe(
+        frame_pil,
+        contrast=contrast,
+        vibrance=vibrance,
+        edge_strength=edge_strength,
+        simplify_radius=simplify_radius
+    )
+
+    # 2️⃣ Lissage adaptatif (smoothing léger, préserve contours)
+    # On utilise un GaussianBlur très léger et on peut mélanger avec l'image originale pour contrôler le lissage
+    frame_blur = frame_pil.filter(ImageFilter.GaussianBlur(radius=smooth_radius))
+    frame_pil = Image.blend(frame_pil, frame_blur, alpha=0.35)  # alpha <1 pour ne pas tout écraser
+
+    # 3️⃣ Adaptive / final tweaks
+    frame_pil = apply_post_processing_adaptive(
+        frame_pil,
+        blur_radius=0.0,
+        contrast=1.05,
+        brightness=1.05,
+        saturation=0.90,
+        vibrance_base=1.0,
+        vibrance_max=1.05,
+        sharpen=True,
+        sharpen_radius=1,
+        sharpen_percent=sharpen_percent,
+        sharpen_threshold=2
+    )
+
+    # 4️⃣ Clamp final pour éviter pixels blancs
+    frame_pil = frame_pil.point(lambda i: max(0, min(255, int(i))))
+
+    return frame_pil
+
+
+def apply_post_processing_unreal_safe(frame_pil,
+                                      blur_radius=0.02,
+                                      contrast=1.2,
+                                      brightness=1.05,
+                                      saturation=0.95,
+                                      vibrance=1.05,
+                                      edge_boost=True,
+                                      edge_strength=1.5,
+                                      simplify_radius=0.8,
+                                      sharpen=True,
+                                      sharpen_radius=1,
+                                      sharpen_percent=90,
+                                      sharpen_threshold=2):
+    """
+    Post-processing 'Unreal' sécurisé : volume/bords sans saturer les couleurs.
+    """
+    # 1️⃣ Simplification textures
+    if simplify_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=simplify_radius))
+
+    # 2️⃣ Vibrance modérée (avant contraste)
+    if vibrance != 1.0:
+        frame_hsv = frame_pil.convert("HSV")
+        h, s, v = frame_hsv.split()
+        s = s.point(lambda i: min(255, int(i * vibrance) if i < 128 else i))
+        frame_pil = Image.merge("HSV", (h, s, v)).convert("RGB")
+
+    # 3️⃣ Contraste / Luminosité / Saturation
+    frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
+    frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    # 4️⃣ Edge boost uniquement sur luminance
+    if edge_boost:
+        gray = frame_pil.convert("L")
+        edge = gray.filter(ImageFilter.FIND_EDGES)
+        edge = ImageEnhance.Contrast(edge).enhance(edge_strength)
+        # Convert edge en RGB mais neutre en couleur
+        edge_rgb = Image.merge("RGB", (edge, edge, edge))
+        frame_pil = ImageChops.add(frame_pil, edge_rgb, scale=1.0, offset=0)
+
+    # 5️⃣ Sharp
+    if sharpen:
+        frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+            radius=sharpen_radius,
+            percent=sharpen_percent,
+            threshold=sharpen_threshold
+        ))
+
+    # 6️⃣ Blur final léger
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # 7️⃣ Clamp final pour éviter saturation excessive
+    frame_pil = frame_pil.point(lambda i: max(0, min(255, int(i))))
+
+    return frame_pil
+
+
+def apply_post_processing_unreal(frame_pil,
+                                 blur_radius=0.02,
+                                 contrast=1.2,
+                                 brightness=1.05,
+                                 saturation=1.0,
+                                 vibrance=1.1,
+                                 sharpen=True,
+                                 sharpen_radius=2,
+                                 sharpen_percent=150,
+                                 sharpen_threshold=2,
+                                 edge_boost=True,
+                                 edge_strength=1.5,
+                                 texture_simplify=True,
+                                 simplify_radius=1.0):
+    """
+    Post-processing de type 'Unreal' pour donner plus de volume et styliser les images.
+    """
+
+    # ----------------- 1) Lissage / simplification textures -----------------
+    if texture_simplify and simplify_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=simplify_radius))
+
+    # ----------------- 2) Contraste / Luminosité / Saturation -----------------
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    if brightness != 1.0:
+        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
+    if saturation != 1.0:
+        frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    # ----------------- 3) Vibrance (boost couleurs faibles) -----------------
+    if vibrance != 1.0:
+        frame_hsv = frame_pil.convert("HSV")
+        h, s, v = frame_hsv.split()
+        s = s.point(lambda i: min(255, int(i * vibrance) if i < 128 else i))
+        frame_pil = Image.merge("HSV", (h, s, v)).convert("RGB")
+
+    # ----------------- 4) Edge Enhance / Relief -----------------
+    if edge_boost:
+        # Edge enhance + high contrast overlay pour effet 'bordelands / unreal'
+        edge = frame_pil.filter(ImageFilter.FIND_EDGES)
+        edge = ImageEnhance.Contrast(edge).enhance(edge_strength)
+        frame_pil = ImageChops.add(frame_pil, edge, scale=1.0, offset=0)
+
+    # ----------------- 5) Sharp -----------------
+    if sharpen:
+        frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+            radius=sharpen_radius,
+            percent=sharpen_percent,
+            threshold=sharpen_threshold
+        ))
+
+    # ----------------- 6) Option blur final léger -----------------
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    return frame_pil
 
 
 # ---------------- Fusion N3R/VAE adaptative ----------------
