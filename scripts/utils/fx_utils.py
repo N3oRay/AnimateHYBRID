@@ -137,9 +137,137 @@ def adaptive_post_process(image):
         )
 
 
+def apply_post_processing_adaptive(
+    frame_pil,
+    blur_radius=0.05,
+    contrast=1.15,
+    brightness=1.05,
+    saturation=0.85,
+    vibrance_base=1.1,      # vibrance de base
+    vibrance_max=1.3,       # max booster pour zones peu saturées
+    sharpen=False,
+    sharpen_radius=1,
+    sharpen_percent=90,
+    sharpen_threshold=2,
+    clamp_r=True            # clamp adaptatif du canal rouge
+):
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
 
+    # ---------------- GaussianBlur léger ----------------
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
-def apply_post_processing(frame_pil,
+    # ---------------- Contrast / Brightness / Saturation ----------------
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    if brightness != 1.0:
+        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
+    if saturation != 1.0:
+        frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    # ---------------- Vibrance adaptative ----------------
+    try:
+        frame_np = np.array(frame_pil).astype(np.float32)
+        # calculer la saturation relative par pixel
+        max_rgb = np.max(frame_np, axis=2)
+        min_rgb = np.min(frame_np, axis=2)
+        sat = max_rgb - min_rgb
+        # vibrance: plus le pixel est peu saturé, plus on boost
+        factor_map = vibrance_base + (vibrance_max - vibrance_base) * (1 - sat/255.0)
+        factor_map = np.clip(factor_map, vibrance_base, vibrance_max)
+        for c in range(3):
+            frame_np[:,:,c] = np.clip(frame_np[:,:,c] * factor_map, 0, 255)
+        frame_pil = Image.fromarray(frame_np.astype(np.uint8))
+    except Exception as e:
+        print(f"[WARNING] vibrance adaptative skipped: {e}")
+
+    # ---------------- Clamp adaptatif du canal rouge ----------------
+    if clamp_r:
+        try:
+            r, g, b = frame_pil.split()
+            r_np = np.array(r).astype(np.float32)
+            r_mean = r_np.mean()
+            # si la moyenne est trop haute, réduire légèrement
+            if r_mean > 180:
+                factor = 180 / r_mean
+                r_np = np.clip(r_np * factor, 0, 255)
+            r = Image.fromarray(r_np.astype(np.uint8))
+            frame_pil = Image.merge("RGB", (r, g, b))
+        except Exception as e:
+            print(f"[WARNING] clamp rouge skipped: {e}")
+
+    # ---------------- Sharp / UnsharpMask ----------------
+    if sharpen:
+        try:
+            frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+                radius=sharpen_radius,
+                percent=sharpen_percent,
+                threshold=sharpen_threshold
+            ))
+        except Exception as e:
+            print(f"[WARNING] sharpening skipped: {e}")
+
+    return frame_pil
+
+def apply_post_processing(
+    frame_pil,
+    blur_radius=0.05,
+    contrast=1.15,
+    brightness=1.05,
+    saturation=0.85,
+    vibrance=1.0,   # valeurs raisonnables pour éviter doré
+    sharpen=False,
+    sharpen_radius=1,
+    sharpen_percent=90,
+    sharpen_threshold=2,
+    clamp_r=True     # optionnel: clamp canal rouge pour éviter doré
+):
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
+
+    # GaussianBlur
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # Contrast / Brightness / Saturation
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    if brightness != 1.0:
+        frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
+    if saturation != 1.0:
+        frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    # Vibrance: booster légèrement les couleurs peu saturées
+    if vibrance != 1.0:
+        try:
+            frame_hsv = frame_pil.convert("HSV")
+            h, s, v = frame_hsv.split()
+            s = s.point(lambda i: min(255, int(i * vibrance) if i < 128 else i))
+            frame_pil = Image.merge("HSV", (h, s, v)).convert("RGB")
+        except Exception as e:
+            print(f"[WARNING] vibrance skipped due to error: {e}")
+
+    # Clamp canal rouge pour éviter les zones trop dorées
+    if clamp_r:
+        r, g, b = frame_pil.split()
+        r = r.point(lambda i: min(230, i))  # clamp max à 230 (~90% du max)
+        frame_pil = Image.merge("RGB", (r, g, b))
+
+    # Sharp / UnsharpMask
+    if sharpen:
+        try:
+            frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+                radius=sharpen_radius,
+                percent=sharpen_percent,
+                threshold=sharpen_threshold
+            ))
+        except Exception as e:
+            print(f"[WARNING] sharpening skipped due to error: {e}")
+
+    return frame_pil
+
+def apply_post_processing_v1(frame_pil,
                           blur_radius=0.05,
                           contrast=1.15,
                           brightness=1.05,
