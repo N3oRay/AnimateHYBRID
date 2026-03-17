@@ -24,15 +24,23 @@ from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing, encode_images_to_latents_hybrid
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing, encode_images_to_latents_hybrid, interpolate_param_fast
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 
 LATENT_SCALE = 0.18215
 stop_generation = False
 
+# Variation de l'interpolation'
+# Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast --------------------------------
+#init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
 
+# Valeurs finales (plus de créativité, moins d'input)
+init_image_scale_end = 0.6
+guidance_scale_end   = 4.0
+creative_noise_end   = 0.05
 
+# -------------------------------------------------------------------------------------------
 # --- Sélection simple des embeddings prompts par frame ---
 def get_embeddings_for_frame(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
     """
@@ -75,7 +83,6 @@ def fuse_n3r_latents_adaptive(latents_frame, n3r_latents, latent_injection=0.7, 
     return fused_latents
 
 
-
 # ---------------- DEBUG UTILS ----------------
 def log_debug(message, level="INFO", verbose=True):
     """
@@ -84,7 +91,6 @@ def log_debug(message, level="INFO", verbose=True):
     """
     if verbose:
         print(f"[{level}] {message}")
-
 
 # ---------------- Thread stop ----------------
 def wait_for_stop():
@@ -138,8 +144,8 @@ def main(args):
     transition_frames = cfg.get("transition_frames", 4)
     num_fraps_per_image = cfg.get("num_fraps_per_image", 2)
     steps = max(cfg.get("steps", 16), 4)
-    guidance_scale = cfg.get("guidance_scale", 4.5)
-    init_image_scale = cfg.get("init_image_scale", 0.5) # 0.85
+    guidance_scale = cfg.get("guidance_scale", 4.5) # 0.15 peut de créativité 4.5 moderé
+    init_image_scale = cfg.get("init_image_scale", 0.5) # 0.85 ou 0.95 proche de l'init'
     creative_noise = cfg.get("creative_noise", 0.0)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 3)  # nombre de frames par prompt
@@ -274,6 +280,12 @@ def main(args):
     for img_idx, img_path in enumerate(input_paths):
         if stop_generation: break
         try:
+            # Paramètres interpolés
+            current_init_image_scale = interpolate_param_fast(init_image_scale, init_image_scale_end, frame_counter, total_frames, mode="cosine")
+            current_guidance_scale   = interpolate_param_fast(guidance_scale, guidance_scale_end, frame_counter, total_frames, mode="cosine")
+            current_creative_noise   = interpolate_param_fast(creative_noise, creative_noise_end, frame_counter, total_frames, mode="cosine")
+            print(f"[Frame {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
+
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
             input_image = ensure_4_channels(input_image)
@@ -286,10 +298,8 @@ def main(args):
             )
 
             # Génération initiale robuste :
-            #42	Classique, beaucoup de tests communautaires utilisent ce seed.
-            #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
-            #5555	Fidélité à l’image initiale (ton choix actuel)
-            #2026	Léger changement dans la texture ou la posture, subtil mais prévisible
+            #42	Classique, beaucoup de tests communautaires utilisent ce seed. #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
+            #5555	Fidélité à l’image initiale (ton choix actuel) #2026	Léger changement dans la texture ou la posture, subtil mais prévisible
             #9876	Variation un peu plus visible, garde la structure globale
             try:
                 current_latent_single = generate_latents_robuste_4D(
@@ -301,9 +311,9 @@ def main(args):
                     motion_module=None,
                     device=device,
                     dtype=dtype,
-                    guidance_scale=1.5,  #guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte
-                    init_image_scale=0.95, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
-                    creative_noise=0.0, # creative_noise: 0.08    # moins de liberté, plus de cohérence
+                    guidance_scale=current_guidance_scale,  #guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte
+                    init_image_scale=current_init_image_scale, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
+                    creative_noise=current_creative_noise, # creative_noise: 0.08    # moins de liberté, plus de cohérence
                     seed=seed  # 42, 1234, 2026, 5555
                 )
             except Exception as e:
@@ -320,8 +330,15 @@ def main(args):
                     if stop_generation: break
                     alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
                     with torch.no_grad():
-                        latent_interp = (1-alpha)*previous_latent_single.to(device) + alpha*current_latent_single.to(device)
-                        latent_interp = torch.clamp(latent_interp, -1.0, 1.0).contiguous()
+                        #latent_interp = (1-alpha)*previous_latent_single.to(device) + alpha*current_latent_single.to(device)
+                        # --- Fusion adaptative avec diminution progressive de l'influence de la frame précédente
+                        injection_start = 0.8  # influence initiale de l'ancienne frame
+                        injection_end   = 0.1  # influence finale
+                        injection_alpha = injection_start * (1 - t/(transition_frames-1)) + injection_end * (t/(transition_frames-1))
+
+                        latent_interp = injection_alpha * previous_latent_single.to(device) + (1 - injection_alpha) * current_latent_single.to(device)
+                        latent_interp = torch.clamp(latent_interp, -1.0, 1.0)
+                        #latent_interp = torch.clamp(latent_interp, -1.0, 1.0).contiguous()
 
                         if motion_module:
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
@@ -373,6 +390,15 @@ def main(args):
                                 indexing='ij'
                             )
                             coords = torch.stack([xs, ys, ss.float()], dim=-1).reshape(-1,3).float()
+
+                            # --- 🔥 Variation temporelle N3R ---
+                            noise_scale = 0.01 + 0.02 * math.sin(frame_counter * 0.1)
+
+                            # (optionnel mais recommandé pour reproductibilité)
+                            torch.manual_seed(seed + frame_counter)
+
+                            coords = coords + torch.randn_like(coords) * noise_scale
+                            # --- N3R forward --- une variation douce oscillante dans le temps non brutale
                             n3r_latents_raw = n3r_model(coords, H, W)[:, :3]
                             n3r_latents = n3r_latents_raw.view(H, W, n3r_model.N_samples, 3).mean(dim=2)
                             n3r_latents = n3r_latents.permute(2,0,1).unsqueeze(0)
@@ -393,10 +419,10 @@ def main(args):
                         latents = generate_latents_mini_gpu_320(
                             unet=unet, scheduler=scheduler,
                             input_latents=latents_frame, embeddings=cf_embeds,
-                            motion_module=motion_module, guidance_scale=guidance_scale,
+                            motion_module=motion_module, guidance_scale=current_guidance_scale,
                             device=device, fp16=True, steps=steps,
-                            debug=verbose, init_image_scale=init_image_scale,
-                            creative_noise=creative_noise
+                            debug=verbose, init_image_scale=current_init_image_scale,
+                            creative_noise=current_creative_noise
                         )
                         if latent_injection > 0:
                             if latents.shape[-2:] != latents_frame.shape[-2:]:
@@ -417,7 +443,6 @@ def main(args):
                         latents = latents.squeeze(2)      # revenir à [B,C,H,W]
 
                     previous_latent_single = latents.detach().cpu()
-
 
                     # Clamp et resize final
                     latents = torch.clamp(latents, -1.0, 1.0)
