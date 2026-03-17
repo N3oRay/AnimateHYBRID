@@ -24,7 +24,7 @@ from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing, encode_images_to_latents_hybrid
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing, encode_images_to_latents_hybrid
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 
@@ -139,10 +139,12 @@ def main(args):
     num_fraps_per_image = cfg.get("num_fraps_per_image", 2)
     steps = max(cfg.get("steps", 16), 4)
     guidance_scale = cfg.get("guidance_scale", 4.5)
-    init_image_scale = cfg.get("init_image_scale", 0.85)
+    init_image_scale = cfg.get("init_image_scale", 0.5) # 0.85
     creative_noise = cfg.get("creative_noise", 0.0)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 3)  # nombre de frames par prompt
+    # Seed aléatoire
+    seed = torch.randint(0, 100000, (1,)).item()
 
     print("📌 Paramètres de génération :")
     print(f"  fps                  : {fps}")
@@ -154,6 +156,7 @@ def main(args):
     print(f"  creative_noise       : {creative_noise}")
     print(f"  latent_scale_boost   : {latent_scale_boost}")
     print(f"  final_latent_scale   : {final_latent_scale}")
+    print(f"  seed                 : {seed}")
 
     scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012,
                               beta_schedule="scaled_linear", num_train_timesteps=1000)
@@ -301,7 +304,7 @@ def main(args):
                     guidance_scale=1.5,  #guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte
                     init_image_scale=0.95, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
                     creative_noise=0.0, # creative_noise: 0.08    # moins de liberté, plus de cohérence
-                    seed=5555  # 42, 1234, 2026, 5555
+                    seed=seed  # 42, 1234, 2026, 5555
                 )
             except Exception as e:
                 print(f"[Robuste INIT ERROR] {e}")
@@ -335,7 +338,8 @@ def main(args):
                             latent_scale_boost=latent_scale_boost
                         )
                         #frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
-                        frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
+                        #frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
+                        frame_pil = adaptive_post_process(frame_pil)
                         frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                         frame_counter += 1
                         pbar.update(1)
