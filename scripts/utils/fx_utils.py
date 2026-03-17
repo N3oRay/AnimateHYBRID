@@ -15,6 +15,45 @@ import torch.nn.functional as FF
 LATENT_SCALE = 0.18215
 
 
+def interpolate_param_fast(start_val, end_val, current_frame, total_frames, mode="linear", speed=2.0):
+    """
+    Interpolation accélérée pour faire varier les paramètres plus rapidement au début.
+    speed > 1 → plus rapide, speed < 1 → plus lent
+    """
+    t = current_frame / max(total_frames-1, 1)
+    t = min(1.0, t * speed)  # accélère la progression
+
+    if mode == "linear":
+        return start_val + (end_val - start_val) * t
+    elif mode == "cosine":
+        t = (1 - math.cos(math.pi * t)) / 2
+        return start_val + (end_val - start_val) * t
+    elif mode == "ease_in_out":
+        t = t*t*(3 - 2*t)
+        return start_val + (end_val - start_val) * t
+    else:
+        return start_val + (end_val - start_val) * t
+
+
+def interpolate_param(start_val, end_val, current_frame, total_frames, mode="linear"):
+    """
+    Interpolation d'un paramètre entre start_val -> end_val sur total_frames.
+    Modes disponibles: 'linear', 'cosine', 'ease_in_out'
+    """
+    t = current_frame / max(total_frames-1,1)
+    if mode == "linear":
+        return start_val + (end_val - start_val) * t
+    elif mode == "cosine":
+        # Cosine easing pour un départ/arrivée plus doux
+        t = (1 - math.cos(math.pi * t)) / 2
+        return start_val + (end_val - start_val) * t
+    elif mode == "ease_in_out":
+        t = t*t*(3 - 2*t)
+        return start_val + (end_val - start_val) * t
+    else:
+        return start_val + (end_val - start_val) * t
+
+
 def estimate_sharpness(image):
     gray = image.convert("L")
     arr = np.array(gray, dtype=np.float32)
