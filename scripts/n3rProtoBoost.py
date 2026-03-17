@@ -2,7 +2,6 @@
 # n3rProtoBoost.py - AnimateDiff ultra-light ~2Go VRAM
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
 #Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅
-
 #Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM, un peu plus gourmand mais toujours raisonnable ✅
 # --------------------------------------------------------------
 import os, math, threading
@@ -24,7 +23,8 @@ from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing_adaptive, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, apply_post_processing_unreal_smooth_pil
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing_adaptive, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, apply_post_processing_unreal_smooth_pro, apply_post_processing_cinematic_ultra_refined_pro, remove_white_noise, apply_post_processing
+
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 
@@ -33,11 +33,11 @@ stop_generation = False
 
 # Variation de l'interpolation' Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast ---
 #init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
-
 # Valeurs finales (plus de créativité, moins d'input)
-init_image_scale_end = 0.6
+init_image_scale_end = 0.95
 guidance_scale_end   = 4.0
-creative_noise_end   = 0.05
+creative_noise_end   = 0.0
+
 
 # -------------------------------------------------------------------------------------------
 def sanitize_latents(latents):
@@ -45,10 +45,27 @@ def sanitize_latents(latents):
 
     # clamp doux (évite saturation brutale)
     latents = torch.clamp(latents, -1.2, 1.2)
-
     # normalisation légère si explosion
     if latents.std() > 1.5:
         latents = latents / latents.std()
+
+    return latents
+
+# -------------------------------------------------------------------------------------------
+def stabilize_latents_advanced(latents, strength=0.99, knee=0.7):
+    # sécurité
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # clamp doux
+    latents = torch.clamp(latents, -1.2, 1.2)
+    # normalisation si explosion
+    std = latents.std()
+    if std > 1.5:
+        latents = latents / std
+    # 🔥 compression non-linéaire (anti crispy blanc)
+    latents = torch.tanh(latents * (1.0 / knee)) * knee
+    # léger scaling global
+    latents = latents * strength
 
     return latents
 # --- Sélection simple des embeddings prompts par frame ---
@@ -258,7 +275,7 @@ def main(args):
             current_init_image_scale = interpolate_param_fast(init_image_scale, init_image_scale_end, frame_counter, total_frames, mode="cosine")
             current_guidance_scale   = interpolate_param_fast(guidance_scale, guidance_scale_end, frame_counter, total_frames, mode="cosine")
             current_creative_noise   = interpolate_param_fast(creative_noise, creative_noise_end, frame_counter, total_frames, mode="cosine")
-            print(f"[Frame {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
+            print(f"[Frame Start {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
 
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
@@ -272,6 +289,7 @@ def main(args):
 
             # 🔥 FIX NaN / stabilité
             current_latent_single = sanitize_latents(current_latent_single)
+            current_latent_single = current_latent_single * 0.985
 
             # Génération initiale robuste :
             #42	Classique, beaucoup de tests communautaires utilisent ce seed. #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
@@ -309,6 +327,12 @@ def main(args):
                     if stop_generation: break
                     alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
                     with torch.no_grad():
+
+                        # Paramètres interpolés
+                        current_init_image_scale = interpolate_param_fast(init_image_scale, init_image_scale_end, frame_counter, total_frames, mode="cosine")
+                        current_guidance_scale   = interpolate_param_fast(guidance_scale, guidance_scale_end, frame_counter, total_frames, mode="cosine")
+                        current_creative_noise   = interpolate_param_fast(creative_noise, creative_noise_end, frame_counter, total_frames, mode="cosine")
+                        print(f"[Frame init {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
                         # --- Fusion adaptative avec diminution progressive de l'influence de la frame précédente
                         injection_start = 0.8  # influence initiale de l'ancienne frame
                         injection_end   = 0.1  # influence finale
@@ -332,10 +356,10 @@ def main(args):
                             frame_counter=frame_counter,
                             latent_scale_boost=latent_scale_boost
                         )
-                        #frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
-                        #frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
-                        #frame_pil = adaptive_post_process(frame_pil)
-                        #frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, vibrance_base=1.2, vibrance_max=1.3, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
+                        frame_pil = apply_post_processing(frame_pil, blur_radius=0.0, contrast=1.20, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=2, sharpen_threshold=2)
+                        #frame_pil = remove_white_noise(frame_pil, threshold=245, blur_radius=0.6)
+                        frame_pil = frame_pil.point(lambda i: max(0, min(255, int(i))))
+                        # save
                         frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                         frame_counter += 1
                         pbar.update(1)
@@ -349,6 +373,12 @@ def main(args):
                 with torch.no_grad():
                     latents_frame = current_latent_single.to(device)
 
+                    # Paramètres interpolés
+                    current_init_image_scale = interpolate_param_fast(init_image_scale, init_image_scale_end, frame_counter, total_frames, mode="cosine")
+                    current_guidance_scale   = interpolate_param_fast(guidance_scale, guidance_scale_end, frame_counter, total_frames, mode="cosine")
+                    current_creative_noise   = interpolate_param_fast(creative_noise, creative_noise_end, frame_counter, total_frames, mode="cosine")
+                    print(f"[Frame principales {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
+
                     # --- Interpolation des embeddings prompts ---
                     #cf_embeds = get_interpolated_embeddings(frame_counter, total_frames, pos_embeds_list, neg_embeds_list)
                     cf_embeds = get_embeddings_for_frame(frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device)
@@ -356,9 +386,6 @@ def main(args):
                     # --- N3R ou mini GPU diffusion ---
                     n3r_latents = None
                     latents = latents_frame.clone()
-
-                    # 🔥 FIX NaN / stabilité
-                    latents = sanitize_latents(latents)
 
                     #------------------------------------------------- use_n3r_model:
                     use_n3r_this_frame = use_n3r_model and (frame_counter % 2 == 0)
@@ -399,7 +426,7 @@ def main(args):
                             latents = fuse_n3r_latents_adaptive(latents, n3r_latents, latent_injection=latent_injection, clamp_val=1.0, creative_noise=0.0)
 
                             # 🔥 FIX NaN / stabilité
-                            latents = sanitize_latents(latents)
+                            latents = stabilize_latents_advanced(latents)
                         except Exception as e:
                             print(f"[N3R ERROR] {e}")
 
@@ -427,11 +454,10 @@ def main(args):
 
                     if motion_module is not None:
                         # 🔥 FIX NaN / stabilité
-                        latents = sanitize_latents(latents)
                         latents = latents.unsqueeze(2)  # [B,C,F,H,W], F=1
                         latents = motion_module(latents)  # juste les latents
                         latents = latents.squeeze(2)      # revenir à [B,C,H,W]
-                        latents = sanitize_latents(latents)
+
 
                     # 🔥 stabilisation temporelle (avant update)
                     if previous_latent_single is not None:
@@ -440,16 +466,29 @@ def main(args):
                     # 🔥 update après
                     previous_latent_single = latents.detach().cpu()
 
-                    # Clamp et resize final
-                    # 🔥 FIX NaN / stabilité
-                    latents = sanitize_latents(latents)
+                    # Clamp et resize final 🔥 FIX NaN / stabilité  🔥 nettoyage final intelligent (LE point clé)
 
+                    # 🔥 micro-smoothing adaptatif (plus doux)
+                    high_mask = latents.abs() > 0.7
+                    latents[high_mask] *= 0.987
+
+                    # 🔥 spikes progressifs (meilleur que soustraction)
+                    spike_mask = latents.abs() > 0.88
+                    latents[spike_mask] *= 0.965
+
+                    # compression douce finale
+                    latents = stabilize_latents_advanced(latents, strength=0.995, knee=0.65)
+
+                    # clamp propre
+                    latents = torch.clamp(latents, -1.0, 1.0)
+
+                    # decode
                     latents = latents / LATENT_SCALE
                     frame_pil = decode_latents_ultrasafe_blockwise(
                         latents, vae,
                         block_size=block_size, overlap=overlap,
-                        gamma=1.0, brightness=1.0,
-                        contrast=1.0, saturation=1.0,  # contrast=1.5, saturation=1.3,
+                        gamma=0.9, brightness=1.1,
+                        contrast=1.2, saturation=1.08,  # contrast=1.5, saturation=1.3,
                         device=device,
                         frame_counter=frame_counter,
                         latent_scale_boost=latent_scale_boost  #  Recommmander 1.0
@@ -457,22 +496,12 @@ def main(args):
 
                     # 1️⃣ Unreal / relief
                     # ---------------- Post-processing final sécurisé ----------------
-
-                    frame_pil = apply_post_processing_unreal_smooth_pro(frame_pil,
-                        contrast=1.2,
-                        brightness=1.02,
-                        saturation=0.95,
-                        vibrance_base=1.03,
-                        vibrance_max=1.1,
-                        edge_strength=1.2,
-                        simplify_radius=0.5,
-                        smooth_radius_global=0.08,
-                        smooth_radius_local=0.05,
-                        sharpen=True,
-                        sharpen_radius=0.8,
-                        sharpen_percent=60,
-                        white_threshold=245
-                    )
+                    # Lissage ciblé sur points blancs très clairs
+                    #
+                    #frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.5, brightness=1.05, saturation=0.85, vibrance_base=1.0, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
+                    frame_pil = apply_post_processing(frame_pil, blur_radius=0.0, contrast=1.20, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=2, sharpen_threshold=2)
+                    #frame_pil = remove_white_noise(frame_pil, threshold=245, blur_radius=0.6)
+                    frame_pil = frame_pil.point(lambda i: max(0, min(255, int(i))))
 
                     frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                     frame_counter += 1
