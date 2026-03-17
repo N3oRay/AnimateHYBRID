@@ -9,6 +9,70 @@ from torchvision.transforms import functional as F
 
 LATENT_SCALE = 0.18215  # valeur globale, peut être importée si nécessaire
 
+def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
+    overlap = int(block_size * max_overlap_ratio)
+    return min(overlap, min(W,H)//4)
+
+# ---------------- DEBUG UTILS ----------------
+def log_debug(message, level="INFO", verbose=True):
+    """
+    Affiche le message si verbose=True.
+    level: "INFO", "DEBUG", "WARNING"
+    """
+    if verbose:
+        print(f"[{level}] {message}")
+# -------------------------------------------------------------------------------------------
+def sanitize_latents(latents):
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # clamp doux (évite saturation brutale)
+    latents = torch.clamp(latents, -1.2, 1.2)
+    # normalisation légère si explosion
+    if latents.std() > 1.5:
+        latents = latents / latents.std()
+
+    return latents
+
+# -------------------------------------------------------------------------------------------
+def stabilize_latents_advanced(latents, strength=0.99, knee=0.7):
+    # sécurité
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # clamp doux
+    latents = torch.clamp(latents, -1.2, 1.2)
+    # normalisation si explosion
+    std = latents.std()
+    if std > 1.5:
+        latents = latents / std
+    # 🔥 compression non-linéaire (anti crispy blanc)
+    latents = torch.tanh(latents * (1.0 / knee)) * knee
+    # léger scaling global
+    latents = latents * strength
+
+    return latents
+
+
+
+def print_generation_params(params: dict):
+    """
+    Affiche les paramètres de génération dans un tableau clair.
+
+    params : dict
+        Dictionnaire contenant tous les paramètres nécessaires.
+        Exemple de clés attendues :
+        'fps', 'upscale_factor', 'num_fraps_per_image', 'steps',
+        'guidance_scale', 'init_image_scale', 'creative_noise',
+        'latent_scale_boost', 'final_latent_scale', 'seed'
+    """
+    print("📌 Paramètres de génération :")
+    print(f"{'Paramètre':<20} {'Valeur':>10}   {'Paramètre':<20} {'Valeur':>10}")
+
+    left_keys = ['fps', 'num_fraps_per_image', 'guidance_scale', 'creative_noise', 'final_latent_scale']
+    right_keys = ['upscale_factor', 'steps', 'init_image_scale', 'latent_scale_boost', 'seed']
+
+    for l, r in zip(left_keys, right_keys):
+        print(f"{l:<20} {params.get(l, ''):>10}   {r:<20} {params.get(r, ''):>10}")
+
 
 # ---------------- Tensor / PIL utils ----------------
 def prepare_frame_tensor(frame_tensor):
