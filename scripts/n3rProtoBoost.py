@@ -24,7 +24,7 @@ from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing_adaptive, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing_adaptive, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, apply_post_processing_unreal_smooth_pil
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 
@@ -454,9 +454,25 @@ def main(args):
                         frame_counter=frame_counter,
                         latent_scale_boost=latent_scale_boost  #  Recommmander 1.0
                     )
-                    frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, vibrance_base=1.1, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
-                    # Post-processing léger pour lisser les overlaps, sans écraser les détails
-                    #frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=0.1))
+
+                    # 1️⃣ Unreal / relief
+                    # ---------------- Post-processing final sécurisé ----------------
+
+                    frame_pil = apply_post_processing_unreal_smooth_pro(frame_pil,
+                        contrast=1.2,
+                        brightness=1.02,
+                        saturation=0.95,
+                        vibrance_base=1.03,
+                        vibrance_max=1.1,
+                        edge_strength=1.2,
+                        simplify_radius=0.5,
+                        smooth_radius_global=0.08,
+                        smooth_radius_local=0.05,
+                        sharpen=True,
+                        sharpen_radius=0.8,
+                        sharpen_percent=60,
+                        white_threshold=245
+                    )
 
                     frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                     frame_counter += 1
