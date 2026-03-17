@@ -15,6 +15,58 @@ import torch.nn.functional as FF
 LATENT_SCALE = 0.18215
 
 
+def estimate_sharpness(image):
+    gray = image.convert("L")
+    arr = np.array(gray, dtype=np.float32)
+    laplacian = np.abs(
+        arr[:-2,1:-1] + arr[2:,1:-1] + arr[1:-1,:-2] + arr[1:-1,2:] - 4*arr[1:-1,1:-1]
+    )
+    return laplacian.mean()
+
+def adaptive_post_process(image):
+    sharpness = estimate_sharpness(image)
+
+    # seuils empiriques (à ajuster)
+    if sharpness < 8:
+        # image floue → sharpen fort
+        return apply_post_processing(
+            image,
+            blur_radius=0.02,
+            contrast=1.1,
+            brightness=1.05,
+            saturation=0.9,
+            sharpen=True,
+            sharpen_radius=1,
+            sharpen_percent=120,
+            sharpen_threshold=2
+        )
+
+    elif sharpness > 15:
+        # image déjà très nette → adoucir
+        return apply_post_processing(
+            image,
+            blur_radius=0.15,
+            contrast=1.05,
+            brightness=1.02,
+            saturation=0.85,
+            sharpen=False
+        )
+
+    else:
+        # équilibré
+        return apply_post_processing(
+            image,
+            blur_radius=0.05,
+            contrast=1.1,
+            brightness=1.05,
+            saturation=0.9,
+            sharpen=True,
+            sharpen_radius=1,
+            sharpen_percent=80,
+            sharpen_threshold=2
+        )
+
+
 def apply_post_processing(frame_pil,
                           blur_radius=0.05,
                           contrast=1.15,

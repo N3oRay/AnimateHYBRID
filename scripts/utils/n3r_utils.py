@@ -811,7 +811,7 @@ def generate_latents_mini_gpu_320(unet, **kwargs):
     scheduler = kwargs.get("scheduler", None)
     guidance_scale = kwargs.get("guidance_scale", 1.0)
     steps = kwargs.get("steps", 20)
-    debug = kwargs.get("debug", True)
+    debug = kwargs.get("debug", False)
 
     # Nouveaux params
     init_image_scale = kwargs.get("init_image_scale", 0.0)
