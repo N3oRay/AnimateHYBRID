@@ -1,8 +1,7 @@
 # --------------------------------------------------------------
 # n3rProtoBoost.py - AnimateDiff ultra-light ~2Go VRAM
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
-#Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅
-#Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM, un peu plus gourmand mais toujours raisonnable ✅
+#Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM, un peu plus gourmand mais toujours raisonnable ✅
 # --------------------------------------------------------------
 import os, math, threading
 from pathlib import Path
@@ -10,16 +9,13 @@ from datetime import datetime
 import torch
 from tqdm import tqdm
 from torchvision.transforms.functional import to_pil_image
-from PIL import Image
-from PIL import ImageFilter
+from PIL import Image, ImageFilter
 import argparse
-
 from diffusers import PNDMScheduler
 from transformers import CLIPTokenizerFast, CLIPTextModel
-
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
-from scripts.utils.tools_utils import ensure_4_channels
+from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
@@ -38,54 +34,12 @@ init_image_scale_end = 0.95
 guidance_scale_end   = 4.0
 creative_noise_end   = 0.0
 
-
-# -------------------------------------------------------------------------------------------
-def sanitize_latents(latents):
-    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    # clamp doux (évite saturation brutale)
-    latents = torch.clamp(latents, -1.2, 1.2)
-    # normalisation légère si explosion
-    if latents.std() > 1.5:
-        latents = latents / latents.std()
-
-    return latents
-
-# -------------------------------------------------------------------------------------------
-def stabilize_latents_advanced(latents, strength=0.99, knee=0.7):
-    # sécurité
-    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    # clamp doux
-    latents = torch.clamp(latents, -1.2, 1.2)
-    # normalisation si explosion
-    std = latents.std()
-    if std > 1.5:
-        latents = latents / std
-    # 🔥 compression non-linéaire (anti crispy blanc)
-    latents = torch.tanh(latents * (1.0 / knee)) * knee
-    # léger scaling global
-    latents = latents * strength
-
-    return latents
 # --- Sélection simple des embeddings prompts par frame ---
 def get_embeddings_for_frame(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
-    """
-    Retourne les embeddings du prompt correspondant à la frame_idx.
-    Chaque prompt produit `frames_per_prompt` frames consécutives.
-    """
+    #Retourne les embeddings du prompt correspondant à la frame_idx. Chaque prompt produit `frames_per_prompt` frames consécutives.
     num_prompts = len(pos_list)
     prompt_idx = min(frame_idx // frames_per_prompt, num_prompts - 1)
     return pos_list[prompt_idx].to(device), neg_list[prompt_idx].to(device)
-
-# ---------------- DEBUG UTILS ----------------
-def log_debug(message, level="INFO", verbose=True):
-    """
-    Affiche le message si verbose=True.
-    level: "INFO", "DEBUG", "WARNING"
-    """
-    if verbose:
-        print(f"[{level}] {message}")
 
 # ---------------- Thread stop ----------------
 def wait_for_stop():
@@ -96,11 +50,6 @@ def wait_for_stop():
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
 # ---------------- Utilitaires ----------------
-
-def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
-    overlap = int(block_size * max_overlap_ratio)
-    return min(overlap, min(W,H)//4)
-
 def apply_motion_safe(latents, motion_module, threshold=1e-3):
     if latents.abs().max() < threshold:
         return latents, False
@@ -147,13 +96,10 @@ def main(args):
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
 
-    print("📌 Paramètres de génération :")
-    print(f"{'Paramètre':<20} {'Valeur':>10}   {'Paramètre':<20} {'Valeur':>10}")
-    print(f"{'fps':<20} {fps:>10}   {'upscale_factor':<20} {upscale_factor:>10}")
-    print(f"{'num_fraps_per_image':<20} {num_fraps_per_image:>10}   {'steps':<20} {steps:>10}")
-    print(f"{'guidance_scale':<20} {guidance_scale:>10}   {'init_image_scale':<20} {init_image_scale:>10}")
-    print(f"{'creative_noise':<20} {creative_noise:>10}   {'latent_scale_boost':<20} {latent_scale_boost:>10}")
-    print(f"{'final_latent_scale':<20} {final_latent_scale:>10}   {'seed':<20} {seed:>10}")
+
+    params = { 'fps': fps, 'upscale_factor': upscale_factor, 'num_fraps_per_image': num_fraps_per_image, 'steps': steps, 'guidance_scale': guidance_scale, 'init_image_scale': init_image_scale, 'creative_noise': creative_noise, 'latent_scale_boost': latent_scale_boost, 'final_latent_scale': final_latent_scale, 'seed': seed }
+    print_generation_params(params)
+
 
     scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012,
                               beta_schedule="scaled_linear", num_train_timesteps=1000)
@@ -268,7 +214,10 @@ def main(args):
 
     # ---------------- Frames principales avec interpolation prompts ----------------
 
+    # Paramètres adaptatifs
+
     for img_idx, img_path in enumerate(input_paths):
+
         if stop_generation: break
         try:
             # Paramètres interpolés
@@ -488,16 +437,13 @@ def main(args):
                         latents, vae,
                         block_size=block_size, overlap=overlap,
                         gamma=0.9, brightness=1.1,
-                        contrast=1.2, saturation=1.08,  # contrast=1.5, saturation=1.3,
+                        contrast=1.2, saturation=1.08,
                         device=device,
                         frame_counter=frame_counter,
                         latent_scale_boost=latent_scale_boost  #  Recommmander 1.0
                     )
 
-                    # 1️⃣ Unreal / relief
-                    # ---------------- Post-processing final sécurisé ----------------
-                    # Lissage ciblé sur points blancs très clairs
-                    #
+                    # ---------------- Post-processing final sécurisé ---------------- Lissage ciblé sur points blancs très clairs
                     #frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.5, brightness=1.05, saturation=0.85, vibrance_base=1.0, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
                     frame_pil = apply_post_processing(frame_pil, blur_radius=0.0, contrast=1.20, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=2, sharpen_threshold=2)
                     #frame_pil = remove_white_noise(frame_pil, threshold=245, blur_radius=0.6)
