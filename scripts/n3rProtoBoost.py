@@ -417,7 +417,7 @@ def main(args):
                         frame_counter=frame_counter,
                         latent_scale_boost=latent_scale_boost  #  Recommmander 1.0
                     )
-                    frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
+                    frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, vibrance=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
                     # Post-processing léger pour lisser les overlaps, sans écraser les détails
                     #frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=0.1))
 
