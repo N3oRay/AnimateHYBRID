@@ -137,43 +137,36 @@ def adaptive_post_process(image):
         )
 
 
+
+
 def apply_post_processing(frame_pil,
                           blur_radius=0.05,
                           contrast=1.15,
                           brightness=1.05,
                           saturation=0.85,
+                          vibrance=1.1,  # <-- ajout vibrance
                           sharpen=False,
                           sharpen_radius=1,
                           sharpen_percent=90,
                           sharpen_threshold=2):
-    """
-    Appliquer des effets post-decode sur une frame PIL.
-
-    Args:
-        frame_pil (PIL.Image): L'image décodée depuis les latents
-        blur_radius (float): Rayon du flou gaussien
-        contrast (float): Facteur de contraste (1.0 = inchangé)
-        brightness (float): Facteur de luminosité (1.0 = inchangé)
-        saturation (float): Facteur de saturation (1.0 = inchangé)
-        sharpen (bool): Appliquer un sharpen/unsharp mask si True
-        sharpen_radius (float): Rayon pour l'UnsharpMask
-        sharpen_percent (float): Intensité pour l'UnsharpMask
-        sharpen_threshold (float): Seuil pour l'UnsharpMask
-
-    Returns:
-        PIL.Image: Image modifiée
-    """
-    # GaussianBlur simple
+    # GaussianBlur
     if blur_radius > 0:
         frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
-    # Ajustements optionnels (contrast, brightness, saturation)
+    # Contrast / Brightness / Saturation
     if contrast != 1.0:
         frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
     if brightness != 1.0:
         frame_pil = ImageEnhance.Brightness(frame_pil).enhance(brightness)
     if saturation != 1.0:
         frame_pil = ImageEnhance.Color(frame_pil).enhance(saturation)
+
+    # Vibrance: booster les couleurs peu saturées
+    if vibrance != 1.0:
+        frame_hsv = frame_pil.convert("HSV")
+        h, s, v = frame_hsv.split()
+        s = s.point(lambda i: min(255, int(i * vibrance) if i < 128 else i))
+        frame_pil = Image.merge("HSV", (h, s, v)).convert("RGB")
 
     # Sharp / UnsharpMask
     if sharpen:
