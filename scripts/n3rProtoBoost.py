@@ -323,25 +323,20 @@ def main(args):
                         if motion_module:
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
-                        # Resize final pour VAE
-                        final_H, final_W = int(cfg["H"]*final_latent_scale), int(cfg["W"]*final_latent_scale)
-                        if latent_interp.shape[-2:] != (final_H, final_W):
-                            latent_interp = torch.nn.functional.interpolate(
-                                latent_interp, size=(final_H, final_W),
-                                mode='bilinear', align_corners=False
-                            ).contiguous()
 
                         # Décodage streaming
+                        latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         frame_pil = decode_latents_ultrasafe_blockwise(
                             latent_interp, vae,
                             block_size=block_size, overlap=overlap,
                             gamma=1.0, brightness=1.0,
-                            contrast=1.5, saturation=1.3,
+                            contrast=1.0, saturation=1.0,
                             device=device,
                             frame_counter=frame_counter,
-                            latent_scale_boost=LATENT_SCALE
+                            latent_scale_boost=1.0
                         )
-                        frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
+                        #frame_pil = apply_post_processing(frame_pil, blur_radius=0.2)
+                        frame_pil = apply_post_processing(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
                         frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                         frame_counter += 1
                         pbar.update(1)
@@ -423,10 +418,6 @@ def main(args):
 
                     # Clamp et resize final
                     latents = torch.clamp(latents, -1.0, 1.0)
-                    final_H, final_W = int(cfg["H"]*final_latent_scale), int(cfg["W"]*final_latent_scale)
-                    if latents.shape[-2:] != (final_H, final_W):
-                        latents = torch.nn.functional.interpolate(latents, size=(final_H, final_W),
-                                                                mode='bilinear', align_corners=False).contiguous()
 
                     # Décodage streaming
                     latents = latents / LATENT_SCALE  # “rescale” avant décodage
