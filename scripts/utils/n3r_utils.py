@@ -4502,7 +4502,7 @@ def generate_latents_robuste(latents, pos_embeds, neg_embeds, unet, scheduler,
 
 
 #-------------------------------------------------------------------------------
-# VERY STABLE
+# VERY STABLE - Parfait pour l'init de la video'
 #-------------------------------------------------------------------------------
 
 def generate_latents_robuste_4D(
@@ -4845,9 +4845,9 @@ def safe_load_vae(model_path, device, fp16=False, offload=False):
 def safe_load_scheduler(model_path):
     return DPMSolverMultistepScheduler.from_pretrained(os.path.join(model_path,"scheduler"))
 
-# -------------------------
+# --------------------------------------
 # Encode / Decode FP16 simple
-# -------------------------
+# --------------------------------------
 def encode_images_to_latents_simple(images, vae):
     device = vae.device
     dtype = next(vae.parameters()).dtype  # prend fp16 si le VAE est en FP16
