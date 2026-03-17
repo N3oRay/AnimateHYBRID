@@ -24,15 +24,14 @@ from scripts.utils.tools_utils import ensure_4_channels
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing, encode_images_to_latents_hybrid, interpolate_param_fast
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 
 LATENT_SCALE = 0.18215
 stop_generation = False
 
-# Variation de l'interpolation'
-# Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast --------------------------------
+# Variation de l'interpolation' Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast ---
 #init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
 
 # Valeurs finales (plus de créativité, moins d'input)
@@ -50,38 +49,6 @@ def get_embeddings_for_frame(frame_idx, frames_per_prompt, pos_list, neg_list, d
     num_prompts = len(pos_list)
     prompt_idx = min(frame_idx // frames_per_prompt, num_prompts - 1)
     return pos_list[prompt_idx].to(device), neg_list[prompt_idx].to(device)
-
-
-# ---------------- Fusion N3R/VAE adaptative ----------------
-
-def fuse_n3r_latents_adaptive(latents_frame, n3r_latents, latent_injection=0.7, clamp_val=1.0, creative_noise=0.0):
-    n3r_latents = n3r_latents.clone()
-
-    # Normalisation **canal par canal**
-    for c in range(3):  # RGB uniquement
-        n3r_c = n3r_latents[:,c:c+1,:,:]
-        frame_c = latents_frame[:,c:c+1,:,:]
-        mean, std = n3r_c.mean(), n3r_c.std()
-        n3r_c = (n3r_c - mean) / (std + 1e-6)
-        n3r_c = n3r_c * frame_c.std() + frame_c.mean()
-        n3r_latents[:,c:c+1,:,:] = n3r_c
-
-    # Ajouter un bruit créatif léger si nécessaire
-    if creative_noise > 0.0:
-        noise = torch.randn_like(n3r_latents) * creative_noise
-        n3r_latents += noise
-
-    # Clamp stricte pour éviter débordement
-    n3r_latents = torch.clamp(n3r_latents, -clamp_val, clamp_val)
-    latents_frame = torch.clamp(latents_frame, -clamp_val, clamp_val)
-
-    # Fusion finale
-    fused_latents = latent_injection * latents_frame + (1 - latent_injection) * n3r_latents
-    fused_latents = torch.clamp(fused_latents, -clamp_val, clamp_val)
-
-    print(f"[N3R fusion frame] mean/std par canal: {fused_latents.mean(dim=(2,3))}, injection={latent_injection:.2f}")
-    return fused_latents
-
 
 # ---------------- DEBUG UTILS ----------------
 def log_debug(message, level="INFO", verbose=True):
@@ -127,7 +94,6 @@ def adapt_embeddings_to_unet(pos_embeds, neg_embeds, target_dim):
         neg_embeds = torch.nn.functional.pad(neg_embeds, (0, pad))
     return pos_embeds, neg_embeds
 
-# ---------------- MAIN ----------------
 # ---------------- MAIN FIABLE ----------------
 def main(args):
     global stop_generation
@@ -153,16 +119,12 @@ def main(args):
     seed = torch.randint(0, 100000, (1,)).item()
 
     print("📌 Paramètres de génération :")
-    print(f"  fps                  : {fps}")
-    print(f"  upscale_factor       : {upscale_factor}")
-    print(f"  num_fraps_per_image  : {num_fraps_per_image}")
-    print(f"  steps                : {steps}")
-    print(f"  guidance_scale       : {guidance_scale}")
-    print(f"  init_image_scale     : {init_image_scale}")
-    print(f"  creative_noise       : {creative_noise}")
-    print(f"  latent_scale_boost   : {latent_scale_boost}")
-    print(f"  final_latent_scale   : {final_latent_scale}")
-    print(f"  seed                 : {seed}")
+    print(f"{'Paramètre':<20} {'Valeur':>10}   {'Paramètre':<20} {'Valeur':>10}")
+    print(f"{'fps':<20} {fps:>10}   {'upscale_factor':<20} {upscale_factor:>10}")
+    print(f"{'num_fraps_per_image':<20} {num_fraps_per_image:>10}   {'steps':<20} {steps:>10}")
+    print(f"{'guidance_scale':<20} {guidance_scale:>10}   {'init_image_scale':<20} {init_image_scale:>10}")
+    print(f"{'creative_noise':<20} {creative_noise:>10}   {'latent_scale_boost':<20} {latent_scale_boost:>10}")
+    print(f"{'final_latent_scale':<20} {final_latent_scale:>10}   {'seed':<20} {seed:>10}")
 
     scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012,
                               beta_schedule="scaled_linear", num_train_timesteps=1000)
@@ -289,7 +251,6 @@ def main(args):
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
             input_image = ensure_4_channels(input_image)
-            #current_latent_single = encode_images_to_latents_safe(input_image, vae, device=device, latent_scale=LATENT_SCALE) # origine
 
             current_latent_single = encode_images_to_latents_hybrid(input_image, vae, device=device, latent_scale=LATENT_SCALE)
             current_latent_single = torch.nn.functional.interpolate(
@@ -330,7 +291,6 @@ def main(args):
                     if stop_generation: break
                     alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
                     with torch.no_grad():
-                        #latent_interp = (1-alpha)*previous_latent_single.to(device) + alpha*current_latent_single.to(device)
                         # --- Fusion adaptative avec diminution progressive de l'influence de la frame précédente
                         injection_start = 0.8  # influence initiale de l'ancienne frame
                         injection_end   = 0.1  # influence finale
@@ -338,7 +298,6 @@ def main(args):
 
                         latent_interp = injection_alpha * previous_latent_single.to(device) + (1 - injection_alpha) * current_latent_single.to(device)
                         latent_interp = torch.clamp(latent_interp, -1.0, 1.0)
-                        #latent_interp = torch.clamp(latent_interp, -1.0, 1.0).contiguous()
 
                         if motion_module:
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
@@ -411,7 +370,7 @@ def main(args):
                                     mode='bilinear', align_corners=False
                                 ).contiguous()
                             n3r_latents = torch.clamp(n3r_latents, -1.0, 1.0)
-                            latents = fuse_n3r_latents_adaptive(latents, n3r_latents, latent_injection=latent_injection)
+                            latents = fuse_n3r_latents_adaptive(latents, n3r_latents, latent_injection=latent_injection, clamp_val=1.0, creative_noise=0.0)
                         except Exception as e:
                             print(f"[N3R ERROR] {e}")
 
