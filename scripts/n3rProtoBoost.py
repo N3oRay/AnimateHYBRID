@@ -86,7 +86,7 @@ def main(args):
 
     use_mini_gpu = cfg.get("use_mini_gpu", True)
     verbose = cfg.get("verbose", False)
-    latent_injection = float(cfg.get("latent_injection", 0.7))
+    latent_injection = float(cfg.get("latent_injection", 0.5))
     latent_injection = min(max(latent_injection, 0.5), 0.9)  # plage sûre
     final_latent_scale = cfg.get("final_latent_scale", 1/8) # 1/8 speed, 1/4 moyen, 1/2 low
     fps = cfg.get("fps", 12)
@@ -296,7 +296,7 @@ def main(args):
                         # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
                         frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
                         # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
-                        frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.05, brightness=1.05, saturation=0.80, vibrance_base=1.0, vibrance_max=1.1, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
+                        frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.05, brightness=1.05, saturation=0.80, vibrance_base=1.0, vibrance_max=1.1, sharpen=True, sharpen_radius=1, sharpen_percent=60, sharpen_threshold=2)
                         # save
                         print(f"[ init SAVE Frame {frame_counter:03d}]")
                         frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
@@ -330,40 +330,54 @@ def main(args):
                     if use_n3r_this_frame:
                         try:
                             H, W = cfg["H"], cfg["W"]
-                            ys, xs, ss = torch.meshgrid(
-                                torch.arange(H, device=device),
-                                torch.arange(W, device=device),
-                                torch.arange(n3r_model.N_samples, device=device),
-                                indexing='ij'
-                            )
-                            coords = torch.stack([xs, ys, ss.float()], dim=-1).reshape(-1,3).float()
+                            N_samples = n3r_model.N_samples
 
-                            # --- 🔥 Variation temporelle N3R ---
+                            # ------------------- Coordonnées normalisées -1..1 -------------------
+                            ys = torch.linspace(-1.0, 1.0, H, device=device)
+                            xs = torch.linspace(-1.0, 1.0, W, device=device)
+                            ss = torch.arange(N_samples, device=device, dtype=torch.float32)
+
+                            ys, xs, ss = torch.meshgrid(ys, xs, ss, indexing='ij')
+                            coords = torch.stack([xs, ys, ss], dim=-1).reshape(-1, 3)
+
+                            # ------------------- Variation temporelle et jitter -------------------
                             noise_scale = 0.01 + 0.02 * math.sin(frame_counter * 0.1)
-
-                            # (optionnel mais recommandé pour reproductibilité)
-                            torch.manual_seed(seed)
-
-                            coords = coords + torch.randn_like(coords) * noise_scale
+                            torch.manual_seed(seed)  # reproductibilité
+                            jitter = (torch.rand_like(coords) - 0.5) * 0.02
+                            coords = coords + jitter + torch.randn_like(coords) * noise_scale
                             coords = torch.nan_to_num(coords)
-                            # --- N3R forward --- une variation douce oscillante dans le temps non brutale
+
+                            # ------------------- Forward N3R -------------------
                             n3r_latents_raw = n3r_model(coords, H, W)[:, :3]
-                            n3r_latents = n3r_latents_raw.view(H, W, n3r_model.N_samples, 3).mean(dim=2)
-                            n3r_latents = n3r_latents.permute(2,0,1).unsqueeze(0)
+                            n3r_latents = n3r_latents_raw.view(H, W, N_samples, 3).mean(dim=2)
+                            n3r_latents = n3r_latents.permute(2, 0, 1).unsqueeze(0)
+
+                            # Ajouter canal alpha si nécessaire
                             if n3r_latents.shape[1] == 3:
                                 n3r_latents = torch.cat([n3r_latents, torch.zeros_like(n3r_latents[:, :1, :, :])], dim=1)
+
+                            # ------------------- Redimensionner si besoin -------------------
                             target_H, target_W = latents.shape[-2], latents.shape[-1]
                             if n3r_latents.shape[-2:] != (target_H, target_W):
                                 n3r_latents = torch.nn.functional.interpolate(
                                     n3r_latents, size=(target_H, target_W),
                                     mode='bilinear', align_corners=False
                                 ).contiguous()
+
+                            # ------------------- Fusion adaptative -------------------
                             n3r_latents = torch.clamp(n3r_latents, -1.0, 1.0)
                             n3r_latents = torch.nan_to_num(n3r_latents)
-                            latents = fuse_n3r_latents_adaptive(latents, n3r_latents, latent_injection=latent_injection, clamp_val=1.0, creative_noise=0.0)
+                            latents = fuse_n3r_latents_adaptive(
+                                latents,
+                                n3r_latents,
+                                latent_injection=latent_injection,
+                                clamp_val=1.0,
+                                creative_noise=0.0
+                            )
 
-                            # 🔥 FIX NaN / stabilité
+                            # ------------------- Nettoyage final -------------------
                             latents = sanitize_latents(latents)
+
                         except Exception as e:
                             print(f"[N3R ERROR] {e}")
 
@@ -397,19 +411,17 @@ def main(args):
                         latents = latents.squeeze(2)      # revenir à [B,C,H,W]
                         latents = sanitize_latents(latents)
 
-                    # 🔥 stabilisation temporelle (avant update)
-                    if previous_latent_single is not None:
-                        latents = 0.85 * latents + 0.15 * previous_latent_single.to(device)
+                    # 🔥 stabilisation temporelle KO
+                    #if previous_latent_single is not None:
+                    #    latents = 0.85 * latents + 0.15 * previous_latent_single.to(device)
 
-                    # 🔥 update après
+                    # 🔥 AUCUN blending → juste update mémoire
                     previous_latent_single = latents.detach().cpu()
-
                     # Clamp et resize final 🔥 FIX NaN / stabilité  🔥 nettoyage final intelligent (LE point clé)
-
                     latents = latents / LATENT_SCALE
                     # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
                     frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
-                    frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, vibrance_base=1.1, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=90, sharpen_threshold=2)
+                    frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, vibrance_base=1.1, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=60, sharpen_threshold=2)
                     frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                     frame_counter += 1
                     pbar.update(1)
