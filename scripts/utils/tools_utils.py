@@ -1,13 +1,33 @@
 # --------------------------------------------------------------
 # tools_utils.py - Fonctions utilitaires génériques
 # --------------------------------------------------------------
-import os
+import os, math
 import torch
 from PIL import Image, ImageEnhance
 from torchvision.transforms import ToPILImage
 from torchvision.transforms import functional as F
 
 LATENT_SCALE = 0.18215  # valeur globale, peut être importée si nécessaire
+
+
+def get_interpolated_embeddings(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
+    num_prompts = len(pos_list)
+
+    # index de base
+    idx = frame_idx // frames_per_prompt
+    idx_next = min(idx + 1, num_prompts - 1)
+
+    # progression locale dans le segment
+    t = (frame_idx % frames_per_prompt) / frames_per_prompt
+
+    # cosine smooth (beaucoup mieux que linéaire)
+    t = 0.5 - 0.5 * math.cos(math.pi * t)
+
+    pos = (1 - t) * pos_list[idx] + t * pos_list[idx_next]
+    neg = (1 - t) * neg_list[idx] + t * neg_list[idx_next]
+
+    return pos.to(device), neg.to(device)
+
 
 def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
     overlap = int(block_size * max_overlap_ratio)
