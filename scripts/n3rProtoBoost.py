@@ -225,7 +225,10 @@ def main(args):
             # Paramètres interpolés
             current_init_image_scale = init_image_scale
             current_guidance_scale   = 2.5
-            current_creative_noise   = 0.02
+            if frame_counter == 0:
+                current_creative_noise = 0.0
+            else:
+                current_creative_noise = 0.02
             print(f"[Frame Start {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
 
             # Charger et encoder l'image sur GPU
@@ -246,7 +249,7 @@ def main(args):
             #42	Classique, beaucoup de tests communautaires utilisent ce seed. #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
             #5555	Fidélité à l’image initiale (ton choix actuel) #2026	Léger changement dans la texture ou la posture, subtil mais prévisible
             #9876	Variation un peu plus visible, garde la structure globale
-            pos_embeds, neg_embeds = get_embeddings_for_frame( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device )
+            pos_embeds, neg_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device )
             try:
                 # Warmup latent sur 2 passes pour stabiliser
                 current_latent_single = generate_latents_robuste_4D(
