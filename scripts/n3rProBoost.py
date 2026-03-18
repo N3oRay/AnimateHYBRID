@@ -1,12 +1,13 @@
 # --------------------------------------------------------------
-# n3rProtoBoost.py - AnimateDiff ultra-light ~2Go VRAM
+# n3rProBoost.py - AnimateDiff ultra-light ~2Go VRAM
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
-#Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM, un peu plus gourmand mais toujours raisonnable ✅
+#Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
 # --------------------------------------------------------------
 import os, math, threading
+import torch
+import pickle
 from pathlib import Path
 from datetime import datetime
-import torch
 from tqdm import tqdm
 from torchvision.transforms.functional import to_pil_image
 from PIL import Image, ImageFilter
@@ -199,11 +200,22 @@ def main(args):
         n3r_model.eval()
         print(f"✅ N3RModelOptimized initialisé sur {device}")
 
+        # ------------------- Initialisation mémoire -------------------
+        output_dir_m = Path(f"./outputs")
+        memory_file = output_dir_m / "n3r_memory.pkl"
+        if memory_file.exists():
+            with open(memory_file, "rb") as f:
+                memory_dict = pickle.load(f)
+            print(f"✅ Mémoire N3R chargée depuis {memory_file}")
+        else:
+            memory_dict = {}
+            print("⚡ Nouvelle mémoire N3R initialisée")
+
     # ---------------- Input images ----------------
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
     total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/ProtoBoost{timestamp}")
+    output_dir = Path(f"./outputs/ProBoost{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
     block_size = cfg.get("block_size", 160)
@@ -328,35 +340,36 @@ def main(args):
                     use_n3r_this_frame = use_n3r_model and (frame_counter % 3 == 0)
 
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
+                    # ------------------- Bloc N3R par frame -------------------
                     if use_n3r_this_frame:
                         try:
                             H, W = cfg["H"], cfg["W"]
                             N_samples = n3r_model.N_samples
 
-                            # ------------------- Coordonnées normalisées -1..1 -------------------
+                            # Coordonnées normalisées
                             ys = torch.linspace(-1.0, 1.0, H, device=device)
                             xs = torch.linspace(-1.0, 1.0, W, device=device)
                             ss = torch.arange(N_samples, device=device, dtype=torch.float32)
                             ys, xs, ss = torch.meshgrid(ys, xs, ss, indexing='ij')
                             coords = torch.stack([xs, ys, ss], dim=-1).reshape(-1, 3)
 
-                            # ------------------- Variation temporelle et jitter -------------------
+                            # Jitter et variation temporelle
                             noise_scale = 0.01 + 0.02 * math.sin(frame_counter * 0.1)
-                            torch.manual_seed(seed)  # reproductibilité
+                            torch.manual_seed(seed)
                             jitter = (torch.rand_like(coords) - 0.5) * 0.02
                             coords = coords + jitter + torch.randn_like(coords) * noise_scale
                             coords = torch.nan_to_num(coords)
 
-                            # ------------------- Forward N3R -------------------
+                            # Forward N3R
                             n3r_latents_raw = n3r_model(coords, H, W)[:, :3]
                             n3r_latents = n3r_latents_raw.view(H, W, N_samples, 3).mean(dim=2)
                             n3r_latents = n3r_latents.permute(2, 0, 1).unsqueeze(0)
 
-                            # Ajouter canal alpha si nécessaire
+                            # Canal alpha si nécessaire
                             if n3r_latents.shape[1] == 3:
                                 n3r_latents = torch.cat([n3r_latents, torch.zeros_like(n3r_latents[:, :1, :, :])], dim=1)
 
-                            # ------------------- Redimensionner si besoin -------------------
+                            # Redimensionner si besoin
                             target_H, target_W = latents.shape[-2], latents.shape[-1]
                             if n3r_latents.shape[-2:] != (target_H, target_W):
                                 n3r_latents = torch.nn.functional.interpolate(
@@ -364,14 +377,14 @@ def main(args):
                                     mode='bilinear', align_corners=False
                                 ).contiguous()
 
-                            # ------------------- Fusion mémoire par prompt -------------------
-                            prompt_key = "_".join(str(cf_embeds[0,0].tolist())[:10])  # clé simplifiée par embedding
+                            # Fusion mémoire par prompt
+                            prompt_key = "_".join(str(cf_embeds[0,0].tolist())[:10])
                             previous_memory = memory_dict.get(prompt_key, torch.zeros_like(n3r_latents))
-                            memory_alpha = 0.15  # poids de mise à jour mémoire
+                            memory_alpha = 0.15
                             fused_latents = (1 - memory_alpha) * previous_memory.to(device) + memory_alpha * n3r_latents
-                            memory_dict[prompt_key] = fused_latents.detach().cpu()  # mise à jour mémoire permanente
+                            memory_dict[prompt_key] = fused_latents.detach().cpu()
 
-                            # ------------------- Fusion adaptative N3R -------------------
+                            # Fusion adaptative N3R
                             fused_latents = torch.clamp(fused_latents, -1.0, 1.0)
                             fused_latents = torch.nan_to_num(fused_latents)
                             latents = fuse_n3r_latents_adaptive(
@@ -382,11 +395,16 @@ def main(args):
                                 creative_noise=0.0
                             )
 
-                            # ------------------- Nettoyage final -------------------
+                            # Nettoyage final
                             latents = sanitize_latents(latents)
 
                         except Exception as e:
                             print(f"[N3R ERROR] {e}")
+                        # ------------------- Sauvegarde mémoire périodique -------------------
+                        if frame_counter % 10 == 0:  # tous les 10 frames
+                            with open(memory_file, "wb") as f:
+                                pickle.dump(memory_dict, f)
+                            print(f"💾 Mémoire N3R sauvegardée : {memory_file}")
 
                     elif use_mini_gpu:
                         latents = generate_latents_mini_gpu_320(
@@ -421,7 +439,6 @@ def main(args):
                     # 🔥 stabilisation temporelle KO
                     #if previous_latent_single is not None:
                     #    latents = 0.85 * latents + 0.15 * previous_latent_single.to(device)
-
                     # 🔥 AUCUN blending → juste update mémoire
                     previous_latent_single = latents.detach().cpu()
                     # Clamp et resize final 🔥 FIX NaN / stabilité  🔥 nettoyage final intelligent (LE point clé)
