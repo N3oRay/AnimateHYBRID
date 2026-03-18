@@ -1,6 +1,13 @@
 # -------------------------
 # Tiny-SD 256x256 VRAM-safe FP16 pour 5D AnimateDiff
 # Avec Motion Module Tiny et VAE offload
+latent_injection: 0.70 # 85% proche de l'image init - 0.6 on s'éloigne de l'init - 0.5 creatif
+creative_noise: 0.00 # moins de liberté, plus de cohérence 0.08 ou 0.15 rendu creatif; 0.00 rendu cinéma (0.10)
+#init_image_scale: 0.25  # Exploration maximale du latent 0. (0.25)  - Augmenter init_image_scale → donne plus de signal à partir de ton image d’initiation. (1.0 image original)
+init_image_scale: 0.85  # presque tout le signal de l'image d'origine 0.85 - on s'éloigne de l'init 0.5
+# guidance_scale = 12 → les prompts positifs et négatifs auront un impact plus marqué.
+guidance_scale: 2.7 # un peu plus strict pour que le chat ressorte 8.0 - 1.5 rendu proche de l'input - 4.0  creatif
+steps: 50 # diffusion steps faible pour VRAM - Augmenter steps ou fps → le motion module a plus de temps pour transformer les latents. (20)
 # -------------------------
 use_n3r_model: true
 use_mini_gpu: true
@@ -8,29 +15,20 @@ n3r_L: 6
 n3r_N_samples: 12
 n3r_L_low: 4
 n3r_L_high: 8
-verbose: true
-#L_low, L_high = 4, 8  # plus de couches = plus de structure
-#final_latent_scale: 0.18215
+verbose: False
+
 final_latent_scale: 0.25
 tile_size: 64
 #--------------------latent_scale_boost 5.71 ------------
-latent_injection: 0.85  # 85%
-latent_scale_boost: 5.71 #0.18215 # 5.71
+latent_scale_boost: 1.0 # Permet d'augmenter le rendu à utiliser doucement :)
 #
-W: 512
-H: 512
-#W: 512
-#H: 512
+W: 540
+H: 960
+
 L: 4
-steps: 50 # diffusion steps faible pour VRAM - Augmenter steps ou fps → le motion module a plus de temps pour transformer les latents. (20)
+
 
 fps: 12 # moins de frames simultanées
-#init_image_scale: 0.25  # Exploration maximale du latent 0. (0.25)  - Augmenter init_image_scale → donne plus de signal à partir de ton image d’initiation. (1.0 image original)
-init_image_scale: 0.85  # presque tout le signal de l'image d'origine
-creative_noise: 0.08    # moins de liberté, plus de cohérence
-guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte 8.0
-
-
 
 # -------------------------
 # Modèles n3oray
@@ -38,10 +36,7 @@ guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte 8.0
 # Liste des modèles à utiliser (ordre = interpolation possible) LoRA est FP16 ou compatible avec ton UNet SDXL.
 
 n3oray_models:
-  #cyberpunk_style_v3: "/mnt/62G/huggingface/cyber-fp16/cyberpunk style v3_fp16.safetensors"  #OK
-  #cybersamurai_v2: "/mnt/62G/huggingface/cyber-fp16/cybersamuraiV2E12_fp16.safetensors" #OK
   #cyber_skin: "/mnt/62G/huggingface/cyber-fp16/Cyber skin_fp16.safetensors" #OK
-  #cyber_skin_girl: "/mnt/62G/huggingface/cyber/cyber_style_girl_v1.safetensors" #OK
 
 motion_module: "v3_sd15_mm.ckpt"
 
@@ -59,7 +54,7 @@ scheduler:
   beta_start: 0.00085
   beta_end: 0.012
 
-num_fraps_per_image: 5        # plus de frames par image pour plus de cohérence
+num_fraps_per_image: 10        # plus de frames par image pour plus de cohérence
 transition_frames: 2          # transitions plus douces
 key_frames: 1
 
@@ -74,10 +69,10 @@ motion_module_device: cpu
 #motion_module_device: cuda
 
 #   Vérifier le motion module → certains modules “lite” sont trop conservateurs avec des images petites ou des frames peu nombreuses.
-#motion_module: scripts/modules/motion_module_tiny.py
+motion_module: scripts/modules/motion_module_tiny.py
 #motion_module: scripts/modules/Motion_module_Masked.py
 #motion_module: scripts/modules/Motion_module_Enhanced.py
-motion_module: scripts/modules/Motion_module_Wind.py
+#motion_module: scripts/modules/Motion_module_Wind.py
 #motion_module: scripts/modules/motion_module_lite.py
 #motion_module: scripts/modules/motion_module_ultralite_debug.py
 #motion_module: scripts/modules/motion_ulta_lite_fix.py
@@ -102,23 +97,30 @@ vae_path: "/mnt/62G/huggingface/miniSD-fp16/vae/diffusion_pytorch_model.safetens
 
 
 
+
 prompt:
-  - "Super realistic, hyper realistic, hyperdetailed, cybersamurai, long flowing hair, blue eyes, black hair, upper body, cyber armor, mask, science fiction, cyborg, cyberpunk, katana on back, bright glowing background, neon lights, soft colorful lighting, masterpiece, best quality, wide-angle, 8k, dynamic lighting, dramatic shadows, motion blur, sparks, holograms, futuristic calligraphy, vibrant colors, multi-layered texture, Japanese decor, ethereal atmosphere,Hyper realistic, hyper realistic, hyperdetailed, cybersamurai, long hair, green eyes, black hair, upper body, cyber armor, cyber mask, science fiction, cyborg, cyberpunk, katana on back, bright glowing background, neon lights, soft colorful lighting, masterpiece, best quality, wide-angle, 8k, natural sunlight, studio lighting, HDR, vibrant colors, maximum clarity, multi-layered texture, multi-layered texture, Japanese cyber decor, ethereal atmosphere, purple hair"
-  - "Super realistic, hyper realistic, hyperdetailed, cybersamurai, long flowing hair, green eyes, blue eyes, purple hair, black hair, upper body, armor, cyber armor, mask, cyber mask, science fiction, cyborg, cyberpunk, katana on back, bright glowing background, neon lights, soft colorful lighting, masterpiece, best quality, wide-angle, 8k, dynamic lighting, dramatic shadows, motion blur, sparks, holograms, futuristic calligraphy, natural sunlight, studio lighting, HDR, vibrant colors, maximum clarity, multi-layered texture, Japanese decor, Japanese cyber decor, ethereal atmosphere"
-  - "Synthwave neon lights, glowing grid streets, reflective wet asphalt, futuristic 80s aesthetic, pink and purple neon glows, dynamic lighting"
-  - "Digital angel, luminous wings made of neon light, holographic textures, glowing circuits, ethereal floating presence, radiant aura, cyber-futuristic divine being"
-  - "Cyberpunk city night, dense futuristic skyline, neon signs and holograms, rainy streets, flying cars, misty atmosphere, dramatic lighting"
+  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, comic book style Marvel, cel shading, bold outlines, dramatic action pose, neon lighting, vibrant colors, glowing effects, dynamic perspective, cinematic composition, energy lines, stylized shadows, inked lines, comic panel framing, halftone shading, high contrast lighting, happy expression"
+
+  - "female  superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, Marvel comic style, dynamic pose, neon city background, glowing circuits, vibrant colors, cinematic lighting, dramatic angles, stylized shadows, action scene, inked lines, comic panel framing, halftone shading, high contrast lighting"
+
+  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, katana on back, Marvel comic style, synthwave neon city, pink and purple lighting, reflective wet streets, dynamic perspective, cinematic composition, glowing atmosphere, motion energy, inked lines, comic panel framing, halftone shading, high contrast lighting"
+
+  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, katana on back, Marvel comic style, angelic transformation, glowing neon wings, radiant energy, floating pose, dramatic lighting, vibrant colors, stylized aura, inked lines, comic panel framing, halftone shading, high contrast lighting"
+
+  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, katana on back, Marvel comic style, cyberpunk city night, dense skyline, neon signs, holograms, rainy streets, cinematic composition, dramatic shadows, dynamic perspective, inked lines, comic panel framing, halftone shading, high contrast lighting"
+
 
 n_prompt:
-  - "low quality, blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
-  - "low quality, blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
-  - "low quality, blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
-  - "low quality, blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
-  - "low quality, blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
+  - "blurry, deformed, extra limbs, bad anatomy, low quality, messy background, dark colors, scary, realistic, human features"
+  - "blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
+  - "blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
+  - "blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
+  - "blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
+
 
 input_images:
-  - "input/512/image_512x.png"
-  - "input/512/image_512x.png"
-  - "input/512/image_512x.png"
-  - "input/512/image_512x.png"
-  - "input/512/image_512x.png"
+  - "input/540-960/1.png"
+  - "input/540-960/2.png"
+  - "input/540-960/3.png"
+  - "input/540-960/4.png"
+  - "input/540-960/5.png"
