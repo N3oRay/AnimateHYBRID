@@ -4,6 +4,7 @@
 #Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
 # --------------------------------------------------------------
 import os, math, threading
+import hashlib
 import torch
 import pickle
 from pathlib import Path
@@ -18,7 +19,7 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
-from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings
+from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
@@ -127,7 +128,8 @@ def main(args):
             if not applied: print(f"⚠ LoRA '{model_name}' ignorée (incompatible UNet)")
     else:
         print("⚠ Aucun modèle LoRA configuré, étape ignorée.")
-
+    #iniy external_latent
+    external_latent = None
     # ---------------- Motion module ----------------
     motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
     if motion_module and verbose:
@@ -201,15 +203,11 @@ def main(args):
         print(f"✅ N3RModelOptimized initialisé sur {device}")
 
         # ------------------- Initialisation mémoire -------------------
-        output_dir_m = Path(f"./outputs")
-        memory_file = output_dir_m / "n3r_memory.pkl"
-        if memory_file.exists():
-            with open(memory_file, "rb") as f:
-                memory_dict = pickle.load(f)
-            print(f"✅ Mémoire N3R chargée depuis {memory_file}")
-        else:
-            memory_dict = {}
-            print("⚡ Nouvelle mémoire N3R initialisée")
+
+
+        output_dir_m = Path("./outputs")
+        memory_file = output_dir_m / "n3r_memory"
+        memory_dict = load_memory(memory_file)
 
     # ---------------- Input images ----------------
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
@@ -231,7 +229,7 @@ def main(args):
     pbar = tqdm(total=total_frames, ncols=120)
 
     # ---------------- Frames principales avec interpolation prompts ----------------
-
+    external_embeddings = None
     for img_idx, img_path in enumerate(input_paths):
         if stop_generation: break
         try:
@@ -319,6 +317,7 @@ def main(args):
                     torch.cuda.empty_cache()
 
             # ---------------- Frames principales ----------------
+
             for f in range(num_fraps_per_image):
                 if stop_generation: break
                 with torch.no_grad():
@@ -355,7 +354,7 @@ def main(args):
 
                             # Jitter et variation temporelle
                             noise_scale = 0.01 + 0.02 * math.sin(frame_counter * 0.1)
-                            torch.manual_seed(seed)
+                            torch.manual_seed(seed + frame_counter)
                             jitter = (torch.rand_like(coords) - 0.5) * 0.02
                             coords = coords + jitter + torch.randn_like(coords) * noise_scale
                             coords = torch.nan_to_num(coords)
@@ -377,16 +376,30 @@ def main(args):
                                     mode='bilinear', align_corners=False
                                 ).contiguous()
 
-                            # Fusion mémoire par prompt
-                            prompt_key = "_".join(str(cf_embeds[0,0].tolist())[:10])
-                            previous_memory = memory_dict.get(prompt_key, torch.zeros_like(n3r_latents))
-                            memory_alpha = 0.15
-                            fused_latents = (1 - memory_alpha) * previous_memory.to(device) + memory_alpha * n3r_latents
-                            memory_dict[prompt_key] = fused_latents.detach().cpu()
+                            # Fusion mémoire par prompt -----
+                            memory_alpha = 0.1 + 0.1 * math.sin(frame_counter * 0.05)
+                            fused_latents = update_n3r_memory( memory_dict, cf_embeds[0],  n3r_latents, memory_alpha=memory_alpha )
+                            similarity = torch.cosine_similarity( n3r_latents.flatten(), fused_latents.flatten(), dim=0 )
+                            adaptive_alpha = 0.1 + 0.2 * (1 - similarity)
+                            fused_latents = ( (1 - adaptive_alpha) * fused_latents + adaptive_alpha * n3r_latents )
+                            # 🔥 Injection externe
+                            if external_latent is None:
+                                external_latent = load_external_embedding_as_latent( "/mnt/62G/huggingface/cyber-fp16/pt/KnxCOmiXNeg.safetensors", n3r_latents.shape ).to(device)
+                            # ⚡ TOUJOURS recalculé
+                            dynamic_weight = 0.08 * (0.6 + 0.4 * math.sin(frame_counter * 0.1))
+
+                            external_embeddings = [ { "key": "knx_neg", "latent": external_latent, "weight": dynamic_weight, "type": "negative" } ]
+                            # Stocker dans la mémoire (CPU)
+                            if external_embeddings:
+                                fused_latents = 0.9 * fused_latents + 0.1 * inject_external_embeddings(
+                                    fused_latents,
+                                    external_embeddings,   # liste que tu définis
+                                    device
+                                )
 
                             # Fusion adaptative N3R
-                            fused_latents = torch.clamp(fused_latents, -1.0, 1.0)
-                            fused_latents = torch.nan_to_num(fused_latents)
+                            ####fused_latents = torch.clamp(fused_latents, -1.0, 1.0) # A tester
+                            ####fused_latents = torch.nan_to_num(fused_latents)
                             latents = fuse_n3r_latents_adaptive(
                                 latents,
                                 fused_latents,
@@ -401,10 +414,8 @@ def main(args):
                         except Exception as e:
                             print(f"[N3R ERROR] {e}")
                         # ------------------- Sauvegarde mémoire périodique -------------------
-                        if frame_counter % 10 == 0:  # tous les 10 frames
-                            with open(memory_file, "wb") as f:
-                                pickle.dump(memory_dict, f)
-                            print(f"💾 Mémoire N3R sauvegardée : {memory_file}")
+                        if frame_counter % 30 == 0:  # tous les 30 frames
+                            save_memory(memory_dict, memory_file)
 
                     elif use_mini_gpu:
                         latents = generate_latents_mini_gpu_320(
