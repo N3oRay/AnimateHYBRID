@@ -2,12 +2,148 @@
 # tools_utils.py - Fonctions utilitaires génériques
 # --------------------------------------------------------------
 import os, math
-import torch
+import hashlib
 from PIL import Image, ImageEnhance
 from torchvision.transforms import ToPILImage
 from torchvision.transforms import functional as F
 
 LATENT_SCALE = 0.18215  # valeur globale, peut être importée si nécessaire
+
+import json
+import torch
+from pathlib import Path
+
+def load_external_embedding_as_latent(path, target_shape):
+    from safetensors.torch import load_file
+    emb = load_file(path)
+    clip_vec = list(emb.values())[0]
+
+    # projection simple
+    latent = clip_vec.mean() * torch.randn(target_shape)
+    return latent
+
+def inject_external_embeddings(
+    latents,
+    external_embeddings,
+    device,
+    normalize=True,
+    clamp_range=(-1.0, 1.0)
+):
+    """
+    Injecte des embeddings latents externes dans les latents principaux.
+
+    Args:
+        latents (torch.Tensor): latents [B,C,H,W]
+        external_embeddings (list[dict]): liste de dicts avec :
+            - "latent": tensor
+            - "weight": float
+            - "type": "positive" ou "negative"
+        device (str): device cible
+        normalize (bool): normalise les embeddings pour éviter domination
+        clamp_range (tuple): clamp final
+
+    Returns:
+        torch.Tensor: latents modifiés
+    """
+
+    if not external_embeddings:
+        return latents
+
+    latents = latents.to(device)
+
+    for emb in external_embeddings:
+        try:
+            ext = emb.get("latent", None)
+            weight = float(emb.get("weight", 0.0))
+            emb_type = emb.get("type", "positive")
+
+            if ext is None or weight == 0.0:
+                continue
+
+            # --- Device + dtype safe ---
+            ext = ext.to(device=device, dtype=latents.dtype)
+
+            # --- Resize si nécessaire ---
+            if ext.shape != latents.shape:
+                ext = torch.nn.functional.interpolate(
+                    ext,
+                    size=latents.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+                # Ajustement batch/channel si besoin
+                if ext.shape[1] != latents.shape[1]:
+                    ext = ext[:, :latents.shape[1], :, :]
+
+            # --- Nettoyage ---
+            ext = torch.nan_to_num(ext)
+
+            # --- Normalisation (important) ---
+            if normalize:
+                ext_std = ext.std()
+                lat_std = latents.std()
+
+                if ext_std > 1e-6:
+                    ext = ext * (lat_std / ext_std)
+
+            # --- Injection ---
+            if emb_type == "negative":
+                latents = latents - weight * ext
+            else:
+                latents = latents + weight * ext
+
+        except Exception as e:
+            print(f"[inject_external_embeddings ERROR] {e}")
+            continue
+
+    # --- Clamp + sécurité ---
+    latents = torch.clamp(latents, clamp_range[0], clamp_range[1])
+    latents = torch.nan_to_num(latents)
+
+    return latents
+
+
+def update_n3r_memory(memory_dict, cf_embeds, n3r_latents, memory_alpha=0.15):
+    prompt_bytes = cf_embeds[0,0].cpu().numpy().tobytes()
+    prompt_key = hashlib.sha256(prompt_bytes).hexdigest()
+    print(f"[DEBUG] clé mémoire : {prompt_key[:8]}..., latents fusionnés")
+    previous_memory = memory_dict.get(prompt_key, torch.zeros_like(n3r_latents))
+    fused_latents = (1 - memory_alpha) * previous_memory.to(n3r_latents.device) + memory_alpha * n3r_latents
+    memory_dict[prompt_key] = fused_latents.detach().cpu()
+    return fused_latents
+
+# ------------------- Sauvegarde mémoire -------------------
+def save_memory(memory_dict, memory_file: Path):
+    """
+    Sauvegarde la mémoire N3R au format JSON.
+    Convertit les tensors en listes pour compatibilité JSON.
+    """
+    serializable_memory = {k: v.tolist() for k, v in memory_dict.items()}
+    memory_file = memory_file.with_suffix(".json")
+    memory_file.parent.mkdir(parents=True, exist_ok=True)  # créer dossier si absent
+    with open(memory_file, "w") as f:
+        json.dump(serializable_memory, f, indent=2)
+    print(f"💾 Mémoire N3R sauvegardée : {memory_file}")
+
+
+# ------------------- Chargement mémoire -------------------
+def load_memory(memory_file: Path):
+    """
+    Charge la mémoire N3R depuis un fichier JSON.
+    Convertit les listes en tensors.
+    """
+    memory_file = memory_file.with_suffix(".json")
+    if memory_file.exists():
+        with open(memory_file, "r") as f:
+            mem = json.load(f)
+        # Convertir listes → tensors
+        memory_dict = {k: torch.tensor(v) for k, v in mem.items()}
+        print(f"✅ Mémoire N3R chargée depuis {memory_file}")
+        return memory_dict
+    else:
+        print("⚡ Nouvelle mémoire N3R initialisée")
+        return {}
 
 def stabilize_latents_before_decode(
     latents,

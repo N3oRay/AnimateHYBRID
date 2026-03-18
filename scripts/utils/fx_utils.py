@@ -972,11 +972,11 @@ def encode_images_to_latents_target(images, vae, device="cuda", latent_scale=LAT
 def decode_latents_ultrasafe_blockwise(
     latents, vae,
     block_size=32, overlap=16,
-    gamma=1.2, brightness=1.0,
-    contrast=1.2, saturation=1.3,
+    gamma=1.0, brightness=1.0,
+    contrast=1.0, saturation=1.0,
     device="cuda", frame_counter=0, output_dir=Path("."),
     epsilon=1e-6,
-    latent_scale_boost=1.1  # boost léger pour récupérer les nuances
+    latent_scale_boost=1.0  # boost léger pour récupérer les nuances
 ):
     """
     Décodage ultra-safe par blocs des latents en image PIL.
