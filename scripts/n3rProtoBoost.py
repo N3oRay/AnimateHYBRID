@@ -15,7 +15,7 @@ from diffusers import PNDMScheduler
 from transformers import CLIPTokenizerFast, CLIPTextModel
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
-from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap
+from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
@@ -33,6 +33,8 @@ stop_generation = False
 init_image_scale_end = 0.9
 guidance_scale_end   = 4.0
 creative_noise_end   = 0.0
+
+
 
 # --- Sélection simple des embeddings prompts par frame ---
 def get_embeddings_for_frame(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
@@ -221,7 +223,7 @@ def main(args):
         if stop_generation: break
         try:
             # Paramètres interpolés
-            current_init_image_scale = 0.9
+            current_init_image_scale = init_image_scale
             current_guidance_scale   = 2.5
             current_creative_noise   = 0.02
             print(f"[Frame Start {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
@@ -333,7 +335,8 @@ def main(args):
 
                     # --- Interpolation des embeddings prompts ---
                     #cf_embeds = get_interpolated_embeddings(frame_counter, total_frames, pos_embeds_list, neg_embeds_list)
-                    cf_embeds = get_embeddings_for_frame(frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device)
+                    #cf_embeds = get_embeddings_for_frame(frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device)
+                    cf_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device )
 
                     # --- N3R ou mini GPU diffusion ---
                     n3r_latents = None
@@ -357,7 +360,7 @@ def main(args):
                             noise_scale = 0.01 + 0.02 * math.sin(frame_counter * 0.1)
 
                             # (optionnel mais recommandé pour reproductibilité)
-                            torch.manual_seed(seed + frame_counter)
+                            torch.manual_seed(seed)
 
                             coords = coords + torch.randn_like(coords) * noise_scale
                             coords = torch.nan_to_num(coords)
