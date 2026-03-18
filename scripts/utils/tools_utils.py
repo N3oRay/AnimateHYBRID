@@ -9,6 +9,40 @@ from torchvision.transforms import functional as F
 
 LATENT_SCALE = 0.18215  # valeur globale, peut être importée si nécessaire
 
+def stabilize_latents_before_decode(
+    latents,
+    latent_scale,
+    clamp_val=0.95,
+    smooth_kernel=3,
+    enable_smoothing=True
+):
+    """
+    Stabilise les latents avant décodage pour éviter les artefacts de tiles. Args: latents (torch.Tensor): latents [B,C,H,W] latent_scale (float): facteur VAE (ex: 0.18215) clamp_val (float): limite de clamp (0.9–1.0 recommandé) smooth_kernel (int): taille du noyau de smoothing enable_smoothing (bool): active le lissage spatial Returns: torch.Tensor: latents prêts pour decode
+    """
+
+    # 🔥 sécurité NaN / inf
+    latents = torch.nan_to_num(latents)
+
+    # 🔥 clamp doux (évite contrastes violents entre tiles)
+    latents = torch.clamp(latents, -clamp_val, clamp_val)
+
+    # 🔥 lissage spatial (corrige les seams)
+    if enable_smoothing and smooth_kernel > 1:
+        latents = torch.nn.functional.avg_pool2d(
+            latents,
+            kernel_size=smooth_kernel,
+            stride=1,
+            padding=smooth_kernel // 2
+        )
+
+    # 🔥 continuité mémoire (important pour decode blockwise)
+    latents = latents.contiguous()
+
+    # 🔥 scale VAE
+    latents = latents / latent_scale
+
+    return latents
+
 
 def get_interpolated_embeddings(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
     num_prompts = len(pos_list)
