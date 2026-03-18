@@ -19,7 +19,7 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
-from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory
+from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
@@ -232,9 +232,7 @@ def main(args):
         if stop_generation: break
         try:
             # Paramètres interpolés
-            current_init_image_scale = interpolate_param_fast(init_image_scale, init_image_scale_end, frame_counter, total_frames, mode="cosine")
-            current_guidance_scale   = interpolate_param_fast(guidance_scale, guidance_scale_end, frame_counter, total_frames, mode="cosine")
-            current_creative_noise   = interpolate_param_fast(creative_noise, creative_noise_end, frame_counter, total_frames, mode="cosine")
+            current_init_image_scale, current_creative_noise, current_guidance_scale = compute_weighted_params( frame_counter, total_frames, init_start=0.85, init_end=0.5,noise_start=0.0, noise_end=0.08, guidance_start=3.5, guidance_end=4.5, mode="cosine" )
             print(f"[Frame {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
 
             # Charger et encoder l'image sur GPU
