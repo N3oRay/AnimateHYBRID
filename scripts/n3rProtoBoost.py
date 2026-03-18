@@ -30,7 +30,7 @@ stop_generation = False
 # Variation de l'interpolation' Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast ---
 #init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
 # Valeurs finales (plus de créativité, moins d'input)
-init_image_scale_end = 0.95
+init_image_scale_end = 0.9
 guidance_scale_end   = 4.0
 creative_noise_end   = 0.0
 
@@ -88,11 +88,11 @@ def main(args):
     transition_frames = cfg.get("transition_frames", 4)
     num_fraps_per_image = cfg.get("num_fraps_per_image", 2)
     steps = max(cfg.get("steps", 16), 4)
-    guidance_scale = cfg.get("guidance_scale", 4.5) # 0.15 peut de créativité 4.5 moderé
+    guidance_scale = cfg.get("guidance_scale", 2.5) # 0.15 peut de créativité 4.5 moderé
     init_image_scale = cfg.get("init_image_scale", 0.5) # 0.85 ou 0.95 proche de l'init'
     creative_noise = cfg.get("creative_noise", 0.0)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
-    frames_per_prompt = cfg.get("frames_per_prompt", 3)  # nombre de frames par prompt
+    frames_per_prompt = cfg.get("frames_per_prompt", 10)  # nombre de frames par prompt
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
 
@@ -221,9 +221,9 @@ def main(args):
         if stop_generation: break
         try:
             # Paramètres interpolés
-            current_init_image_scale = interpolate_param_fast(init_image_scale, init_image_scale_end, frame_counter, total_frames, mode="cosine")
-            current_guidance_scale   = interpolate_param_fast(guidance_scale, guidance_scale_end, frame_counter, total_frames, mode="cosine")
-            current_creative_noise   = interpolate_param_fast(creative_noise, creative_noise_end, frame_counter, total_frames, mode="cosine")
+            current_init_image_scale = 0.9
+            current_guidance_scale   = 2.5
+            current_creative_noise   = 0.02
             print(f"[Frame Start {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
 
             # Charger et encoder l'image sur GPU
@@ -244,11 +244,13 @@ def main(args):
             #42	Classique, beaucoup de tests communautaires utilisent ce seed. #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
             #5555	Fidélité à l’image initiale (ton choix actuel) #2026	Léger changement dans la texture ou la posture, subtil mais prévisible
             #9876	Variation un peu plus visible, garde la structure globale
+            pos_embeds, neg_embeds = get_embeddings_for_frame( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device )
             try:
+                # Warmup latent sur 2 passes pour stabiliser
                 current_latent_single = generate_latents_robuste_4D(
                     latents=current_latent_single.to(device),
-                    pos_embeds=None,
-                    neg_embeds=None,
+                    pos_embeds=pos_embeds,
+                    neg_embeds=neg_embeds,
                     unet=unet,
                     scheduler=scheduler,
                     motion_module=None,
@@ -257,7 +259,7 @@ def main(args):
                     guidance_scale=current_guidance_scale,  #guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte
                     init_image_scale=current_init_image_scale, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
                     creative_noise=current_creative_noise, # creative_noise: 0.08    # moins de liberté, plus de cohérence
-                    seed=seed  # 42, 1234, 2026, 5555
+                    seed=5555  # 42, 1234, 2026, 5555
                 )
 
                 # 🔥 FIX NaN / stabilité
@@ -309,6 +311,7 @@ def main(args):
                         #frame_pil = remove_white_noise(frame_pil, threshold=245, blur_radius=0.6)
                         frame_pil = frame_pil.point(lambda i: max(0, min(255, int(i))))
                         # save
+                        print(f"[ init SAVE Frame {frame_counter:03d}]")
                         frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                         frame_counter += 1
                         pbar.update(1)
@@ -337,7 +340,7 @@ def main(args):
                     latents = latents_frame.clone()
 
                     #------------------------------------------------- use_n3r_model:
-                    use_n3r_this_frame = use_n3r_model and (frame_counter % 2 == 0)
+                    use_n3r_this_frame = use_n3r_model and (frame_counter % 3 == 0)
 
                     if use_n3r_this_frame:
                         try:
@@ -448,7 +451,7 @@ def main(args):
                     frame_pil = apply_post_processing(frame_pil, blur_radius=0.0, contrast=1.20, brightness=1.05, saturation=0.85, sharpen=True, sharpen_radius=1, sharpen_percent=2, sharpen_threshold=2)
                     #frame_pil = remove_white_noise(frame_pil, threshold=245, blur_radius=0.6)
                     frame_pil = frame_pil.point(lambda i: max(0, min(255, int(i))))
-
+                    print(f"[ principales SAVE Frame {frame_counter:03d}]")
                     frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                     frame_counter += 1
                     pbar.update(1)
