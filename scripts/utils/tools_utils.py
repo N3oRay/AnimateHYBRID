@@ -13,6 +13,35 @@ import json
 import torch
 from pathlib import Path
 
+def compute_weighted_params(frame_idx, total_frames,
+                            init_start=0.85, init_end=0.5,
+                            noise_start=0.0, noise_end=0.08,
+                            guidance_start=3.5, guidance_end=4.5,
+                            mode="cosine"):
+    """
+    Calcule init_image_scale, creative_noise et guidance_scale de manière pondérée.
+    Ajuste guidance en fonction du signal de l'image et du bruit.
+    """
+    # interpolation linéaire ou cosinus
+    def interp(a, b, t, mode="cosine"):
+        if mode=="cosine":
+            mu = (1 - math.cos(math.pi * t)) / 2
+        else:
+            mu = t
+        return a*(1-mu) + b*mu
+
+    t = frame_idx / max(total_frames-1,1)
+    init_scale = interp(init_start, init_end, t, mode)
+    creative_noise = interp(noise_start, noise_end, t, mode)
+
+    # pondération guidance_scale :
+    # si init_scale élevé → fidèle → guidance plus faible
+    # si init_scale faible → moins fidèle → guidance plus créative
+    base_guidance = interp(guidance_start, guidance_end, t, mode)
+    weighted_guidance = base_guidance * (1 + 0.5*(1-init_scale)) * (1 - 0.5*creative_noise)
+
+    return init_scale, creative_noise, weighted_guidance
+
 def load_external_embedding_as_latent(path, target_shape):
     from safetensors.torch import load_file
     emb = load_file(path)
@@ -257,8 +286,8 @@ def print_generation_params(params: dict):
     print("📌 Paramètres de génération :")
     print(f"{'Paramètre':<20} {'Valeur':>10}   {'Paramètre':<20} {'Valeur':>10}")
 
-    left_keys = ['fps', 'num_fraps_per_image', 'guidance_scale', 'guidance_scale_end', 'creative_noise', 'creative_noise_end','final_latent_scale']
-    right_keys = ['use_mini_gpu', 'upscale_factor', 'steps', 'init_image_scale', 'init_image_scale_end', 'latent_scale_boost', 'seed']
+    left_keys = ['fps', 'num_fraps_per_image', 'guidance_scale', 'guidance_scale_end', 'creative_noise', 'creative_noise_end','final_latent_scale', 'transition_frames']
+    right_keys = ['use_mini_gpu', 'upscale_factor', 'steps', 'init_image_scale', 'init_image_scale_end', 'latent_scale_boost', 'seed', 'latent_injection']
 
     for l, r in zip(left_keys, right_keys):
         print(f"{l:<20} {params.get(l, ''):>10}   {r:<20} {params.get(r, ''):>10}")
