@@ -34,11 +34,6 @@ stop_generation = False
 # Variation de l'interpolation' Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast ---
 #init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
 
-# Valeurs finales (plus de créativité, moins d'input)
-init_image_scale_end = 0.9
-guidance_scale_end   = 4.0
-creative_noise_end   = 0.0
-
 # -------------------------------------------------------------------------------------------
 # --- Sélection simple des embeddings prompts par frame ---
 def get_embeddings_for_frame(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
@@ -96,16 +91,19 @@ def main(args):
     transition_frames = cfg.get("transition_frames", 4)
     num_fraps_per_image = cfg.get("num_fraps_per_image", 2)
     steps = max(cfg.get("steps", 16), 4)
-    guidance_scale = cfg.get("guidance_scale", 2.5) # 0.15 peut de créativité 4.5 moderé
+    guidance_scale = cfg.get("guidance_scale", 2.7) # 0.15 peut de créativité 4.5 moderé
+    guidance_scale_end = cfg.get("guidance_scale_end", 4.5) # 0.15 peut de créativité 4.5 moderé
     init_image_scale = cfg.get("init_image_scale", 0.5) # 0.85 ou 0.95 proche de l'init'
+    init_image_scale_end = cfg.get("init_image_scale_end", 0.9) # 0.85 ou 0.95 proche de l'init'
     creative_noise = cfg.get("creative_noise", 0.0)
+    creative_noise_end = cfg.get("creative_noise_end", 0.08)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 10)  # nombre de frames par prompt
+
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
-
-
-    params = { 'fps': fps, 'upscale_factor': upscale_factor, 'num_fraps_per_image': num_fraps_per_image, 'steps': steps, 'guidance_scale': guidance_scale, 'init_image_scale': init_image_scale, 'creative_noise': creative_noise, 'latent_scale_boost': latent_scale_boost, 'final_latent_scale': final_latent_scale, 'seed': seed }
+    #latent_injection
+    params = { 'use_mini_gpu': use_mini_gpu,  'fps': fps, 'upscale_factor': upscale_factor, 'num_fraps_per_image': num_fraps_per_image, 'steps': steps, 'guidance_scale': guidance_scale, 'guidance_scale_end': guidance_scale_end, 'init_image_scale': init_image_scale, 'init_image_scale_end': init_image_scale_end, 'creative_noise': creative_noise, 'creative_noise_end': creative_noise_end, 'latent_scale_boost': latent_scale_boost, 'final_latent_scale': final_latent_scale, 'seed': seed }
     print_generation_params(params)
 
 
