@@ -452,6 +452,46 @@ def apply_post_processing_unreal(frame_pil,
 # ---------------- Fusion N3R/VAE adaptative ----------------
 
 def fuse_n3r_latents_adaptive(latents_frame, n3r_latents, latent_injection=0.7, clamp_val=1.0, creative_noise=0.0):
+    # Assurer même taille
+    if n3r_latents.shape != latents_frame.shape:
+        n3r_latents = torch.nn.functional.interpolate(
+            n3r_latents, size=latents_frame.shape[-2:], mode='bilinear', align_corners=False
+        )
+        # Ajuster le nombre de canaux si nécessaire
+        if n3r_latents.shape[1] < latents_frame.shape[1]:
+            extra = latents_frame[:, n3r_latents.shape[1]:, :, :].clone() * 0
+            n3r_latents = torch.cat([n3r_latents, extra], dim=1)
+        elif n3r_latents.shape[1] > latents_frame.shape[1]:
+            n3r_latents = n3r_latents[:, :latents_frame.shape[1], :, :]
+
+    n3r_latents = n3r_latents.clone()
+
+    # Normalisation **canal par canal** (RGB uniquement)
+    for c in range(min(3, n3r_latents.shape[1])):
+        n3r_c = n3r_latents[:, c:c+1, :, :]
+        frame_c = latents_frame[:, c:c+1, :, :]
+        mean, std = n3r_c.mean(), n3r_c.std()
+        n3r_c = (n3r_c - mean) / (std + 1e-6)
+        n3r_c = n3r_c * frame_c.std() + frame_c.mean()
+        n3r_latents[:, c:c+1, :, :] = n3r_c
+
+    # Ajouter un bruit créatif léger si nécessaire
+    if creative_noise > 0.0:
+        noise = torch.randn_like(n3r_latents) * creative_noise
+        n3r_latents += noise
+
+    # Clamp stricte
+    n3r_latents = torch.clamp(n3r_latents, -clamp_val, clamp_val)
+    latents_frame = torch.clamp(latents_frame, -clamp_val, clamp_val)
+
+    # Fusion finale
+    fused_latents = latent_injection * latents_frame + (1 - latent_injection) * n3r_latents
+    fused_latents = torch.clamp(fused_latents, -clamp_val, clamp_val)
+
+    print(f"[N3R fusion frame] mean/std par canal: {fused_latents.mean(dim=(2,3))}, injection={latent_injection:.2f}")
+    return fused_latents
+
+def fuse_n3r_latents_adaptive_v1(latents_frame, n3r_latents, latent_injection=0.7, clamp_val=1.0, creative_noise=0.0):
     n3r_latents = n3r_latents.clone()
 
     # Normalisation **canal par canal**
