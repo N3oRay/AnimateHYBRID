@@ -200,6 +200,13 @@ def main(args):
 
     # ---------------- Frames principales avec interpolation prompts ----------------
     external_embeddings = None
+
+    # Charger latent externe avant la génération
+    external_path = "/mnt/62G/huggingface/cyber-fp16/pt/KnxCOmiXNeg.safetensors"
+    external_latent = load_external_embedding_as_latent(
+        external_path, (1, 4, cfg["H"]//8, cfg["W"]//8)
+    ).to(device)
+    #------------------------------------------------------------------------------
     for img_idx, img_path in enumerate(input_paths):
         if stop_generation: break
         try:
