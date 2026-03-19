@@ -436,16 +436,16 @@ def main(args):
                     #    latents, _ = apply_motion_safe(latents, motion_module)
 
                     if motion_module is not None:
-                        # 🔥 FIX NaN / stabilité
-                        latents = sanitize_latents(latents)
-                        latents = latents.unsqueeze(2)  # [B,C,F,H,W], F=1
-                        latents = motion_module(latents)  # juste les latents
-                        latents = latents.squeeze(2)      # revenir à [B,C,H,W]
-                        latents = sanitize_latents(latents)
+                       latents = latents.unsqueeze(2).repeat(1, 1, 3, 1, 1)
+                       latents = motion_module(latents)
+                       #  🔥 garder la frame centrale (important)
+                       latents = latents[:, :, 1, :, :]
+                       latents = sanitize_latents(latents)
 
                     # 🔥 stabilisation temporelle KO
-                    #if previous_latent_single is not None:
-                    #    latents = 0.85 * latents + 0.15 * previous_latent_single.to(device)
+                    if previous_latent_single is not None:
+                        #latents = 0.85 * latents + 0.15 * previous_latent_single.to(device)
+                        latents = 0.97 * latents + 0.03 * previous_latent_single.to(device)
                     # 🔥 AUCUN blending → juste update mémoire
                     previous_latent_single = latents.detach().cpu()
                     # Clamp et resize final 🔥 FIX NaN / stabilité  🔥 nettoyage final intelligent (LE point clé)
