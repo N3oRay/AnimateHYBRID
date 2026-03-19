@@ -311,8 +311,8 @@ def print_generation_params(params: dict):
     print("📌 Paramètres de génération :")
     print(f"{'Paramètre':<20} {'Valeur':>10}   {'Paramètre':<20} {'Valeur':>10}")
 
-    left_keys = ['fps', 'num_fraps_per_image', 'guidance_scale', 'guidance_scale_end', 'creative_noise', 'creative_noise_end','final_latent_scale', 'transition_frames']
-    right_keys = ['use_mini_gpu', 'upscale_factor', 'steps', 'init_image_scale', 'init_image_scale_end', 'latent_scale_boost', 'seed', 'latent_injection']
+    left_keys = ['fps', 'num_fraps_per_image', 'guidance_scale', 'guidance_scale_end', 'creative_noise', 'creative_noise_end','final_latent_scale', 'transition_frames', 'use_n3r_model']
+    right_keys = ['use_mini_gpu', 'upscale_factor', 'steps', 'init_image_scale', 'init_image_scale_end', 'latent_scale_boost', 'seed', 'latent_injection', 'block_size']
 
     for l, r in zip(left_keys, right_keys):
         print(f"{l:<20} {params.get(l, ''):>10}   {r:<20} {params.get(r, ''):>10}")
