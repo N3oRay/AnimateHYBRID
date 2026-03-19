@@ -91,14 +91,18 @@ def main(args):
     transition_frames = cfg.get("transition_frames", 4)
     num_fraps_per_image = cfg.get("num_fraps_per_image", 2)
     steps = max(cfg.get("steps", 16), 4)
-    guidance_scale = cfg.get("guidance_scale", 2.7) # 0.15 peut de créativité 4.5 moderé
-    guidance_scale_end = cfg.get("guidance_scale_end", 4.5) # 0.15 peut de créativité 4.5 moderé
-    init_image_scale = cfg.get("init_image_scale", 0.5) # 0.85 ou 0.95 proche de l'init'
+    guidance_scale = cfg.get("guidance_scale", 5.5) # 0.15 peut de créativité 4.5 moderé
+    guidance_scale_end = cfg.get("guidance_scale_end", 7.0) # 0.15 peut de créativité 4.5 moderé
+    init_image_scale = cfg.get("init_image_scale", 0.75) # 0.85 ou 0.95 proche de l'init' (0.75)
     init_image_scale_end = cfg.get("init_image_scale_end", 0.9) # 0.85 ou 0.95 proche de l'init'
     creative_noise = cfg.get("creative_noise", 0.0)
     creative_noise_end = cfg.get("creative_noise_end", 0.08)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 10)  # nombre de frames par prompt
+    contrast = cfg.get("contrast", 1.15)  # nombre de frames par prompt
+    saturation = cfg.get("saturation", 1.00)  # nombre de frames par prompt
+    blur_radius = cfg.get("blur_radius", 0.03)  # nombre de frames par prompt
+    sharpen_percent = cfg.get("sharpen_percent", 90)  # nombre de frames par prompt
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
@@ -221,11 +225,6 @@ def main(args):
     frame_counter = 0
     pbar = tqdm(total=total_frames, ncols=120)
 
-    # ---------------- Frames principales VRAM-safe ----------------
-    previous_latent_single = None
-    frame_counter = 0
-    pbar = tqdm(total=total_frames, ncols=120)
-
     # ---------------- Frames principales avec interpolation prompts ----------------
     external_embeddings = None
     for img_idx, img_path in enumerate(input_paths):
@@ -302,7 +301,7 @@ def main(args):
                         # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
                         frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
                         # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
-                        frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.05, brightness=1.05, saturation=0.80, vibrance_base=1.0, vibrance_max=1.1, sharpen=True, sharpen_radius=1, sharpen_percent=60, sharpen_threshold=2)
+                        frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=blur_radius, contrast=contrast, brightness=1.05, saturation=saturation, vibrance_base=1.0, vibrance_max=1.1, sharpen=True, sharpen_radius=1, sharpen_percent=sharpen_percent, sharpen_threshold=2)
                         # save
                         print(f"[ init SAVE Frame {frame_counter:03d}]")
                         frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
@@ -405,7 +404,6 @@ def main(args):
                                 clamp_val=1.0,
                                 creative_noise=0.0
                             )
-
                             # Nettoyage final
                             latents = sanitize_latents(latents)
 
@@ -463,7 +461,7 @@ def main(args):
                     latents = latents / LATENT_SCALE
                     # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
                     frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
-                    frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=0.05, contrast=1.15, brightness=1.05, saturation=0.85, vibrance_base=1.1, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=60, sharpen_threshold=2)
+                    frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=blur_radius, contrast=contrast, brightness=1.00, saturation=saturation, vibrance_base=1.1, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=sharpen_percent, sharpen_threshold=2)
                     frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                     frame_counter += 1
                     pbar.update(1)
