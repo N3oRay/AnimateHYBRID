@@ -76,11 +76,15 @@ def main(args):
     saturation = cfg.get("saturation", 1.00)  # Post Traitement saturation
     blur_radius = cfg.get("blur_radius", 0.03)  # Post Traitement blur
     sharpen_percent = cfg.get("sharpen_percent", 90)  #Post Traitement sharpen
+    #block_size = cfg.get("block_size", 256) # 160 / 192 / 256
+    H, W = cfg.get("H", 512), cfg.get("W", 512)
+    block_size = min(256, H//2, W//2)  # block_size auto selon résolution
+    use_n3r_model = cfg.get("use_n3r_model", False)
+
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
-    #latent_injection
-    params = { 'use_mini_gpu': use_mini_gpu,  'fps': fps, 'upscale_factor': upscale_factor, 'num_fraps_per_image': num_fraps_per_image, 'steps': steps, 'guidance_scale': guidance_scale, 'guidance_scale_end': guidance_scale_end, 'init_image_scale': init_image_scale, 'init_image_scale_end': init_image_scale_end, 'creative_noise': creative_noise, 'creative_noise_end': creative_noise_end, 'latent_scale_boost': latent_scale_boost, 'final_latent_scale': final_latent_scale, 'seed': seed, 'latent_injection': latent_injection, 'transition_frames': transition_frames  }
+    params = { 'use_mini_gpu': use_mini_gpu,  'fps': fps, 'upscale_factor': upscale_factor, 'num_fraps_per_image': num_fraps_per_image, 'steps': steps, 'guidance_scale': guidance_scale, 'guidance_scale_end': guidance_scale_end, 'init_image_scale': init_image_scale, 'init_image_scale_end': init_image_scale_end, 'creative_noise': creative_noise, 'creative_noise_end': creative_noise_end, 'latent_scale_boost': latent_scale_boost, 'final_latent_scale': final_latent_scale, 'seed': seed, 'latent_injection': latent_injection, 'transition_frames': transition_frames, 'block_size': block_size, 'use_n3r_model': use_n3r_model }
     print_generation_params(params)
 
 
@@ -164,7 +168,7 @@ def main(args):
         neg_embeds_list.append(neg_embeds)
 
     # ---------------- N3RModelOptimized ----------------
-    use_n3r_model = cfg.get("use_n3r_model", False)
+
     n3r_model = None
     if use_n3r_model:
         n3r_model = N3RModelOptimized(
@@ -191,7 +195,7 @@ def main(args):
     output_dir = Path(f"./outputs/ProBoost{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
-    block_size = cfg.get("block_size", 160)
+
     overlap = compute_overlap(cfg["W"], cfg["H"], block_size)
 
     previous_latent_single = None
@@ -309,11 +313,8 @@ def main(args):
                     # 🔥 FIX NaN / stabilité
                     latents = sanitize_latents(latents)
 
-                    #------------------------------------------------- use_n3r_model:
-                    #use_n3r_this_frame = use_n3r_model and (frame_counter % 3 == 0)
-                    use_n3r_this_frame = use_n3r_model and (frame_counter % random.choice([4,5,6]) == 0)
-
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
+                    use_n3r_this_frame = use_n3r_model and (frame_counter % random.choice([4,5,6]) == 0)
                     # ------------------- Bloc N3R par frame -------------------
                     if use_n3r_this_frame:
                         try:
