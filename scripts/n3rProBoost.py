@@ -374,7 +374,9 @@ def main(args):
 
                             # Fusion mémoire par prompt -----
                             memory_alpha = 0.1 + 0.1 * math.sin(frame_counter * 0.05)
-                            fused_latents = update_n3r_memory( memory_dict, cf_embeds[0],  n3r_latents, memory_alpha=memory_alpha )
+                            pos_emb, neg_emb = cf_embeds
+                            key_embed = pos_emb - 0.5 * neg_emb  # meilleure séparation sémantique
+                            fused_latents = update_n3r_memory( memory_dict, key_embed, n3r_latents, memory_alpha=memory_alpha )
                             similarity = torch.cosine_similarity( n3r_latents.flatten(), fused_latents.flatten(), dim=0 )
                             adaptive_alpha = 0.1 + 0.2 * (1 - similarity)
                             fused_latents = ( (1 - adaptive_alpha) * fused_latents + adaptive_alpha * n3r_latents )
@@ -431,21 +433,30 @@ def main(args):
                                 ).contiguous()
                             latents = latent_injection*latents_frame + (1-latent_injection)*latents
 
-                    # --- Motion module ---
-                    #if motion_module:
-                    #    latents, _ = apply_motion_safe(latents, motion_module)
-
+                    # --- Motion module propre et safe ---
                     if motion_module is not None:
-                       latents = latents.unsqueeze(2).repeat(1, 1, 3, 1, 1)
-                       latents = motion_module(latents)
-                       #  🔥 garder la frame centrale (important)
-                       latents = latents[:, :, 1, :, :]
-                       latents = sanitize_latents(latents)
+                        if previous_latent_single is not None:
+                            latents_seq = torch.stack([
+                                previous_latent_single.to(device),
+                                latents,
+                                latents + 0.01 * torch.randn_like(latents)
+                            ], dim=2)  # [B,C,F,H,W]
+                        else:
+                            latents_seq = latents.unsqueeze(2).repeat(1, 1, 3, 1, 1)
 
-                    # 🔥 stabilisation temporelle KO
-                    if previous_latent_single is not None:
-                        #latents = 0.85 * latents + 0.15 * previous_latent_single.to(device)
-                        latents = 0.97 * latents + 0.03 * previous_latent_single.to(device)
+                        # 🔥 sécurisation AVANT motion
+                        latents_seq = sanitize_latents(latents_seq)
+
+                        # 🔥 motion safe (une seule fois)
+                        latents_seq, applied = apply_motion_safe(latents_seq, motion_module)
+
+                        if applied:
+                            latents = latents_seq[:, :, 1, :, :]
+                        else:
+                            latents = latents
+
+                        latents = sanitize_latents(latents)
+
                     # 🔥 AUCUN blending → juste update mémoire
                     previous_latent_single = latents.detach().cpu()
                     # Clamp et resize final 🔥 FIX NaN / stabilité  🔥 nettoyage final intelligent (LE point clé)
