@@ -13,6 +13,31 @@ import json
 import torch
 from pathlib import Path
 
+# -------------------------------------------------------------------------------------------
+# --- Sélection simple des embeddings prompts par frame ---
+def get_embeddings_for_frame(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
+    #Retourne les embeddings du prompt correspondant à la frame_idx. Chaque prompt produit `frames_per_prompt` frames consécutives.
+    num_prompts = len(pos_list)
+    prompt_idx = min(frame_idx // frames_per_prompt, num_prompts - 1)
+    return pos_list[prompt_idx].to(device), neg_list[prompt_idx].to(device)
+
+
+def adapt_embeddings_to_unet(pos_embeds, neg_embeds, target_dim):
+    """Adapte automatiquement les embeddings texte pour correspondre au cross_attention_dim du UNet."""
+    current_dim = pos_embeds.shape[-1]
+    if current_dim == target_dim:
+        return pos_embeds, neg_embeds
+    # Troncature
+    if current_dim > target_dim:
+        pos_embeds = pos_embeds[..., :target_dim]
+        neg_embeds = neg_embeds[..., :target_dim]
+    # Padding
+    elif current_dim < target_dim:
+        pad = target_dim - current_dim
+        pos_embeds = torch.nn.functional.pad(pos_embeds, (0, pad))
+        neg_embeds = torch.nn.functional.pad(neg_embeds, (0, pad))
+    return pos_embeds, neg_embeds
+
 def compute_weighted_params(frame_idx, total_frames,
                             init_start=0.85, init_end=0.5,
                             noise_start=0.0, noise_end=0.08,
