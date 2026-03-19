@@ -99,24 +99,24 @@ vae_path: "/mnt/62G/huggingface/miniSD-fp16/vae/diffusion_pytorch_model.safetens
 
 
 prompt:
-  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, comic book style Marvel, cel shading, bold outlines, dramatic action pose, neon lighting, vibrant colors, glowing effects, dynamic perspective, cinematic composition, energy lines, stylized shadows, inked lines, comic panel framing, halftone shading, high contrast lighting, happy expression"
-  - "female  superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, Marvel comic style, dynamic pose, neon city background, glowing circuits, vibrant colors, cinematic lighting, dramatic angles, stylized shadows, action scene, inked lines, comic panel framing, halftone shading, high contrast lighting"
-  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, katana on back, Marvel comic style, synthwave neon city, pink and purple lighting, reflective wet streets, dynamic perspective, cinematic composition, glowing atmosphere, motion energy, inked lines, comic panel framing, halftone shading, high contrast lighting"
-  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, katana on back, Marvel comic style, angelic transformation, glowing neon wings, radiant energy, floating pose, dramatic lighting, vibrant colors, stylized aura, inked lines, comic panel framing, halftone shading, high contrast lighting"
-  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, katana on back, Marvel comic style, cyberpunk city night, dense skyline, neon signs, holograms, rainy streets, cinematic composition, dramatic shadows, dynamic perspective, inked lines, comic panel framing, halftone shading, high contrast lighting"
+  - "cyber armor, mask, comic book style Marvel, cel shading, bold outlines, dramatic, neon lighting, vibrant colors, glowing effects, dynamic perspective, cinematic composition, energy lines, stylized shadows, inked lines, comic panel framing, halftone shading, high contrast lighting"
+  - "superhero, consistent character, blue light, cyber armor, mask, Marvel comic style, dynamic, neon city background, glowing circuits, vibrant colors, cinematic lighting, dramatic angles, stylized shadows, action scene, inked lines, comic panel framing, halftone shading, high contrast lighting"
+  - "cyber armor, mask, Marvel comic style, synthwave neon city, pink and purple lighting, reflective wet streets, dynamic perspective, cinematic composition, glowing atmosphere, motion energy, inked lines, comic panel framing, halftone shading, high contrast lighting"
+  - "cyber armor, mask, Marvel comic style, angelic transformation, glowing neon wings, radiant energy, dramatic lighting, vibrant colors, stylized aura, inked lines, comic panel framing, halftone shading, high contrast lighting"
+  - "Marvel comic style, cyberpunk city night, dense skyline, neon signs, holograms, rainy streets, cinematic composition, dramatic shadows, dynamic perspective, inked lines, comic panel framing, halftone shading, high contrast lighting"
 
 
 n_prompt:
-  - "blurry, deformed, extra limbs, bad anatomy, low quality, messy background, dark colors, scary, realistic, human features"
-  - "blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
-  - "blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
-  - "blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
-  - "blurry, deformed, stiff pose, unnatural movement, distorted anatomy, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic, bad anatomy, extra fingers"
+  - "blurry, deformed, low quality, messy background, dark colors, scary, realistic"
+  - "blurry, deformed, stiff pose, unnatural movement, distorted, missing parts, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic"
+  - "blurry, deformed, stiff pose, unnatural movement, distorted, missing parts, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic"
+  - "blurry, deformed, stiff pose, unnatural movement, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic"
+  - "blurry, deformed, unnatural movement, missing parts, extra limbs, broken motion, low resolution, inconsistent colors, messy background, realistic, clear, detailed, structured, photo-realistic"
 
 
 input_images:
-  - "input/540-960/1.png"
-  - "input/540-960/2.png"
-  - "input/540-960/3.png"
-  - "input/540-960/4.png"
-  - "input/540-960/5.png"
+  - "input/540x960/1.png"
+  - "input/540x960/2.png"
+  - "input/540x960/3.png"
+  - "input/540x960/4.png"
+  - "input/540x960/5.png"
