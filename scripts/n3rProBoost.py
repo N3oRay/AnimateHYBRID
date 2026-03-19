@@ -17,6 +17,7 @@ from diffusers import PNDMScheduler
 from transformers import CLIPTokenizerFast, CLIPTextModel
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
+from scripts.utils.n3rModelUtils import generate_n3r_coords, process_n3r_latents, fuse_with_memory, inject_external
 from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
@@ -309,85 +310,14 @@ def main(args):
                     # ------------------- Bloc N3R par frame -------------------
                     if use_n3r_this_frame:
                         try:
-                            # 🔥 ALIGNEMENT TOTAL AVEC LATENT SPACE
                             H, W = latents.shape[-2], latents.shape[-1]
                             N_samples = n3r_model.N_samples
-
-                            # Coordonnées normalisées
-                            ys = torch.linspace(-1.0, 1.0, H, device=device)
-                            xs = torch.linspace(-1.0, 1.0, W, device=device)
-                            ss = torch.arange(N_samples, device=device, dtype=torch.float32)
-                            ys, xs, ss = torch.meshgrid(ys, xs, ss, indexing='ij')
-                            coords = torch.stack([xs, ys, ss], dim=-1).reshape(-1, 3)
-
-                            # jitter léger
-                            noise_scale = 0.01 + 0.02 * math.sin(frame_counter * 0.1)
-                            torch.manual_seed(seed + frame_counter)
-                            coords = coords + (torch.rand_like(coords) - 0.5) * 0.02
-                            coords = coords + torch.randn_like(coords) * noise_scale
-                            coords = torch.nan_to_num(coords)
-
-                            # Forward N3R (tile safe, CPU offload si activé)
-                            n3r_latents_raw = n3r_model(coords, H, W)[:, :3]
-
-                            # Sécurité reshape + interpolation pour match exact
-                            expected = H * W * N_samples
-                            if n3r_latents_raw.shape[0] != expected:
-                                raise RuntimeError(f"N3R reshape mismatch: {n3r_latents_raw.shape[0]} vs {expected}")
-
-                            n3r_latents = n3r_latents_raw.view(H, W, N_samples, 3).mean(dim=2)
-                            n3r_latents = n3r_latents.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
-
-                            # Ajout canal alpha si nécessaire
-                            if n3r_latents.shape[1] == 3:
-                                n3r_latents = torch.cat([n3r_latents, torch.zeros_like(n3r_latents[:, :1])], dim=1)
-
-                            # ⚡ Interpolation forcée pour aligner H x W
-                            target_H, target_W = latents.shape[-2], latents.shape[-1]
-                            if n3r_latents.shape[-2:] != (target_H, target_W):
-                                n3r_latents = F.interpolate(
-                                    n3r_latents, size=(target_H, target_W),
-                                    mode='bilinear', align_corners=False
-                                ).contiguous()
-
-                            # Fusion mémoire
-                            memory_alpha = 0.1 + 0.1 * math.sin(frame_counter * 0.05)
-                            pos_emb, neg_emb = cf_embeds
-                            key_embed = pos_emb - 0.5 * neg_emb
-                            fused_latents = update_n3r_memory(memory_dict, key_embed, n3r_latents, memory_alpha=memory_alpha)
-
-                            # Si tailles différentes après update mémoire, interp
-                            if fused_latents.shape[-2:] != n3r_latents.shape[-2:]:
-                                fused_latents = F.interpolate(fused_latents, size=n3r_latents.shape[-2:], mode='bilinear', align_corners=False)
-
-                            # Similarité + alpha adaptatif
-                            similarity = torch.cosine_similarity(n3r_latents.flatten(), fused_latents.flatten(), dim=0)
-                            adaptive_alpha = 0.1 + 0.2 * (1 - similarity)
-                            fused_latents = (1 - adaptive_alpha) * fused_latents + adaptive_alpha * n3r_latents
-
-                            # Injection externe
-                            if external_latent is None or external_latent.shape != n3r_latents.shape:
-                                external_latent = load_external_embedding_as_latent(
-                                    "/mnt/62G/huggingface/cyber-fp16/pt/KnxCOmiXNeg.safetensors",
-                                    n3r_latents.shape
-                                ).to(device)
-                            dynamic_weight = 0.08 * (0.6 + 0.4 * math.sin(frame_counter * 0.1))
-                            external_embeddings = [{"key": "knx_neg", "latent": external_latent, "weight": dynamic_weight, "type": "negative"}]
-                            if external_embeddings:
-                                fused_latents = 0.9 * fused_latents + 0.1 * inject_external_embeddings(fused_latents, external_embeddings, device)
-
-                            # Fusion finale N3R
-                            latents = fuse_n3r_latents_adaptive(
-                                latents,
-                                fused_latents,
-                                latent_injection=latent_injection,
-                                clamp_val=1.0,
-                                creative_noise=0.0
-                            )
-
-                            # Nettoyage final
+                            coords = generate_n3r_coords(H, W, N_samples, seed, frame_counter, device)
+                            n3r_latents = process_n3r_latents(n3r_model, coords, H, W, H, W)
+                            fused_latents = fuse_with_memory(n3r_latents, memory_dict, cf_embeds, frame_counter)
+                            fused_latents = inject_external(fused_latents, external_latent, frame_counter, device)
+                            latents = fuse_n3r_latents_adaptive(latents, fused_latents, latent_injection=latent_injection)
                             latents = sanitize_latents(latents)
-
                         except Exception as e:
                             print(f"[N3R ERROR] {e}")
 
