@@ -44,13 +44,24 @@ decode_latents_ultrasafe_blockwise → stable decoding with high-quality output.
 💡 Bottom Line: With these settings, AnimateDiff can run even on GPUs with 3–4 GB VRAM without sacrificing output quality.
 
 And yes… N3R did it for you! 🚀
-
+n3rProtoBoost:
+```
 python -m scripts.n3rProtoBoost \
                       --pretrained-model-path "/huggingface/miniSD" \
                       --config "configs/prompts/2_animate/1080.yaml" \
                       --device "cuda" \
                       --vae-offload \
+                      --fp16*
+```
+n3rProBoost:
+```                      
+python -m scripts.n3rProBoost \
+                      --pretrained-model-path "/huggingface/miniSD" \
+                      --config "configs/prompts/2_animate/960.yaml" \
+                      --device "cuda" \
+                      --vae-offload \
                       --fp16
+```                      
 
 
 
