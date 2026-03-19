@@ -19,7 +19,7 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
-from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params
+from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
@@ -34,15 +34,6 @@ stop_generation = False
 # Variation de l'interpolation' Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast ---
 #init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
 
-# -------------------------------------------------------------------------------------------
-# --- Sélection simple des embeddings prompts par frame ---
-def get_embeddings_for_frame(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
-    #Retourne les embeddings du prompt correspondant à la frame_idx. Chaque prompt produit `frames_per_prompt` frames consécutives.
-    num_prompts = len(pos_list)
-    prompt_idx = min(frame_idx // frames_per_prompt, num_prompts - 1)
-    return pos_list[prompt_idx].to(device), neg_list[prompt_idx].to(device)
-
-
 # ---------------- Thread stop ----------------
 def wait_for_stop():
     global stop_generation
@@ -52,27 +43,10 @@ def wait_for_stop():
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
 # ---------------- Utilitaires ----------------
-
 def apply_motion_safe(latents, motion_module, threshold=1e-3):
     if latents.abs().max() < threshold:
         return latents, False
     return motion_module(latents), True
-
-def adapt_embeddings_to_unet(pos_embeds, neg_embeds, target_dim):
-    """Adapte automatiquement les embeddings texte pour correspondre au cross_attention_dim du UNet."""
-    current_dim = pos_embeds.shape[-1]
-    if current_dim == target_dim:
-        return pos_embeds, neg_embeds
-    # Troncature
-    if current_dim > target_dim:
-        pos_embeds = pos_embeds[..., :target_dim]
-        neg_embeds = neg_embeds[..., :target_dim]
-    # Padding
-    elif current_dim < target_dim:
-        pad = target_dim - current_dim
-        pos_embeds = torch.nn.functional.pad(pos_embeds, (0, pad))
-        neg_embeds = torch.nn.functional.pad(neg_embeds, (0, pad))
-    return pos_embeds, neg_embeds
 
 # ---------------- MAIN FIABLE ----------------
 def main(args):
@@ -99,10 +73,10 @@ def main(args):
     creative_noise_end = cfg.get("creative_noise_end", 0.08)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 10)  # nombre de frames par prompt
-    contrast = cfg.get("contrast", 1.15)  # nombre de frames par prompt
-    saturation = cfg.get("saturation", 1.00)  # nombre de frames par prompt
-    blur_radius = cfg.get("blur_radius", 0.03)  # nombre de frames par prompt
-    sharpen_percent = cfg.get("sharpen_percent", 90)  # nombre de frames par prompt
+    contrast = cfg.get("contrast", 1.15)  # Post Traitement constrat
+    saturation = cfg.get("saturation", 1.00)  # Post Traitement saturation
+    blur_radius = cfg.get("blur_radius", 0.03)  # Post Traitement blur
+    sharpen_percent = cfg.get("sharpen_percent", 90)  #Post Traitement sharpen
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
@@ -319,8 +293,6 @@ def main(args):
                     latents_frame = current_latent_single.to(device)
 
                     # --- Interpolation des embeddings prompts ---
-                    #cf_embeds = get_interpolated_embeddings(frame_counter, total_frames, pos_embeds_list, neg_embeds_list)
-                    #cf_embeds = get_embeddings_for_frame(frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device)
                     cf_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device )
 
                     # --- N3R ou mini GPU diffusion ---
