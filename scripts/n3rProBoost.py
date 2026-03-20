@@ -4,6 +4,7 @@
 #Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
 # --------------------------------------------------------------
 import os, math, threading, random
+import traceback
 import hashlib
 import torch
 import pickle
@@ -17,8 +18,8 @@ from diffusers import PNDMScheduler
 from transformers import CLIPTokenizerFast, CLIPTextModel
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
-from scripts.utils.n3rModelUtils import generate_n3r_coords, process_n3r_latents, fuse_with_memory, inject_external
-from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet
+from scripts.utils.n3rModelUtils import generate_n3r_coords, process_n3r_latents, fuse_with_memory, inject_external, fuse_n3r_latents_adaptive_new
+from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet, get_dynamic_latent_injection
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
@@ -272,7 +273,8 @@ def main(args):
                         # --- Fusion adaptative avec diminution progressive de l'influence de la frame précédente
                         injection_start = 0.8  # influence initiale de l'ancienne frame
                         injection_end   = 0.1  # influence finale
-                        injection_alpha = injection_start * (1 - t/(transition_frames-1)) + injection_end * (t/(transition_frames-1))
+                        denom = max(transition_frames-1, 1)
+                        injection_alpha = injection_start * (1 - t/denom) + injection_end * (t/denom)
 
                         latent_interp = injection_alpha * previous_latent_single.to(device) + (1 - injection_alpha) * current_latent_single.to(device)
                         # 🔥 FIX NaN / stabilité
@@ -324,7 +326,9 @@ def main(args):
                             n3r_latents = process_n3r_latents(n3r_model, coords, H, W, H, W)
                             fused_latents = fuse_with_memory(n3r_latents, memory_dict, cf_embeds, frame_counter)
                             fused_latents = inject_external(fused_latents, external_latent, frame_counter, device)
-                            latents = fuse_n3r_latents_adaptive(latents, fused_latents, latent_injection=latent_injection)
+                            #latent_injection = get_dynamic_latent_injection(frame_counter, total_frames, start=0.90, end=0.55)
+                            #latents = fuse_n3r_latents_adaptive(latents, fused_latents, latent_injection=latent_injection)
+                            latents = fuse_n3r_latents_adaptive_new(latents, fused_latents, frame_counter=frame_counter, total_frames=total_frames, latent_injection_start=0.90, latent_injection_end=0.55)
                             latents = sanitize_latents(latents)
                         except Exception as e:
                             print(f"[N3R ERROR] {e}")
@@ -392,7 +396,11 @@ def main(args):
             previous_latent_single = current_latent_single
 
         except Exception as e:
-            print(f"[FRAME ERROR] {img_path} : {e}")
+            print(f"\n[FRAME ERROR] {img_path}")
+            print(f"Type d'erreur : {type(e).__name__}")
+            print(f"Message d'erreur : {e}")
+            print("Traceback complet :")
+            traceback.print_exc()
             continue
 
     pbar.close()
