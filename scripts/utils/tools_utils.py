@@ -6,12 +6,53 @@ import hashlib
 from PIL import Image, ImageEnhance
 from torchvision.transforms import ToPILImage
 from torchvision.transforms import functional as F
+from .fx_utils import apply_post_processing_adaptive
 
 LATENT_SCALE = 0.18215  # valeur globale, peut être importée si nécessaire
 
 import json
 import torch
 from pathlib import Path
+
+def save_input_frame(input_image, output_dir, frame_counter, pbar=None,
+                     blur_radius=0.0, contrast=1.0, saturation=1.0, apply_post=False):
+    try:
+        from torchvision.transforms.functional import to_pil_image
+
+        # Tensor → CPU + clamp
+        img = input_image[0].detach().cpu().clamp(-1, 1)
+
+        # [-1,1] → [0,1]
+        img = (img + 1) / 2
+
+        # → PIL
+        img_pil = to_pil_image(img)
+
+        # Option post-process
+        if apply_post:
+            img_pil = apply_post_processing_adaptive(
+                img_pil,
+                blur_radius=blur_radius,
+                contrast=contrast,
+                brightness=1.0,
+                saturation=saturation
+            )
+
+        # Save
+        img_pil.save(output_dir / f"frame_{frame_counter:05d}_input.png")
+
+        print(f"[INPUT SAVE Frame {frame_counter:03d}]")
+
+        # Update compteur + progress bar
+        frame_counter += 1
+        if pbar:
+            pbar.update(1)
+
+        return frame_counter
+
+    except Exception as e:
+        print(f"[INPUT SAVE ERROR] {e}")
+        return frame_counter
 
 def get_dynamic_latent_injection(frame_counter, total_frames, start=0.90, end=0.55, mode="cosine"):
     """
