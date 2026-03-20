@@ -39,7 +39,7 @@ def save_input_frame(input_image, output_dir, frame_counter, pbar=None,
             )
 
         # Save
-        img_pil.save(output_dir / f"frame_{frame_counter:05d}_input.png")
+        img_pil.save(output_dir / f"frame_{frame_counter+1:05d}_input.png")
 
         print(f"[INPUT SAVE Frame {frame_counter:03d}]")
 
