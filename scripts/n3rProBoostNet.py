@@ -1,5 +1,5 @@
 # --------------------------------------------------------------
-# n3rProBoost.py - AnimateDiff ultra-light ~2Go VRAM
+# n3rProBoostNet.py - AnimateDiff ultra-light ~2Go VRAM
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
 #Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
 # --------------------------------------------------------------
@@ -81,6 +81,9 @@ def main(args):
     H, W = cfg.get("H", 512), cfg.get("W", 512)
     block_size = min(256, H//2, W//2)  # block_size auto selon résolution
     use_n3r_model = cfg.get("use_n3r_model", False)
+    # Configurable depuis ton fichier cfg
+    use_n3r_pro_net = cfg.get("use_n3r_pro_net", True)
+    n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
@@ -185,9 +188,7 @@ def main(args):
         memory_file = output_dir_m / "n3r_memory"
         memory_dict = load_memory(memory_file)
 
-    # Configurable depuis ton fichier cfg
-    use_n3r_pro_net = cfg.get("use_n3r_pro_net", True)
-    n3r_pro_strength = cfg.get("n3r_pro_strength", 0.3)
+
 
     n3r_pro_net = None
     if use_n3r_pro_net:
@@ -200,7 +201,7 @@ def main(args):
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
     total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/ProBoost{timestamp}")
+    output_dir = Path(f"./outputs/ProBoostNet{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
 
@@ -291,31 +292,20 @@ def main(args):
                         if motion_module:
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
-
                         # Application de n3r_pro_net
-                        latent_interp = apply_n3r_pro_net( latent_interp, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_latents )
+                        if use_n3r_pro_net:
+                            latent_interp = apply_n3r_pro_net( latent_interp, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_latents )
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
-                        frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
-                        #frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=blur_radius, contrast=contrast, brightness=1.05, saturation=saturation, vibrance_base=1.0, vibrance_max=1.1, sharpen=True, sharpen_radius=1, sharpen_percent=sharpen_percent, sharpen_threshold=2)
 
-
-                        frame_pil = soft_tone_map(frame_pil)
-                        frame_pil = apply_post_processing_adaptive(
-                            frame_pil,
-                            blur_radius=0.02,          # ↓ plus léger (évite wash)
-                            contrast=1.03,             # 🔥 très important → quasi neutre
-                            brightness=1.0,            # ne jamais toucher sauf besoin
-                            saturation=0.93,           # 🔥 clé → évite saturation globale
-                            vibrance_base=0.98,        # 🔥 baisse globale
-                            vibrance_max=1.02,         # limite haute très faible
-                            sharpen=True,
-                            sharpen_radius=0.6,        # 🔥 plus fin
-                            sharpen_percent=60,        # 🔥 beaucoup moins agressif
-                            sharpen_threshold=3        # évite bruit
-                        )
-
+                        if use_n3r_pro_net:
+                            frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
+                            frame_pil = soft_tone_map(frame_pil)
+                            frame_pil = apply_post_processing_adaptive( frame_pil, blur_radius=blur_radius, contrast=contrast, brightness=1.0, saturation=saturation, vibrance_base=1.0, vibrance_max=1.0, sharpen=True, sharpen_radius=1, sharpen_percent=50, sharpen_threshold=2 )
+                        else:
+                            frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
+                            frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=blur_radius, contrast=contrast, brightness=1.0, saturation=saturation, vibrance_base=1.1, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=sharpen_percent, sharpen_threshold=2)
                         # save
                         print(f"[ init SAVE Frame {frame_counter:03d}]")
                         frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
@@ -353,8 +343,6 @@ def main(args):
                             n3r_latents = process_n3r_latents(n3r_model, coords, H, W, H, W)
                             fused_latents = fuse_with_memory(n3r_latents, memory_dict, cf_embeds, frame_counter)
                             fused_latents = inject_external(fused_latents, external_latent, frame_counter, device)
-                            #latent_injection = get_dynamic_latent_injection(frame_counter, total_frames, start=0.90, end=0.55)
-                            #latents = fuse_n3r_latents_adaptive(latents, fused_latents, latent_injection=latent_injection)
                             latents = fuse_n3r_latents_adaptive_new(latents, fused_latents, frame_counter=frame_counter, total_frames=total_frames, latent_injection_start=0.90, latent_injection_end=0.55)
                             latents = sanitize_latents(latents)
                         except Exception as e:
@@ -409,27 +397,21 @@ def main(args):
                     # 🔥 AUCUN blending → juste update mémoire
                     previous_latent_single = latents.detach().cpu()
                     # Application de n3r_pro_net
-                    latents = apply_n3r_pro_net( latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_latents )
+                    if use_n3r_pro_net:
+                        latents = apply_n3r_pro_net( latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_latents )
                      # Clamp et resize final 🔥 FIX NaN / stabilité  🔥 nettoyage final intelligent (LE point clé)
                     latents = latents / LATENT_SCALE
-                    # Decode
-                    frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
-                    #frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=blur_radius, contrast=contrast, brightness=1.00, saturation=saturation, vibrance_base=1.1, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=sharpen_percent, sharpen_threshold=2)
 
-                    frame_pil = soft_tone_map(frame_pil)
-                    frame_pil = apply_post_processing_adaptive(
-                        frame_pil,
-                        blur_radius=0.02,          # ↓ plus léger (évite wash)
-                        contrast=1.03,             # 🔥 très important → quasi neutre
-                        brightness=1.0,            # ne jamais toucher sauf besoin
-                        saturation=0.93,           # 🔥 clé → évite saturation globale
-                        vibrance_base=0.98,        # 🔥 baisse globale
-                        vibrance_max=1.02,         # limite haute très faible
-                        sharpen=True,
-                        sharpen_radius=0.6,        # 🔥 plus fin
-                        sharpen_percent=60,        # 🔥 beaucoup moins agressif
-                        sharpen_threshold=3        # évite bruit
-                    )
+                    #
+                    if use_n3r_pro_net:
+                        # Decode
+                        frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.10, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
+                        frame_pil = soft_tone_map(frame_pil)
+                        frame_pil = apply_post_processing_adaptive( frame_pil, blur_radius=blur_radius, contrast=contrast, brightness=1.0, saturation=saturation, vibrance_base=1.0, vibrance_max=1.0, sharpen=True, sharpen_radius=1, sharpen_percent=50, sharpen_threshold=2 )
+                    else:
+                        # Decode
+                        frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
+                        frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=blur_radius, contrast=contrast, brightness=1.0, saturation=saturation, vibrance_base=1.1, vibrance_max=1.2, sharpen=True, sharpen_radius=1, sharpen_percent=sharpen_percent, sharpen_threshold=2)
 
                     frame_pil.save(output_dir / f"frame_{frame_counter:05d}.png")
                     frame_counter += 1
