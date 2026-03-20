@@ -13,6 +13,21 @@ import json
 import torch
 from pathlib import Path
 
+def get_dynamic_latent_injection(frame_counter, total_frames, start=0.90, end=0.55, mode="cosine"):
+    """
+    Calcule latent_injection pour chaque frame, avec protection contre division par zéro.
+    """
+    if total_frames <= 1:
+        return start  # Pas de progression possible
+
+    t = frame_counter / (total_frames - 1)  # toujours safe
+    if mode == "cosine":
+        alpha = 0.5 - 0.5 * math.cos(math.pi * t)
+    else:
+        alpha = t
+    latent_injection = start + (end - start) * alpha
+    return min(max(latent_injection, 0.0), 1.0)
+
 # -------------------------------------------------------------------------------------------
 # --- Sélection simple des embeddings prompts par frame ---
 def get_embeddings_for_frame(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):

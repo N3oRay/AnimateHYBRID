@@ -4,6 +4,68 @@ import torch
 from torchvision.transforms import functional as F
 from scripts.utils.tools_utils import update_n3r_memory, inject_external_embeddings
 
+def fuse_n3r_latents_adaptive_new(latents_frame, n3r_latents, frame_counter=None, total_frames=None,
+                              latent_injection_start=0.9, latent_injection_end=0.55,
+                              clamp_val=1.0, creative_noise=0.0):
+    """
+    Fusion adaptative des latents N3R avec les latents du frame courant.
+    - latents_frame : tensor [B,C,H,W] du frame courant
+    - n3r_latents   : tensor [B,C,H,W] N3R latents à fusionner
+    - frame_counter, total_frames : pour injection dynamique
+    - latent_injection_start / end : plage d'injection dynamique
+    - creative_noise : ajout de bruit léger
+    """
+    # ---------------- Resize si nécessaire ----------------
+    if n3r_latents.shape != latents_frame.shape:
+        n3r_latents = torch.nn.functional.interpolate(
+            n3r_latents, size=latents_frame.shape[-2:], mode='bilinear', align_corners=False
+        )
+        # Ajuster le nombre de canaux
+        if n3r_latents.shape[1] < latents_frame.shape[1]:
+            extra = latents_frame[:, n3r_latents.shape[1]:, :, :].clone() * 0
+            n3r_latents = torch.cat([n3r_latents, extra], dim=1)
+        elif n3r_latents.shape[1] > latents_frame.shape[1]:
+            n3r_latents = n3r_latents[:, :latents_frame.shape[1], :, :]
+
+    n3r_latents = n3r_latents.clone()
+
+    # ---------------- Normalisation sûre par canal ----------------
+    for c in range(min(3, n3r_latents.shape[1])):
+        n3r_c = n3r_latents[:, c:c+1, :, :]
+        frame_c = latents_frame[:, c:c+1, :, :]
+        mean, std = n3r_c.mean(), n3r_c.std()
+        if std.item() == 0:  # sécurité division par zéro
+            std = 1.0
+        n3r_c = (n3r_c - mean) / std
+        frame_std = frame_c.std()
+        frame_mean = frame_c.mean()
+        if frame_std.item() == 0:
+            frame_std = 1.0
+        n3r_c = n3r_c * frame_std + frame_mean
+        n3r_latents[:, c:c+1, :, :] = n3r_c
+
+    # ---------------- Bruit créatif léger ----------------
+    if creative_noise > 0.0:
+        noise = torch.randn_like(n3r_latents) * creative_noise
+        n3r_latents += noise
+
+    # ---------------- Clamp ----------------
+    n3r_latents = torch.clamp(n3r_latents, -clamp_val, clamp_val)
+    latents_frame = torch.clamp(latents_frame, -clamp_val, clamp_val)
+
+    # ---------------- Injection dynamique ----------------
+    if frame_counter is not None and total_frames is not None:
+        alpha = 0.5 - 0.5 * math.cos(math.pi * frame_counter / max(total_frames - 1, 1))
+        latent_injection = latent_injection_start + (latent_injection_end - latent_injection_start) * alpha
+        latent_injection = min(max(latent_injection, 0.0), 1.0)
+    else:
+        latent_injection = latent_injection_start
+
+    fused_latents = latent_injection * latents_frame + (1 - latent_injection) * n3r_latents
+    fused_latents = torch.clamp(fused_latents, -clamp_val, clamp_val)
+
+    return fused_latents
+
 
 def generate_n3r_coords(H, W, N_samples, seed, frame_counter, device):
     """Génère des coordonnées normalisées + jitter + bruit."""
