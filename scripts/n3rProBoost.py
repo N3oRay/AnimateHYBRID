@@ -33,7 +33,6 @@ stop_generation = False
 
 # Variation de l'interpolation' Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast ---
 #init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
-
 # ---------------- Thread stop ----------------
 def wait_for_stop():
     global stop_generation
@@ -77,11 +76,9 @@ def main(args):
     saturation = cfg.get("saturation", 1.00)  # Post Traitement saturation
     blur_radius = cfg.get("blur_radius", 0.03)  # Post Traitement blur
     sharpen_percent = cfg.get("sharpen_percent", 90)  #Post Traitement sharpen
-    #block_size = cfg.get("block_size", 256) # 160 / 192 / 256
     H, W = cfg.get("H", 512), cfg.get("W", 512)
     block_size = min(256, H//2, W//2)  # block_size auto selon résolution
     use_n3r_model = cfg.get("use_n3r_model", False)
-
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
@@ -169,7 +166,6 @@ def main(args):
         neg_embeds_list.append(neg_embeds)
 
     # ---------------- N3RModelOptimized ----------------
-
     n3r_model = None
     if use_n3r_model:
         n3r_model = N3RModelOptimized(
@@ -183,8 +179,6 @@ def main(args):
         print(f"✅ N3RModelOptimized initialisé sur {device}")
 
         # ------------------- Initialisation mémoire -------------------
-
-
         output_dir_m = Path("./outputs")
         memory_file = output_dir_m / "n3r_memory"
         memory_dict = load_memory(memory_file)
@@ -287,7 +281,6 @@ def main(args):
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
                         frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.0, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
-                        # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
                         frame_pil = apply_post_processing_adaptive(frame_pil, blur_radius=blur_radius, contrast=contrast, brightness=1.05, saturation=saturation, vibrance_base=1.0, vibrance_max=1.1, sharpen=True, sharpen_radius=1, sharpen_percent=sharpen_percent, sharpen_threshold=2)
                         # save
                         print(f"[ init SAVE Frame {frame_counter:03d}]")
