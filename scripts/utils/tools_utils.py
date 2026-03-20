@@ -384,7 +384,6 @@ def prepare_frame_tensor(frame_tensor):
         frame_tensor = frame_tensor.permute(2,0,1)
     return frame_tensor.clamp(0,1)
 
-
 def normalize_frame(frame_tensor):
     """
     Normalise un tensor image dans l'intervalle [0, 1].
