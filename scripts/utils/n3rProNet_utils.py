@@ -4,15 +4,54 @@ import torch
 import math
 import numpy as np
 from PIL import Image, ImageFilter
+import torch.nn.functional as F
 
 def soft_tone_map(img):
     arr = np.array(img).astype(np.float32) / 255.0
-    arr = arr / (arr + 0.6)  # 🔥 compresse hautes lumières
+
+    # 🔥 compression plus douce (log-like)
+    arr = np.log1p(arr * 1.5) / np.log1p(1.5)
+
+    # 🔥 léger adoucissement des contrastes
+    arr = np.power(arr, 0.95)
+
+    return Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
+
+def soft_tone_map1(img):
+    arr = np.array(img).astype(np.float32) / 255.0
+    arr = arr / (arr + 0.2)
+    arr = np.power(arr, 0.95)
     arr = np.clip(arr, 0, 1)
     return Image.fromarray((arr * 255).astype(np.uint8))
 
-
 def apply_n3r_pro_net(latents, model=None, strength=0.3, sanitize_fn=None):
+    if model is None or strength <= 0:
+        return latents
+
+    try:
+        latents = latents.to(next(model.parameters()).dtype)
+        refined = model(latents)
+
+        # 🔥 différence (detail map)
+        detail = refined - latents
+
+        # 🔥 SMOOTH du détail (clé !!!)
+        detail = F.avg_pool2d(detail, kernel_size=3, stride=1, padding=1)
+
+        # 🔥 injection contrôlée
+        latents = latents + strength * detail
+
+        if sanitize_fn:
+            latents = sanitize_fn(latents)
+
+        return latents
+
+    except Exception as e:
+        print(f"[N3RProNet ERROR] {e}")
+        return latents
+
+
+def apply_n3r_pro_net1(latents, model=None, strength=0.3, sanitize_fn=None):
     if model is None or strength <= 0:
         return latents
 
