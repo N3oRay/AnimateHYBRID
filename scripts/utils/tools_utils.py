@@ -40,7 +40,6 @@ def save_input_frame(input_image, output_dir, frame_counter, pbar=None,
 
         # Save
         img_pil.save(output_dir / f"frame_{frame_counter+1:05d}_input.png")
-
         print(f"[INPUT SAVE Frame {frame_counter:03d}]")
 
         # Update compteur + progress bar
@@ -387,25 +386,78 @@ def prepare_frame_tensor(frame_tensor):
 
 
 def normalize_frame(frame_tensor):
-    """Normalise un tensor [0,1] pour éviter overflow"""
+    """
+    Normalise un tensor image dans l'intervalle [0, 1].
+
+    Cette fonction évite les problèmes d'overflow ou de valeurs hors plage
+    en re-scalant dynamiquement les valeurs du tensor.
+
+    Args:
+        frame_tensor (torch.Tensor):
+            Tensor image de forme [C, H, W] ou [B, C, H, W],
+            avec des valeurs arbitraires.
+
+    Returns:
+        torch.Tensor:
+            Tensor normalisé dans [0, 1].
+
+    Notes:
+        - Si min == max, aucune normalisation n'est appliquée.
+        - Un clamp final garantit la stabilité numérique.
+    """
     min_val = frame_tensor.min()
     max_val = frame_tensor.max()
+
     if max_val > min_val:
-        frame_tensor = (frame_tensor - min_val)/(max_val - min_val)
-    return frame_tensor.clamp(0,1)
+        frame_tensor = (frame_tensor - min_val) / (max_val - min_val)
+
+    return frame_tensor.clamp(0, 1)
 
 
 def tensor_to_pil(frame_tensor):
-    """Convertit un tensor torch en PIL Image"""
+    """
+    Convertit un tensor torch en image PIL.
+
+    Args:
+        frame_tensor (torch.Tensor):
+            Tensor image de forme [C, H, W] ou [1, C, H, W],
+            avec des valeurs attendues dans [0, 1].
+
+    Returns:
+        PIL.Image.Image:
+            Image PIL prête à être sauvegardée ou affichée.
+
+    Notes:
+        - Si un batch est fourni ([B, C, H, W]), seule la première image est utilisée.
+        - Les valeurs sont automatiquement clampées dans [0, 1].
+        - Le tensor est déplacé sur CPU avant conversion.
+    """
     if frame_tensor.ndim == 4:
         frame_tensor = frame_tensor[0]
-    return ToPILImage()(frame_tensor.cpu().clamp(0,1))
+
+    return ToPILImage()(frame_tensor.cpu().clamp(0, 1))
 
 
 def ensure_4_channels(latents):
-    """Force un tensor latent à 4 canaux si nécessaire"""
+    """
+    Garantit que le tensor latent possède 4 canaux (format attendu par les modèles SD).
+
+    Args:
+        latents (torch.Tensor):
+            Tensor latent de forme [B, C, H, W].
+
+    Returns:
+        torch.Tensor:
+            Tensor avec exactement 4 canaux.
+
+    Notes:
+        - Si C == 1, les canaux sont dupliqués pour obtenir 4 canaux.
+        - Si C == 4, le tensor est retourné tel quel.
+        - Ne gère pas les cas C != 1 et C != 4 (à étendre si besoin).
+    """
     if latents.shape[1] == 1:
         latents = latents.repeat(1, 4, 1, 1)
+
     return latents
 
 
