@@ -1,0 +1,79 @@
+# ---------------------------------------------------------
+# Tiny-SD 256x256 VRAM-safe FP16 pour 5D AnimateDiff
+# Optimisé pour créativité + mouvement dynamique
+# ---------------------------------------------------------
+fps: 12
+num_fraps_per_image: 12        # plus de frames par image = interpolation plus fluide
+upscale_factor: 2
+steps: 50
+guidance_scale: 7.5
+guidance_scale_end: 6.5       # légère décroissance pour variation naturelle
+init_image_scale: 0.85
+init_image_scale_end: 0.75   # Plus proche de init_image_scale pour limiter le flou
+creative_noise: 0.08
+creative_noise_end: 0.10     # Progression plus douce
+latent_scale_boost: 1.0
+final_latent_scale: 0.25
+transition_frames: 4         # Plus de frames pour une interpolation uniforme
+latent_injection: 0.55
+
+block_size: 256              # Assurez-vous que divisible par la résolution
+use_n3r_model: true
+use_mini_gpu: true
+n3r_L: 6
+n3r_N_samples: 12
+n3r_L_low: 4
+n3r_L_high: 8
+verbose: False
+
+W: 536
+H: 960
+overlap: 96
+tile_size: 64
+
+# -------------------------
+# VAE et upscale
+# -------------------------
+vae_path: "/mnt/62G/huggingface/miniSD-fp16/vae/diffusion_pytorch_model.safetensors"
+vae_device: cpu
+vae_slicing: true
+vae_tiling: true
+use_real_esrgan: true
+
+# -------------------------
+# Motion module → dynamique et créatif
+# -------------------------
+#motion_module: scripts/modules/motion_module_show.py
+#motion_module: scripts/modules/motion_module_show_safe.py
+motion_module: scripts/modules/Motion_module_Enhanced.py
+motion_module_device: cpu
+
+# -------------------------
+# LoRA / UNet
+# -------------------------
+pretrained_model_path: "/mnt/62G/huggingface/miniSD"
+unet_dtype: float32
+dtype: float16
+enable_xformers_memory_efficient_attention: true
+batch_size: 1
+offload_folder: /tmp/offload
+accelerate: true
+low_cpu_mem_usage: true
+
+# -------------------------
+# Seeds & contrôle
+# -------------------------
+seed: 1234
+
+# -------------------------
+# Prompts
+# -------------------------
+prompt:
+  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, comic book style Marvel, cel shading, bold outlines, dramatic action pose, neon lighting, vibrant colors, glowing effects, dynamic perspective, cinematic composition, energy lines, stylized shadows, inked lines, comic panel framing, halftone shading, high contrast lighting, happy expression"
+
+n_prompt:
+  - "blurry, deformed, extra limbs, bad anatomy, low quality, messy background, dark colors, scary, realistic, human features"
+
+
+input_images:
+  - "input/540-960/6.png"
