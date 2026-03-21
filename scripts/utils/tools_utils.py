@@ -39,8 +39,8 @@ def save_input_frame(input_image, output_dir, frame_counter, pbar=None,
             )
 
         # Save
-        img_pil.save(output_dir / f"frame_{frame_counter:05d}0_input.png")
-        print(f"[INPUT SAVE Frame {frame_counter:03d}]")
+        img_pil.save(output_dir / f"frame_{frame_counter:05d}_00.png")
+        print(f"[INPUT SAVE Frame {frame_counter:03d}_00]")
 
         # Update compteur + progress bar
         frame_counter += 1
