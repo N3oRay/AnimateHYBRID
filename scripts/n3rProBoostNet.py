@@ -305,11 +305,13 @@ def main(args):
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
                         # Application de n3r_pro_net - réutilisé pour toutes les frames - creation des masques
-                        eye_mask = create_eye_mask(latent_interp, coords)
-                        volume_mask = create_volumetrique_mask(latent_interp, coords, debug=False)
+                        eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latent_interp.shape[-2], lat_W=latent_interp.shape[-1] )
+                        if eye_coords_latent:
+                            eye_mask = create_eye_mask(latent_interp, eye_coords_latent)
+                        volume_mask = create_volumetrique_mask(latent_interp, coords_v, debug=False)
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
-                            latents = apply_pro_net_volumetrique(latents, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
+                            latents = apply_pro_net_volumetrique(latent_interp, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
                             eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latents.shape[-2], lat_W=latents.shape[-1] )
                             if eye_coords_latent:
                                 latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
