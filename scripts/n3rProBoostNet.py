@@ -37,7 +37,6 @@ stop_generation = False
 #init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
 # ---------------- Thread stop ----------------
 
-
 def wait_for_stop():
     global stop_generation
     inp = input("Appuyez sur '²' + Entrée pour arrêter : ")
@@ -61,7 +60,7 @@ def main(args):
 
     use_mini_gpu = cfg.get("use_mini_gpu", True)
     verbose = cfg.get("verbose", False)
-    psave = cfg.get("psave", True)
+    psave = cfg.get("psave", False)
     latent_injection = float(cfg.get("latent_injection", 0.75))
     latent_injection = min(max(latent_injection, 0.5), 0.9)  # plage sûre
     final_latent_scale = cfg.get("final_latent_scale", 1/8) # 1/8 speed, 1/4 moyen, 1/2 low
@@ -88,10 +87,10 @@ def main(args):
     use_n3r_pro_net = cfg.get("use_n3r_pro_net", True)
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
 
-    #target_temp=10000,    reference_temp=6500
-    target_temp = 8000
-    reference_temp = 6000
-    strength = 0.25
+
+    #target_temp = 8000 reference_temp = 6000  (Froid)
+    target_temp = 7800
+    reference_temp = 6500
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
@@ -310,7 +309,7 @@ def main(args):
                         frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.10, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
 
                         #Post Traitement
-                        frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, temp_strength=strength, blur_radius=blur_radius, contrast=contrast, saturation=1.0, sharpen_percent=sharpen_percent, psave=psave )
+                        frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
                         save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
                         frame_counter += 1
                         pbar.update(1)
@@ -407,7 +406,7 @@ def main(args):
                     # Decode
                     frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.10, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
                     #Post Traitement
-                    frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, temp_strength=strength, blur_radius=blur_radius, contrast=contrast, saturation=1.0, sharpen_percent=sharpen_percent, psave=psave )
+                    frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
                     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
                     frame_counter += 1
                     pbar.update(1)
