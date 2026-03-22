@@ -28,7 +28,7 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_po
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords, create_eye_mask, tensor_to_pil
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_eye_mask, tensor_to_pil, apply_pro_net_with_eye
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -236,7 +236,8 @@ def main(args):
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
             # 🔥 Détection yeux (une seule fois par image)
             input_pil = tensor_to_pil(input_image)  # à créer si tu ne l'as pas
-            eye_coords = get_eye_coords(input_pil)
+            #eye_coords = get_eye_coords(input_pil)
+            eye_coords = get_eye_coords_safe( input_pil, H=cfg["H"], W=cfg["W"] )
             input_image = ensure_4_channels(input_image)
             if frame_counter > 0:
                 initframe = frame_counter+transition_frames
@@ -308,23 +309,9 @@ def main(args):
                         eye_mask = create_eye_mask(latent_interp, eye_coords)
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
-                            latents_prot = apply_n3r_pro_net(latent_interp, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_latents)
-                            if eye_coords:
-                                eye_mask = create_eye_mask(latents, eye_coords)
-
-                                if eye_mask is not None:
-                                    eye_mask = eye_mask.to(latents.device)
-                                    print("fusion yeux main frames: OK")
-                                    latents = latents * eye_mask + latents_prot * (1 - eye_mask)
-                                else:
-                                    latents = latents_prot
-                            else:
-                                latents = latents_prot
-
+                            latent_interp = apply_pro_net_with_eye(latent_interp, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_latents)
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
-                        # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
-                        # Decode
                         frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
 
                         #Post Traitement
@@ -419,10 +406,9 @@ def main(args):
                     previous_latent_single = latents.detach().cpu()
                     # Application de n3r_pro_net
                     if use_n3r_pro_net:
-                        latents = apply_n3r_pro_net( latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_latents )
-                     # Clamp et resize final 🔥 FIX NaN / stabilité  🔥 nettoyage final intelligent (LE point clé)
+                        latents = apply_pro_net_with_eye(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_latents)
+                    # Décodage streaming
                     latents = latents / LATENT_SCALE
-                    # Decode
                     frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=block_size, overlap=overlap,device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
                     #Post Traitement
                     frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
