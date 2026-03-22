@@ -8,6 +8,95 @@ import torch.nn.functional as F
 from pathlib import Path
 
 
+
+
+def smooth_edges(frame_pil, strength=0.4, blur_radius=1.2):
+    from PIL import ImageFilter, ImageChops
+    import numpy as np
+
+    # 1️⃣ edges
+    edges = frame_pil.convert("L").filter(ImageFilter.FIND_EDGES)
+
+    # 2️⃣ normalisation du masque
+    edges_np = np.array(edges).astype(np.float32) / 255.0
+    edges_np = np.clip(edges_np * 2.0, 0, 1)  # renforce zones edges
+
+    # 3️⃣ blur global (source)
+    blurred = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # 4️⃣ blend intelligent
+    orig = np.array(frame_pil).astype(np.float32)
+    blur = np.array(blurred).astype(np.float32)
+
+    mask = edges_np[..., None] * strength
+
+    result = orig * (1 - mask) + blur * mask
+
+    return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
+
+
+def apply_post_processing_unreal_cinematic(
+    frame_pil,
+    exposure=1.0,
+    vibrance=1.02,
+    edge_strength=0.25,
+    sharpen=True,
+    brightness_adj=0.90,   # 🔻 -5%
+    contrast_adj=1.65      # 🔺 +65%
+):
+    from PIL import Image, ImageEnhance, ImageFilter, ImageChops
+    import numpy as np
+
+    # 🔥 1. Base (sans toucher contraste global)
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+    arr *= exposure
+
+    # Vibrance douce
+    mean_c = arr.mean(axis=2, keepdims=True)
+    arr = mean_c + (arr - mean_c) * vibrance
+    arr = np.clip(arr, 0, 1)
+
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # =========================
+    # ✏️ EDGE CRAYON BLANC
+    # =========================
+    gray = img.convert("L")
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+
+    edges = edges.filter(ImageFilter.GaussianBlur(radius=0.8))
+    edges = ImageChops.invert(edges)
+    edges = ImageEnhance.Contrast(edges).enhance(1.2)
+
+    edge_rgb = Image.merge("RGB", (edges, edges, edges))
+
+    # Screen = effet lumineux propre
+    img_edges = ImageChops.screen(img, edge_rgb)
+
+    # Blend final contrôlé
+    img = Image.blend(frame_pil, img_edges, edge_strength)
+
+    # =========================
+    # 🔥 AJUSTEMENTS DEMANDÉS
+    # =========================
+    img = ImageEnhance.Brightness(img).enhance(brightness_adj)
+    img = ImageEnhance.Contrast(img).enhance(contrast_adj)
+
+    # =========================
+    # 🔧 Sharpen doux
+    # =========================
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(
+            radius=0.5,
+            percent=30,
+            threshold=3
+        ))
+
+    # 🔥 micro lissage final
+    img = img.filter(ImageFilter.GaussianBlur(radius=0.25))
+
+    return img
+
 def apply_post_processing_minimal(
     frame_pil,
     blur_radius=0.05,
@@ -794,3 +883,76 @@ def apply_n3r_pro_net_v1(latents, model=None, strength=0.3, sanitize_fn=None, fr
     except Exception as e:
         print(f"[N3RProNet ERROR] {e}")
         return latents
+
+
+
+def full_frame_postprocess( frame_pil: Image.Image, output_dir: Path, frame_counter: int, target_temp: int = 7800, reference_temp: int = 6500, temp_strength: float = 0.22, blur_radius: float = 0.03, contrast: float = 1.10, saturation: float = 1.0, sharpen_percent: int = 90, psave: bool = True, unreal: bool = False, cartoon: bool = False , glow: bool = False) -> Image.Image:
+    """
+    Returns:
+        frame_pil final traité
+    """
+    removewhite = False
+
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="01", psave=psave)
+    # 🔥 1. Température
+    frame_pil = adjust_color_temperature(
+        frame_pil,
+        target_temp=target_temp,
+        reference_temp=reference_temp,
+        strength=temp_strength
+    )
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="02", psave=psave)
+
+    # 🔥 2. Neutralisation de la dominante
+    frame_pil = neutralize_color_cast(frame_pil)
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="03", psave=psave)
+
+    # 🔥 3. Tone mapping
+    frame_pil = soft_tone_map(frame_pil)
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="04", psave=psave)
+
+    # 🔥 4. Post-traitement adaptatif
+    frame_pil = apply_post_processing_minimal(
+        frame_pil,
+        blur_radius=blur_radius,
+        contrast=contrast,
+        vibrance_base=1.0,
+        vibrance_max=1.1,
+        sharpen=True,
+        sharpen_radius=1,
+        sharpen_percent=sharpen_percent,
+        sharpen_threshold=2
+    )
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="05", psave=psave)
+
+
+    # 🔥 5. clean white Style
+    if removewhite:
+        frame_pil = remove_white_noise(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="06", psave=psave)
+
+    # 🔥 6. Unreal Style
+    if unreal:
+        frame_pil = apply_post_processing_unreal_cinematic(frame_pil)
+        frame_pil = smooth_edges(frame_pil, strength=0.35, blur_radius=1.0)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="07", psave=psave)
+
+    elif cartoon:
+        # 🔥 6. Cartoon Style
+        frame_pil = apply_post_processing_sketch(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="08", psave=psave)
+
+    # 🔥 7. Glow Style
+    if glow:
+        # Glow forcé pour le style
+        frame_pil = apply_chromatic_soft_glow(frame_pil)
+        frame_pil = apply_localized_soft_glow(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
+    else:
+        # Glow intelligent
+        frame_pil = apply_intelligent_glow( frame_pil )
+        from PIL import ImageEnhance
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(1.04)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
+
+    return frame_pil
