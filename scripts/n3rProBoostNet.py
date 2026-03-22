@@ -28,7 +28,7 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_po
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_eye_mask, tensor_to_pil, apply_pro_net_with_eye
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_eye_mask, tensor_to_pil, apply_pro_net_with_eyes
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -308,7 +308,8 @@ def main(args):
                         eye_mask = create_eye_mask(latent_interp, eye_coords)
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
-                            latent_interp = apply_pro_net_with_eye(latent_interp, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_latents)
+                            latents = apply_pro_net_with_eyes(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_latents)
+
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
@@ -384,7 +385,8 @@ def main(args):
 
                     # ProNet avec yeux
                     if use_n3r_pro_net:
-                        latents = apply_pro_net_with_eye(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_latents)
+                        latents = apply_pro_net_with_eyes(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_latents)
+
 
                     # Décodage final
                     latents = latents / LATENT_SCALE
