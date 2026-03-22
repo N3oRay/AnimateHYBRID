@@ -10,6 +10,22 @@ from pathlib import Path
 
 from torchvision.transforms.functional import to_pil_image
 
+
+def apply_pro_net_with_eye(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn):
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+    if eye_coords:
+        eye_radius = int(min(latents.shape[-2:]) * 0.12)
+        eye_mask = create_eye_mask(latents, eye_coords, eye_radius)
+        if eye_mask is not None:
+            eye_mask = eye_mask.to(latents.device)
+            latents = latents * eye_mask + latents_prot * (1 - eye_mask)
+            print("👁 protection yeux appliquée (main frames)")
+        else:
+            latents = latents_prot
+    else:
+        latents = latents_prot
+    return latents
+
 def tensor_to_pil(tensor):
     """
     tensor: [1,3,H,W] ou [3,H,W] dans [-1,1]
@@ -28,7 +44,20 @@ except Exception:
     print("⚠ mediapipe non disponible → fallback sans yeux")
 
 
+def get_eye_coords_safe(image, H, W):
+    coords = get_eye_coords(image)
 
+    if coords:
+        print(f"👁 Eyes detected: {coords}")
+        return coords
+
+    print("⚠ fallback eye coords used")
+
+    # 🔥 adapté portrait vertical (ton cas 536x960)
+    return [
+        (int(H * 0.32), int(W * 0.38)),
+        (int(H * 0.32), int(W * 0.62))
+    ]
 
 # --------------------------------------------------
 # 🔥 Détection yeux (version clean sans cv2)
