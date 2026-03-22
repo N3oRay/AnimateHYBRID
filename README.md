@@ -53,11 +53,11 @@ python -m scripts.n3rProtoBoost \
                       --vae-offload \
                       --fp16*
 ```
-n3rProBoost:
+n3rProBoostNet:
 ```                      
-python -m scripts.n3rProBoost \
-                      --pretrained-model-path "/huggingface/miniSD" \
-                      --config "configs/prompts/2_animate/960.yaml" \
+python -m scripts.n3rProBoostNet \
+                      --pretrained-model-path "/mnt/62G/huggingface/miniSD" \
+                      --config "configs/prompts/0_n3r/960.yaml" \
                       --device "cuda" \
                       --vae-offload \
                       --fp16
