@@ -242,23 +242,38 @@ def apply_pro_net_volumetrique(
     iris_radius_ratio=0.08,
     debug=False
 ):
+    """
+    Applique ProNet et un effet "HDR / détail" sur les iris des yeux,
+    compatible FP16 / latents interpolés.
+
+    Args:
+        latents (torch.Tensor): [B,C,H,W] Latents à traiter.
+        coords_v (list of tuples): Coordonnées yeux [(x1,y1),(x2,y2)].
+        n3r_pro_net: modèle ProNet
+        n3r_pro_strength (float): force ProNet
+        sanitize_fn: fonction de nettoyage latents
+        glow_strength (float): intensité du glow / amplification
+        blur_kernel (int): taille du kernel pour flou
+        iris_radius_ratio (float): proportion de H/W pour rayon iris
+        debug (bool): visualisation mask + latents
+
+    Returns:
+        torch.Tensor: latents avec effet HDR sur iris uniquement
+    """
+    if not coords_v:
+        # Aucun yeux détectés → ProNet seul
+        return apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
 
-    # 1️⃣ ProNet
+    # 1️⃣ Appliquer ProNet
     latents_prot = apply_n3r_pro_net(
-        latents,
-        model=n3r_pro_net,
-        strength=n3r_pro_strength,
-        sanitize_fn=sanitize_fn
+        latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn
     )
 
-    if not coords_v:
-        return latents_prot
-
-    # 2️⃣ Mask IRIS
+    # 2️⃣ Créer masque iris
     iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
-
     Y, X = torch.meshgrid(
         torch.arange(H, device=device),
         torch.arange(W, device=device),
@@ -270,21 +285,20 @@ def apply_pro_net_volumetrique(
         ry = int(H * iris_radius_ratio)
         dist2 = ((X - x)**2)/(rx**2) + ((Y - y)**2)/(ry**2)
         iris_mask[0, 0] += (dist2 <= 1).float()
-
     iris_mask = iris_mask.clamp(0, 1)
 
-    # 3️⃣ Kernel gaussien propre
+    # 3️⃣ Kernel gaussien, même dtype que latents (FP16 ok)
     sigma = blur_kernel / 3
-    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device)
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device, dtype=dtype)
     xx, yy = torch.meshgrid(ax, ax, indexing='ij')
     kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
     kernel_2d = kernel_2d / kernel_2d.sum()
-
     kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)
 
-    # 4️⃣ Glow uniquement sur iris
+    # 4️⃣ Convolution channel-wise → amplification détails iris
     glow = F.conv2d(latents_prot * iris_mask, kernel, padding=blur_kernel // 2, groups=C)
 
+    # 5️⃣ Fusion ProNet + iris glow
     latents_out = latents_prot * (1 - iris_mask) + glow * iris_mask * glow_strength
     latents_out = latents_out.clamp(-1.0, 1.0)
 
@@ -296,27 +310,21 @@ def apply_pro_net_volumetrique(
         mask_vis = iris_mask[0, 0].detach().cpu()
 
         plt.figure(figsize=(12, 4))
-
         plt.subplot(1, 4, 1)
         plt.imshow(lat_vis, cmap='gray')
         plt.title("Latent original")
-
         plt.subplot(1, 4, 2)
         plt.imshow(prot_vis, cmap='gray')
         plt.title("ProNet")
-
         plt.subplot(1, 4, 3)
         plt.imshow(glow_vis, cmap='gray')
-        plt.title("Glow")
-
+        plt.title("HDR / Glow Iris")
         plt.subplot(1, 4, 4)
         plt.imshow(lat_vis, cmap='gray', alpha=0.7)
         plt.imshow(mask_vis, cmap='Reds', alpha=0.4)
         plt.title("Mask Iris")
-
         plt.tight_layout()
         plt.show()
-
         print("👁 DEBUG activé → vérifie position / taille iris")
 
     return latents_out
