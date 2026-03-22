@@ -8,6 +8,147 @@ import torch.nn.functional as F
 from pathlib import Path
 
 
+def apply_post_processing_minimal(
+    frame_pil,
+    blur_radius=0.05,
+    contrast=1.15,
+    vibrance_base=1.0,
+    vibrance_max=1.25,
+    sharpen=False,
+    sharpen_radius=1,
+    sharpen_percent=90,
+    sharpen_threshold=2,
+    clamp_r=True
+):
+    from PIL import Image, ImageFilter, ImageEnhance
+    import numpy as np
+
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
+
+    # ---------------- 1. Blur léger ----------------
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # ---------------- 2. Contraste ----------------
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+
+    # ---------------- 3. Vibrance adaptative ----------------
+    try:
+        frame_np = np.array(frame_pil).astype(np.float32)
+
+        max_rgb = np.max(frame_np, axis=2)
+        min_rgb = np.min(frame_np, axis=2)
+        sat = max_rgb - min_rgb
+
+        factor_map = vibrance_base + (vibrance_max - vibrance_base) * (1 - sat / 255.0)
+        factor_map = np.clip(factor_map, vibrance_base, vibrance_max)
+
+        frame_np *= factor_map[..., None]
+        frame_np = np.clip(frame_np, 0, 255)
+
+        frame_pil = Image.fromarray(frame_np.astype(np.uint8))
+
+    except Exception as e:
+        print(f"[WARNING] vibrance skipped: {e}")
+
+    # ---------------- 4. Clamp rouge ----------------
+    if clamp_r:
+        try:
+            arr = np.array(frame_pil).astype(np.float32)
+            r_mean = arr[..., 0].mean()
+
+            if r_mean > 180:
+                factor = 180 / r_mean
+                arr[..., 0] *= factor
+
+            frame_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+        except Exception as e:
+            print(f"[WARNING] clamp rouge skipped: {e}")
+
+    # ---------------- 5. Sharpen ----------------
+    if sharpen:
+        frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+            radius=sharpen_radius,
+            percent=sharpen_percent,
+            threshold=sharpen_threshold
+        ))
+
+    return frame_pil
+
+def apply_intelligent_glow(frame_pil,
+                           glow_strength=0.22,
+                           blur_radius=1.2,
+                           luminance_threshold=0.7,
+                           edge_strength=1.2,
+                           detail_preservation=0.85):
+    """
+    Glow intelligent :
+    - basé sur luminance + edges
+    - évite effet flou global
+    - boost détails lumineux uniquement
+    """
+    from PIL import Image, ImageFilter, ImageEnhance, ImageChops
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Base numpy
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+    # -----------------------
+    # 2️⃣ Luminance mask
+    # -----------------------
+    gray = frame_pil.convert("L")
+    lum = np.array(gray).astype(np.float32) / 255.0
+
+    lum_mask = np.clip((lum - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+
+    # -----------------------
+    # 3️⃣ Edge mask (important 🔥)
+    # -----------------------
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = ImageEnhance.Contrast(edges).enhance(edge_strength)
+
+    edge_arr = np.array(edges).astype(np.float32) / 255.0
+
+    # 🔥 combinaison intelligente
+    combined_mask = lum_mask * edge_arr
+
+    # -----------------------
+    # 4️⃣ Glow blur
+    # -----------------------
+    blurred = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    blurred_arr = np.array(blurred).astype(np.float32) / 255.0
+
+    # -----------------------
+    # 5️⃣ Application du glow
+    # -----------------------
+    for c in range(3):
+        arr[..., c] = arr[..., c] + glow_strength * combined_mask * blurred_arr[..., c]
+
+    arr = np.clip(arr, 0, 1)
+
+    # -----------------------
+    # 6️⃣ Reconstruction
+    # -----------------------
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # 7️⃣ Préservation détails
+    # -----------------------
+    img = Image.blend(frame_pil, img, 1 - detail_preservation)
+
+    # -----------------------
+    # 8️⃣ Micro sharpen
+    # -----------------------
+    img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=25, threshold=2))
+
+    return img
+
+
 def apply_chromatic_soft_glow(frame_pil,
                               glow_strength=0.25,
                               exposure=1.05,
