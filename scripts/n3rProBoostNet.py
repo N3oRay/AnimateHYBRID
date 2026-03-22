@@ -28,7 +28,7 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_po
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_eye_mask, tensor_to_pil, apply_pro_net_with_eyes
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -236,8 +236,8 @@ def main(args):
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
             # 🔥 Détection yeux (une seule fois par image)
             input_pil = tensor_to_pil(input_image)  # à créer si tu ne l'as pas
-            #eye_coords = get_eye_coords(input_pil)
-            eye_coords = get_eye_coords_safe( input_pil, H=cfg["H"], W=cfg["W"] )
+            eye_coords = get_eye_coords_safe(input_pil)
+            coords_v = get_coords_safe( input_pil, H=cfg["H"], W=cfg["W"] )
             input_image = ensure_4_channels(input_image)
             if frame_counter > 0:
                 initframe = frame_counter+transition_frames
@@ -304,11 +304,20 @@ def main(args):
                         if motion_module:
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
-                        # Application de n3r_pro_net - réutilisé pour toutes les frames
-                        eye_mask = create_eye_mask(latent_interp, eye_coords)
+                        # Application de n3r_pro_net - réutilisé pour toutes les frames - creation des masques
+                        eye_mask = create_eye_mask(latent_interp, coords, debug= True)
+                        volume_mask = create_volumetrique_mask(latent_interp, coords, debug= True)
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
-                            latents = apply_pro_net_with_eyes(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_latents)
+                            latents = apply_pro_net_volumetrique(latents, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
+                            eye_coords_latent = scale_eye_coords_to_latents(
+                                eye_coords,
+                                img_H=cfg["H"],
+                                img_W=cfg["W"],
+                                lat_H=latents.shape[-2],
+                                lat_W=latents.shape[-1]
+                            )
+                            latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
 
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
@@ -385,7 +394,15 @@ def main(args):
 
                     # ProNet avec yeux
                     if use_n3r_pro_net:
-                        latents = apply_pro_net_with_eyes(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_latents)
+                        latents = apply_pro_net_volumetrique(latents, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
+                        eye_coords_latent = scale_eye_coords_to_latents(
+                                eye_coords,
+                                img_H=cfg["H"],
+                                img_W=cfg["W"],
+                                lat_H=latents.shape[-2],
+                                lat_W=latents.shape[-1]
+                            )
+                        latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
 
 
                     # Décodage final
