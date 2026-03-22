@@ -1,8 +1,8 @@
-# --------------------------------------------------------------
-# n3rProBoostNet.py - AnimateDiff ultra-light ~2Go VRAM
+# ----------------------------------------------------------------------------------------
+# n3rProBoostNet.py - AnimateDiff stables, ProNet + HDR ultra-light ~2Go VRAM
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
 #Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
-# --------------------------------------------------------------
+# ----------------------------------------------------------------------------------------
 import os, math, threading, random
 import traceback
 import hashlib
@@ -33,8 +33,6 @@ from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose,
 LATENT_SCALE = 0.18215
 stop_generation = False
 
-# Variation de l'interpolation' Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast ---
-#init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
 # ---------------- Thread stop ----------------
 
 def wait_for_stop():
@@ -395,7 +393,6 @@ def main(args):
                         eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latents.shape[-2], lat_W=latents.shape[-1] )
                         if eye_coords_latent:
                             latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
-
 
                     # Décodage final
                     latents = latents / LATENT_SCALE
