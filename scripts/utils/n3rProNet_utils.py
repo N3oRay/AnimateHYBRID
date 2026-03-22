@@ -8,6 +8,333 @@ import torch.nn.functional as F
 from pathlib import Path
 
 
+def apply_chromatic_soft_glow(frame_pil,
+                              glow_strength=0.25,
+                              exposure=1.05,
+                              blur_radius=2.0,
+                              luminance_threshold=0.8,
+                              color_saturation=1.05,
+                              sharpen=True):
+    """
+    Soft Glow chromatique localisé :
+    - Glow appliqué sur pixels clairs selon leur canal (R/G/B)
+    - Zones sombres préservées
+    - Détails conservés
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+    arr = np.clip(arr * exposure, 0, 1)
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # Masque par canal
+    # -----------------------
+    r, g, b = arr[...,0], arr[...,1], arr[...,2]
+    mask_r = np.clip((r - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+    mask_g = np.clip((g - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+    mask_b = np.clip((b - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+
+    # -----------------------
+    # Glow par canal
+    # -----------------------
+    bright = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    bright_arr = np.array(bright).astype(np.float32) / 255.0
+
+    # Mélange selon masque couleur
+    arr[...,0] = np.clip(arr[...,0] + glow_strength * mask_r * bright_arr[...,0], 0, 1)
+    arr[...,1] = np.clip(arr[...,1] + glow_strength * mask_g * bright_arr[...,1], 0, 1)
+    arr[...,2] = np.clip(arr[...,2] + glow_strength * mask_b * bright_arr[...,2], 0, 1)
+
+    img = Image.fromarray((arr*255).astype(np.uint8))
+
+    # -----------------------
+    # Saturation douce
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(color_saturation)
+
+    # -----------------------
+    # Micro sharpen subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=30, threshold=2))
+
+    return img
+
+
+def apply_localized_soft_glow(frame_pil,
+                              glow_strength=0.25,
+                              exposure=1.05,
+                              blur_radius=2.0,
+                              luminance_threshold=0.6,
+                              color_saturation=1.05,
+                              sharpen=True):
+    """
+    Filtre 'Soft Glow Localisé':
+    - Glow appliqué seulement sur les zones lumineuses
+    - Effet subtil, préserve les zones sombres
+    - Maintien des détails
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Convertir en float + exposure
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+    arr = np.clip(arr * exposure, 0, 1)
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # 2️⃣ Masque de luminosité
+    # -----------------------
+    gray = img.convert("L")
+    lum_arr = np.array(gray).astype(np.float32) / 255.0
+    mask = np.clip((lum_arr - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+    mask_img = Image.fromarray((mask * 255).astype(np.uint8))
+
+    # -----------------------
+    # 3️⃣ Glow léger
+    # -----------------------
+    bright = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    glow_img = ImageChops.screen(img, bright)
+    # Appliquer glow uniquement là où mask > 0
+    glow_img = Image.composite(glow_img, img, mask_img)
+    img = Image.blend(img, glow_img, glow_strength)
+
+    # -----------------------
+    # 4️⃣ Saturation douce
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(color_saturation)
+
+    # -----------------------
+    # 5️⃣ Micro sharpen subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=30, threshold=2))
+
+    return img
+
+
+def apply_soft_glow(frame_pil,
+                    glow_strength=0.25,
+                    exposure=1.05,
+                    blur_radius=2.0,
+                    color_saturation=1.05,
+                    sharpen=True):
+    """
+    Filtre 'Soft Glow' :
+    - Surexposition douce sur les zones claires
+    - Glow léger et subtil
+    - Maintien des détails et textures
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Convertir en float + exposure léger
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+    arr = np.clip(arr * exposure, 0, 1)
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # 2️⃣ Glow subtil (Light Bloom)
+    # -----------------------
+    bright = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    img = ImageChops.screen(img, bright)
+    img = Image.blend(img, bright, glow_strength)
+
+    # -----------------------
+    # 3️⃣ Saturation douce
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(color_saturation)
+
+    # -----------------------
+    # 4️⃣ Micro sharpen subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=30, threshold=2))
+
+    return img
+
+
+def apply_cinematic_neon_glow(frame_pil,
+                              glow_strength=0.25,
+                              edge_strength=0.15,
+                              color_saturation=1.15,
+                              exposure=1.05,
+                              contrast=1.25,
+                              blur_radius=0.4,
+                              sharpen=True):
+    """
+    Filtre original 'Cinematic Neon Glow':
+    - Glow subtil autour des zones claires
+    - Couleurs saturées style néon / cinématographique
+    - Bords légèrement lumineux type sketch
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Convertir en float
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+    # -----------------------
+    # 2️⃣ Exposure léger
+    # -----------------------
+    arr *= exposure
+    arr = np.clip(arr, 0, 1)
+
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # 3️⃣ Glow subtil (Light Bloom)
+    # -----------------------
+    bright = img.filter(ImageFilter.GaussianBlur(radius=5))
+    img = ImageChops.screen(img, bright)  # effet lumineux
+    img = Image.blend(img, bright, glow_strength)
+
+    # -----------------------
+    # 4️⃣ Edge sketch léger
+    # -----------------------
+    gray = img.convert("L").filter(ImageFilter.GaussianBlur(radius=1.0))
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = ImageChops.invert(edges)
+    edges_rgb = Image.merge("RGB", (edges, edges, edges))
+    img = ImageChops.blend(img, edges_rgb, edge_strength)
+
+    # -----------------------
+    # 5️⃣ Saturation & Contraste
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(color_saturation)
+    img = ImageEnhance.Contrast(img).enhance(contrast)
+
+    # -----------------------
+    # 6️⃣ Micro blur anti-pixel
+    # -----------------------
+    img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # -----------------------
+    # 7️⃣ Sharpen subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=40, threshold=2))
+
+    return img
+
+
+def apply_post_processing_sketch(frame_pil, edge_strength=0.2, blur_radius=0.3, sharpen=True,
+                                           contrast_boost=1.6,   # +60% contraste
+                                           exposure=0.80):       # -20% brillance
+    """
+    Effet dessin subtil / croquis clair ajusté :
+    - Contours légèrement visibles (blancs doux)
+    - +40% contraste, -10% brillance
+    - Lisse les pixels isolés
+    - Ne dénature pas les couleurs de base
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Edge detection doux
+    # -----------------------
+    gray = frame_pil.convert("L").filter(ImageFilter.GaussianBlur(radius=0.5))
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = edges.filter(ImageFilter.MedianFilter(size=3))   # supprime points isolés
+    edges = edges.filter(ImageFilter.GaussianBlur(radius=0.6))  # lissage
+    edges = ImageEnhance.Contrast(edges).enhance(1.2)
+    edges = ImageChops.invert(edges)
+    edge_rgb = Image.merge("RGB", (edges, edges, edges))
+
+    # -----------------------
+    # 2️⃣ Fusion douce des edges
+    # -----------------------
+    img = ImageChops.blend(frame_pil, edge_rgb, edge_strength)
+
+    # -----------------------
+    # 3️⃣ Exposure / Brillance
+    # -----------------------
+    img = ImageEnhance.Brightness(img).enhance(exposure)
+
+    # -----------------------
+    # 4️⃣ Contraste
+    # -----------------------
+    img = ImageEnhance.Contrast(img).enhance(contrast_boost)
+
+    # -----------------------
+    # 5️⃣ Blur léger anti-pixel
+    # -----------------------
+    if blur_radius > 0:
+        img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # -----------------------
+    # 6️⃣ Sharp subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=40, threshold=2))
+
+    return img
+
+
+
+def apply_post_processing_drawing(frame_pil,
+                                  edge_strength=0.7,
+                                  color_levels=48,
+                                  saturation=0.95,
+                                  contrast=1.10,
+                                  sharpen=True):
+    """
+    Post-processing dessin type line-art.
+    Simplifie les couleurs, ajoute des contours au crayon blanc,
+    supprime les points noirs et garde un rendu net.
+    """
+
+    from PIL import Image, ImageFilter, ImageEnhance, ImageChops
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Color simplification douce
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32)
+    levels = color_levels
+    arr = np.round(arr / (256 / levels)) * (256 / levels)
+    img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+    # -----------------------
+    # 2️⃣ Edge detection propre
+    # -----------------------
+    gray = frame_pil.convert("L").filter(ImageFilter.GaussianBlur(radius=0.6))
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = edges.filter(ImageFilter.GaussianBlur(radius=0.8))
+    edges = edges.filter(ImageFilter.MedianFilter(size=3))  # supprime points isolés
+    edges = ImageEnhance.Contrast(edges).enhance(1.4)
+    edges = edges.point(lambda x: 0 if x < 15 else int(x * 1.2))
+    edges = ImageChops.invert(edges)
+    edge_rgb = Image.merge("RGB", (edges, edges, edges))
+
+    # -----------------------
+    # 3️⃣ Fusion douce contours
+    # -----------------------
+    img_edges = ImageChops.multiply(img, edge_rgb)
+    img = Image.blend(img, img_edges, edge_strength * 0.85)
+
+    # -----------------------
+    # 4️⃣ Color / Contrast / Sharpen
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(saturation)
+    img = ImageEnhance.Contrast(img).enhance(contrast)
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.6, percent=60, threshold=3))
+
+    return img
+
+
+
+
 def save_frame_verbose(frame: Image.Image, output_dir: Path, frame_counter: int, suffix: str = "00", psave: bool = True):
     """
     Sauvegarde une frame avec suffixe et affiche un message si verbose=True
