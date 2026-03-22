@@ -8,6 +8,109 @@ from PIL import Image, ImageFilter
 import torch.nn.functional as F
 from pathlib import Path
 
+from torchvision.transforms.functional import to_pil_image
+
+def tensor_to_pil(tensor):
+    """
+    tensor: [1,3,H,W] ou [3,H,W] dans [-1,1]
+    """
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    tensor = (tensor.clamp(-1,1) + 1) / 2
+    return to_pil_image(tensor.cpu())
+
+try:
+    import mediapipe as mp
+    from mediapipe.python.solutions import face_mesh as mp_face_mesh
+    MP_FACE_MESH = mp_face_mesh
+except Exception:
+    MP_FACE_MESH = None
+    print("⚠ mediapipe non disponible → fallback sans yeux")
+
+
+
+
+# --------------------------------------------------
+# 🔥 Détection yeux (version clean sans cv2)
+# --------------------------------------------------
+def get_eye_coords(image):
+    """
+    Retourne [(y_left, x_left), (y_right, x_right)]
+    Compatible PIL ou numpy
+    """
+    if MP_FACE_MESH is None:
+        return []
+
+    # Conversion propre
+    if isinstance(image, Image.Image):
+        img = np.array(image)
+    else:
+        img = image
+
+    if img is None or img.ndim != 3:
+        return []
+
+    h, w, _ = img.shape
+
+    with MP_FACE_MESH.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+        results = face_mesh.process(img)  # ✅ déjà RGB → pas besoin de cv2
+
+        if not results.multi_face_landmarks:
+            return []
+
+        lm = results.multi_face_landmarks[0].landmark
+
+        # 🔥 Points clés yeux (stables)
+        left_eye_pts  = [33, 133]
+        right_eye_pts = [362, 263]
+
+        left_eye = np.mean([(lm[i].y * h, lm[i].x * w) for i in left_eye_pts], axis=0)
+        right_eye = np.mean([(lm[i].y * h, lm[i].x * w) for i in right_eye_pts], axis=0)
+
+        return [
+            (int(left_eye[0]), int(left_eye[1])),
+            (int(right_eye[0]), int(right_eye[1]))
+        ]
+
+# --------------------------------------------------
+# 🔥 Création mask yeux (latents)
+# --------------------------------------------------
+def create_eye_mask(latents, eye_coords, eye_radius=8, falloff=4):
+    """
+    Soft mask gaussien → transitions naturelles
+    """
+    if not eye_coords:
+        return None
+
+    B, C, H, W = latents.shape
+    mask = torch.zeros((1, 1, H, W), device=latents.device)
+
+    for y_c, x_c in eye_coords:
+        y_lat = int(y_c / 8)
+        x_lat = int(x_c / 8)
+
+        for y in range(H):
+            for x in range(W):
+                dist = ((y - y_lat)**2 + (x - x_lat)**2)**0.5
+                value = max(0, 1 - dist / (eye_radius + falloff))
+                mask[0, 0, y, x] = torch.maximum(mask[0, 0, y, x], torch.tensor(value, device=latents.device))
+
+    return mask.repeat(B, C, 1, 1)
+
+def detect_eyes_auto(frame_pil):
+    """Retourne les coordonnées (y,x) approximatives des yeux"""
+    img = np.array(frame_pil)
+    h, w, _ = img.shape
+    with MP_FACE_MESH.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+        results = face_mesh.process(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        if not results.multi_face_landmarks:
+            return []
+        lm = results.multi_face_landmarks[0].landmark
+        left_eye = np.mean([(lm[i].y*h, lm[i].x*w) for i in [33, 133]], axis=0)
+        right_eye = np.mean([(lm[i].y*h, lm[i].x*w) for i in [362, 263]], axis=0)
+        return [(int(left_eye[0]), int(left_eye[1])), (int(right_eye[0]), int(right_eye[1]))]
+
+
 def decode_latents_ultrasafe_blockwise(latents, vae,
                                        block_size=32, overlap=16,
                                        device="cuda",
