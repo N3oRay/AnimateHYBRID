@@ -10,10 +10,21 @@ from pathlib import Path
 
 from torchvision.transforms.functional import to_pil_image
 
+
 def scale_eye_coords_to_latents(eye_coords, img_H, img_W, lat_H, lat_W):
+    """
+    Convertit coords image -> latent space
+    """
+
+    # 🔥 FIX : gérer None ou liste vide
+    if not eye_coords:
+        return None
+
     scale_x = lat_W / img_W
     scale_y = lat_H / img_H
+
     return [(int(x * scale_x), int(y * scale_y)) for x, y in eye_coords]
+
 
 def get_eye_coords_safe(image_pil, H=None, W=None):
     try:
