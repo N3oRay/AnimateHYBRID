@@ -14,7 +14,8 @@ from torchvision.transforms.functional import to_pil_image
 def apply_pro_net_with_eye(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn):
     latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
     if eye_coords:
-        eye_radius = int(min(latents.shape[-2:]) * 0.12)
+        print("Eye coords:", eye_coords)
+        eye_radius = int(min(latents.shape[-2:]) * 0.15)  # un peu plus large valeur 0.12 ou 0.15
         eye_mask = create_eye_mask(latents, eye_coords, eye_radius)
         if eye_mask is not None:
             eye_mask = eye_mask.to(latents.device)
