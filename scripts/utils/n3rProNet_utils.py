@@ -10,8 +10,276 @@ from pathlib import Path
 
 from torchvision.transforms.functional import to_pil_image
 
+def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=0.25, blur_kernel=5):
+    """
+    Applique un glow froid ciblé sur l'iris des yeux dans les latents [B,C,H,W].
 
-def apply_pro_net_with_eye(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn):
+    Args:
+        latents (torch.Tensor): Latents [B,C,H,W].
+        eye_coords (list of tuples): Coordonnées yeux [(x1,y1),(x2,y2)].
+        iris_radius_ratio (float): Ratio de rayon de l'iris par rapport à la plus petite dimension H/W.
+        strength (float): Intensité du glow (0.0 à 1.0).
+        blur_kernel (int): Taille du noyau pour un léger flou gaussien.
+
+    Returns:
+        torch.Tensor: Latents avec glow appliqué sur les iris.
+    """
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ Créer un masque radial pour chaque œil
+    mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+    min_dim = min(H, W)
+    iris_radius = iris_radius_ratio * min_dim
+
+    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    for x_eye, y_eye in eye_coords:
+        dist = torch.sqrt((xx - x_eye)**2 + (yy - y_eye)**2)
+        eye_mask = torch.exp(-(dist**2) / (2 * iris_radius**2))
+        mask += eye_mask.unsqueeze(0)  # broadcast batch dimension
+
+    # Clamp à 1 pour éviter dépassement si 2 yeux se chevauchent
+    mask = mask.clamp(0.0, 1.0)
+
+    # 2️⃣ Appliquer léger blur pour adoucir les bords
+    if blur_kernel > 1:
+        kernel = torch.ones((C, 1, blur_kernel, blur_kernel), device=device, dtype=dtype)
+        kernel = kernel / kernel.sum()
+        mask = F.conv2d(mask.repeat(1, C, 1, 1), kernel, padding=blur_kernel//2, groups=C)
+
+    # 3️⃣ Créer glow gaussien via convolution légère
+    sigma = blur_kernel / 3.0
+    glow_kernel = torch.exp(-((torch.arange(-blur_kernel//2+1, blur_kernel//2+2, device=device).view(-1,1))**2)/ (2*sigma**2))
+    glow_kernel = glow_kernel / glow_kernel.sum()
+    glow_kernel = glow_kernel.view(1,1,blur_kernel,1).repeat(C,1,1,1)
+    glow = F.conv2d(latents, glow_kernel, padding=(blur_kernel//2,0), groups=C)
+    glow = F.conv2d(glow, glow_kernel.transpose(2,3), padding=(0,blur_kernel//2), groups=C)  # convolution 2D approximative
+
+    # 4️⃣ Fusion glow sur iris seulement
+    latents_out = latents * (1 - mask) + glow * mask * strength
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    return latents_out
+
+def apply_intelligent_glow_froid_latents(latents, strength=0.2, blur_kernel=7):
+    """
+    Applique un effet "glow froid" directement sur des latents [B, C, H, W].
+
+    Args:
+        latents (torch.Tensor): Latents [B,C,H,W].
+        strength (float): Intensité du glow (0.0 à 1.0).
+        blur_kernel (int): Taille du noyau pour le flou gaussien (doit être impair).
+
+    Returns:
+        torch.Tensor: Latents avec glow appliqué.
+    """
+    if latents.ndim != 4:
+        raise ValueError("Latents doivent être de shape [B, C, H, W]")
+
+    B, C, H, W = latents.shape
+
+    # 🔹 Création noyau gaussien 2D
+    def gaussian_kernel(kernel_size, sigma, channels):
+        ax = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1., device=latents.device)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel = torch.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
+        kernel = kernel / kernel.sum()
+        kernel = kernel.view(1, 1, kernel_size, kernel_size).repeat(channels, 1, 1, 1)
+        return kernel
+
+    sigma = blur_kernel / 3.0
+    kernel = gaussian_kernel(blur_kernel, sigma, C).to(latents.device, latents.dtype)
+
+    padding = blur_kernel // 2
+    # 🔹 Appliquer convolution pour obtenir le glow
+    glow = F.conv2d(latents, kernel, padding=padding, groups=C)
+
+    # 🔹 Fusion latents original + glow
+    latents_out = latents * (1 - strength) + glow * strength
+
+    # 🔹 Clamp pour stabilité
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    return latents_out
+
+
+# Appplication effect sur les iris yeux:
+def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=0.2, blur_kernel=7):
+    """
+    Applique un glow froid uniquement sur l'iris des yeux dans les latents [B,C,H,W].
+
+    Args:
+        latents (torch.Tensor): Latents SD [B,C,H,W]
+        eye_coords (list of tuples): Coordonnées des yeux [(x1,y1),(x2,y2)]
+        iris_radius_ratio (float): proportion de H/W pour rayon iris
+        strength (float): intensité du glow
+        blur_kernel (int): taille du kernel gaussien (impair)
+
+    Returns:
+        torch.Tensor: latents avec glow sur iris
+    """
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ Créer masque radial pour l’iris
+    iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+    for i, (x, y) in enumerate(eye_coords):
+        rx = int(W * iris_radius_ratio)
+        ry = int(H * iris_radius_ratio)
+        # coordonnées grille
+        Y, X = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+        dist2 = ((X - x)**2) / (rx**2) + ((Y - y)**2) / (ry**2)
+        iris_mask[0, 0] += (dist2 <= 1).float()
+    iris_mask = iris_mask.clamp(0, 1)  # éviter >1 si deux yeux se chevauchent
+
+    # 2️⃣ Créer kernel gaussien 2D
+    sigma = blur_kernel / 3
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device)
+    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel_2d = kernel_2d / kernel_2d.sum()
+    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)  # [C,1,kH,kW]
+
+    # 3️⃣ Appliquer convolution channel-wise
+    glow = F.conv2d(latents * iris_mask, kernel, padding=blur_kernel // 2, groups=C)
+
+    # 4️⃣ Fusion glow sur iris uniquement
+    latents_out = latents * (1 - iris_mask) + glow * iris_mask * strength
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    return latents_out
+
+
+import torch
+import torch.nn.functional as F
+
+def apply_pro_net_with_eyes(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn,
+                           glow_strength=0.2, blur_kernel=7, iris_radius_ratio=0.08):
+    """
+    Applique ProNet et un glow froid uniquement sur l’iris des yeux.
+
+    Args:
+        latents (torch.Tensor): [B,C,H,W] Latents à traiter.
+        eye_coords (list of tuples): Coordonnées yeux [(x1,y1),(x2,y2)]
+        n3r_pro_net: modèle ProNet
+        n3r_pro_strength (float): force ProNet
+        sanitize_fn: fonction de nettoyage latents
+        glow_strength (float): intensité du glow
+        blur_kernel (int): kernel pour flou gaussien
+        iris_radius_ratio (float): proportion de H/W pour rayon iris
+
+    Returns:
+        torch.Tensor: latents avec glow sur iris uniquement
+    """
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ Application ProNet
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
+    # 2️⃣ Glow froid uniquement sur l’iris
+    if eye_coords:
+        iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+        for x, y in eye_coords:
+            rx = int(W * iris_radius_ratio)
+            ry = int(H * iris_radius_ratio)
+            Y, X = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+            dist2 = ((X - x)**2) / (rx**2) + ((Y - y)**2) / (ry**2)
+            iris_mask[0, 0] += (dist2 <= 1).float()
+        iris_mask = iris_mask.clamp(0, 1)
+
+        # Kernel gaussien 2D
+        sigma = blur_kernel / 3
+        ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)
+
+        # Convolution channel-wise pour glow
+        glow = F.conv2d(latents_prot * iris_mask, kernel, padding=blur_kernel // 2, groups=C)
+
+        # Fusion uniquement sur l’iris
+        latents_out = latents_prot * (1 - iris_mask) + glow * iris_mask * glow_strength
+        latents_out = latents_out.clamp(-1.0, 1.0)
+        print("👁 Glow froid appliqué sur iris uniquement")
+    else:
+        # fallback si pas d’yeux détectés
+        latents_out = latents_prot
+
+    return latents_out
+
+
+def apply_pro_net_with_eye_glow(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn, glow_strength=0.2, blur_kernel=7):
+    """
+    Applique ProNet et un glow froid uniquement sur les yeux.
+
+    Args:
+        latents (torch.Tensor): [B,C,H,W] Latents à traiter.
+        eye_coords (list of tuples): Coordonnées yeux [(x1,y1),(x2,y2)]
+        n3r_pro_net: modèle ProNet
+        n3r_pro_strength (float): force ProNet
+        sanitize_fn: fonction de nettoyage latents
+        glow_strength (float): intensité du glow
+        blur_kernel (int): kernel pour le flou
+
+    Returns:
+        torch.Tensor: latents avec glow sur yeux uniquement
+    """
+    # 1️⃣ Appliquer ProNet
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
+    # 2️⃣ Glow froid sur latents ProNet
+    glow_latents = apply_intelligent_glow_froid_latents(latents_prot, strength=glow_strength, blur_kernel=blur_kernel)
+
+
+    # 3️⃣ Fusion glow uniquement sur les yeux
+    if eye_coords:
+        eye_radius = int(min(latents.shape[-2:]) * 0.15)
+        eye_mask = create_eye_mask(latents, eye_coords, eye_radius)
+        if eye_mask is not None:
+            eye_mask = eye_mask.to(latents.device).float()
+            if eye_mask.ndim == 3:  # [B,H,W] -> [B,1,H,W]
+                eye_mask = eye_mask.unsqueeze(1)
+            latents = latents * (1 - eye_mask) + glow_latents * eye_mask
+            print("👁 Glow froid appliqué uniquement sur yeux")
+        else:
+            latents = glow_latents  # fallback
+    else:
+        latents = glow_latents  # pas d’yeux détectés → glow global
+
+    return latents
+
+# Application effect en dehors de yeux:
+def apply_pro_net_with_out_eyes(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn):
+    # 1️⃣ Application du ProNet
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
+    # 2️⃣ Application du glow froid intelligent en dehors des yeux sur le ProNet
+    latents_prot = apply_intelligent_glow_froid_out(latents_prot)
+
+    # 3️⃣ Fusion avec le masque yeux si détecté
+    if eye_coords:
+        print("Eye coords:", eye_coords)
+        eye_radius = int(min(latents.shape[-2:]) * 0.15)  # augmenter légèrement pour protection
+        eye_mask = create_eye_mask(latents, eye_coords, eye_radius)
+
+        if eye_mask is not None:
+            eye_mask = eye_mask.to(latents.device)
+            # protection yeux + ProNet + glow
+            latents = latents * eye_mask + latents_prot * (1 - eye_mask)
+            print("👁 protection yeux appliquée avec glow froid")
+        else:
+            # si le masque échoue, on applique ProNet + glow sur tout
+            latents = latents_prot
+    else:
+        # pas d’yeux détectés → ProNet + glow global
+        latents = latents_prot
+
+    return latents
+
+
+def apply_pro_net_with_eye_simple(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn):
     latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
     if eye_coords:
         print("Eye coords:", eye_coords)
