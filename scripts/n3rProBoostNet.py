@@ -305,8 +305,8 @@ def main(args):
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
                         # Application de n3r_pro_net - réutilisé pour toutes les frames - creation des masques
-                        eye_mask = create_eye_mask(latent_interp, coords, debug= True)
-                        volume_mask = create_volumetrique_mask(latent_interp, coords, debug= True)
+                        eye_mask = create_eye_mask(latent_interp, coords)
+                        volume_mask = create_volumetrique_mask(latent_interp, coords, debug=False)
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
                             latents = apply_pro_net_volumetrique(latents, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
