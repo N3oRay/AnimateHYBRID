@@ -23,12 +23,12 @@ from scripts.utils.tools_utils import ensure_4_channels, print_generation_params
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing_adaptive, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, apply_post_processing_unreal_smooth_pro, apply_post_processing_cinematic_ultra_refined_pro, remove_white_noise, apply_post_processing
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_latents_ultrasafe_blockwise, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, apply_post_processing_adaptive, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, remove_white_noise, apply_post_processing, apply_post_processing_unreal_smooth, apply_post_processing_unreal_cinematic, smooth_edges
 
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, soft_tone_map, adjust_color_temperature, neutralize_color_cast, save_frame_verbose
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, soft_tone_map, adjust_color_temperature, neutralize_color_cast, save_frame_verbose, apply_post_processing_drawing, apply_post_processing_sketch, apply_localized_soft_glow, apply_chromatic_soft_glow
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -36,11 +36,13 @@ stop_generation = False
 # Variation de l'interpolation' Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast ---
 #init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
 # ---------------- Thread stop ----------------
-def full_frame_postprocess( frame_pil: Image.Image, output_dir: Path, frame_counter: int, target_temp: int = 7800, reference_temp: int = 6500, temp_strength: float = 0.22, blur_radius: float = 0.03, contrast: float = 1.10, saturation: float = 1.0, sharpen_percent: int = 90, psave: bool = True ) -> Image.Image:
+def full_frame_postprocess( frame_pil: Image.Image, output_dir: Path, frame_counter: int, target_temp: int = 7800, reference_temp: int = 6500, temp_strength: float = 0.22, blur_radius: float = 0.03, contrast: float = 1.10, saturation: float = 1.0, sharpen_percent: int = 90, psave: bool = True, unreal: bool = False, cartoon: bool = False , glow: bool = True) -> Image.Image:
     """
     Returns:
         frame_pil final traité
     """
+    removewhite = False
+
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="01", psave=psave)
     # 🔥 1. Température
     frame_pil = adjust_color_temperature(
@@ -75,6 +77,30 @@ def full_frame_postprocess( frame_pil: Image.Image, output_dir: Path, frame_coun
     )
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="05", psave=psave)
 
+
+    # 🔥 5. clean white Style
+    if removewhite:
+        frame_pil = remove_white_noise(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="06", psave=psave)
+
+    # 🔥 6. Unreal Style
+    if unreal:
+        frame_pil = apply_post_processing_unreal_cinematic(frame_pil)
+        frame_pil = smooth_edges(frame_pil, strength=0.35, blur_radius=1.0)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="07", psave=psave)
+
+    # 🔥 6. Cartoon Style
+    if cartoon:
+        frame_pil = apply_post_processing_sketch(frame_pil)
+        #frame_pil = smooth_edges(frame_pil, strength=0.35, blur_radius=1.0)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="08", psave=psave)
+
+    # 🔥 7. Unreal Style
+    if glow:
+        frame_pil = apply_chromatic_soft_glow(frame_pil)
+        frame_pil = apply_localized_soft_glow(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
+
     return frame_pil
 
 
@@ -102,7 +128,7 @@ def main(args):
 
     use_mini_gpu = cfg.get("use_mini_gpu", True)
     verbose = cfg.get("verbose", False)
-    psave = cfg.get("verbose", False)
+    psave = cfg.get("psave", True)
     latent_injection = float(cfg.get("latent_injection", 0.75))
     latent_injection = min(max(latent_injection, 0.5), 0.9)  # plage sûre
     final_latent_scale = cfg.get("final_latent_scale", 1/8) # 1/8 speed, 1/4 moyen, 1/2 low
