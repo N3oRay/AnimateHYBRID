@@ -28,7 +28,7 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, decode_late
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, soft_tone_map, adjust_color_temperature, neutralize_color_cast, save_frame_verbose, apply_post_processing_drawing, apply_post_processing_sketch, apply_localized_soft_glow, apply_chromatic_soft_glow
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, soft_tone_map, adjust_color_temperature, neutralize_color_cast, save_frame_verbose, apply_post_processing_drawing, apply_post_processing_sketch, apply_localized_soft_glow, apply_chromatic_soft_glow, apply_intelligent_glow, apply_post_processing_minimal
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -36,7 +36,7 @@ stop_generation = False
 # Variation de l'interpolation' Valeurs de départ (fidèles à l'image)-----------------------interpolate_param_fast ---
 #init_image_scale_start = 0.95 #guidance_scale_start   = 1.5 #creative_noise_start   = 0.0
 # ---------------- Thread stop ----------------
-def full_frame_postprocess( frame_pil: Image.Image, output_dir: Path, frame_counter: int, target_temp: int = 7800, reference_temp: int = 6500, temp_strength: float = 0.22, blur_radius: float = 0.03, contrast: float = 1.10, saturation: float = 1.0, sharpen_percent: int = 90, psave: bool = True, unreal: bool = False, cartoon: bool = False , glow: bool = True) -> Image.Image:
+def full_frame_postprocess( frame_pil: Image.Image, output_dir: Path, frame_counter: int, target_temp: int = 7800, reference_temp: int = 6500, temp_strength: float = 0.22, blur_radius: float = 0.03, contrast: float = 1.10, saturation: float = 1.0, sharpen_percent: int = 90, psave: bool = True, unreal: bool = False, cartoon: bool = False , glow: bool = False) -> Image.Image:
     """
     Returns:
         frame_pil final traité
@@ -62,12 +62,10 @@ def full_frame_postprocess( frame_pil: Image.Image, output_dir: Path, frame_coun
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="04", psave=psave)
 
     # 🔥 4. Post-traitement adaptatif
-    frame_pil = apply_post_processing_adaptive(
+    frame_pil = apply_post_processing_minimal(
         frame_pil,
         blur_radius=blur_radius,
         contrast=contrast,
-        brightness=1.0,
-        saturation=saturation,
         vibrance_base=1.0,
         vibrance_max=1.1,
         sharpen=True,
@@ -89,16 +87,23 @@ def full_frame_postprocess( frame_pil: Image.Image, output_dir: Path, frame_coun
         frame_pil = smooth_edges(frame_pil, strength=0.35, blur_radius=1.0)
         save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="07", psave=psave)
 
-    # 🔥 6. Cartoon Style
-    if cartoon:
+    elif cartoon:
+        # 🔥 6. Cartoon Style
         frame_pil = apply_post_processing_sketch(frame_pil)
         #frame_pil = smooth_edges(frame_pil, strength=0.35, blur_radius=1.0)
         save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="08", psave=psave)
 
-    # 🔥 7. Unreal Style
+    # 🔥 7. Glow Style
     if glow:
+        # Glow forcé pour le style
         frame_pil = apply_chromatic_soft_glow(frame_pil)
         frame_pil = apply_localized_soft_glow(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
+    else:
+        # Glow intelligent
+        frame_pil = apply_intelligent_glow( frame_pil )
+        from PIL import ImageEnhance
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(1.04)
         save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
 
     return frame_pil
@@ -146,7 +151,6 @@ def main(args):
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 10)  # nombre de frames par prompt
     contrast = cfg.get("contrast", 1.15)  # Post Traitement constrat
-    saturation = cfg.get("saturation", 1.00)  # Post Traitement saturation
     blur_radius = cfg.get("blur_radius", 0.03)  # Post Traitement blur
     sharpen_percent = cfg.get("sharpen_percent", 90)  #Post Traitement sharpen
     H, W = cfg.get("H", 512), cfg.get("W", 512)
@@ -306,7 +310,7 @@ def main(args):
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
             input_image = ensure_4_channels(input_image)
-            frame_counter = save_input_frame( input_image, output_dir, frame_counter, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=saturation, apply_post=False )
+            frame_counter = save_input_frame( input_image, output_dir, frame_counter, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=1.0, apply_post=False )
 
             current_latent_single = encode_images_to_latents_hybrid(input_image, vae, device=device, latent_scale=LATENT_SCALE)
             current_latent_single = torch.nn.functional.interpolate(
@@ -378,7 +382,7 @@ def main(args):
                         frame_pil = decode_latents_ultrasafe_blockwise( latent_interp, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.10, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
 
                         #Post Traitement
-                        frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, temp_strength=strength, blur_radius=blur_radius, contrast=contrast, saturation=saturation, sharpen_percent=sharpen_percent, psave=psave )
+                        frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, temp_strength=strength, blur_radius=blur_radius, contrast=contrast, saturation=1.0, sharpen_percent=sharpen_percent, psave=psave )
                         save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
                         frame_counter += 1
                         pbar.update(1)
@@ -475,7 +479,7 @@ def main(args):
                     # Decode
                     frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=block_size, overlap=overlap, gamma=1.0, brightness=1.0, contrast=1.10, saturation=1.0, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
                     #Post Traitement
-                    frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, temp_strength=strength, blur_radius=blur_radius, contrast=contrast, saturation=saturation, sharpen_percent=sharpen_percent, psave=psave )
+                    frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, temp_strength=strength, blur_radius=blur_radius, contrast=contrast, saturation=1.0, sharpen_percent=sharpen_percent, psave=psave )
                     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
                     frame_counter += 1
                     pbar.update(1)
