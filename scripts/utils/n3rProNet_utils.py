@@ -1,4 +1,5 @@
 # n3rProNet_utils.py
+#-------------------------------------------------------------------------------
 from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
 import torch
 import math
