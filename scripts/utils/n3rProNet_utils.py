@@ -633,6 +633,7 @@ def get_coords(image):
 import torch
 import matplotlib.pyplot as plt
 
+
 def create_volumetrique_mask(latents, coords, radius_ratio=0.15, only=False, in_radius_ratio=0.08, debug=False):
     """
     Crée un masque pour les yeux ou uniquement pour l’iris.
@@ -648,7 +649,8 @@ def create_volumetrique_mask(latents, coords, radius_ratio=0.15, only=False, in_
     Returns:
         torch.Tensor: [B,1,H,W] masque float (0=hors masque, 1=masque)
     """
-    if not coords or latents.ndim != 4:
+    #if not coords or latents.ndim != 4:
+    if coords is None or len(coords) == 0 or latents.ndim != 4:
         return None
 
     B, C, H, W = latents.shape
@@ -679,7 +681,7 @@ def create_eye_mask(latents, eye_coords, eye_radius=8, falloff=4):
     """
     Soft mask gaussien → transitions naturelles
     """
-    if not eye_coords:
+    if eye_coords is None or len(eye_coords) == 0:
         return None
 
     B, C, H, W = latents.shape
