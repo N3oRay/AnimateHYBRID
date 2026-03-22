@@ -3,7 +3,7 @@
 # Optimisé pour créativité + mouvement dynamique
 # ---------------------------------------------------------
 fps: 12
-num_fraps_per_image: 12        # plus de frames par image = interpolation plus fluide
+num_fraps_per_image: 3        # plus de frames par image = interpolation plus fluide
 upscale_factor: 2
 steps: 50
 guidance_scale: 7.5
@@ -15,10 +15,11 @@ creative_noise_end: 0.10     # Progression plus douce
 latent_scale_boost: 1.0
 final_latent_scale: 0.25
 transition_frames: 4         # Plus de frames pour une interpolation uniforme
-latent_injection: 0.55
+latent_injection: 0.85
 
 block_size: 256              # Assurez-vous que divisible par la résolution
 use_n3r_model: true
+use_n3r_pro_net: true
 use_mini_gpu: true
 n3r_L: 6
 n3r_N_samples: 12
@@ -43,9 +44,10 @@ use_real_esrgan: true
 # -------------------------
 # Motion module → dynamique et créatif
 # -------------------------
+#motion_module: scripts/modules/motion_module_lite.py
 #motion_module: scripts/modules/motion_module_show.py
-#motion_module: scripts/modules/motion_module_show_safe.py
-motion_module: scripts/modules/Motion_module_Enhanced.py
+motion_module: scripts/modules/motion_module_show_safe.py  # Cool effect
+#motion_module: scripts/modules/Motion_module_Enhanced.py
 motion_module_device: cpu
 
 # -------------------------
@@ -70,10 +72,13 @@ seed: 1234
 # -------------------------
 prompt:
   - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, comic book style Marvel, cel shading, bold outlines, dramatic action pose, neon lighting, vibrant colors, glowing effects, dynamic perspective, cinematic composition, energy lines, stylized shadows, inked lines, comic panel framing, halftone shading, high contrast lighting, happy expression"
+  - "female superhero, consistent character, same face, long flowing black hair, blue eyes, upper body, cyber armor, mask, comic book style Marvel, cel shading, bold outlines, dramatic action pose, neon lighting, vibrant colors, glowing effects, dynamic perspective, cinematic composition, energy lines, stylized shadows, inked lines, comic panel framing, halftone shading, high contrast lighting, happy expression"
 
 n_prompt:
+  - "blurry, deformed, extra limbs, bad anatomy, low quality, messy background, dark colors, scary, realistic, human features"
   - "blurry, deformed, extra limbs, bad anatomy, low quality, messy background, dark colors, scary, realistic, human features"
 
 
 input_images:
+  - "input/540-960/5.png"
   - "input/540-960/6.png"
