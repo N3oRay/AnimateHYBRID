@@ -152,8 +152,99 @@ def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=
 
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
-def apply_pro_net_with_eyes(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn,
+def apply_pro_net_volumetrique(
+    latents,
+    coords_v,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    glow_strength=0.2,
+    blur_kernel=7,
+    iris_radius_ratio=0.08,
+    debug=False
+):
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet
+    latents_prot = apply_n3r_pro_net(
+        latents,
+        model=n3r_pro_net,
+        strength=n3r_pro_strength,
+        sanitize_fn=sanitize_fn
+    )
+
+    if not coords_v:
+        return latents_prot
+
+    # 2️⃣ Mask IRIS
+    iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    for x, y in coords_v:
+        rx = int(W * iris_radius_ratio)
+        ry = int(H * iris_radius_ratio)
+        dist2 = ((X - x)**2)/(rx**2) + ((Y - y)**2)/(ry**2)
+        iris_mask[0, 0] += (dist2 <= 1).float()
+
+    iris_mask = iris_mask.clamp(0, 1)
+
+    # 3️⃣ Kernel gaussien propre
+    sigma = blur_kernel / 3
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device)
+    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel_2d = kernel_2d / kernel_2d.sum()
+
+    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)
+
+    # 4️⃣ Glow uniquement sur iris
+    glow = F.conv2d(latents_prot * iris_mask, kernel, padding=blur_kernel // 2, groups=C)
+
+    latents_out = latents_prot * (1 - iris_mask) + glow * iris_mask * glow_strength
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    # ---------------- DEBUG ----------------
+    if debug:
+        lat_vis = latents[0, 0].detach().cpu()
+        prot_vis = latents_prot[0, 0].detach().cpu()
+        glow_vis = glow[0, 0].detach().cpu()
+        mask_vis = iris_mask[0, 0].detach().cpu()
+
+        plt.figure(figsize=(12, 4))
+
+        plt.subplot(1, 4, 1)
+        plt.imshow(lat_vis, cmap='gray')
+        plt.title("Latent original")
+
+        plt.subplot(1, 4, 2)
+        plt.imshow(prot_vis, cmap='gray')
+        plt.title("ProNet")
+
+        plt.subplot(1, 4, 3)
+        plt.imshow(glow_vis, cmap='gray')
+        plt.title("Glow")
+
+        plt.subplot(1, 4, 4)
+        plt.imshow(lat_vis, cmap='gray', alpha=0.7)
+        plt.imshow(mask_vis, cmap='Reds', alpha=0.4)
+        plt.title("Mask Iris")
+
+        plt.tight_layout()
+        plt.show()
+
+        print("👁 DEBUG activé → vérifie position / taille iris")
+
+    return latents_out
+
+def apply_pro_net_with_eyes_v1(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn,
                            glow_strength=0.2, blur_kernel=7, iris_radius_ratio=0.08):
     """
     Applique ProNet et un glow froid uniquement sur l’iris des yeux.
@@ -313,8 +404,8 @@ except Exception:
     print("⚠ mediapipe non disponible → fallback sans yeux")
 
 
-def get_eye_coords_safe(image, H, W):
-    coords = get_eye_coords(image)
+def get_coords_safe(image, H, W):
+    coords = get_coords(image)
 
     if coords:
         print(f"👁 Eyes detected: {coords}")
@@ -331,7 +422,7 @@ def get_eye_coords_safe(image, H, W):
 # --------------------------------------------------
 # 🔥 Détection yeux (version clean sans cv2)
 # --------------------------------------------------
-def get_eye_coords(image):
+def get_coords(image):
     """
     Retourne [(y_left, x_left), (y_right, x_right)]
     Compatible PIL ou numpy
@@ -373,6 +464,51 @@ def get_eye_coords(image):
 # --------------------------------------------------
 # 🔥 Création mask yeux (latents)
 # --------------------------------------------------
+import torch
+import matplotlib.pyplot as plt
+
+def create_volumetrique_mask(latents, coords, radius_ratio=0.15, only=False, in_radius_ratio=0.08, debug=False):
+    """
+    Crée un masque pour les yeux ou uniquement pour l’iris.
+
+    Args:
+        latents (torch.Tensor): [B,C,H,W] Latents
+        coords (list of tuples): [(x1,y1),(x2,y2)] coordonnées yeux
+        radius_ratio (float): proportion H/W pour rayon
+        only (bool): True → masque uniquement iris, False → masque œil entier
+        in_radius_ratio (float): proportion H/W pour rayon iris si only=True
+        debug (bool): Si True, affiche le masque
+
+    Returns:
+        torch.Tensor: [B,1,H,W] masque float (0=hors masque, 1=masque)
+    """
+    if not coords or latents.ndim != 4:
+        return None
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+
+    for x, y in coords:
+        r = int(min(H, W) * (radius_ratio if only else in_radius_ratio))
+        Y, X = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+        dist2 = (X - x)**2 + (Y - y)**2
+        mask[0, 0] += (dist2 <= r**2).float()
+
+    mask = mask.clamp(0, 1)
+
+    if debug:
+        # Affiche le masque superposé à un latents converti en image pour vérification
+        lat_vis = latents[0, 0].detach().cpu()  # canal 0
+        plt.figure(figsize=(6,6))
+        plt.imshow(lat_vis, cmap='gray', alpha=0.7)
+        plt.imshow(mask[0,0].cpu(), cmap='Reds', alpha=0.3)
+        plt.title("Debug Eye/Iris Mask")
+        plt.show()
+
+    return mask
+
 def create_eye_mask(latents, eye_coords, eye_radius=8, falloff=4):
     """
     Soft mask gaussien → transitions naturelles
