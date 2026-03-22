@@ -8,6 +8,52 @@ from PIL import Image, ImageFilter
 import torch.nn.functional as F
 from pathlib import Path
 
+def decode_latents_ultrasafe_blockwise(latents, vae,
+                                       block_size=32, overlap=16,
+                                       device="cuda",
+                                       frame_counter=0,
+                                       latent_scale_boost=1.0):
+    """
+    Décodage ultra-safe par blocs des latents en image PIL.
+    Paramètres conservés uniquement : block_size, overlap, device, frame_counter, latent_scale_boost
+    """
+    import torch
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + decoded.shape[2], ix0 + decoded.shape[3]
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded
+            weight[:, :, iy0:iy1, ix0:ix1] += 1.0
+
+    output_rgb = (output_rgb / weight.clamp(min=1e-6)).clamp(-1.0, 1.0)
+
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
 
 def apply_intelligent_glow_pro(
     frame_pil,
@@ -1212,14 +1258,14 @@ def full_frame_postprocess(
 
     frame_pil = apply_intelligent_glow_pro(
         frame_pil,
-        strength=0.15,              # 🔥 moins agressif
-        edge_weight=0.5,            # 🔥 priorise edges
+        strength=0.18,              # 🔥 moins agressif
+        edge_weight=0.6,            # 🔥 priorise edges
         luminance_weight=0.8        # 🔥 glow sur zones lumineuses
     )
 
     # 🔥 micro contraste FINAL (après glow → très important)
     from PIL import ImageEnhance
-    frame_pil = ImageEnhance.Contrast(frame_pil).enhance(1.03)
+    frame_pil = ImageEnhance.Contrast(frame_pil).enhance(1.04)
 
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
 
