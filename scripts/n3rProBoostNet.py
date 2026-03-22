@@ -28,7 +28,7 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_po
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords, create_eye_mask, tensor_to_pil
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -194,9 +194,7 @@ def main(args):
         output_dir_m = Path("./outputs")
         memory_file = output_dir_m / "n3r_memory"
         memory_dict = load_memory(memory_file)
-
-
-
+    # ---------------- n3r_pro_net ----------------
     n3r_pro_net = None
     if use_n3r_pro_net:
         n3r_pro_net = N3RProNet(channels=4).to(device).to(dtype)
@@ -236,6 +234,9 @@ def main(args):
 
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
+            # 🔥 Détection yeux (une seule fois par image)
+            input_pil = tensor_to_pil(input_image)  # à créer si tu ne l'as pas
+            eye_coords = get_eye_coords(input_pil)
             input_image = ensure_4_channels(input_image)
             if frame_counter > 0:
                 initframe = frame_counter+transition_frames
@@ -252,7 +253,6 @@ def main(args):
 
             # 🔥 FIX NaN / stabilité
             current_latent_single = sanitize_latents(current_latent_single)
-
             # Génération initiale robuste :
             #42	Classique, beaucoup de tests communautaires utilisent ce seed. #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
             #5555	Fidélité à l’image initiale (ton choix actuel) #2026	Léger changement dans la texture ou la posture, subtil mais prévisible
@@ -304,8 +304,23 @@ def main(args):
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
                         # Application de n3r_pro_net
+                        # réutilisé pour toutes les frames
+                        eye_mask = create_eye_mask(latent_interp, eye_coords)
+                        # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
-                            latent_interp = apply_n3r_pro_net( latent_interp, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_latents )
+                            latents_prot = apply_n3r_pro_net(latent_interp, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_latents)
+                            if eye_coords:
+                                eye_mask = create_eye_mask(latents, eye_coords)
+
+                                if eye_mask is not None:
+                                    eye_mask = eye_mask.to(latents.device)
+                                    print("fusion yeux main frames: OK")
+                                    latents = latents * eye_mask + latents_prot * (1 - eye_mask)
+                                else:
+                                    latents = latents_prot
+                            else:
+                                latents = latents_prot
+
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         # contrast=1.5, saturation=1.3, latent_scale_boost  #  Recommmander 1.0
