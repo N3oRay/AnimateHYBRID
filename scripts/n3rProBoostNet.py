@@ -304,8 +304,7 @@ def main(args):
                         if motion_module:
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
 
-                        # Application de n3r_pro_net
-                        # réutilisé pour toutes les frames
+                        # Application de n3r_pro_net - réutilisé pour toutes les frames
                         eye_mask = create_eye_mask(latent_interp, eye_coords)
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
@@ -371,48 +370,29 @@ def main(args):
                         )
                         if latent_injection > 0:
                             if latents.shape[-2:] != latents_frame.shape[-2:]:
-                                latents = torch.nn.functional.interpolate(
-                                    latents,
-                                    size=latents_frame.shape[-2:],
-                                    mode='bilinear', align_corners=False
-                                ).contiguous()
+                                latents = torch.nn.functional.interpolate( latents, size=latents_frame.shape[-2:], mode='bilinear', align_corners=False ).contiguous()
                             latents = latent_injection*latents_frame + (1-latent_injection)*latents
 
                     # --- Motion module propre et safe ---
+                    # Motion safe
                     if motion_module is not None:
-                        if previous_latent_single is not None:
-                            latents_seq = torch.stack([
-                                previous_latent_single.to(device),
-                                latents,
-                                latents + 0.01 * torch.randn_like(latents)
-                            ], dim=2)  # [B,C,F,H,W]
-                        else:
-                            latents_seq = latents.unsqueeze(2).repeat(1, 1, 3, 1, 1)
-
-                        # 🔥 sécurisation AVANT motion
+                        latents_seq = latents.unsqueeze(2).repeat(1,1,3,1,1) if previous_latent_single is None else torch.stack([previous_latent_single.to(device), latents, latents+0.01*torch.randn_like(latents)], dim=2)
                         latents_seq = sanitize_latents(latents_seq)
-
-                        # 🔥 motion safe (une seule fois)
                         latents_seq, applied = apply_motion_safe(latents_seq, motion_module)
-
-                        if applied:
-                            latents = latents_seq[:, :, 1, :, :]
-                        else:
-                            latents = latents
-
+                        latents = latents_seq[:, :, 1, :, :] if applied else latents
                         latents = sanitize_latents(latents)
 
-                    # 🔥 AUCUN blending → juste update mémoire
-                    previous_latent_single = latents.detach().cpu()
-                    # Application de n3r_pro_net
+                    # ProNet avec yeux
                     if use_n3r_pro_net:
                         latents = apply_pro_net_with_eye(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_latents)
-                    # Décodage streaming
+
+                    # Décodage final
                     latents = latents / LATENT_SCALE
-                    frame_pil = decode_latents_ultrasafe_blockwise( latents, vae, block_size=block_size, overlap=overlap,device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
-                    #Post Traitement
-                    frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
+                    frame_pil = decode_latents_ultrasafe_blockwise(latents, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost)
+                    frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
                     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
+
+                    previous_latent_single = latents.detach().cpu()
                     frame_counter += 1
                     pbar.update(1)
 
