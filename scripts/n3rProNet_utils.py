@@ -1,0 +1,1809 @@
+# n3rProNet_utils.py
+#-------------------------------------------------------------------------------
+from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
+import torch
+import math
+import numpy as np
+from PIL import Image, ImageFilter
+import torch.nn.functional as F
+from pathlib import Path
+
+from torchvision.transforms.functional import to_pil_image
+
+def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=0.25, blur_kernel=5):
+    """
+    Applique un glow froid ciblé sur l'iris des yeux dans les latents [B,C,H,W].
+
+    Args:
+        latents (torch.Tensor): Latents [B,C,H,W].
+        eye_coords (list of tuples): Coordonnées yeux [(x1,y1),(x2,y2)].
+        iris_radius_ratio (float): Ratio de rayon de l'iris par rapport à la plus petite dimension H/W.
+        strength (float): Intensité du glow (0.0 à 1.0).
+        blur_kernel (int): Taille du noyau pour un léger flou gaussien.
+
+    Returns:
+        torch.Tensor: Latents avec glow appliqué sur les iris.
+    """
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ Créer un masque radial pour chaque œil
+    mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+    min_dim = min(H, W)
+    iris_radius = iris_radius_ratio * min_dim
+
+    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    for x_eye, y_eye in eye_coords:
+        dist = torch.sqrt((xx - x_eye)**2 + (yy - y_eye)**2)
+        eye_mask = torch.exp(-(dist**2) / (2 * iris_radius**2))
+        mask += eye_mask.unsqueeze(0)  # broadcast batch dimension
+
+    # Clamp à 1 pour éviter dépassement si 2 yeux se chevauchent
+    mask = mask.clamp(0.0, 1.0)
+
+    # 2️⃣ Appliquer léger blur pour adoucir les bords
+    if blur_kernel > 1:
+        kernel = torch.ones((C, 1, blur_kernel, blur_kernel), device=device, dtype=dtype)
+        kernel = kernel / kernel.sum()
+        mask = F.conv2d(mask.repeat(1, C, 1, 1), kernel, padding=blur_kernel//2, groups=C)
+
+    # 3️⃣ Créer glow gaussien via convolution légère
+    sigma = blur_kernel / 3.0
+    glow_kernel = torch.exp(-((torch.arange(-blur_kernel//2+1, blur_kernel//2+2, device=device).view(-1,1))**2)/ (2*sigma**2))
+    glow_kernel = glow_kernel / glow_kernel.sum()
+    glow_kernel = glow_kernel.view(1,1,blur_kernel,1).repeat(C,1,1,1)
+    glow = F.conv2d(latents, glow_kernel, padding=(blur_kernel//2,0), groups=C)
+    glow = F.conv2d(glow, glow_kernel.transpose(2,3), padding=(0,blur_kernel//2), groups=C)  # convolution 2D approximative
+
+    # 4️⃣ Fusion glow sur iris seulement
+    latents_out = latents * (1 - mask) + glow * mask * strength
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    return latents_out
+
+def apply_intelligent_glow_froid_latents(latents, strength=0.2, blur_kernel=7):
+    """
+    Applique un effet "glow froid" directement sur des latents [B, C, H, W].
+
+    Args:
+        latents (torch.Tensor): Latents [B,C,H,W].
+        strength (float): Intensité du glow (0.0 à 1.0).
+        blur_kernel (int): Taille du noyau pour le flou gaussien (doit être impair).
+
+    Returns:
+        torch.Tensor: Latents avec glow appliqué.
+    """
+    if latents.ndim != 4:
+        raise ValueError("Latents doivent être de shape [B, C, H, W]")
+
+    B, C, H, W = latents.shape
+
+    # 🔹 Création noyau gaussien 2D
+    def gaussian_kernel(kernel_size, sigma, channels):
+        ax = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1., device=latents.device)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel = torch.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
+        kernel = kernel / kernel.sum()
+        kernel = kernel.view(1, 1, kernel_size, kernel_size).repeat(channels, 1, 1, 1)
+        return kernel
+
+    sigma = blur_kernel / 3.0
+    kernel = gaussian_kernel(blur_kernel, sigma, C).to(latents.device, latents.dtype)
+
+    padding = blur_kernel // 2
+    # 🔹 Appliquer convolution pour obtenir le glow
+    glow = F.conv2d(latents, kernel, padding=padding, groups=C)
+
+    # 🔹 Fusion latents original + glow
+    latents_out = latents * (1 - strength) + glow * strength
+
+    # 🔹 Clamp pour stabilité
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    return latents_out
+
+
+# Appplication effect sur les iris yeux:
+def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=0.2, blur_kernel=7):
+    """
+    Applique un glow froid uniquement sur l'iris des yeux dans les latents [B,C,H,W].
+
+    Args:
+        latents (torch.Tensor): Latents SD [B,C,H,W]
+        eye_coords (list of tuples): Coordonnées des yeux [(x1,y1),(x2,y2)]
+        iris_radius_ratio (float): proportion de H/W pour rayon iris
+        strength (float): intensité du glow
+        blur_kernel (int): taille du kernel gaussien (impair)
+
+    Returns:
+        torch.Tensor: latents avec glow sur iris
+    """
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ Créer masque radial pour l’iris
+    iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+    for i, (x, y) in enumerate(eye_coords):
+        rx = int(W * iris_radius_ratio)
+        ry = int(H * iris_radius_ratio)
+        # coordonnées grille
+        Y, X = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+        dist2 = ((X - x)**2) / (rx**2) + ((Y - y)**2) / (ry**2)
+        iris_mask[0, 0] += (dist2 <= 1).float()
+    iris_mask = iris_mask.clamp(0, 1)  # éviter >1 si deux yeux se chevauchent
+
+    # 2️⃣ Créer kernel gaussien 2D
+    sigma = blur_kernel / 3
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device)
+    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel_2d = kernel_2d / kernel_2d.sum()
+    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)  # [C,1,kH,kW]
+
+    # 3️⃣ Appliquer convolution channel-wise
+    glow = F.conv2d(latents * iris_mask, kernel, padding=blur_kernel // 2, groups=C)
+
+    # 4️⃣ Fusion glow sur iris uniquement
+    latents_out = latents * (1 - iris_mask) + glow * iris_mask * strength
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    return latents_out
+
+
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+def apply_pro_net_volumetrique(
+    latents,
+    coords_v,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    glow_strength=0.2,
+    blur_kernel=7,
+    iris_radius_ratio=0.08,
+    debug=False
+):
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet
+    latents_prot = apply_n3r_pro_net(
+        latents,
+        model=n3r_pro_net,
+        strength=n3r_pro_strength,
+        sanitize_fn=sanitize_fn
+    )
+
+    if not coords_v:
+        return latents_prot
+
+    # 2️⃣ Mask IRIS
+    iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    for x, y in coords_v:
+        rx = int(W * iris_radius_ratio)
+        ry = int(H * iris_radius_ratio)
+        dist2 = ((X - x)**2)/(rx**2) + ((Y - y)**2)/(ry**2)
+        iris_mask[0, 0] += (dist2 <= 1).float()
+
+    iris_mask = iris_mask.clamp(0, 1)
+
+    # 3️⃣ Kernel gaussien propre
+    sigma = blur_kernel / 3
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device)
+    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel_2d = kernel_2d / kernel_2d.sum()
+
+    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)
+
+    # 4️⃣ Glow uniquement sur iris
+    glow = F.conv2d(latents_prot * iris_mask, kernel, padding=blur_kernel // 2, groups=C)
+
+    latents_out = latents_prot * (1 - iris_mask) + glow * iris_mask * glow_strength
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    # ---------------- DEBUG ----------------
+    if debug:
+        lat_vis = latents[0, 0].detach().cpu()
+        prot_vis = latents_prot[0, 0].detach().cpu()
+        glow_vis = glow[0, 0].detach().cpu()
+        mask_vis = iris_mask[0, 0].detach().cpu()
+
+        plt.figure(figsize=(12, 4))
+
+        plt.subplot(1, 4, 1)
+        plt.imshow(lat_vis, cmap='gray')
+        plt.title("Latent original")
+
+        plt.subplot(1, 4, 2)
+        plt.imshow(prot_vis, cmap='gray')
+        plt.title("ProNet")
+
+        plt.subplot(1, 4, 3)
+        plt.imshow(glow_vis, cmap='gray')
+        plt.title("Glow")
+
+        plt.subplot(1, 4, 4)
+        plt.imshow(lat_vis, cmap='gray', alpha=0.7)
+        plt.imshow(mask_vis, cmap='Reds', alpha=0.4)
+        plt.title("Mask Iris")
+
+        plt.tight_layout()
+        plt.show()
+
+        print("👁 DEBUG activé → vérifie position / taille iris")
+
+    return latents_out
+
+def apply_pro_net_with_eyes_v1(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn,
+                           glow_strength=0.2, blur_kernel=7, iris_radius_ratio=0.08):
+    """
+    Applique ProNet et un glow froid uniquement sur l’iris des yeux.
+
+    Args:
+        latents (torch.Tensor): [B,C,H,W] Latents à traiter.
+        eye_coords (list of tuples): Coordonnées yeux [(x1,y1),(x2,y2)]
+        n3r_pro_net: modèle ProNet
+        n3r_pro_strength (float): force ProNet
+        sanitize_fn: fonction de nettoyage latents
+        glow_strength (float): intensité du glow
+        blur_kernel (int): kernel pour flou gaussien
+        iris_radius_ratio (float): proportion de H/W pour rayon iris
+
+    Returns:
+        torch.Tensor: latents avec glow sur iris uniquement
+    """
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ Application ProNet
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
+    # 2️⃣ Glow froid uniquement sur l’iris
+    if eye_coords:
+        iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+        for x, y in eye_coords:
+            rx = int(W * iris_radius_ratio)
+            ry = int(H * iris_radius_ratio)
+            Y, X = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+            dist2 = ((X - x)**2) / (rx**2) + ((Y - y)**2) / (ry**2)
+            iris_mask[0, 0] += (dist2 <= 1).float()
+        iris_mask = iris_mask.clamp(0, 1)
+
+        # Kernel gaussien 2D
+        sigma = blur_kernel / 3
+        ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)
+
+        # Convolution channel-wise pour glow
+        glow = F.conv2d(latents_prot * iris_mask, kernel, padding=blur_kernel // 2, groups=C)
+
+        # Fusion uniquement sur l’iris
+        latents_out = latents_prot * (1 - iris_mask) + glow * iris_mask * glow_strength
+        latents_out = latents_out.clamp(-1.0, 1.0)
+        print("👁 Glow froid appliqué sur iris uniquement")
+    else:
+        # fallback si pas d’yeux détectés
+        latents_out = latents_prot
+
+    return latents_out
+
+
+def apply_pro_net_with_eye_glow(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn, glow_strength=0.2, blur_kernel=7):
+    """
+    Applique ProNet et un glow froid uniquement sur les yeux.
+
+    Args:
+        latents (torch.Tensor): [B,C,H,W] Latents à traiter.
+        eye_coords (list of tuples): Coordonnées yeux [(x1,y1),(x2,y2)]
+        n3r_pro_net: modèle ProNet
+        n3r_pro_strength (float): force ProNet
+        sanitize_fn: fonction de nettoyage latents
+        glow_strength (float): intensité du glow
+        blur_kernel (int): kernel pour le flou
+
+    Returns:
+        torch.Tensor: latents avec glow sur yeux uniquement
+    """
+    # 1️⃣ Appliquer ProNet
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
+    # 2️⃣ Glow froid sur latents ProNet
+    glow_latents = apply_intelligent_glow_froid_latents(latents_prot, strength=glow_strength, blur_kernel=blur_kernel)
+
+
+    # 3️⃣ Fusion glow uniquement sur les yeux
+    if eye_coords:
+        eye_radius = int(min(latents.shape[-2:]) * 0.15)
+        eye_mask = create_eye_mask(latents, eye_coords, eye_radius)
+        if eye_mask is not None:
+            eye_mask = eye_mask.to(latents.device).float()
+            if eye_mask.ndim == 3:  # [B,H,W] -> [B,1,H,W]
+                eye_mask = eye_mask.unsqueeze(1)
+            latents = latents * (1 - eye_mask) + glow_latents * eye_mask
+            print("👁 Glow froid appliqué uniquement sur yeux")
+        else:
+            latents = glow_latents  # fallback
+    else:
+        latents = glow_latents  # pas d’yeux détectés → glow global
+
+    return latents
+
+# Application effect en dehors de yeux:
+def apply_pro_net_with_out_eyes(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn):
+    # 1️⃣ Application du ProNet
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
+    # 2️⃣ Application du glow froid intelligent en dehors des yeux sur le ProNet
+    latents_prot = apply_intelligent_glow_froid_out(latents_prot)
+
+    # 3️⃣ Fusion avec le masque yeux si détecté
+    if eye_coords:
+        print("Eye coords:", eye_coords)
+        eye_radius = int(min(latents.shape[-2:]) * 0.15)  # augmenter légèrement pour protection
+        eye_mask = create_eye_mask(latents, eye_coords, eye_radius)
+
+        if eye_mask is not None:
+            eye_mask = eye_mask.to(latents.device)
+            # protection yeux + ProNet + glow
+            latents = latents * eye_mask + latents_prot * (1 - eye_mask)
+            print("👁 protection yeux appliquée avec glow froid")
+        else:
+            # si le masque échoue, on applique ProNet + glow sur tout
+            latents = latents_prot
+    else:
+        # pas d’yeux détectés → ProNet + glow global
+        latents = latents_prot
+
+    return latents
+
+
+def apply_pro_net_with_eye_simple(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn):
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+    if eye_coords:
+        print("Eye coords:", eye_coords)
+        eye_radius = int(min(latents.shape[-2:]) * 0.15)  # un peu plus large valeur 0.12 ou 0.15
+        eye_mask = create_eye_mask(latents, eye_coords, eye_radius)
+        if eye_mask is not None:
+            eye_mask = eye_mask.to(latents.device)
+            latents = latents * eye_mask + latents_prot * (1 - eye_mask)
+            print("👁 protection yeux appliquée (main frames)")
+        else:
+            latents = latents_prot
+    else:
+        latents = latents_prot
+    return latents
+
+def tensor_to_pil(tensor):
+    """
+    tensor: [1,3,H,W] ou [3,H,W] dans [-1,1]
+    """
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    tensor = (tensor.clamp(-1,1) + 1) / 2
+    return to_pil_image(tensor.cpu())
+
+try:
+    import mediapipe as mp
+    from mediapipe.python.solutions import face_mesh as mp_face_mesh
+    MP_FACE_MESH = mp_face_mesh
+except Exception:
+    MP_FACE_MESH = None
+    print("⚠ mediapipe non disponible → fallback sans yeux")
+
+
+def get_coords_safe(image, H, W):
+    coords = get_coords(image)
+
+    if coords:
+        print(f"👁 Eyes detected: {coords}")
+        return coords
+
+    print("⚠ fallback eye coords used")
+
+    # 🔥 adapté portrait vertical (ton cas 536x960)
+    return [
+        (int(H * 0.32), int(W * 0.38)),
+        (int(H * 0.32), int(W * 0.62))
+    ]
+
+# --------------------------------------------------
+# 🔥 Détection yeux (version clean sans cv2)
+# --------------------------------------------------
+def get_coords(image):
+    """
+    Retourne [(y_left, x_left), (y_right, x_right)]
+    Compatible PIL ou numpy
+    """
+    if MP_FACE_MESH is None:
+        return []
+
+    # Conversion propre
+    if isinstance(image, Image.Image):
+        img = np.array(image)
+    else:
+        img = image
+
+    if img is None or img.ndim != 3:
+        return []
+
+    h, w, _ = img.shape
+
+    with MP_FACE_MESH.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+        results = face_mesh.process(img)  # ✅ déjà RGB → pas besoin de cv2
+
+        if not results.multi_face_landmarks:
+            return []
+
+        lm = results.multi_face_landmarks[0].landmark
+
+        # 🔥 Points clés yeux (stables)
+        left_eye_pts  = [33, 133]
+        right_eye_pts = [362, 263]
+
+        left_eye = np.mean([(lm[i].y * h, lm[i].x * w) for i in left_eye_pts], axis=0)
+        right_eye = np.mean([(lm[i].y * h, lm[i].x * w) for i in right_eye_pts], axis=0)
+
+        return [
+            (int(left_eye[0]), int(left_eye[1])),
+            (int(right_eye[0]), int(right_eye[1]))
+        ]
+
+# --------------------------------------------------
+# 🔥 Création mask yeux (latents)
+# --------------------------------------------------
+import torch
+import matplotlib.pyplot as plt
+
+def create_volumetrique_mask(latents, coords, radius_ratio=0.15, only=False, in_radius_ratio=0.08, debug=False):
+    """
+    Crée un masque pour les yeux ou uniquement pour l’iris.
+
+    Args:
+        latents (torch.Tensor): [B,C,H,W] Latents
+        coords (list of tuples): [(x1,y1),(x2,y2)] coordonnées yeux
+        radius_ratio (float): proportion H/W pour rayon
+        only (bool): True → masque uniquement iris, False → masque œil entier
+        in_radius_ratio (float): proportion H/W pour rayon iris si only=True
+        debug (bool): Si True, affiche le masque
+
+    Returns:
+        torch.Tensor: [B,1,H,W] masque float (0=hors masque, 1=masque)
+    """
+    if not coords or latents.ndim != 4:
+        return None
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+
+    for x, y in coords:
+        r = int(min(H, W) * (radius_ratio if only else in_radius_ratio))
+        Y, X = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+        dist2 = (X - x)**2 + (Y - y)**2
+        mask[0, 0] += (dist2 <= r**2).float()
+
+    mask = mask.clamp(0, 1)
+
+    if debug:
+        # Affiche le masque superposé à un latents converti en image pour vérification
+        lat_vis = latents[0, 0].detach().cpu()  # canal 0
+        plt.figure(figsize=(6,6))
+        plt.imshow(lat_vis, cmap='gray', alpha=0.7)
+        plt.imshow(mask[0,0].cpu(), cmap='Reds', alpha=0.3)
+        plt.title("Debug Eye/Iris Mask")
+        plt.show()
+
+    return mask
+
+def create_eye_mask(latents, eye_coords, eye_radius=8, falloff=4):
+    """
+    Soft mask gaussien → transitions naturelles
+    """
+    if not eye_coords:
+        return None
+
+    B, C, H, W = latents.shape
+    mask = torch.zeros((1, 1, H, W), device=latents.device)
+
+    for y_c, x_c in eye_coords:
+        y_lat = int(y_c / 8)
+        x_lat = int(x_c / 8)
+
+        for y in range(H):
+            for x in range(W):
+                dist = ((y - y_lat)**2 + (x - x_lat)**2)**0.5
+                value = max(0, 1 - dist / (eye_radius + falloff))
+                mask[0, 0, y, x] = torch.maximum(mask[0, 0, y, x], torch.tensor(value, device=latents.device))
+
+    return mask.repeat(B, C, 1, 1)
+
+def detect_eyes_auto(frame_pil):
+    """Retourne les coordonnées (y,x) approximatives des yeux"""
+    img = np.array(frame_pil)
+    h, w, _ = img.shape
+    with MP_FACE_MESH.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+        results = face_mesh.process(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        if not results.multi_face_landmarks:
+            return []
+        lm = results.multi_face_landmarks[0].landmark
+        left_eye = np.mean([(lm[i].y*h, lm[i].x*w) for i in [33, 133]], axis=0)
+        right_eye = np.mean([(lm[i].y*h, lm[i].x*w) for i in [362, 263]], axis=0)
+        return [(int(left_eye[0]), int(left_eye[1])), (int(right_eye[0]), int(right_eye[1]))]
+
+
+def decode_latents_ultrasafe_blockwise(latents, vae,
+                                       block_size=32, overlap=16,
+                                       device="cuda",
+                                       frame_counter=0,
+                                       latent_scale_boost=1.0):
+    """
+    Décodage ultra-safe par blocs des latents en image PIL.
+    Paramètres conservés uniquement : block_size, overlap, device, frame_counter, latent_scale_boost
+    """
+    import torch
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + decoded.shape[2], ix0 + decoded.shape[3]
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded
+            weight[:, :, iy0:iy1, ix0:ix1] += 1.0
+
+    output_rgb = (output_rgb / weight.clamp(min=1e-6)).clamp(-1.0, 1.0)
+
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+
+def apply_intelligent_glow_pro(
+    frame_pil,
+    strength=0.18,
+    edge_weight=0.6,
+    luminance_weight=0.8,
+    blur_radius=1.2
+):
+    from PIL import Image, ImageFilter
+    import numpy as np
+
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
+
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+    # ---------------- Luminance ----------------
+    lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    lum_mask = np.clip((lum - 0.6) / 0.4, 0, 1)
+    lum_mask = np.power(lum_mask, 1.5)
+
+    # ---------------- Edge ----------------
+    gray = (lum * 255).astype(np.uint8)
+    edge = Image.fromarray(gray).filter(ImageFilter.FIND_EDGES)
+    edge = np.array(edge).astype(np.float32) / 255.0
+    edge = np.clip(edge * 1.2, 0, 1)
+    edge = np.power(edge, 1.3)
+
+    # ---------------- Mask combiné ----------------
+    combined_mask = np.clip(luminance_weight * lum_mask + edge_weight * edge, 0, 1)
+
+    # ---------------- Glow ----------------
+    glow_img = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    glow_arr = np.array(glow_img).astype(np.float32) / 255.0
+
+    # ---------------- Appliquer glow seulement sur la luminance ----------------
+    glow_lum = 0.299 * glow_arr[:, :, 0] + 0.587 * glow_arr[:, :, 1] + 0.114 * glow_arr[:, :, 2]
+
+    # mixer luminance glow + couleur originale
+    result = arr.copy()
+    for c in range(3):
+        # conserver la teinte originale mais injecter glow sur la luminosité
+        result[:, :, c] = arr[:, :, c] + (glow_lum - lum) * combined_mask * strength
+
+    result = np.clip(result, 0, 1)
+    return Image.fromarray((result * 255).astype(np.uint8))
+
+
+def apply_intelligent_glow_froid(
+    frame_pil,
+    strength=0.18,
+    edge_weight=0.6,
+    luminance_weight=0.8,
+    blur_radius=1.2
+):
+    from PIL import Image, ImageFilter, ImageEnhance
+    import numpy as np
+
+    # ---------------- Base ----------------
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
+
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+    # ---------------- Luminance mask ----------------
+    # luminance perceptuelle
+    lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+
+    # masque doux (favorise les zones claires)
+    lum_mask = np.clip((lum - 0.6) / 0.4, 0, 1)
+    lum_mask = np.power(lum_mask, 1.5)  # douceur
+
+    # ---------------- Edge mask ----------------
+    gray = (lum * 255).astype(np.uint8)
+    edge = Image.fromarray(gray).filter(ImageFilter.FIND_EDGES)
+    edge = np.array(edge).astype(np.float32) / 255.0
+
+    # adoucir les edges (évite bruit)
+    edge = np.clip(edge * 1.2, 0, 1)
+    edge = np.power(edge, 1.3)
+
+    # ---------------- Fusion intelligente ----------------
+    combined_mask = (
+        luminance_weight * lum_mask +
+        edge_weight * edge
+    )
+
+    combined_mask = np.clip(combined_mask, 0, 1)
+
+    # ---------------- Glow ----------------
+    # blur image pour glow
+    glow_img = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    glow_arr = np.array(glow_img).astype(np.float32) / 255.0
+
+    # appliquer glow uniquement où mask actif
+    result = arr + (glow_arr - arr) * combined_mask[..., None] * strength
+
+    result = np.clip(result, 0, 1)
+
+    return Image.fromarray((result * 255).astype(np.uint8))
+
+
+def apply_post_processing_adaptive(
+    frame_pil,
+    blur_radius=0.03,
+    contrast=1.10,
+    vibrance_strength=0.25,   # 🔥 contrôle simple (0 → off, 0.3 = doux)
+    sharpen=False,
+    sharpen_radius=1,
+    sharpen_percent=90,
+    sharpen_threshold=2,
+    clamp_r=True
+):
+    from PIL import ImageEnhance, ImageFilter
+    import numpy as np
+
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
+
+    # ---------------- 1️⃣ Micro blur (anti pixel) ----------------
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # ---------------- 2️⃣ Contrast (seul vrai levier global) ----------------
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+
+    # ---------------- 3️⃣ Vibrance douce (version stable) ----------------
+    if vibrance_strength > 0:
+        try:
+            arr = np.array(frame_pil).astype(np.float32)
+
+            # saturation simple
+            max_rgb = arr.max(axis=2)
+            min_rgb = arr.min(axis=2)
+            sat = (max_rgb - min_rgb) / 255.0
+
+            # 🔥 boost UNIQUEMENT zones peu saturées
+            boost = 1.0 + vibrance_strength * (1.0 - sat)
+
+            arr = arr * boost[..., None]
+
+            frame_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+        except Exception as e:
+            print(f"[WARNING] vibrance skipped: {e}")
+
+    # ---------------- 4️⃣ Clamp rouge (anti rose / peau cramée) ----------------
+    if clamp_r:
+        try:
+            arr = np.array(frame_pil).astype(np.float32)
+
+            r = arr[:, :, 0]
+            r_mean = r.mean()
+
+            if r_mean > 160:  # 🔥 seuil plus bas = plus stable
+                factor = 160 / (r_mean + 1e-6)
+                arr[:, :, 0] *= factor
+
+            frame_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+        except Exception as e:
+            print(f"[WARNING] clamp rouge skipped: {e}")
+
+    # ---------------- 5️⃣ Sharpen léger ----------------
+    if sharpen:
+        try:
+            frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+                radius=sharpen_radius,
+                percent=sharpen_percent,
+                threshold=sharpen_threshold
+            ))
+        except Exception as e:
+            print(f"[WARNING] sharpening skipped: {e}")
+
+    return frame_pil
+
+
+
+
+def smooth_edges(frame_pil, strength=0.4, blur_radius=1.2):
+    from PIL import ImageFilter, ImageChops
+    import numpy as np
+
+    # 1️⃣ edges
+    edges = frame_pil.convert("L").filter(ImageFilter.FIND_EDGES)
+
+    # 2️⃣ normalisation du masque
+    edges_np = np.array(edges).astype(np.float32) / 255.0
+    edges_np = np.clip(edges_np * 2.0, 0, 1)  # renforce zones edges
+
+    # 3️⃣ blur global (source)
+    blurred = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # 4️⃣ blend intelligent
+    orig = np.array(frame_pil).astype(np.float32)
+    blur = np.array(blurred).astype(np.float32)
+
+    mask = edges_np[..., None] * strength
+
+    result = orig * (1 - mask) + blur * mask
+
+    return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
+
+
+def apply_post_processing_unreal_cinematic(
+    frame_pil,
+    exposure=1.0,
+    vibrance=1.02,
+    edge_strength=0.25,
+    sharpen=True,
+    brightness_adj=0.90,   # 🔻 -5%
+    contrast_adj=1.65      # 🔺 +65%
+):
+    from PIL import Image, ImageEnhance, ImageFilter, ImageChops
+    import numpy as np
+
+    # 🔥 1. Base (sans toucher contraste global)
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+    arr *= exposure
+
+    # Vibrance douce
+    mean_c = arr.mean(axis=2, keepdims=True)
+    arr = mean_c + (arr - mean_c) * vibrance
+    arr = np.clip(arr, 0, 1)
+
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # =========================
+    # ✏️ EDGE CRAYON BLANC
+    # =========================
+    gray = img.convert("L")
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+
+    edges = edges.filter(ImageFilter.GaussianBlur(radius=0.8))
+    edges = ImageChops.invert(edges)
+    edges = ImageEnhance.Contrast(edges).enhance(1.2)
+
+    edge_rgb = Image.merge("RGB", (edges, edges, edges))
+
+    # Screen = effet lumineux propre
+    img_edges = ImageChops.screen(img, edge_rgb)
+
+    # Blend final contrôlé
+    img = Image.blend(frame_pil, img_edges, edge_strength)
+
+    # =========================
+    # 🔥 AJUSTEMENTS DEMANDÉS
+    # =========================
+    img = ImageEnhance.Brightness(img).enhance(brightness_adj)
+    img = ImageEnhance.Contrast(img).enhance(contrast_adj)
+
+    # =========================
+    # 🔧 Sharpen doux
+    # =========================
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(
+            radius=0.5,
+            percent=30,
+            threshold=3
+        ))
+
+    # 🔥 micro lissage final
+    img = img.filter(ImageFilter.GaussianBlur(radius=0.25))
+
+    return img
+
+def apply_post_processing_minimal(
+    frame_pil,
+    blur_radius=0.05,
+    contrast=1.15,
+    vibrance_base=1.0,
+    vibrance_max=1.25,
+    sharpen=False,
+    sharpen_radius=1,
+    sharpen_percent=90,
+    sharpen_threshold=2,
+    clamp_r=True
+):
+    from PIL import Image, ImageFilter, ImageEnhance
+    import numpy as np
+
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
+
+    # ---------------- 1. Blur léger ----------------
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # ---------------- 2. Contraste ----------------
+    if contrast != 1.0:
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+
+    # ---------------- 3. Vibrance adaptative ----------------
+    try:
+        frame_np = np.array(frame_pil).astype(np.float32)
+
+        max_rgb = np.max(frame_np, axis=2)
+        min_rgb = np.min(frame_np, axis=2)
+        sat = max_rgb - min_rgb
+
+        factor_map = vibrance_base + (vibrance_max - vibrance_base) * (1 - sat / 255.0)
+        factor_map = np.clip(factor_map, vibrance_base, vibrance_max)
+
+        frame_np *= factor_map[..., None]
+        frame_np = np.clip(frame_np, 0, 255)
+
+        frame_pil = Image.fromarray(frame_np.astype(np.uint8))
+
+    except Exception as e:
+        print(f"[WARNING] vibrance skipped: {e}")
+
+    # ---------------- 4. Clamp rouge ----------------
+    if clamp_r:
+        try:
+            arr = np.array(frame_pil).astype(np.float32)
+            r_mean = arr[..., 0].mean()
+
+            if r_mean > 180:
+                factor = 180 / r_mean
+                arr[..., 0] *= factor
+
+            frame_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+        except Exception as e:
+            print(f"[WARNING] clamp rouge skipped: {e}")
+
+    # ---------------- 5. Sharpen ----------------
+    if sharpen:
+        frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
+            radius=sharpen_radius,
+            percent=sharpen_percent,
+            threshold=sharpen_threshold
+        ))
+
+    return frame_pil
+
+def apply_intelligent_glow(frame_pil,
+                           glow_strength=0.22,
+                           blur_radius=1.2,
+                           luminance_threshold=0.7,
+                           edge_strength=1.2,
+                           detail_preservation=0.85):
+    """
+    Glow intelligent :
+    - basé sur luminance + edges
+    - évite effet flou global
+    - boost détails lumineux uniquement
+    """
+    from PIL import Image, ImageFilter, ImageEnhance, ImageChops
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Base numpy
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+    # -----------------------
+    # 2️⃣ Luminance mask
+    # -----------------------
+    gray = frame_pil.convert("L")
+    lum = np.array(gray).astype(np.float32) / 255.0
+
+    lum_mask = np.clip((lum - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+
+    # -----------------------
+    # 3️⃣ Edge mask (important 🔥)
+    # -----------------------
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = ImageEnhance.Contrast(edges).enhance(edge_strength)
+
+    edge_arr = np.array(edges).astype(np.float32) / 255.0
+
+    # 🔥 combinaison intelligente
+    combined_mask = lum_mask * edge_arr
+
+    # -----------------------
+    # 4️⃣ Glow blur
+    # -----------------------
+    blurred = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    blurred_arr = np.array(blurred).astype(np.float32) / 255.0
+
+    # -----------------------
+    # 5️⃣ Application du glow
+    # -----------------------
+    for c in range(3):
+        arr[..., c] = arr[..., c] + glow_strength * combined_mask * blurred_arr[..., c]
+
+    arr = np.clip(arr, 0, 1)
+
+    # -----------------------
+    # 6️⃣ Reconstruction
+    # -----------------------
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # 7️⃣ Préservation détails
+    # -----------------------
+    img = Image.blend(frame_pil, img, 1 - detail_preservation)
+
+    # -----------------------
+    # 8️⃣ Micro sharpen
+    # -----------------------
+    img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=25, threshold=2))
+
+    return img
+
+
+def apply_chromatic_soft_glow(frame_pil,
+                              glow_strength=0.25,
+                              exposure=1.05,
+                              blur_radius=2.0,
+                              luminance_threshold=0.8,
+                              color_saturation=1.05,
+                              sharpen=True):
+    """
+    Soft Glow chromatique localisé :
+    - Glow appliqué sur pixels clairs selon leur canal (R/G/B)
+    - Zones sombres préservées
+    - Détails conservés
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+    arr = np.clip(arr * exposure, 0, 1)
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # Masque par canal
+    # -----------------------
+    r, g, b = arr[...,0], arr[...,1], arr[...,2]
+    mask_r = np.clip((r - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+    mask_g = np.clip((g - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+    mask_b = np.clip((b - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+
+    # -----------------------
+    # Glow par canal
+    # -----------------------
+    bright = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    bright_arr = np.array(bright).astype(np.float32) / 255.0
+
+    # Mélange selon masque couleur
+    arr[...,0] = np.clip(arr[...,0] + glow_strength * mask_r * bright_arr[...,0], 0, 1)
+    arr[...,1] = np.clip(arr[...,1] + glow_strength * mask_g * bright_arr[...,1], 0, 1)
+    arr[...,2] = np.clip(arr[...,2] + glow_strength * mask_b * bright_arr[...,2], 0, 1)
+
+    img = Image.fromarray((arr*255).astype(np.uint8))
+
+    # -----------------------
+    # Saturation douce
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(color_saturation)
+
+    # -----------------------
+    # Micro sharpen subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=30, threshold=2))
+
+    return img
+
+
+def apply_localized_soft_glow(frame_pil,
+                              glow_strength=0.25,
+                              exposure=1.05,
+                              blur_radius=2.0,
+                              luminance_threshold=0.6,
+                              color_saturation=1.05,
+                              sharpen=True):
+    """
+    Filtre 'Soft Glow Localisé':
+    - Glow appliqué seulement sur les zones lumineuses
+    - Effet subtil, préserve les zones sombres
+    - Maintien des détails
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Convertir en float + exposure
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+    arr = np.clip(arr * exposure, 0, 1)
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # 2️⃣ Masque de luminosité
+    # -----------------------
+    gray = img.convert("L")
+    lum_arr = np.array(gray).astype(np.float32) / 255.0
+    mask = np.clip((lum_arr - luminance_threshold) / (1.0 - luminance_threshold), 0, 1)
+    mask_img = Image.fromarray((mask * 255).astype(np.uint8))
+
+    # -----------------------
+    # 3️⃣ Glow léger
+    # -----------------------
+    bright = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    glow_img = ImageChops.screen(img, bright)
+    # Appliquer glow uniquement là où mask > 0
+    glow_img = Image.composite(glow_img, img, mask_img)
+    img = Image.blend(img, glow_img, glow_strength)
+
+    # -----------------------
+    # 4️⃣ Saturation douce
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(color_saturation)
+
+    # -----------------------
+    # 5️⃣ Micro sharpen subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=30, threshold=2))
+
+    return img
+
+
+def apply_soft_glow(frame_pil,
+                    glow_strength=0.25,
+                    exposure=1.05,
+                    blur_radius=2.0,
+                    color_saturation=1.05,
+                    sharpen=True):
+    """
+    Filtre 'Soft Glow' :
+    - Surexposition douce sur les zones claires
+    - Glow léger et subtil
+    - Maintien des détails et textures
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Convertir en float + exposure léger
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+    arr = np.clip(arr * exposure, 0, 1)
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # 2️⃣ Glow subtil (Light Bloom)
+    # -----------------------
+    bright = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    img = ImageChops.screen(img, bright)
+    img = Image.blend(img, bright, glow_strength)
+
+    # -----------------------
+    # 3️⃣ Saturation douce
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(color_saturation)
+
+    # -----------------------
+    # 4️⃣ Micro sharpen subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=30, threshold=2))
+
+    return img
+
+
+def apply_cinematic_neon_glow(frame_pil,
+                              glow_strength=0.25,
+                              edge_strength=0.15,
+                              color_saturation=1.15,
+                              exposure=1.05,
+                              contrast=1.25,
+                              blur_radius=0.4,
+                              sharpen=True):
+    """
+    Filtre original 'Cinematic Neon Glow':
+    - Glow subtil autour des zones claires
+    - Couleurs saturées style néon / cinématographique
+    - Bords légèrement lumineux type sketch
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Convertir en float
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+    # -----------------------
+    # 2️⃣ Exposure léger
+    # -----------------------
+    arr *= exposure
+    arr = np.clip(arr, 0, 1)
+
+    img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # -----------------------
+    # 3️⃣ Glow subtil (Light Bloom)
+    # -----------------------
+    bright = img.filter(ImageFilter.GaussianBlur(radius=5))
+    img = ImageChops.screen(img, bright)  # effet lumineux
+    img = Image.blend(img, bright, glow_strength)
+
+    # -----------------------
+    # 4️⃣ Edge sketch léger
+    # -----------------------
+    gray = img.convert("L").filter(ImageFilter.GaussianBlur(radius=1.0))
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = ImageChops.invert(edges)
+    edges_rgb = Image.merge("RGB", (edges, edges, edges))
+    img = ImageChops.blend(img, edges_rgb, edge_strength)
+
+    # -----------------------
+    # 5️⃣ Saturation & Contraste
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(color_saturation)
+    img = ImageEnhance.Contrast(img).enhance(contrast)
+
+    # -----------------------
+    # 6️⃣ Micro blur anti-pixel
+    # -----------------------
+    img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # -----------------------
+    # 7️⃣ Sharpen subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=40, threshold=2))
+
+    return img
+
+
+def apply_post_processing_sketch(frame_pil, edge_strength=0.2, blur_radius=0.3, sharpen=True,
+                                           contrast_boost=1.6,   # +60% contraste
+                                           exposure=0.80):       # -20% brillance
+    """
+    Effet dessin subtil / croquis clair ajusté :
+    - Contours légèrement visibles (blancs doux)
+    - +40% contraste, -10% brillance
+    - Lisse les pixels isolés
+    - Ne dénature pas les couleurs de base
+    """
+    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Edge detection doux
+    # -----------------------
+    gray = frame_pil.convert("L").filter(ImageFilter.GaussianBlur(radius=0.5))
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = edges.filter(ImageFilter.MedianFilter(size=3))   # supprime points isolés
+    edges = edges.filter(ImageFilter.GaussianBlur(radius=0.6))  # lissage
+    edges = ImageEnhance.Contrast(edges).enhance(1.2)
+    edges = ImageChops.invert(edges)
+    edge_rgb = Image.merge("RGB", (edges, edges, edges))
+
+    # -----------------------
+    # 2️⃣ Fusion douce des edges
+    # -----------------------
+    img = ImageChops.blend(frame_pil, edge_rgb, edge_strength)
+
+    # -----------------------
+    # 3️⃣ Exposure / Brillance
+    # -----------------------
+    img = ImageEnhance.Brightness(img).enhance(exposure)
+
+    # -----------------------
+    # 4️⃣ Contraste
+    # -----------------------
+    img = ImageEnhance.Contrast(img).enhance(contrast_boost)
+
+    # -----------------------
+    # 5️⃣ Blur léger anti-pixel
+    # -----------------------
+    if blur_radius > 0:
+        img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # -----------------------
+    # 6️⃣ Sharp subtil
+    # -----------------------
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=40, threshold=2))
+
+    return img
+
+
+
+def apply_post_processing_drawing(frame_pil,
+                                  edge_strength=0.7,
+                                  color_levels=48,
+                                  saturation=0.95,
+                                  contrast=1.10,
+                                  sharpen=True):
+    """
+    Post-processing dessin type line-art.
+    Simplifie les couleurs, ajoute des contours au crayon blanc,
+    supprime les points noirs et garde un rendu net.
+    """
+
+    from PIL import Image, ImageFilter, ImageEnhance, ImageChops
+    import numpy as np
+
+    # -----------------------
+    # 1️⃣ Color simplification douce
+    # -----------------------
+    arr = np.array(frame_pil).astype(np.float32)
+    levels = color_levels
+    arr = np.round(arr / (256 / levels)) * (256 / levels)
+    img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+    # -----------------------
+    # 2️⃣ Edge detection propre
+    # -----------------------
+    gray = frame_pil.convert("L").filter(ImageFilter.GaussianBlur(radius=0.6))
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edges = edges.filter(ImageFilter.GaussianBlur(radius=0.8))
+    edges = edges.filter(ImageFilter.MedianFilter(size=3))  # supprime points isolés
+    edges = ImageEnhance.Contrast(edges).enhance(1.4)
+    edges = edges.point(lambda x: 0 if x < 15 else int(x * 1.2))
+    edges = ImageChops.invert(edges)
+    edge_rgb = Image.merge("RGB", (edges, edges, edges))
+
+    # -----------------------
+    # 3️⃣ Fusion douce contours
+    # -----------------------
+    img_edges = ImageChops.multiply(img, edge_rgb)
+    img = Image.blend(img, img_edges, edge_strength * 0.85)
+
+    # -----------------------
+    # 4️⃣ Color / Contrast / Sharpen
+    # -----------------------
+    img = ImageEnhance.Color(img).enhance(saturation)
+    img = ImageEnhance.Contrast(img).enhance(contrast)
+    if sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(radius=0.6, percent=60, threshold=3))
+
+    return img
+
+
+
+
+def save_frame_verbose(frame: Image.Image, output_dir: Path, frame_counter: int, suffix: str = "00", psave: bool = True):
+    """
+    Sauvegarde une frame avec suffixe et affiche un message si verbose=True
+
+    Args:
+        frame (Image.Image): Image PIL à sauvegarder
+        output_dir (Path): Dossier de sortie
+        frame_counter (int): Numéro de frame
+        suffix (str): Suffixe pour différencier les étapes
+        verbose (bool): Affiche le message si True
+    """
+    file_path = output_dir / f"frame_{frame_counter:05d}_{suffix}.png"
+
+    if psave:
+        print(f"[SAVE Frame {frame_counter:03d}_{suffix}] -> {file_path}")
+        frame.save(file_path)
+    return file_path
+
+def neutralize_color_cast(img, strength=0.45, warm_bias=0.015, green_bias=-0.07):
+    """
+    Neutralise la dominante de couleur tout en corrigeant un excès de vert.
+
+    Args:
+        img (PIL.Image): image à corriger
+        strength (float): intensité de neutralisation (0.0 = off, 1.0 = full)
+        warm_bias (float): réchauffe légèrement (rouge+/bleu-)
+        green_bias (float): ajuste le vert (-0.07 = moins 7%)
+    """
+    import numpy as np
+    from PIL import Image
+
+    arr = np.array(img).astype(np.float32)
+
+    mean = arr.mean(axis=(0,1))
+    gray = mean.mean()
+
+    gain = gray / (mean + 1e-6)
+    gain = 1.0 + (gain - 1.0) * strength
+
+    arr[..., 0] *= gain[0] * (1 + warm_bias)  # rouge +
+    arr[..., 1] *= gain[1] * (1 + green_bias) # vert corrigé
+    arr[..., 2] *= gain[2] * (1 - warm_bias)  # bleu -
+
+    arr = np.clip(arr, 0, 255)
+
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def neutralize_color_cast_clean(img, strength=0.6, warm_bias=0.02):
+    import numpy as np
+    from PIL import Image
+
+    arr = np.array(img).astype(np.float32)
+
+    mean = arr.mean(axis=(0,1))
+    gray = mean.mean()
+
+    gain = gray / (mean + 1e-6)
+    gain = 1.0 + (gain - 1.0) * strength
+
+    arr[..., 0] *= gain[0] * (1 + warm_bias)  # 🔥 léger rouge +
+    arr[..., 1] *= gain[1]
+    arr[..., 2] *= gain[2] * (1 - warm_bias)  # 🔥 léger bleu -
+
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+def neutralize_color_cast_str(img, strength=0.6):
+    import numpy as np
+    from PIL import Image
+
+    arr = np.array(img).astype(np.float32)
+
+    mean = arr.mean(axis=(0,1))
+    gray = mean.mean()
+
+    gain = gray / (mean + 1e-6)
+
+    # 🔥 interpolation (clé)
+    gain = 1.0 + (gain - 1.0) * strength
+
+    arr[..., 0] *= gain[0]
+    arr[..., 1] *= gain[1]
+    arr[..., 2] *= gain[2]
+
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def neutralize_color_cast_simple(img):
+    import numpy as np
+    arr = np.array(img).astype(np.float32)
+
+    mean = arr.mean(axis=(0,1))
+
+    # cible gris neutre
+    gray = mean.mean()
+
+    gain = gray / (mean + 1e-6)
+
+    arr[..., 0] *= gain[0]
+    arr[..., 1] *= gain[1]
+    arr[..., 2] *= gain[2]
+
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+def kelvin_to_rgb(temp):
+    """
+    Approximation réaliste Kelvin → RGB (inspiré photographie)
+    """
+    temp = temp / 100.0
+
+    # Rouge
+    if temp <= 66:
+        r = 255
+    else:
+        r = temp - 60
+        r = 329.698727446 * (r ** -0.1332047592)
+
+    # Vert
+    if temp <= 66:
+        g = temp
+        g = 99.4708025861 * math.log(g) - 161.1195681661
+    else:
+        g = temp - 60
+        g = 288.1221695283 * (g ** -0.0755148492)
+
+    # Bleu
+    if temp >= 66:
+        b = 255
+    elif temp <= 19:
+        b = 0
+    else:
+        b = temp - 10
+        b = 138.5177312231 * math.log(b) - 305.0447927307
+
+    return (
+        max(0, min(255, r)) / 255.0,
+        max(0, min(255, g)) / 255.0,
+        max(0, min(255, b)) / 255.0
+    )
+
+
+def adjust_color_temperature(image, target_temp=10000, reference_temp=6500, strength=0.5):
+    import numpy as np
+
+    img = np.array(image).astype(np.float32) / 255.0
+
+    r1, g1, b1 = kelvin_to_rgb(reference_temp)
+    r2, g2, b2 = kelvin_to_rgb(target_temp)
+
+    # 🔥 interpolation (clé)
+    r_gain = (1 - strength) + strength * (r2 / r1)
+    g_gain = (1 - strength) + strength * (g2 / g1)
+    b_gain = (1 - strength) + strength * (b2 / b1)
+
+    img[..., 0] *= r_gain
+    img[..., 1] *= g_gain
+    img[..., 2] *= b_gain
+
+    img = np.clip(img, 0, 1)
+    return Image.fromarray((img * 255).astype(np.uint8))
+
+def adjust_color_temperature_simple(image, target_temp=3500, reference_temp=8000):
+    import numpy as np
+
+    img = np.array(image).astype(np.float32) / 255.0
+
+    # Gains relatifs (IMPORTANT → comme GIMP)
+    r1, g1, b1 = kelvin_to_rgb(reference_temp)
+    r2, g2, b2 = kelvin_to_rgb(target_temp)
+
+    r_gain = r2 / r1
+    g_gain = g2 / g1
+    b_gain = b2 / b1
+
+    img[..., 0] *= r_gain
+    img[..., 1] *= g_gain
+    img[..., 2] *= b_gain
+
+    img = np.clip(img, 0, 1)
+    return Image.fromarray((img * 255).astype(np.uint8))
+
+
+def soft_tone_map(img):
+    import numpy as np
+
+    arr = np.array(img).astype(np.float32) / 255.0
+
+    # 🔥 contraste léger (au lieu de compression)
+    mean = arr.mean(axis=(0,1), keepdims=True)
+    arr = (arr - mean) * 1.1 + mean
+
+    return Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
+
+def soft_tone_map_unreal(img, exposure=1.0):
+    import numpy as np
+
+    arr = np.array(img).astype(np.float32) / 255.0
+
+    # 🔥 exposure
+    arr = arr * exposure
+
+    # 🔥 tone mapping type Reinhard (plus naturel)
+    mapped = arr / (1.0 + arr)
+
+    # 🔥 léger contraste local (clé !)
+    mapped = np.power(mapped, 0.9)
+
+    return Image.fromarray((np.clip(mapped, 0, 1) * 255).astype(np.uint8))
+
+
+def soft_tone_map_v1(img):
+    arr = np.array(img).astype(np.float32) / 255.0
+
+    # 🔥 compression plus douce (log-like)
+    arr = np.log1p(arr * 1.5) / np.log1p(1.5)
+
+    # 🔥 léger adoucissement des contrastes
+    arr = np.power(arr, 0.95)
+
+    return Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
+
+def soft_tone_map1(img):
+    arr = np.array(img).astype(np.float32) / 255.0
+    arr = arr / (arr + 0.2)
+    arr = np.power(arr, 0.95)
+    arr = np.clip(arr, 0, 1)
+    return Image.fromarray((arr * 255).astype(np.uint8))
+
+def apply_n3r_pro_net(latents, model=None, strength=0.3, sanitize_fn=None):
+    if model is None or strength <= 0:
+        return latents
+
+    try:
+        latents = latents.to(next(model.parameters()).dtype)
+        refined = model(latents)
+
+        # 🔥 différence (detail map)
+        detail = refined - latents
+
+        # 🔥 SMOOTH du détail (clé !!!)
+        detail = F.avg_pool2d(detail, kernel_size=3, stride=1, padding=1)
+
+        # 🔥 injection contrôlée
+        latents = latents + strength * detail
+
+        if sanitize_fn:
+            latents = sanitize_fn(latents)
+
+        return latents
+
+    except Exception as e:
+        print(f"[N3RProNet ERROR] {e}")
+        return latents
+
+
+def apply_n3r_pro_net1(latents, model=None, strength=0.3, sanitize_fn=None):
+    if model is None or strength <= 0:
+        return latents
+
+    try:
+        dtype = next(model.parameters()).dtype
+        latents = latents.to(dtype)
+
+        refined = model(latents)
+
+        # 🔥 CLAMP SAFE (évite explosion)
+        refined = torch.clamp(refined, -2.5, 2.5)
+
+        # 🔥 BLEND DOUX (beaucoup plus stable)
+        latents = (1 - strength) * latents + strength * refined
+
+        # 🔥 NORMALISATION LÉGÈRE
+        latents = latents / (latents.std(dim=[1,2,3], keepdim=True) + 1e-6)
+
+        if sanitize_fn:
+            latents = sanitize_fn(latents)
+
+        return latents
+
+    except Exception as e:
+        print(f"[N3RProNet ERROR] {e}")
+        return latents
+
+
+def apply_n3r_pro_net_v1(latents, model=None, strength=0.3, sanitize_fn=None, frame_idx=None, total_frames=None):
+    if model is None or strength <= 0:
+        return latents
+
+    try:
+        model_dtype = next(model.parameters()).dtype
+        model_device = next(model.parameters()).device
+        latents = latents.to(dtype=model_dtype, device=model_device)
+        latents = ensure_4_channels(latents)
+
+        if frame_idx is not None and total_frames is not None:
+            adaptive_strength = strength * (0.3 + 0.7 * 0.5 * (1 - math.cos(math.pi * frame_idx / total_frames)))
+        else:
+            adaptive_strength = strength
+
+        refined = model(latents)
+
+        # 🔹 Normalisation du delta pour éviter saturation
+        delta = refined - latents
+        max_delta = delta.abs().amax(dim=(1,2,3), keepdim=True).clamp(min=1e-5)
+        delta = delta / max_delta
+        latents = latents + adaptive_strength * delta
+
+        # 🔹 Clamp léger pour stabilité
+        latents = latents / latents.abs().amax(dim=(1,2,3), keepdim=True).clamp(min=1.0)
+
+        if sanitize_fn:
+            latents = sanitize_fn(latents)
+
+        return latents
+
+    except Exception as e:
+        print(f"[N3RProNet ERROR] {e}")
+        return latents
+
+
+
+def full_frame_postprocess_add( frame_pil: Image.Image, output_dir: Path, frame_counter: int, target_temp: int = 7800, reference_temp: int = 6500, temp_strength: float = 0.22, blur_radius: float = 0.03, contrast: float = 1.10, saturation: float = 1.0, sharpen_percent: int = 90, psave: bool = True, unreal: bool = False, cartoon: bool = False , glow: bool = False) -> Image.Image:
+    """
+    Returns:
+        frame_pil final traité
+    """
+    removewhite = False
+    minimal = False
+
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="01", psave=psave)
+    # 🔥 1. Température
+    frame_pil = adjust_color_temperature(
+        frame_pil,
+        target_temp=target_temp,
+        reference_temp=reference_temp,
+        strength=temp_strength
+    )
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="02", psave=psave)
+
+    # 🔥 2. Neutralisation de la dominante
+    frame_pil = neutralize_color_cast(frame_pil)
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="03", psave=psave)
+
+    # 🔥 3. Tone mapping
+    frame_pil = soft_tone_map(frame_pil)
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="04", psave=psave)
+
+    # 🔥 4. Post-traitement adaptatif
+    if minimal:
+        frame_pil = apply_post_processing_minimal(
+            frame_pil,
+            blur_radius=blur_radius,
+            contrast=contrast,
+            vibrance_base=1.0,
+            vibrance_max=1.1,
+            sharpen=True,
+            sharpen_radius=1,
+            sharpen_percent=sharpen_percent,
+            sharpen_threshold=2
+        )
+    else:
+        frame_pil = apply_post_processing_adaptive(
+            frame_pil,
+            blur_radius=0.03,
+            contrast=1.10,
+            vibrance_strength=0.25,   # 🔥 contrôle simple (0 → off, 0.3 = doux)
+            sharpen=False,
+            sharpen_radius=1,
+            sharpen_percent=90,
+            sharpen_threshold=2,
+            clamp_r=True
+        )
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="05", psave=psave)
+
+
+    # 🔥 5. clean white Style
+    if removewhite:
+        frame_pil = remove_white_noise(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="06", psave=psave)
+
+    # 🔥 6. Unreal Style
+    if unreal:
+        frame_pil = apply_post_processing_unreal_cinematic(frame_pil)
+        frame_pil = smooth_edges(frame_pil, strength=0.35, blur_radius=1.0)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="07", psave=psave)
+
+    elif cartoon:
+        # 🔥 6. Cartoon Style
+        frame_pil = apply_post_processing_sketch(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="08", psave=psave)
+
+    # 🔥 7. Glow Style
+    if glow:
+        # Glow forcé pour le style
+        frame_pil = apply_chromatic_soft_glow(frame_pil)
+        frame_pil = apply_localized_soft_glow(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
+    else:
+        # Glow intelligent
+        frame_pil = apply_intelligent_glow( frame_pil )
+        from PIL import ImageEnhance
+        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(1.04)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
+
+    return frame_pil
+
+
+
+def full_frame_postprocess(
+    frame_pil: Image.Image,
+    output_dir: Path,
+    frame_counter: int,
+    target_temp: int = 7800,
+    reference_temp: int = 6500,
+    temp_strength: float = 0.20,   # 🔥 légèrement réduit (moins bleu)
+    blur_radius: float = 0.025,    # 🔥 un peu moins de blur global
+    contrast: float = 1.08,        # 🔥 évite sur-contraste cumulé
+    sharpen_percent: int = 90,
+    psave: bool = True,
+    unreal: bool = False,
+    cartoon: bool = False
+) -> Image.Image:
+
+    # ---------------- 1️⃣ Input ----------------
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="01", psave=psave)
+
+    # ---------------- 2️⃣ Température ----------------
+    frame_pil = adjust_color_temperature(
+        frame_pil,
+        target_temp=target_temp,
+        reference_temp=reference_temp,
+        strength=temp_strength
+    )
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="02", psave=psave)
+
+    # ---------------- 3️⃣ Neutralisation (adoucie) ----------------
+    frame_pil = neutralize_color_cast(frame_pil, strength=0.6)  # 🔥 clé
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="03", psave=psave)
+
+    # ---------------- 4️⃣ Tone mapping (plus doux) ----------------
+    frame_pil = soft_tone_map(frame_pil)
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="04", psave=psave)
+
+    # ---------------- 5️⃣ Adaptive (nettoyage + micro boost) ----------------
+    frame_pil = apply_post_processing_adaptive(
+        frame_pil,
+        blur_radius=blur_radius,
+        contrast=contrast,
+        vibrance_strength=0.22,   # 🔥 légèrement réduit
+        sharpen=False,
+        clamp_r=True
+    )
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="05", psave=psave)
+
+    # ---------------- 6️⃣ Stylisation ----------------
+    if unreal:
+        frame_pil = apply_post_processing_unreal_cinematic(frame_pil)
+        frame_pil = smooth_edges(frame_pil, strength=0.30, blur_radius=0.8)  # 🔥 moins destructif
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="06", psave=psave)
+
+    elif cartoon:
+        frame_pil = apply_post_processing_sketch(frame_pil)
+        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="07", psave=psave)
+
+    # ---------------- 7️⃣ Glow intelligent (rééquilibré) ----------------
+   # strength=0.15 edge_weight=0.5 luminance_weight=0.8
+
+    frame_pil = apply_intelligent_glow_pro(
+        frame_pil,
+        strength=0.18,              # 🔥 moins agressif
+        edge_weight=0.6,            # 🔥 priorise edges
+        luminance_weight=0.8        # 🔥 glow sur zones lumineuses
+    )
+
+    # 🔥 micro contraste FINAL (après glow → très important)
+    from PIL import ImageEnhance
+    frame_pil = ImageEnhance.Contrast(frame_pil).enhance(1.04)
+
+    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
+
+    return frame_pil
