@@ -10,6 +10,72 @@ from pathlib import Path
 
 from torchvision.transforms.functional import to_pil_image
 
+def scale_eye_coords_to_latents(eye_coords, img_H, img_W, lat_H, lat_W):
+    scale_x = lat_W / img_W
+    scale_y = lat_H / img_H
+    return [(int(x * scale_x), int(y * scale_y)) for x, y in eye_coords]
+
+def get_eye_coords_safe(image_pil, H=None, W=None):
+    try:
+        coords = get_eye_coords(image_pil)
+        if coords is None:
+            print("⚠️ Aucun visage détecté")
+            return None
+        print(f"👁 Eyes detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Eye detection ERROR] {e}")
+        return None
+
+
+def get_eye_coords(image_pil):
+    """
+    Détecte les coordonnées des yeux avec MediaPipe.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+
+    Returns:
+        list[(x, y)]: centres des yeux en coordonnées image
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    mp_face_mesh = mp.solutions.face_mesh
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True
+    ) as face_mesh:
+
+        results = face_mesh.process(image)
+
+        if not results.multi_face_landmarks:
+            return None
+
+        face_landmarks = results.multi_face_landmarks[0]
+
+        # 🔹 Indices iris MediaPipe (refine_landmarks=True requis)
+        LEFT_IRIS = [474, 475, 476, 477]
+        RIGHT_IRIS = [469, 470, 471, 472]
+
+        def get_center(indices):
+            xs, ys = [], []
+            for idx in indices:
+                lm = face_landmarks.landmark[idx]
+                xs.append(lm.x * w)
+                ys.append(lm.y * h)
+            return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+        left_eye = get_center(LEFT_IRIS)
+        right_eye = get_center(RIGHT_IRIS)
+
+        return [left_eye, right_eye]
+
 def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=0.25, blur_kernel=5):
     """
     Applique un glow froid ciblé sur l'iris des yeux dans les latents [B,C,H,W].
@@ -244,7 +310,96 @@ def apply_pro_net_volumetrique(
 
     return latents_out
 
-def apply_pro_net_with_eyes_v1(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn,
+
+def apply_pro_net_with_eyes(
+    latents,
+    eye_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    detail_strength=0.35,     # intensité HDR
+    blur_kernel=5,            # plus petit = plus précis
+    iris_radius_ratio=0.06    # plus petit = cible mieux iris
+):
+    """
+    ProNet + amplification HDR des détails sur l’iris (pas glow).
+    """
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet
+    latents_prot = apply_n3r_pro_net(
+        latents,
+        model=n3r_pro_net,
+        strength=n3r_pro_strength,
+        sanitize_fn=sanitize_fn
+    )
+
+    # 🔒 sécurité dtype (évite ton erreur Half/Float)
+    latents_prot = latents_prot.to(dtype)
+
+    # 2️⃣ Si pas d’yeux → fallback
+    if not eye_coords:
+        return latents_prot
+
+    # 3️⃣ Création masque IRIS (ellipse fine)
+    iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    for x, y in eye_coords:
+        rx = int(W * iris_radius_ratio)
+        ry = int(H * iris_radius_ratio)
+
+        dist = ((X - x)**2) / (rx**2 + 1e-6) + ((Y - y)**2) / (ry**2 + 1e-6)
+        iris_mask[0, 0] += (dist <= 1).float()
+
+    iris_mask = iris_mask.clamp(0, 1)
+
+    # 4️⃣ Kernel GAUSSIEN (corrigé)
+    sigma = blur_kernel / 3
+
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device, dtype=dtype)
+    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+
+    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel_2d = kernel_2d / kernel_2d.sum()
+
+    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)
+
+    # 🔒 même dtype que latents
+    kernel = kernel.to(dtype)
+
+    # 5️⃣ Blur = base low-frequency
+    blurred = F.conv2d(
+        latents_prot,
+        kernel,
+        padding=blur_kernel // 2,
+        groups=C
+    )
+
+    # 6️⃣ Détails (high-frequency)
+    details = latents_prot - blurred
+
+    # 7️⃣ Amplification HDR
+    enhanced = latents_prot + detail_strength * details
+
+    # 8️⃣ Fusion UNIQUEMENT sur iris
+    latents_out = latents_prot * (1 - iris_mask) + enhanced * iris_mask
+
+    # 9️⃣ Clamp sécurité
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    print("👁 HDR détails appliqué sur iris")
+
+    return latents_out
+
+def apply_pro_net_with_eyes_test(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn,
                            glow_strength=0.2, blur_kernel=7, iris_radius_ratio=0.08):
     """
     Applique ProNet et un glow froid uniquement sur l’iris des yeux.
