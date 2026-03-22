@@ -237,7 +237,11 @@ def main(args):
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
             input_image = ensure_4_channels(input_image)
-            frame_counter = save_input_frame( input_image, output_dir, frame_counter, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=1.0, apply_post=False )
+            if frame_counter > 0:
+                initframe = frame_counter+transition_frames
+            else:
+                initframe = frame_counter
+            save_input_frame( input_image, output_dir, initframe, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=1.0, apply_post=False )
 
             current_latent_single = encode_images_to_latents_hybrid(input_image, vae, device=device, latent_scale=LATENT_SCALE)
             current_latent_single = torch.nn.functional.interpolate(
@@ -310,7 +314,7 @@ def main(args):
 
                         #Post Traitement
                         frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
-                        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
+                        save_frame_verbose(frame_pil, output_dir, frame_counter-1, suffix="0i", psave=True)
                         frame_counter += 1
                         pbar.update(1)
 
