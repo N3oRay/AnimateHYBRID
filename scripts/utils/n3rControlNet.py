@@ -1,4 +1,4 @@
-#n3rControlNet.py
+#n3rControlNet.py ------------------------------------------------
 #**** Ensemble des outils pour n3rControlNet
 #------------------------------------------------------------------
 
