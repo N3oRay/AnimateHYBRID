@@ -35,7 +35,6 @@ LATENT_SCALE = 0.18215
 stop_generation = False
 
 # ---------------- Thread stop ----------------
-
 def wait_for_stop():
     global stop_generation
     inp = input("Appuyez sur '²' + Entrée pour arrêter : ")
@@ -48,7 +47,6 @@ def apply_motion_safe(latents, motion_module, threshold=1e-3):
     if latents.abs().max() < threshold:
         return latents, False
     return motion_module(latents), True
-
 
 # ---------------- MAIN FIABLE ----------------
 def main(args):
@@ -205,7 +203,7 @@ def main(args):
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
     total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/ProBoostNet{timestamp}")
+    output_dir = Path(f"./outputs/RealProNet{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
 
