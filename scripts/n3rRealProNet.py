@@ -228,17 +228,12 @@ def main(args):
             try:
                 current_latent_single = generate_latents_robuste_4D(
                     latents=current_latent_single.to(device),
-                    pos_embeds=pos_embeds,
-                    neg_embeds=neg_embeds,
-                    unet=unet,
-                    scheduler=scheduler,
-                    motion_module=None,
-                    device=device,
-                    dtype=dtype,
+                    pos_embeds=pos_embeds, neg_embeds=neg_embeds,
+                    unet=unet, scheduler=scheduler,
+                    motion_module=None, device=device, dtype=dtype,
                     guidance_scale=current_guidance_scale,  #guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte
                     init_image_scale=current_init_image_scale, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
-                    creative_noise=current_creative_noise, # creative_noise: 0.08    # moins de liberté, plus de cohérence
-                    seed=seed  # 42, 1234, 2026, 5555
+                    creative_noise=current_creative_noise, seed=seed  # 42, 1234, 2026, 5555
                 )
 
                 # 🔥 FIX NaN / stabilité
