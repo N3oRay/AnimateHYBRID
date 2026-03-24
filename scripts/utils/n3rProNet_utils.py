@@ -329,8 +329,95 @@ def apply_pro_net_volumetrique(
 
     return latents_out
 
+#----- Amplification des détails des yeux
 
 def apply_pro_net_with_eyes(
+    latents,
+    eye_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    detail_strength=0.35,       # intensité HDR
+    blur_kernel=5,              # kernel pour détails
+    iris_radius_ratio=0.06,     # plus petit = cible mieux iris
+    mask_blur_kernel=3          # flou du masque pour adoucir les contours
+):
+    """
+    ProNet optimisé + amplification HDR des détails sur l’iris (pas glow)
+    avec fusion douce pour éviter halo sur les contours.
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ Appliquer ProNet standard
+    latents_prot = apply_n3r_pro_net(
+        latents,
+        model=n3r_pro_net,
+        strength=n3r_pro_strength,
+        sanitize_fn=sanitize_fn
+    ).to(dtype)
+
+    # 2️⃣ Si pas d’yeux → fallback
+    if not eye_coords:
+        return latents_prot
+
+    # 3️⃣ Création masque IRIS
+    iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    for x, y in eye_coords:
+        rx = int(W * iris_radius_ratio)
+        ry = int(H * iris_radius_ratio)
+        dist = ((X - x)**2) / (rx**2 + 1e-6) + ((Y - y)**2) / (ry**2 + 1e-6)
+        iris_mask[0, 0] += (dist <= 1).float()
+
+    iris_mask = iris_mask.clamp(0, 1)
+
+    # 4️⃣ Flouter le masque pour adoucir les contours
+    if mask_blur_kernel > 1:
+        sigma = mask_blur_kernel / 3
+        ax = torch.arange(-mask_blur_kernel // 2 + 1., mask_blur_kernel // 2 + 1., device=device, dtype=dtype)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        mask_kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        mask_kernel_2d = mask_kernel_2d / mask_kernel_2d.sum()
+        mask_kernel = mask_kernel_2d.view(1, 1, mask_blur_kernel, mask_blur_kernel)
+        iris_mask = F.conv2d(iris_mask, mask_kernel, padding=mask_blur_kernel // 2)
+        iris_mask = iris_mask.clamp(0, 1)
+
+    # 5️⃣ Blur pour récupérer les détails (high-frequency)
+    sigma = blur_kernel / 3
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device, dtype=dtype)
+    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel_2d = kernel_2d / kernel_2d.sum()
+    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1).to(dtype)
+    blurred = F.conv2d(latents_prot, kernel, padding=blur_kernel // 2, groups=C)
+    details = latents_prot - blurred
+
+    # 6️⃣ Amplification HDR adaptative selon le masque flou
+    detail_strength_map = detail_strength * iris_mask
+    enhanced = latents_prot + details * detail_strength_map
+
+    # 7️⃣ Fusion douce
+    latents_out = latents_prot * (1 - iris_mask) + enhanced * iris_mask
+
+    # 8️⃣ Clamp final pour sécurité
+    latents_out = torch.clamp(latents_out, -1.0, 1.0)
+
+    print("👁 HDR détails appliqué sur iris avec contours adoucis")
+
+    return latents_out
+
+#------------ Stable version mais un peu fort ----
+def apply_pro_net_with_eyes_boost(
     latents,
     eye_coords,
     n3r_pro_net,

@@ -382,6 +382,7 @@ def log_debug(message, level="INFO", verbose=True):
     if verbose:
         print(f"[{level}] {message}")
 # -------------------------------------------------------------------------------------------
+# Version vraiment stable
 def sanitize_latents(
     latents,
     ref_stats=None,           # (mean, std) référence EMA
