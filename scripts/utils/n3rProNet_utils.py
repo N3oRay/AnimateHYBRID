@@ -230,8 +230,91 @@ def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-
+#----------- Rendu HD ------------------------------
 def apply_pro_net_volumetrique(
+    latents,
+    coords_v,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    glow_strength=0.2,
+    blur_kernel=3,          # plus petit = détails plus nets
+    iris_radius_ratio=0.08,
+    mask_blur_kernel=1,     # très léger flou du masque
+    debug=False
+):
+    """
+    ProNet volumétrique HD + glow iris avec contours adoucis mais plus net
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    if not coords_v:
+        return apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn).to(dtype)
+
+    # 2️⃣ Masque iris
+    iris_mask = torch.zeros((B,1,H,W), device=device, dtype=dtype)
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    for x, y in coords_v:
+        rx = max(1, int(W * iris_radius_ratio))
+        ry = max(1, int(H * iris_radius_ratio))
+        dist2 = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
+        iris_mask[0,0] += (dist2 <= 1).float()
+    iris_mask = iris_mask.clamp(0,1)
+
+    # 3️⃣ Léger flou du masque seulement
+    if mask_blur_kernel > 1:
+        sigma = mask_blur_kernel / 3
+        ax = torch.arange(-mask_blur_kernel//2 + 1., mask_blur_kernel//2 + 1., device=device, dtype=dtype)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        mask_kernel = torch.exp(-(xx**2 + yy**2)/(2*sigma**2))
+        mask_kernel = mask_kernel / mask_kernel.sum()
+        mask_kernel = mask_kernel.view(1,1,mask_blur_kernel,mask_blur_kernel)
+        iris_mask = F.conv2d(iris_mask, mask_kernel, padding=mask_blur_kernel//2)
+        iris_mask = iris_mask.clamp(0,1)
+
+    # 4️⃣ Détails HD (high-frequency)
+    if blur_kernel > 1:
+        sigma = blur_kernel / 3
+        ax = torch.arange(-blur_kernel//2 + 1., blur_kernel//2 + 1., device=device, dtype=dtype)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel_2d = torch.exp(-(xx**2 + yy**2)/(2*sigma**2))
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        kernel = kernel_2d.view(1,1,blur_kernel,blur_kernel).repeat(C,1,1,1).to(dtype)
+        blurred = F.conv2d(latents_prot, kernel, padding=blur_kernel//2, groups=C)
+        high_freq = latents_prot - blurred
+    else:
+        high_freq = latents_prot - latents_prot  # pas de flou → pas de high_freq
+
+    # 5️⃣ Glow adaptatif seulement sur iris
+    latents_out = latents_prot + glow_strength * high_freq * iris_mask
+    latents_out = latents_out.clamp(-1.0,1.0)
+
+    # 6️⃣ Debug
+    if debug:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12,4))
+        plt.subplot(1,3,1); plt.imshow(latents_prot[0,0].detach().cpu(), cmap='gray'); plt.title("ProNet")
+        plt.subplot(1,3,2); plt.imshow(high_freq[0,0].detach().cpu(), cmap='gray'); plt.title("High-Freq")
+        plt.subplot(1,3,3); plt.imshow(iris_mask[0,0].detach().cpu(), cmap='Reds', alpha=0.5); plt.title("Mask Iris")
+        plt.tight_layout(); plt.show()
+        print("👁 DEBUG HD sharp appliqué")
+
+    return latents_out
+
+def apply_pro_net_volumetrique_good(
     latents,
     coords_v,
     n3r_pro_net,
