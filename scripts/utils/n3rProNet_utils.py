@@ -1642,8 +1642,68 @@ def kelvin_to_rgb(temp):
         max(0, min(255, b)) / 255.0
     )
 
+def adjust_color_temperature(
+    image,
+    target_temp=7800,
+    reference_temp=6500,
+    strength=0.5,
+    adaptive=True,
+    max_gain=2.0,
+    debug=False
+):
+    import numpy as np
 
-def adjust_color_temperature(image, target_temp=10000, reference_temp=6500, strength=0.5):
+    img = np.array(image).astype(np.float32) / 255.0
+
+    # --- 1. Gains température (comme ton code)
+    r1, g1, b1 = kelvin_to_rgb(reference_temp)
+    r2, g2, b2 = kelvin_to_rgb(target_temp)
+
+    base_gain = np.array([
+        r2 / r1,
+        g2 / g1,
+        b2 / b1
+    ])
+
+    # --- 2. Estimation rapide du WB actuel (gray-world simplifié)
+    if adaptive:
+        mean_rgb = img.reshape(-1, 3).mean(axis=0)
+        mean_rgb = np.maximum(mean_rgb, 1e-6)
+
+        # normalisation sur G
+        wb_ratio = mean_rgb / mean_rgb[1]
+
+        # mesure du déséquilibre
+        imbalance = np.std(wb_ratio)
+
+        # facteur adaptatif doux (évite overcorrection)
+        adaptive_factor = 1.0 + min(1.0, imbalance * 2.0)
+    else:
+        adaptive_factor = 1.0
+
+    # --- 3. Interpolation (ta logique conservée 💡)
+    final_gain = (1 - strength) + strength * base_gain * adaptive_factor
+
+    # --- 4. Clamp sécurité (très important en pratique)
+    final_gain = np.clip(final_gain, 1 / max_gain, max_gain)
+
+    # --- 5. Application
+    img *= final_gain
+
+    img = np.clip(img, 0, 1)
+
+    if debug:
+        print("=== DEBUG TEMP ===")
+        print(f"mean_rgb: {mean_rgb if adaptive else 'disabled'}")
+        print(f"base_gain: {base_gain}")
+        print(f"adaptive_factor: {adaptive_factor}")
+        print(f"final_gain: {final_gain}")
+        print("==================")
+
+    return Image.fromarray((img * 255).astype(np.uint8))
+
+
+def adjust_color_temperature_basic(image, target_temp=10000, reference_temp=6500, strength=0.5):
     import numpy as np
 
     img = np.array(image).astype(np.float32) / 255.0
@@ -1663,7 +1723,7 @@ def adjust_color_temperature(image, target_temp=10000, reference_temp=6500, stre
     img = np.clip(img, 0, 1)
     return Image.fromarray((img * 255).astype(np.uint8))
 
-def adjust_color_temperature_simple(image, target_temp=3500, reference_temp=8000):
+def adjust_color_temperature_simple(image, target_temp=7800, reference_temp=6500):
     import numpy as np
 
     img = np.array(image).astype(np.float32) / 255.0
