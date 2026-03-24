@@ -382,7 +382,106 @@ def log_debug(message, level="INFO", verbose=True):
     if verbose:
         print(f"[{level}] {message}")
 # -------------------------------------------------------------------------------------------
-def sanitize_latents(latents):
+# Version vraiment stable
+def sanitize_latents(
+    latents,
+    ref_stats=None,   # 🔥 référence globale stable
+    momentum=0.9,     # stabilité temporelle
+    max_val=1.2,
+    eps=1e-6,
+    debug=False
+):
+    import torch
+
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=max_val, neginf=-max_val)
+
+    mean = latents.mean()
+    std = latents.std()
+
+    # --- 1. Initialisation référence ---
+    if ref_stats is None:
+        ref_mean = mean.detach()
+        ref_std = std.detach()
+    else:
+        prev_mean, prev_std = ref_stats
+
+        # 🔥 EMA (clé)
+        ref_mean = momentum * prev_mean + (1 - momentum) * mean
+        ref_std  = momentum * prev_std  + (1 - momentum) * std
+
+    # --- 2. Normalisation vers référence stable ---
+    latents = latents - mean
+    latents = latents * (ref_std / (std + eps))
+    latents = latents + ref_mean
+
+    # --- 3. Clamp propre (hard → ton meilleur résultat)
+    latents = torch.clamp(latents, -max_val, max_val)
+
+    # --- 4. Anti saturation final
+    max_abs = latents.abs().max()
+    if max_abs > max_val:
+        latents = latents * (max_val / (max_abs + eps))
+
+    if debug:
+        print(f"[stable] mean={mean:.3f}→{ref_mean:.3f}, std={std:.3f}→{ref_std:.3f}")
+
+    #return latents, (ref_mean.detach(), ref_std.detach())
+    return latents
+
+
+# Version stable hard
+def sanitize_latents_hard(
+    latents,
+    clamp_mode="hard",     # "hard", "tanh"
+    max_val=1.2,
+    std_threshold=1.5,
+    percentile=0.995,
+    eps=1e-6,
+    debug=False
+):
+    import torch
+
+    # --- 1. Nettoyage NaN / Inf (safe)
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=max_val, neginf=-max_val)
+
+    # --- 2. Clamp intelligent (meilleur que clamp brut)
+    if clamp_mode == "hard":
+        latents = torch.clamp(latents, -max_val, max_val)
+
+    elif clamp_mode == "tanh":
+        latents = torch.tanh(latents / max_val) * max_val
+
+    else:
+        raise ValueError(f"Unknown clamp_mode: {clamp_mode}")
+
+    # --- 3. Détection explosion (robuste)
+    std = latents.std()
+
+    if std > std_threshold:
+        # normalisation robuste basée sur percentiles
+        flat = latents.flatten()
+
+        high = torch.quantile(flat, percentile)
+        low = torch.quantile(flat, 1 - percentile)
+
+        scale = max(abs(high), abs(low), eps)
+
+        latents = latents / scale
+
+        if debug:
+            print(f"[sanitize] percentile scaling applied: scale={scale:.4f}")
+
+    # --- 4. Stabilisation fine (évite drift)
+    mean = latents.mean()
+    latents = latents - mean * 0.05  # recentrage léger (pas destructif)
+
+    if debug:
+        print(f"[sanitize] std={std:.4f}, mean={mean:.4f}")
+
+    return latents
+
+# Version original:
+def sanitize_latents_v1(latents):
     latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
 
     # clamp doux (évite saturation brutale)
