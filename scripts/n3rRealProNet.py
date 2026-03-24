@@ -243,7 +243,7 @@ def main(args):
             base_control_latent = control_to_latent(base_control, vae, device, LATENT_SCALE)
             control_latent = base_control_latent + 0.01 * torch.randn_like(base_control_latent, dtype=torch.float16, device=device)
 
-
+            # coordonner masque eye et masque volumetrique
             eye_coords = get_eye_coords_safe(input_pil)
             coords_v = get_coords_safe( input_pil, H=cfg["H"], W=cfg["W"] )
             input_image = ensure_4_channels(input_image)
@@ -266,7 +266,7 @@ def main(args):
             #42	Classique, beaucoup de tests communautaires utilisent ce seed. #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
             #5555	Fidélité à l’image initiale (ton choix actuel) #2026	Léger changement dans la texture ou la posture, subtil mais prévisible
             #9876	Variation un peu plus visible, garde la structure globale
-            pos_embeds, neg_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device )
+            pos_embeds, neg_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device, debug=False)
             try:
                 current_latent_single = generate_latents_robuste_4D(
                     latents=current_latent_single.to(device),
@@ -345,7 +345,7 @@ def main(args):
                     latents_frame = current_latent_single.to(device)
 
                     # --- Interpolation des embeddings prompts ---
-                    cf_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device )
+                    cf_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device, debug=False)
 
                     # --- N3R ou mini GPU diffusion ---
                     n3r_latents = None
