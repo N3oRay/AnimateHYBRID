@@ -890,7 +890,558 @@ def detect_eyes_auto(frame_pil):
         right_eye = np.mean([(lm[i].y*h, lm[i].x*w) for i in [362, 263]], axis=0)
         return [(int(left_eye[0]), int(left_eye[1])), (int(right_eye[0]), int(right_eye[1]))]
 
+# Decode avec blending optimise :
+#
+# ---------------------------------------------------------------------------------------------
+def decode_latents_ultrasafe_blockwise_ultranatural(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_strength=0.015,
+    sharpen_edges_strength=0.02,
+    gamma_boost=1.03                  # légèrement plus de punch naturel
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
 
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # ---------------- Feather ----------------
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    # ---------------- Decode ----------------
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # ---------------- Normalisation ----------------
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    # =========================================================
+    # 🔥 SHARPEN ADAPTATIF
+    # =========================================================
+    if sharpen_mode is not None:
+
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
+            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
+            output_rgb = output_rgb + adapt_strength * torch.tanh(detail)
+
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype)
+            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype)
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
+            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # ---------------- Gamma adaptatif ----------------
+    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
+    luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
+    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))  # boost plus fort pour zones un peu ternes
+    output_rgb_gamma = output_rgb_gamma ** adapt_gamma
+    output_rgb = output_rgb_gamma * 2 - 1
+
+    # ---------------- Micro-boost couleur (zones un peu plates) ----------------
+    mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
+    color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
+    output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
+
+    # ---------------- To PIL ----------------
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+def decode_latents_ultrasafe_blockwise_natural(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_strength=0.02,
+    sharpen_edges_strength=0.02,
+    gamma_boost=1.10                  # 12% plus de punch naturel
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # ---------------- Feather ----------------
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    # ---------------- Decode ----------------
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # ---------------- Normalisation ----------------
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    # =========================================================
+    # 🔥 SHARPEN SECTION ADAPTATIVE
+    # =========================================================
+    if sharpen_mode is not None:
+
+        # ---- 1. Tanh sharpen (détails globaux adaptatifs)
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            # facteur adaptatif selon contraste local
+            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
+            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
+            output_rgb = output_rgb + adapt_strength * torch.tanh(detail)
+
+        # ---- 2. Edge sharpen adaptatif
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+
+            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype)
+            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype)
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
+            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # ---------------- Gamma adaptatif ----------------
+    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)  # [0,1]
+    output_rgb_gamma = output_rgb_gamma ** gamma_boost
+    output_rgb = output_rgb_gamma * 2 - 1
+
+    # ---------------- To PIL ----------------
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+
+def decode_latents_ultrasafe_blockwise_sharp(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_strength=0.04,
+    sharpen_edges_strength=0.05
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # ---------------- Feather ----------------
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    # ---------------- Decode ----------------
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # ---------------- Normalisation ----------------
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    # =========================================================
+    # 🔥 SHARPEN SECTION
+    # =========================================================
+
+    if sharpen_mode is not None:
+
+        # ---- 1. Tanh sharpen (détails globaux)
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            output_rgb = output_rgb + sharpen_strength * torch.tanh(detail)
+
+        # ---- Edge sharpen PRO (anti plastique)
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+
+            kernel_x = torch.tensor(
+                [[-1,0,1],[-2,0,2],[-1,0,1]],
+                device=device,
+                dtype=output_rgb.dtype
+            )
+
+            kernel_y = torch.tensor(
+                [[-1,-2,-1],[0,0,0],[1,2,1]],
+                device=device,
+                dtype=output_rgb.dtype
+            )
+
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+
+            # 🔥 NORMALISATION douce (pas globale)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+
+            # 🔥 MASQUE BEAUCOUP plus sélectif (clé)
+            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
+
+            # 🔥 DIRECTION du contraste (pas ajout brut)
+            sign = torch.sign(output_rgb)
+
+            output_rgb = output_rgb + sharpen_edges_strength * edge_mask * sign * edges * 0.5
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # ---------------- To PIL ----------------
+    # Ajouter gamma boost ici
+    gamma = 1.10
+    output_rgb_gamma = ((output_rgb + 1.0) / 2.0).clamp(0,1)
+    output_rgb_gamma = output_rgb_gamma ** gamma
+    output_rgb_gamma = output_rgb_gamma * 2.0 - 1.0
+    output_rgb = output_rgb_gamma
+
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+
+def decode_latents_ultrasafe_blockwise_plastique(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_strength=0.04,
+    sharpen_edges_strength=0.05
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # ---------------- Feather ----------------
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    # ---------------- Decode ----------------
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # ---------------- Normalisation ----------------
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    # =========================================================
+    # 🔥 SHARPEN SECTION
+    # =========================================================
+
+    if sharpen_mode is not None:
+
+        # ---- 1. Tanh sharpen (détails globaux)
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            output_rgb = output_rgb + sharpen_strength * torch.tanh(detail)
+
+        # ---- 2. Edge sharpen (version PRO stable)
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+
+            kernel_x = torch.tensor(
+                [[-1,0,1],[-2,0,2],[-1,0,1]],
+                device=device,
+                dtype=output_rgb.dtype
+            )
+
+            kernel_y = torch.tensor(
+                [[-1,-2,-1],[0,0,0],[1,2,1]],
+                device=device,
+                dtype=output_rgb.dtype
+            )
+
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+
+            # 🔥 NORMALISATION LOCALE (clé stabilité)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+
+            # 🔥 MASQUE edges (évite bruit dans zones plates)
+            edge_mask = torch.sigmoid(4.0 * (edges - 0.5))
+
+            # 🔥 Sharpen intelligent
+            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # ---------------- To PIL ----------------
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+
+def decode_latents_ultrasafe_blockwise_pro(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True
+):
+    import torch
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # 🔥 Fenêtre de blending PRO (Hann = ultra stable)
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            # 🔥 feather dynamique (corrige bord image)
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # 🔥 sécurité critique (évite artefacts)
+    weight = torch.clamp(weight, min=1e-3)
+
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+
+# Decode latents par blockwise - ultrasafe :
 def decode_latents_ultrasafe_blockwise(latents, vae,
                                        block_size=32, overlap=16,
                                        device="cuda",
