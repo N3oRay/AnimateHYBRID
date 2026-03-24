@@ -10,6 +10,83 @@ from pathlib import Path
 
 from torchvision.transforms.functional import to_pil_image
 
+
+def scale_eye_coords_to_latents(eye_coords, img_H, img_W, lat_H, lat_W):
+    """
+    Convertit coords image -> latent space
+    """
+
+    # 🔥 FIX : gérer None ou liste vide
+    if not eye_coords:
+        return None
+
+    scale_x = lat_W / img_W
+    scale_y = lat_H / img_H
+
+    return [(int(x * scale_x), int(y * scale_y)) for x, y in eye_coords]
+
+
+def get_eye_coords_safe(image_pil, H=None, W=None):
+    try:
+        coords = get_eye_coords(image_pil)
+        if coords is None:
+            print("⚠️ Aucun visage détecté")
+            return None
+        print(f"👁 Eyes detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Eye detection ERROR] {e}")
+        return None
+
+
+def get_eye_coords(image_pil):
+    """
+    Détecte les coordonnées des yeux avec MediaPipe.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+
+    Returns:
+        list[(x, y)]: centres des yeux en coordonnées image
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    mp_face_mesh = mp.solutions.face_mesh
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True
+    ) as face_mesh:
+
+        results = face_mesh.process(image)
+
+        if not results.multi_face_landmarks:
+            return None
+
+        face_landmarks = results.multi_face_landmarks[0]
+
+        # 🔹 Indices iris MediaPipe (refine_landmarks=True requis)
+        LEFT_IRIS = [474, 475, 476, 477]
+        RIGHT_IRIS = [469, 470, 471, 472]
+
+        def get_center(indices):
+            xs, ys = [], []
+            for idx in indices:
+                lm = face_landmarks.landmark[idx]
+                xs.append(lm.x * w)
+                ys.append(lm.y * h)
+            return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+        left_eye = get_center(LEFT_IRIS)
+        right_eye = get_center(RIGHT_IRIS)
+
+        return [left_eye, right_eye]
+
 def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=0.25, blur_kernel=5):
     """
     Applique un glow froid ciblé sur l'iris des yeux dans les latents [B,C,H,W].
@@ -153,8 +230,91 @@ def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-
+#----------- Rendu HD ------------------------------
 def apply_pro_net_volumetrique(
+    latents,
+    coords_v,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    glow_strength=0.2,
+    blur_kernel=3,          # plus petit = détails plus nets
+    iris_radius_ratio=0.08,
+    mask_blur_kernel=1,     # très léger flou du masque
+    debug=False
+):
+    """
+    ProNet volumétrique HD + glow iris avec contours adoucis mais plus net
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    if not coords_v:
+        return apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet
+    latents_prot = apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn).to(dtype)
+
+    # 2️⃣ Masque iris
+    iris_mask = torch.zeros((B,1,H,W), device=device, dtype=dtype)
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    for x, y in coords_v:
+        rx = max(1, int(W * iris_radius_ratio))
+        ry = max(1, int(H * iris_radius_ratio))
+        dist2 = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
+        iris_mask[0,0] += (dist2 <= 1).float()
+    iris_mask = iris_mask.clamp(0,1)
+
+    # 3️⃣ Léger flou du masque seulement
+    if mask_blur_kernel > 1:
+        sigma = mask_blur_kernel / 3
+        ax = torch.arange(-mask_blur_kernel//2 + 1., mask_blur_kernel//2 + 1., device=device, dtype=dtype)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        mask_kernel = torch.exp(-(xx**2 + yy**2)/(2*sigma**2))
+        mask_kernel = mask_kernel / mask_kernel.sum()
+        mask_kernel = mask_kernel.view(1,1,mask_blur_kernel,mask_blur_kernel)
+        iris_mask = F.conv2d(iris_mask, mask_kernel, padding=mask_blur_kernel//2)
+        iris_mask = iris_mask.clamp(0,1)
+
+    # 4️⃣ Détails HD (high-frequency)
+    if blur_kernel > 1:
+        sigma = blur_kernel / 3
+        ax = torch.arange(-blur_kernel//2 + 1., blur_kernel//2 + 1., device=device, dtype=dtype)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kernel_2d = torch.exp(-(xx**2 + yy**2)/(2*sigma**2))
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        kernel = kernel_2d.view(1,1,blur_kernel,blur_kernel).repeat(C,1,1,1).to(dtype)
+        blurred = F.conv2d(latents_prot, kernel, padding=blur_kernel//2, groups=C)
+        high_freq = latents_prot - blurred
+    else:
+        high_freq = latents_prot - latents_prot  # pas de flou → pas de high_freq
+
+    # 5️⃣ Glow adaptatif seulement sur iris
+    latents_out = latents_prot + glow_strength * high_freq * iris_mask
+    latents_out = latents_out.clamp(-1.0,1.0)
+
+    # 6️⃣ Debug
+    if debug:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12,4))
+        plt.subplot(1,3,1); plt.imshow(latents_prot[0,0].detach().cpu(), cmap='gray'); plt.title("ProNet")
+        plt.subplot(1,3,2); plt.imshow(high_freq[0,0].detach().cpu(), cmap='gray'); plt.title("High-Freq")
+        plt.subplot(1,3,3); plt.imshow(iris_mask[0,0].detach().cpu(), cmap='Reds', alpha=0.5); plt.title("Mask Iris")
+        plt.tight_layout(); plt.show()
+        print("👁 DEBUG HD sharp appliqué")
+
+    return latents_out
+
+def apply_pro_net_volumetrique_good(
     latents,
     coords_v,
     n3r_pro_net,
@@ -165,23 +325,38 @@ def apply_pro_net_volumetrique(
     iris_radius_ratio=0.08,
     debug=False
 ):
+    """
+    Applique ProNet et un effet "HDR / détail" sur les iris des yeux,
+    compatible FP16 / latents interpolés.
+
+    Args:
+        latents (torch.Tensor): [B,C,H,W] Latents à traiter.
+        coords_v (list of tuples): Coordonnées yeux [(x1,y1),(x2,y2)].
+        n3r_pro_net: modèle ProNet
+        n3r_pro_strength (float): force ProNet
+        sanitize_fn: fonction de nettoyage latents
+        glow_strength (float): intensité du glow / amplification
+        blur_kernel (int): taille du kernel pour flou
+        iris_radius_ratio (float): proportion de H/W pour rayon iris
+        debug (bool): visualisation mask + latents
+
+    Returns:
+        torch.Tensor: latents avec effet HDR sur iris uniquement
+    """
+    if not coords_v:
+        # Aucun yeux détectés → ProNet seul
+        return apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
+
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
 
-    # 1️⃣ ProNet
+    # 1️⃣ Appliquer ProNet
     latents_prot = apply_n3r_pro_net(
-        latents,
-        model=n3r_pro_net,
-        strength=n3r_pro_strength,
-        sanitize_fn=sanitize_fn
+        latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn
     )
 
-    if not coords_v:
-        return latents_prot
-
-    # 2️⃣ Mask IRIS
+    # 2️⃣ Créer masque iris
     iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
-
     Y, X = torch.meshgrid(
         torch.arange(H, device=device),
         torch.arange(W, device=device),
@@ -193,21 +368,20 @@ def apply_pro_net_volumetrique(
         ry = int(H * iris_radius_ratio)
         dist2 = ((X - x)**2)/(rx**2) + ((Y - y)**2)/(ry**2)
         iris_mask[0, 0] += (dist2 <= 1).float()
-
     iris_mask = iris_mask.clamp(0, 1)
 
-    # 3️⃣ Kernel gaussien propre
+    # 3️⃣ Kernel gaussien, même dtype que latents (FP16 ok)
     sigma = blur_kernel / 3
-    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device)
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device, dtype=dtype)
     xx, yy = torch.meshgrid(ax, ax, indexing='ij')
     kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
     kernel_2d = kernel_2d / kernel_2d.sum()
-
     kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)
 
-    # 4️⃣ Glow uniquement sur iris
+    # 4️⃣ Convolution channel-wise → amplification détails iris
     glow = F.conv2d(latents_prot * iris_mask, kernel, padding=blur_kernel // 2, groups=C)
 
+    # 5️⃣ Fusion ProNet + iris glow
     latents_out = latents_prot * (1 - iris_mask) + glow * iris_mask * glow_strength
     latents_out = latents_out.clamp(-1.0, 1.0)
 
@@ -219,32 +393,202 @@ def apply_pro_net_volumetrique(
         mask_vis = iris_mask[0, 0].detach().cpu()
 
         plt.figure(figsize=(12, 4))
-
         plt.subplot(1, 4, 1)
         plt.imshow(lat_vis, cmap='gray')
         plt.title("Latent original")
-
         plt.subplot(1, 4, 2)
         plt.imshow(prot_vis, cmap='gray')
         plt.title("ProNet")
-
         plt.subplot(1, 4, 3)
         plt.imshow(glow_vis, cmap='gray')
-        plt.title("Glow")
-
+        plt.title("HDR / Glow Iris")
         plt.subplot(1, 4, 4)
         plt.imshow(lat_vis, cmap='gray', alpha=0.7)
         plt.imshow(mask_vis, cmap='Reds', alpha=0.4)
         plt.title("Mask Iris")
-
         plt.tight_layout()
         plt.show()
-
         print("👁 DEBUG activé → vérifie position / taille iris")
 
     return latents_out
 
-def apply_pro_net_with_eyes_v1(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn,
+#----- Amplification des détails des yeux
+
+def apply_pro_net_with_eyes(
+    latents,
+    eye_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    detail_strength=0.35,       # intensité HDR
+    blur_kernel=5,              # kernel pour détails
+    iris_radius_ratio=0.06,     # plus petit = cible mieux iris
+    mask_blur_kernel=3          # flou du masque pour adoucir les contours
+):
+    """
+    ProNet optimisé + amplification HDR des détails sur l’iris (pas glow)
+    avec fusion douce pour éviter halo sur les contours.
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ Appliquer ProNet standard
+    latents_prot = apply_n3r_pro_net(
+        latents,
+        model=n3r_pro_net,
+        strength=n3r_pro_strength,
+        sanitize_fn=sanitize_fn
+    ).to(dtype)
+
+    # 2️⃣ Si pas d’yeux → fallback
+    if not eye_coords:
+        return latents_prot
+
+    # 3️⃣ Création masque IRIS
+    iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    for x, y in eye_coords:
+        rx = int(W * iris_radius_ratio)
+        ry = int(H * iris_radius_ratio)
+        dist = ((X - x)**2) / (rx**2 + 1e-6) + ((Y - y)**2) / (ry**2 + 1e-6)
+        iris_mask[0, 0] += (dist <= 1).float()
+
+    iris_mask = iris_mask.clamp(0, 1)
+
+    # 4️⃣ Flouter le masque pour adoucir les contours
+    if mask_blur_kernel > 1:
+        sigma = mask_blur_kernel / 3
+        ax = torch.arange(-mask_blur_kernel // 2 + 1., mask_blur_kernel // 2 + 1., device=device, dtype=dtype)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        mask_kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        mask_kernel_2d = mask_kernel_2d / mask_kernel_2d.sum()
+        mask_kernel = mask_kernel_2d.view(1, 1, mask_blur_kernel, mask_blur_kernel)
+        iris_mask = F.conv2d(iris_mask, mask_kernel, padding=mask_blur_kernel // 2)
+        iris_mask = iris_mask.clamp(0, 1)
+
+    # 5️⃣ Blur pour récupérer les détails (high-frequency)
+    sigma = blur_kernel / 3
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device, dtype=dtype)
+    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel_2d = kernel_2d / kernel_2d.sum()
+    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1).to(dtype)
+    blurred = F.conv2d(latents_prot, kernel, padding=blur_kernel // 2, groups=C)
+    details = latents_prot - blurred
+
+    # 6️⃣ Amplification HDR adaptative selon le masque flou
+    detail_strength_map = detail_strength * iris_mask
+    enhanced = latents_prot + details * detail_strength_map
+
+    # 7️⃣ Fusion douce
+    latents_out = latents_prot * (1 - iris_mask) + enhanced * iris_mask
+
+    # 8️⃣ Clamp final pour sécurité
+    latents_out = torch.clamp(latents_out, -1.0, 1.0)
+
+    print("👁 HDR détails appliqué sur iris avec contours adoucis")
+
+    return latents_out
+
+#------------ Stable version mais un peu fort ----
+def apply_pro_net_with_eyes_boost(
+    latents,
+    eye_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    detail_strength=0.35,     # intensité HDR
+    blur_kernel=5,            # plus petit = plus précis
+    iris_radius_ratio=0.06    # plus petit = cible mieux iris
+):
+    """
+    ProNet + amplification HDR des détails sur l’iris (pas glow).
+    """
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet
+    latents_prot = apply_n3r_pro_net(
+        latents,
+        model=n3r_pro_net,
+        strength=n3r_pro_strength,
+        sanitize_fn=sanitize_fn
+    )
+
+    # 🔒 sécurité dtype (évite ton erreur Half/Float)
+    latents_prot = latents_prot.to(dtype)
+
+    # 2️⃣ Si pas d’yeux → fallback
+    if not eye_coords:
+        return latents_prot
+
+    # 3️⃣ Création masque IRIS (ellipse fine)
+    iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    for x, y in eye_coords:
+        rx = int(W * iris_radius_ratio)
+        ry = int(H * iris_radius_ratio)
+
+        dist = ((X - x)**2) / (rx**2 + 1e-6) + ((Y - y)**2) / (ry**2 + 1e-6)
+        iris_mask[0, 0] += (dist <= 1).float()
+
+    iris_mask = iris_mask.clamp(0, 1)
+
+    # 4️⃣ Kernel GAUSSIEN (corrigé)
+    sigma = blur_kernel / 3
+
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device, dtype=dtype)
+    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+
+    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel_2d = kernel_2d / kernel_2d.sum()
+
+    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)
+
+    # 🔒 même dtype que latents
+    kernel = kernel.to(dtype)
+
+    # 5️⃣ Blur = base low-frequency
+    blurred = F.conv2d(
+        latents_prot,
+        kernel,
+        padding=blur_kernel // 2,
+        groups=C
+    )
+
+    # 6️⃣ Détails (high-frequency)
+    details = latents_prot - blurred
+
+    # 7️⃣ Amplification HDR
+    enhanced = latents_prot + detail_strength * details
+
+    # 8️⃣ Fusion UNIQUEMENT sur iris
+    latents_out = latents_prot * (1 - iris_mask) + enhanced * iris_mask
+
+    # 9️⃣ Clamp sécurité
+    latents_out = latents_out.clamp(-1.0, 1.0)
+
+    print("👁 HDR détails appliqué sur iris")
+
+    return latents_out
+
+def apply_pro_net_with_eyes_test(latents, eye_coords, n3r_pro_net, n3r_pro_strength, sanitize_fn,
                            glow_strength=0.2, blur_kernel=7, iris_radius_ratio=0.08):
     """
     Applique ProNet et un glow froid uniquement sur l’iris des yeux.
@@ -467,6 +811,7 @@ def get_coords(image):
 import torch
 import matplotlib.pyplot as plt
 
+
 def create_volumetrique_mask(latents, coords, radius_ratio=0.15, only=False, in_radius_ratio=0.08, debug=False):
     """
     Crée un masque pour les yeux ou uniquement pour l’iris.
@@ -482,7 +827,8 @@ def create_volumetrique_mask(latents, coords, radius_ratio=0.15, only=False, in_
     Returns:
         torch.Tensor: [B,1,H,W] masque float (0=hors masque, 1=masque)
     """
-    if not coords or latents.ndim != 4:
+    #if not coords or latents.ndim != 4:
+    if coords is None or len(coords) == 0 or latents.ndim != 4:
         return None
 
     B, C, H, W = latents.shape
@@ -513,7 +859,7 @@ def create_eye_mask(latents, eye_coords, eye_radius=8, falloff=4):
     """
     Soft mask gaussien → transitions naturelles
     """
-    if not eye_coords:
+    if eye_coords is None or len(eye_coords) == 0:
         return None
 
     B, C, H, W = latents.shape
@@ -544,7 +890,558 @@ def detect_eyes_auto(frame_pil):
         right_eye = np.mean([(lm[i].y*h, lm[i].x*w) for i in [362, 263]], axis=0)
         return [(int(left_eye[0]), int(left_eye[1])), (int(right_eye[0]), int(right_eye[1]))]
 
+# Decode avec blending optimise :
+#
+# ---------------------------------------------------------------------------------------------
+def decode_latents_ultrasafe_blockwise_ultranatural(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_strength=0.015,
+    sharpen_edges_strength=0.02,
+    gamma_boost=1.03                  # légèrement plus de punch naturel
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
 
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # ---------------- Feather ----------------
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    # ---------------- Decode ----------------
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # ---------------- Normalisation ----------------
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    # =========================================================
+    # 🔥 SHARPEN ADAPTATIF
+    # =========================================================
+    if sharpen_mode is not None:
+
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
+            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
+            output_rgb = output_rgb + adapt_strength * torch.tanh(detail)
+
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype)
+            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype)
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
+            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # ---------------- Gamma adaptatif ----------------
+    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
+    luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
+    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))  # boost plus fort pour zones un peu ternes
+    output_rgb_gamma = output_rgb_gamma ** adapt_gamma
+    output_rgb = output_rgb_gamma * 2 - 1
+
+    # ---------------- Micro-boost couleur (zones un peu plates) ----------------
+    mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
+    color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
+    output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
+
+    # ---------------- To PIL ----------------
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+def decode_latents_ultrasafe_blockwise_natural(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_strength=0.02,
+    sharpen_edges_strength=0.02,
+    gamma_boost=1.10                  # 12% plus de punch naturel
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # ---------------- Feather ----------------
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    # ---------------- Decode ----------------
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # ---------------- Normalisation ----------------
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    # =========================================================
+    # 🔥 SHARPEN SECTION ADAPTATIVE
+    # =========================================================
+    if sharpen_mode is not None:
+
+        # ---- 1. Tanh sharpen (détails globaux adaptatifs)
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            # facteur adaptatif selon contraste local
+            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
+            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
+            output_rgb = output_rgb + adapt_strength * torch.tanh(detail)
+
+        # ---- 2. Edge sharpen adaptatif
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+
+            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype)
+            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype)
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
+            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # ---------------- Gamma adaptatif ----------------
+    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)  # [0,1]
+    output_rgb_gamma = output_rgb_gamma ** gamma_boost
+    output_rgb = output_rgb_gamma * 2 - 1
+
+    # ---------------- To PIL ----------------
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+
+def decode_latents_ultrasafe_blockwise_sharp(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_strength=0.04,
+    sharpen_edges_strength=0.05
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # ---------------- Feather ----------------
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    # ---------------- Decode ----------------
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # ---------------- Normalisation ----------------
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    # =========================================================
+    # 🔥 SHARPEN SECTION
+    # =========================================================
+
+    if sharpen_mode is not None:
+
+        # ---- 1. Tanh sharpen (détails globaux)
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            output_rgb = output_rgb + sharpen_strength * torch.tanh(detail)
+
+        # ---- Edge sharpen PRO (anti plastique)
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+
+            kernel_x = torch.tensor(
+                [[-1,0,1],[-2,0,2],[-1,0,1]],
+                device=device,
+                dtype=output_rgb.dtype
+            )
+
+            kernel_y = torch.tensor(
+                [[-1,-2,-1],[0,0,0],[1,2,1]],
+                device=device,
+                dtype=output_rgb.dtype
+            )
+
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+
+            # 🔥 NORMALISATION douce (pas globale)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+
+            # 🔥 MASQUE BEAUCOUP plus sélectif (clé)
+            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
+
+            # 🔥 DIRECTION du contraste (pas ajout brut)
+            sign = torch.sign(output_rgb)
+
+            output_rgb = output_rgb + sharpen_edges_strength * edge_mask * sign * edges * 0.5
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # ---------------- To PIL ----------------
+    # Ajouter gamma boost ici
+    gamma = 1.10
+    output_rgb_gamma = ((output_rgb + 1.0) / 2.0).clamp(0,1)
+    output_rgb_gamma = output_rgb_gamma ** gamma
+    output_rgb_gamma = output_rgb_gamma * 2.0 - 1.0
+    output_rgb = output_rgb_gamma
+
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+
+def decode_latents_ultrasafe_blockwise_plastique(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_strength=0.04,
+    sharpen_edges_strength=0.05
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # ---------------- Feather ----------------
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    # ---------------- Decode ----------------
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # ---------------- Normalisation ----------------
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    # =========================================================
+    # 🔥 SHARPEN SECTION
+    # =========================================================
+
+    if sharpen_mode is not None:
+
+        # ---- 1. Tanh sharpen (détails globaux)
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            output_rgb = output_rgb + sharpen_strength * torch.tanh(detail)
+
+        # ---- 2. Edge sharpen (version PRO stable)
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+
+            kernel_x = torch.tensor(
+                [[-1,0,1],[-2,0,2],[-1,0,1]],
+                device=device,
+                dtype=output_rgb.dtype
+            )
+
+            kernel_y = torch.tensor(
+                [[-1,-2,-1],[0,0,0],[1,2,1]],
+                device=device,
+                dtype=output_rgb.dtype
+            )
+
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+
+            # 🔥 NORMALISATION LOCALE (clé stabilité)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+
+            # 🔥 MASQUE edges (évite bruit dans zones plates)
+            edge_mask = torch.sigmoid(4.0 * (edges - 0.5))
+
+            # 🔥 Sharpen intelligent
+            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # ---------------- To PIL ----------------
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+
+def decode_latents_ultrasafe_blockwise_pro(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True
+):
+    import torch
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # 🔥 Fenêtre de blending PRO (Hann = ultra stable)
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            # 🔥 feather dynamique (corrige bord image)
+            feather = create_feather(fh, fw)
+            feather = feather.unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+    # 🔥 sécurité critique (évite artefacts)
+    weight = torch.clamp(weight, min=1e-3)
+
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+
+# Decode latents par blockwise - ultrasafe :
 def decode_latents_ultrasafe_blockwise(latents, vae,
                                        block_size=32, overlap=16,
                                        device="cuda",
@@ -1466,8 +2363,68 @@ def kelvin_to_rgb(temp):
         max(0, min(255, b)) / 255.0
     )
 
+def adjust_color_temperature(
+    image,
+    target_temp=7800,
+    reference_temp=6500,
+    strength=0.5,
+    adaptive=True,
+    max_gain=2.0,
+    debug=False
+):
+    import numpy as np
 
-def adjust_color_temperature(image, target_temp=10000, reference_temp=6500, strength=0.5):
+    img = np.array(image).astype(np.float32) / 255.0
+
+    # --- 1. Gains température (comme ton code)
+    r1, g1, b1 = kelvin_to_rgb(reference_temp)
+    r2, g2, b2 = kelvin_to_rgb(target_temp)
+
+    base_gain = np.array([
+        r2 / r1,
+        g2 / g1,
+        b2 / b1
+    ])
+
+    # --- 2. Estimation rapide du WB actuel (gray-world simplifié)
+    if adaptive:
+        mean_rgb = img.reshape(-1, 3).mean(axis=0)
+        mean_rgb = np.maximum(mean_rgb, 1e-6)
+
+        # normalisation sur G
+        wb_ratio = mean_rgb / mean_rgb[1]
+
+        # mesure du déséquilibre
+        imbalance = np.std(wb_ratio)
+
+        # facteur adaptatif doux (évite overcorrection)
+        adaptive_factor = 1.0 + min(1.0, imbalance * 2.0)
+    else:
+        adaptive_factor = 1.0
+
+    # --- 3. Interpolation (ta logique conservée 💡)
+    final_gain = (1 - strength) + strength * base_gain * adaptive_factor
+
+    # --- 4. Clamp sécurité (très important en pratique)
+    final_gain = np.clip(final_gain, 1 / max_gain, max_gain)
+
+    # --- 5. Application
+    img *= final_gain
+
+    img = np.clip(img, 0, 1)
+
+    if debug:
+        print("=== DEBUG TEMP ===")
+        print(f"mean_rgb: {mean_rgb if adaptive else 'disabled'}")
+        print(f"base_gain: {base_gain}")
+        print(f"adaptive_factor: {adaptive_factor}")
+        print(f"final_gain: {final_gain}")
+        print("==================")
+
+    return Image.fromarray((img * 255).astype(np.uint8))
+
+
+def adjust_color_temperature_basic(image, target_temp=10000, reference_temp=6500, strength=0.5):
     import numpy as np
 
     img = np.array(image).astype(np.float32) / 255.0
@@ -1487,7 +2444,7 @@ def adjust_color_temperature(image, target_temp=10000, reference_temp=6500, stre
     img = np.clip(img, 0, 1)
     return Image.fromarray((img * 255).astype(np.uint8))
 
-def adjust_color_temperature_simple(image, target_temp=3500, reference_temp=8000):
+def adjust_color_temperature_simple(image, target_temp=7800, reference_temp=6500):
     import numpy as np
 
     img = np.array(image).astype(np.float32) / 255.0
@@ -1691,7 +2648,7 @@ def full_frame_postprocess_add( frame_pil: Image.Image, output_dir: Path, frame_
             frame_pil,
             blur_radius=0.03,
             contrast=1.10,
-            vibrance_strength=0.25,   # 🔥 contrôle simple (0 → off, 0.3 = doux)
+            vibrance_strength=0.05,   # 🔥 contrôle simple (0 → off, 0.3 = doux)
             sharpen=False,
             sharpen_radius=1,
             sharpen_percent=90,
