@@ -382,11 +382,64 @@ def log_debug(message, level="INFO", verbose=True):
     if verbose:
         print(f"[{level}] {message}")
 # -------------------------------------------------------------------------------------------
-# Version vraiment stable
 def sanitize_latents(
     latents,
+    ref_stats=None,           # (mean, std) référence EMA
+    max_val=1.2,              # clamp hard
+    eps=1e-6,
+    min_momentum=0.90,        # momentum minimum pour plus de détail
+    max_momentum=0.95,        # momentum maximum pour ultra stabilité
+    debug=False
+):
+    import torch
+
+    # --- 1. Nettoyage NaN / Inf ---
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=max_val, neginf=-max_val)
+
+    mean = latents.mean()
+    std = latents.std()
+
+    # --- 2. Ajustement dynamique du momentum ---
+    # Variance relative : plus std élevé → plus on réduit momentum pour conserver détails
+    std_factor = torch.clamp(std / 1.0, 0.0, 1.0)  # normalisation relative
+    momentum = max_momentum - (max_momentum - min_momentum) * std_factor
+
+    # --- 3. Initialisation référence ---
+    if ref_stats is None:
+        ref_mean = mean.detach()
+        ref_std = std.detach()
+    else:
+        prev_mean, prev_std = ref_stats
+        # EMA adaptatif selon momentum
+        ref_mean = momentum * prev_mean + (1 - momentum) * mean
+        ref_std  = momentum * prev_std  + (1 - momentum) * std
+
+    # --- 4. Alignement vers référence ---
+    latents = latents - mean
+    latents = latents * (ref_std / (std + eps))
+    latents = latents + ref_mean
+
+    # --- 5. Clamp hard final + anti-saturation ---
+    latents = torch.clamp(latents, -max_val, max_val)
+    max_abs = latents.abs().max()
+    if max_abs > max_val:
+        latents = latents * (max_val / (max_abs + eps))
+
+    if debug:
+        print(f"[adaptive] mean={mean:.3f}->{ref_mean:.3f}, std={std:.3f}->{ref_std:.3f}, momentum={momentum:.3f}")
+
+    #return latents, (ref_mean.detach(), ref_std.detach())
+    return latents
+#-------------------------------------------------------------------------------------------------
+# Version vraiment stable
+# 0.95 → ultra stable (vidéo cinéma)
+# 0.9 → compromis détail / stabilité
+# 0.7 → un peu plus réactif (créatif)
+
+def sanitize_latents_adaptive(
+    latents,
     ref_stats=None,   # 🔥 référence globale stable
-    momentum=0.9,     # stabilité temporelle
+    momentum=0.95,     # stabilité temporelle
     max_val=1.2,
     eps=1e-6,
     debug=False
