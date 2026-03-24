@@ -2648,7 +2648,7 @@ def full_frame_postprocess_add( frame_pil: Image.Image, output_dir: Path, frame_
             frame_pil,
             blur_radius=0.03,
             contrast=1.10,
-            vibrance_strength=0.25,   # 🔥 contrôle simple (0 → off, 0.3 = doux)
+            vibrance_strength=0.05,   # 🔥 contrôle simple (0 → off, 0.3 = doux)
             sharpen=False,
             sharpen_radius=1,
             sharpen_percent=90,
