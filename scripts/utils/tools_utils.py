@@ -289,7 +289,68 @@ def stabilize_latents_before_decode(
     return latents
 
 
-def get_interpolated_embeddings(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
+import math
+
+# linear → transition constante (basique)
+# cosine → très fluide (ton choix actuel 👍)
+# smoothstep → encore plus doux (souvent top pour vidéo)
+# ease_in → démarre lentement
+# ease_out → ralentit à la fin
+def get_interpolated_embeddings(
+    frame_idx,
+    frames_per_prompt,
+    pos_list,
+    neg_list,
+    device="cuda",
+    debug=False,
+    profile="cosine"  # "linear", "cosine", "smoothstep", "ease_in", "ease_out"
+):
+    num_prompts = len(pos_list)
+
+    if num_prompts == 0:
+        raise ValueError("pos_list ne peut pas être vide")
+
+    # index de base
+    idx = frame_idx // frames_per_prompt
+    idx = min(idx, num_prompts - 1)
+
+    idx_next = min(idx + 1, num_prompts - 1)
+
+    # progression locale dans le segment
+    t_raw = (frame_idx % frames_per_prompt) / frames_per_prompt
+
+    # profils d'interpolation
+    if profile == "linear":
+        t = t_raw
+    elif profile == "cosine":
+        t = 0.5 - 0.5 * math.cos(math.pi * t_raw)
+    elif profile == "smoothstep":
+        t = t_raw * t_raw * (3 - 2 * t_raw)
+    elif profile == "ease_in":
+        t = t_raw ** 2
+    elif profile == "ease_out":
+        t = 1 - (1 - t_raw) ** 2
+    else:
+        raise ValueError(f"Profil inconnu: {profile}")
+
+    # interpolation
+    pos = (1 - t) * pos_list[idx] + t * pos_list[idx_next]
+    neg = (1 - t) * neg_list[idx] + t * neg_list[idx_next]
+
+    if debug:
+        print("=== DEBUG INTERPOLATION ===")
+        print(f"frame_idx: {frame_idx}")
+        print(f"segment idx: {idx} → {idx_next}")
+        print(f"t_raw: {t_raw:.4f}")
+        print(f"t ({profile}): {t:.4f}")
+        print(f"frames_per_prompt: {frames_per_prompt}")
+        print(f"num_prompts: {num_prompts}")
+        print("===========================")
+
+    return pos.to(device), neg.to(device)
+
+
+def get_interpolated_embeddings_s(frame_idx, frames_per_prompt, pos_list, neg_list, device="cuda"):
     num_prompts = len(pos_list)
 
     # index de base
