@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------------------------
-# n3rProBoostNet.py - AnimateDiff stables, ProNet + HDR ultra-light ~2Go VRAM
+# n3rProBoostNet.py - AnimateDiff stables, ProNet + HDR ultra-light ~2Go VRAM - pipeline 4D
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
 #Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
 # ----------------------------------------------------------------------------------------
@@ -19,7 +19,7 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
 from scripts.utils.n3rModelUtils import generate_n3r_coords, process_n3r_latents, fuse_with_memory, inject_external, fuse_n3r_latents_adaptive_new
-from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet, get_dynamic_latent_injection, save_input_frame
+from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet, get_dynamic_latent_injection, save_input_frame, apply_motion_safe, encode_prompts_batch
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
@@ -33,7 +33,6 @@ from scripts.utils.n3rControlNet import create_canny_control, control_to_latent,
 
 LATENT_SCALE = 0.18215
 stop_generation = False
-
 # ---------------- Thread stop ----------------
 def wait_for_stop():
     global stop_generation
@@ -42,19 +41,13 @@ def wait_for_stop():
         stop_generation = True
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
-# ---------------- Utilitaires ----------------
-def apply_motion_safe(latents, motion_module, threshold=1e-3):
-    if latents.abs().max() < threshold:
-        return latents, False
-    return motion_module(latents), True
-
 # ---------------- MAIN FIABLE ----------------
 def main(args):
     global stop_generation
     cfg = load_config(args.config)
     device = args.device if torch.cuda.is_available() else "cpu"
     dtype = torch.float16
-
+    # Configurable depuis ton fichier cfg
     use_mini_gpu = cfg.get("use_mini_gpu", True)
     verbose = cfg.get("verbose", False)
     psave = cfg.get("psave", False)
@@ -80,20 +73,15 @@ def main(args):
     H, W = cfg.get("H", 512), cfg.get("W", 512)
     block_size = min(256, H//2, W//2)  # block_size auto selon résolution
     use_n3r_model = cfg.get("use_n3r_model", False)
-    # Configurable depuis ton fichier cfg
     use_n3r_pro_net = cfg.get("use_n3r_pro_net", True)
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
-
-
-    #target_temp = 8000 reference_temp = 6000  (Froid)
-    target_temp = 7800
+    target_temp = 7800 #target_temp = 8000 reference_temp = 6000  (Froid)
     reference_temp = 6500
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
     params = { 'use_mini_gpu': use_mini_gpu,  'fps': fps, 'upscale_factor': upscale_factor, 'num_fraps_per_image': num_fraps_per_image, 'steps': steps, 'guidance_scale': guidance_scale, 'guidance_scale_end': guidance_scale_end, 'init_image_scale': init_image_scale, 'init_image_scale_end': init_image_scale_end, 'creative_noise': creative_noise, 'creative_noise_end': creative_noise_end, 'latent_scale_boost': latent_scale_boost, 'final_latent_scale': final_latent_scale, 'seed': seed, 'latent_injection': latent_injection, 'transition_frames': transition_frames, 'block_size': block_size, 'use_n3r_model': use_n3r_model }
     print_generation_params(params)
-
 
     scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012,
                               beta_schedule="scaled_linear", num_train_timesteps=1000)
@@ -120,15 +108,12 @@ def main(args):
     motion_module = load_motion_module(cfg.get("motion_module"), device=device) if cfg.get("motion_module") else None
     if motion_module and verbose:
         print(f"[INFO] motion_module type: {type(motion_module)}")
-
     # ---------------- Tokenizer / Text encoder ----------------
     tokenizer = CLIPTokenizerFast.from_pretrained(os.path.join(args.pretrained_model_path,"tokenizer"))
     text_encoder = CLIPTextModel.from_pretrained(os.path.join(args.pretrained_model_path,"text_encoder")).to(device).to(dtype)
-
     # ---------------- VAE ----------------
     vae_path = cfg.get("vae_path")
     vae, vae_type, latent_channels, LATENT_SCALE = load_vae(vae_path, device=device, dtype=dtype)
-
     # ---------------- Embeddings ----------------
     embeddings = []
     prompts = cfg.get("prompt", [])
@@ -146,33 +131,11 @@ def main(args):
         projection = torch.nn.Linear(current_dim, unet_cross_attention_dim).to(device).to(dtype)
 
     # --- Pré-calcul des embeddings pour interpolation
-    pos_embeds_list = []
-    neg_embeds_list = []
-
-    # Si prompts et n_prompts sont des listes de listes ou chaînes
-    for i, prompt_item in enumerate(prompts):
-        # Texte positif
-        prompt_text = " ".join(prompt_item) if isinstance(prompt_item, list) else str(prompt_item)
-        # Texte négatif correspondant
-        neg_text_item = negative_prompts[i] if i < len(negative_prompts) else negative_prompts[0]
-        neg_text = " ".join(neg_text_item) if isinstance(neg_text_item, list) else str(neg_text_item)
-
-        text_inputs = tokenizer(prompt_text, padding="max_length", truncation=True,
-                                max_length=tokenizer.model_max_length, return_tensors="pt")
-        neg_inputs = tokenizer(neg_text, padding="max_length", truncation=True,
-                            max_length=tokenizer.model_max_length, return_tensors="pt")
-
-        with torch.no_grad():
-            pos_embeds = text_encoder(text_inputs.input_ids.to(device)).last_hidden_state
-            neg_embeds = text_encoder(neg_inputs.input_ids.to(device)).last_hidden_state
-
-        if projection is not None:
-            pos_embeds = projection(pos_embeds)
-            neg_embeds = projection(neg_embeds)
-
-        # Ajouter à la liste complète
-        pos_embeds_list.append(pos_embeds)
-        neg_embeds_list.append(neg_embeds)
+    # Appel de la fonction - encode_prompts_batch
+    pos_embeds_list, neg_embeds_list = encode_prompts_batch( prompts=prompts, negative_prompts=negative_prompts, tokenizer=tokenizer, text_encoder=text_encoder, device="cuda", projection=None)
+    # pos_embeds_list et neg_embeds_list sont des listes de tenseurs [1, seq_len, dim]
+    print(f"Pos embeds shape: {pos_embeds_list[0].shape}")
+    print(f"Neg embeds shape: {neg_embeds_list[0].shape}")
 
     # ---------------- N3RModelOptimized ----------------
     n3r_model = None
@@ -198,7 +161,6 @@ def main(args):
         n3r_pro_net.eval()
         print("✅ N3RProNet activé")
 
-
     # ---------------- Input images ----------------
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
     total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
@@ -206,7 +168,6 @@ def main(args):
     output_dir = Path(f"./outputs/RealProNet{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
-
     overlap = compute_overlap(cfg["W"], cfg["H"], block_size)
 
     previous_latent_single = None
@@ -263,9 +224,6 @@ def main(args):
             # 🔥 FIX NaN / stabilité
             current_latent_single = sanitize_latents(current_latent_single)
             # Génération initiale robuste :
-            #42	Classique, beaucoup de tests communautaires utilisent ce seed. #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
-            #5555	Fidélité à l’image initiale (ton choix actuel) #2026	Léger changement dans la texture ou la posture, subtil mais prévisible
-            #9876	Variation un peu plus visible, garde la structure globale
             pos_embeds, neg_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device, debug=False)
             try:
                 current_latent_single = generate_latents_robuste_4D(
@@ -360,7 +318,6 @@ def main(args):
                     control_weight_map = 0.05 + 0.25 * volume_mask**1.5
                     control_latent = base_control_latent + 0.005 * torch.randn_like(base_control_latent)
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
-
                     control_latent = sanitize_latents(control_latent) # Ne pas oublier !
 
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
@@ -379,8 +336,7 @@ def main(args):
                             latents = fuse_n3r_latents_adaptive_new(latents, fused_latents, frame_counter=frame_counter, total_frames=total_frames, latent_injection_start=0.90, latent_injection_end=0.55)
                             latents = sanitize_latents(latents)
 
-                            # ControlNet injection (PARTOUT)
-                            # Avant d’appliquer ControlNet
+                            # ControlNet injection - Avant d’appliquer ControlNet
                             control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
                             print(f"[DEBUG] latents: {latents.shape}, control_latent: {control_latent.shape}, control_weight_map: {control_weight_map.shape}")
                             latents = latents + control_strength * control_weight_map * control_latent
