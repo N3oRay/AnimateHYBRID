@@ -14,6 +14,72 @@ import json
 import torch
 from pathlib import Path
 
+
+# ---------------- Utilitaires prompt ----------------
+def encode_prompts_batch(prompts, negative_prompts, tokenizer, text_encoder,
+                         device="cuda", projection=None):
+    """
+    Encode une liste de prompts positifs et négatifs en embeddings utilisables pour la génération.
+
+    Args:
+        prompts (list[str] or list[list[str]]): prompts positifs
+        negative_prompts (list[str] or list[list[str]]): prompts négatifs
+        tokenizer: tokenizer du modèle textuel
+        text_encoder: modèle textuel pour embeddings
+        device (str): "cuda" ou "cpu"
+        projection (callable, optional): fonction pour transformer les embeddings (ex: LoRA)
+
+    Returns:
+        pos_embeds_list, neg_embeds_list : listes de torch.Tensor [B, seq_len, dim]
+    """
+    pos_embeds_list = []
+    neg_embeds_list = []
+
+    for i, prompt_item in enumerate(prompts):
+        # Texte positif
+        prompt_text = " ".join(prompt_item) if isinstance(prompt_item, list) else str(prompt_item)
+        # Texte négatif correspondant (fallback au premier si trop court)
+        neg_text_item = negative_prompts[i] if i < len(negative_prompts) else negative_prompts[0]
+        neg_text = " ".join(neg_text_item) if isinstance(neg_text_item, list) else str(neg_text_item)
+
+        # Tokenize
+        text_inputs = tokenizer(
+            prompt_text,
+            padding="max_length",
+            truncation=True,
+            max_length=tokenizer.model_max_length,
+            return_tensors="pt"
+        )
+        neg_inputs = tokenizer(
+            neg_text,
+            padding="max_length",
+            truncation=True,
+            max_length=tokenizer.model_max_length,
+            return_tensors="pt"
+        )
+
+        # Encoder
+        with torch.no_grad():
+            pos_embeds = text_encoder(text_inputs.input_ids.to(device)).last_hidden_state
+            neg_embeds = text_encoder(neg_inputs.input_ids.to(device)).last_hidden_state
+
+        # Appliquer projection si fourni
+        if projection is not None:
+            pos_embeds = projection(pos_embeds)
+            neg_embeds = projection(neg_embeds)
+
+        # Ajouter à la liste
+        pos_embeds_list.append(pos_embeds)
+        neg_embeds_list.append(neg_embeds)
+
+    return pos_embeds_list, neg_embeds_list
+
+# ---------------- Utilitaires motion ----------------
+def apply_motion_safe(latents, motion_module, threshold=1e-3):
+    if latents.abs().max() < threshold:
+        return latents, False
+    return motion_module(latents), True
+
 def save_input_frame(input_image, output_dir, frame_counter, pbar=None,
                      blur_radius=0.0, contrast=1.0, saturation=1.0, apply_post=False):
     try:

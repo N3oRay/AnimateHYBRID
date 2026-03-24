@@ -4499,13 +4499,162 @@ def generate_latents_robuste(latents, pos_embeds, neg_embeds, unet, scheduler,
     latents = latents.reshape(B, T, C, H, W).permute(0,2,1,3,4).contiguous()
     return latents
 
-
-
 #-------------------------------------------------------------------------------
-# VERY STABLE - Parfait pour l'init de la video'
+# VERY STABLE - Parfait pour l'init de la video' - Version la plus adapter
 #-------------------------------------------------------------------------------
-
 def generate_latents_robuste_4D(
+        latents,
+        unet,
+        scheduler,
+        pos_embeds=None,
+        neg_embeds=None,
+        motion_module=None,
+        device='cuda',
+        dtype=torch.float16,
+        guidance_scale=1.0,
+        init_image_scale=0.85,
+        creative_noise=0.0,
+        steps=8,
+        seed=None,
+        gamma_boost=1.08,           # renforce couleurs ~10%
+        detail_strength=0.03,        # amplification douce des détails
+        adaptive_noise_strength=0.005 # bruit créatif local sur zones plates
+    ):
+    """
+    Génération initiale de latents ultra-safe 4D pour AnimateDiff.
+    Clamp, correction NaN/Inf et boost adaptatif de détails et couleurs.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    latents = latents.to(device=device, dtype=dtype)
+
+    # Échelle initiale
+    if init_image_scale != 1.0:
+        latents = latents * init_image_scale
+
+    for t in range(steps):
+        with torch.no_grad():
+            # ----- Dummy UNet step -----
+            noise = torch.randn_like(latents) * 0.01
+            latents = latents + noise
+
+            # ----- Motion module si présent -----
+            if motion_module is not None:
+                latents, _ = motion_module(latents)
+
+            # ----- Clamp strict et correction NaN/Inf -----
+            latents = torch.clamp(latents, -1.0, 1.0)
+            latents[torch.isnan(latents)] = 0.0
+            latents[torch.isinf(latents)] = 0.0
+
+            # ----- Amplification douce des détails -----
+            mean = latents.mean(dim=[2,3], keepdim=True)
+            detail = latents - mean
+            latents = latents + detail_strength * torch.tanh(detail)
+
+            # ----- Bruit créatif adaptatif local -----
+            if adaptive_noise_strength > 0:
+                low_contrast_mask = (latents.std(dim=[2,3], keepdim=True) < 0.1).float()
+                latents = latents + low_contrast_mask * torch.randn_like(latents) * adaptive_noise_strength
+
+            # ----- Bruit créatif global -----
+            if creative_noise > 0.0:
+                latents += torch.randn_like(latents) * creative_noise
+
+    # ----- Gamma adaptatif pour les couleurs -----
+    latents_norm = ((latents + 1.0) / 2.0).clamp(0,1)
+    latents_norm = latents_norm ** gamma_boost
+    latents = latents_norm * 2 - 1
+
+    # ----- Assurer 4D -----
+    if latents.ndim != 4:
+        B, C, H, W = latents.shape[0], 4, latents.shape[-2], latents.shape[-1]
+        latents = latents[:, :C, :, :] if latents.shape[1] >= 4 else F.pad(latents, (0,0,0,0,0,4-latents.shape[1]))
+
+    return latents
+
+def generate_latents_robuste_4D_net(
+    latents,
+    unet,
+    scheduler,
+    pos_embeds=None,
+    neg_embeds=None,
+    motion_module=None,
+    device='cuda',
+    dtype=torch.float16,
+    guidance_scale=1.0,
+    init_image_scale=0.85,
+    creative_noise=0.0,
+    steps=8,
+    seed=None,
+    clamp_percentile=99.5,
+    smoothing_factor=0.05
+):
+    """
+    Génération initiale de latents ultra-safe 4D pour AnimateDiff.
+    - Clamp adaptatif par percentile
+    - Correction NaN / Inf intelligente
+    - Bruit créatif progressif
+    - Motion module sécurisé
+    - Option smoothing léger pour stabiliser latents
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    latents = latents.to(device=device, dtype=dtype)
+    if init_image_scale != 1.0:
+        latents = latents * init_image_scale
+
+    for t in range(steps):
+        with torch.no_grad():
+            # === Bruit UNet (placeholder) ===
+            noise = torch.randn_like(latents) * 0.01
+            latents = latents + noise
+
+            # === Motion module ===
+            if motion_module is not None:
+                latents, _ = motion_module(latents)
+
+            # === Correction NaN / Inf ===
+            mask_invalid = torch.isnan(latents) | torch.isinf(latents)
+            if mask_invalid.any():
+                latents[mask_invalid] = latents[~mask_invalid].mean()
+
+            # === Clamp adaptatif ===
+            upper = torch.quantile(latents, clamp_percentile / 100.0)
+            lower = torch.quantile(latents, 1 - clamp_percentile / 100.0)
+            latents = latents.clamp(min=lower.item(), max=upper.item())
+
+            # === Bruit créatif progressif ===
+            if creative_noise > 0.0:
+                progressive_noise = creative_noise * (1.0 - t / steps)
+                latents += torch.randn_like(latents) * progressive_noise
+
+            # === Smoothing léger pour stabilité ===
+            if smoothing_factor > 0.0 and t > 0:
+                latents = (1 - smoothing_factor) * latents + smoothing_factor * latents_prev
+
+            latents_prev = latents.clone()
+
+    # === Assurer 4D correct ===
+    if latents.ndim != 4:
+        B, H, W = latents.shape[0], latents.shape[-2], latents.shape[-1]
+        C = min(4, latents.shape[1])
+        latents = latents[:, :C, :, :] if latents.shape[1] >= 4 else F.pad(latents, (0,0,0,0,0,4-latents.shape[1]))
+
+    return latents
+            # Génération initiale robuste :
+            #42	Classique, beaucoup de tests communautaires utilisent ce seed. #1234	Fidèle, stable, souvent utilisé pour des tests de cohérence.
+            #5555	Fidélité à l’image initiale (ton choix actuel) #2026	Léger changement dans la texture ou la posture, subtil mais prévisible
+            #9876	Variation un peu plus visible, garde la structure globale
+def generate_latents_robuste_4D_v1(
         latents,
         unet,
         scheduler,
