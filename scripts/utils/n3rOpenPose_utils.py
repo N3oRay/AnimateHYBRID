@@ -7,6 +7,32 @@ import math
 import torch.nn.functional as F
 
 
+def match_latent_size(latents_main, *tensors):
+    """
+    Interpole tous les tensors pour correspondre à la taille HxW de latents_main.
+    """
+    matched = []
+    for t in tensors:
+        if t.shape[2:] != latents_main.shape[2:]:
+            t = F.interpolate(t, size=latents_main.shape[2:], mode='bilinear', align_corners=False)
+        matched.append(t)
+    return matched if len(matched) > 1 else matched[0]
+
+
+def match_latent_size_v1(latents_main, latents_mini):
+    """
+    Assure que latents_mini a la même taille HxW que latents_main.
+    """
+    if latents_mini.shape[2:] != latents_main.shape[2:]:
+        latents_mini = F.interpolate(
+            latents_mini,
+            size=latents_main.shape[2:],  # H, W
+            mode='bilinear',
+            align_corners=False
+        )
+    return latents_mini
+
+
 def apply_controlnet_openpose_step(
     latents,
     t,
