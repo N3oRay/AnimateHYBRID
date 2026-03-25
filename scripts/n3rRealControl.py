@@ -33,7 +33,7 @@ from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 # OpenPose :
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -357,6 +357,10 @@ def main(args):
                             init_image_scale=current_init_image_scale, creative_noise=current_creative_noise
                         )
                         mini_weight = (1 - frame_counter / total_frames) * (1 - latent_injection)
+                        # S'assurer que les dimensions correspondent
+                        mini_latents = match_latent_size(latents, mini_latents)
+
+                        # Fusion pondérée
                         latents = (1 - mini_weight) * latents + mini_weight * mini_latents
                         latents = sanitize_latents(latents)
 
