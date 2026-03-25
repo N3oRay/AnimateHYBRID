@@ -7,6 +7,48 @@ import math
 import torch.nn.functional as F
 
 
+import torch
+
+def process_latents_streamed(control_latent, mini_latents=None, mini_weight=0.5, device="cuda"):
+    """
+    Fusionne ControlNet / mini-latents frame par frame, patch par patch
+    pour réduire l'empreinte VRAM.
+    """
+    # On garde tout en float16 tant que possible
+    control_latent = control_latent.to(device=device, dtype=torch.float16)
+
+    if mini_latents is not None:
+        mini_latents = mini_latents.to(device=device, dtype=torch.float16)
+
+    # Initialisation finale du tensor latents en float16
+    latents = control_latent.clone()
+
+    # Si mini_latents existe, on fait un mix patch par patch
+    if mini_latents is not None:
+        B, C, H, W = latents.shape
+        patch_size = 16  # petit patch pour limiter la VRAM
+        for y in range(0, H, patch_size):
+            y1 = min(y + patch_size, H)
+            for x in range(0, W, patch_size):
+                x1 = min(x + patch_size, W)
+
+                # Sélection patch
+                patch_main = latents[:, :, y:y1, x:x1]
+                patch_mini = mini_latents[:, :, y:y1, x:x1]
+
+                # Mix float16 → float16 pour VRAM
+                patch_main = (1 - mini_weight) * patch_main + mini_weight * patch_mini
+
+                # Écriture patch back
+                latents[:, :, y:y1, x:x1] = patch_main
+
+                # Nettoyage immédiat pour libérer VRAM
+                del patch_main, patch_mini
+                torch.cuda.empty_cache()
+
+    return latents
+
+
 def match_latent_size(latents_main, *tensors):
     """
     Interpole tous les tensors pour correspondre à la taille HxW de latents_main.

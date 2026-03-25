@@ -11,6 +11,7 @@ from pathlib import Path
 from torchvision.transforms.functional import to_pil_image
 
 
+
 def scale_eye_coords_to_latents(eye_coords, img_H, img_W, lat_H, lat_W):
     """
     Convertit coords image -> latent space
@@ -893,7 +894,353 @@ def detect_eyes_auto(frame_pil):
 # Decode avec blending optimise :
 #
 # ---------------------------------------------------------------------------------------------
+def decode_latents_ultrasafe_blockwise_ultranatural_opti(latents, vae,
+                                                    block_size=32, overlap=16,
+                                                    device="cuda",
+                                                    frame_counter=0,
+                                                    use_hann=True,
+                                                    sharpen_mode="both",
+                                                    sharpen_strength=0.015,
+                                                    sharpen_edges_strength=0.02,
+                                                    gamma_boost=1.03):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
+
+    # 🔹 VAE en float16 sur device
+    vae = vae.to(device=device, dtype=torch.float16)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float16)
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device, dtype=torch.float16)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device, dtype=torch.float16)
+            wx = torch.hann_window(w, device=device, dtype=torch.float16)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device, dtype=torch.float16)
+            x = torch.linspace(0, 1, w, device=device, dtype=torch.float16)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    for y in y_positions:
+        for x in x_positions:
+            y1, x1 = min(y + block_size, H), min(x + block_size, W)
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample  # reste float16
+            fh, fw = decoded.shape[2], decoded.shape[3]
+
+            feather = create_feather(fh, fw).unsqueeze(0).unsqueeze(0)
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+            # 🔹 Libération patch décodé pour VRAM
+            del patch, decoded, feather
+            torch.cuda.empty_cache()
+
+    # 🔹 Normalisation
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+    del weight
+    torch.cuda.empty_cache()
+
+    # 🔹 Sharpen adaptatif
+    if sharpen_mode is not None:
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
+            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
+            output_rgb = output_rgb + adapt_strength * torch.tanh(detail)
+
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype).view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype).view(1,1,3,3).repeat(C,1,1,1)
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
+            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # 🔹 Gamma adaptatif
+    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
+    luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
+    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))
+    output_rgb_gamma = output_rgb_gamma ** adapt_gamma
+    output_rgb = output_rgb_gamma * 2 - 1
+    del output_rgb_gamma
+    torch.cuda.empty_cache()
+
+    # 🔹 Micro-boost couleur
+    mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
+    color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
+    output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
+
+    # 🔹 Conversion en PIL
+    frames = [to_pil_image((output_rgb[i]+1)/2) for i in range(B)]
+    return frames[0] if B==1 else frames
+
+
 def decode_latents_ultrasafe_blockwise_ultranatural(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_strength=0.015,
+    sharpen_edges_strength=0.02,
+    gamma_boost=1.03                  # légèrement plus de punch naturel
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
+
+    vae.eval()  # pas besoin de caster tout le VAE
+    B, C, H, W = latents.shape
+
+    # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
+    latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device, dtype=torch.float32)
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # ---------------- Feather ----------------
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device, dtype=torch.float32)
+            wx = torch.hann_window(w, device=device, dtype=torch.float32)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device, dtype=torch.float32)
+            x = torch.linspace(0, 1, w, device=device, dtype=torch.float32)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    # ---------------- Decode patch par patch ----------------
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            with torch.no_grad():
+                # ⚡ Convertir temporairement patch en float32 pour compatibilité VAE
+                decoded = vae.decode(patch.to(torch.float32)).sample
+                decoded = decoded.to(torch.float32)
+
+            fh, fw = decoded.shape[2], decoded.shape[3]
+            feather = create_feather(fh, fw).unsqueeze(0).unsqueeze(0)
+
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
+            weight[:, :, iy0:iy1, ix0:ix1] += feather
+
+            # ⚡ Libération VRAM patch
+            del patch, decoded, feather
+            torch.cuda.empty_cache()
+
+    # ---------------- Normalisation ----------------
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+
+    # ---------------- Sharp adaptatif ----------------
+    if sharpen_mode is not None:
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
+            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
+            output_rgb = output_rgb + adapt_strength * torch.tanh(detail)
+
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype)
+            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype)
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
+            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # ---------------- Gamma adaptatif ----------------
+    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
+    luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
+    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))
+    output_rgb_gamma = output_rgb_gamma ** adapt_gamma
+    output_rgb = output_rgb_gamma * 2 - 1
+
+    # ---------------- Micro-boost couleur ----------------
+    mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
+    color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
+    output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
+
+    # ---------------- Conversion PIL ----------------
+    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    return frames[0] if B == 1 else frames
+
+def decode_latents_ultrasafe_blockwise_ultranatural_optimized(
+    latents, vae,
+    block_size=32, overlap=16,
+    device="cuda",
+    frame_counter=0,
+    latent_scale_boost=1.0,
+    use_hann=True,
+    sharpen_mode="both",
+    sharpen_strength=0.015,
+    sharpen_edges_strength=0.02,
+    gamma_boost=1.03
+):
+    import torch
+    import torch.nn.functional as F
+    from torchvision.transforms.functional import to_pil_image
+
+    vae = vae.to(device=device, dtype=torch.float32)
+    vae.eval()
+
+    B, C, H, W = latents.shape
+    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
+
+    out_H, out_W = H * 8, W * 8
+    # accumulation directement sur CPU
+    output_rgb = torch.zeros(B, 3, out_H, out_W, dtype=torch.float32, device="cpu")
+    weight = torch.zeros_like(output_rgb)
+
+    stride = block_size - overlap
+    y_positions = list(range(0, H, stride))
+    x_positions = list(range(0, W, stride))
+
+    # Feather patch
+    def create_feather(h, w):
+        if use_hann:
+            wy = torch.hann_window(h, device=device)
+            wx = torch.hann_window(w, device=device)
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+        else:
+            y = torch.linspace(0, 1, h, device=device)
+            x = torch.linspace(0, 1, w, device=device)
+            wy = 1 - torch.abs(y - 0.5) * 2
+            wx = 1 - torch.abs(x - 0.5) * 2
+            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
+
+    for y in y_positions:
+        for x in x_positions:
+            y1 = min(y + block_size, H)
+            x1 = min(x + block_size, W)
+
+            patch = latents[:, :, y:y1, x:x1]
+            patch = torch.nan_to_num(patch, nan=0.0)
+
+            # Decode sur GPU
+            with torch.no_grad():
+                decoded = vae.decode(patch).sample.to(torch.float32)
+
+            # feather
+            fh, fw = decoded.shape[2], decoded.shape[3]
+            feather = create_feather(fh, fw).unsqueeze(0).unsqueeze(0)
+
+            # Move decoded sur CPU immédiatement
+            decoded_cpu = (decoded * feather).to("cpu")
+            iy0, ix0 = y*8, x*8
+            iy1, ix1 = iy0 + fh, ix0 + fw
+            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded_cpu
+            weight[:, :, iy0:iy1, ix0:ix1] += feather.to("cpu")
+
+            # Libération VRAM
+            del patch, decoded, feather, decoded_cpu
+            torch.cuda.empty_cache()
+
+    # Normalisation
+    weight = torch.clamp(weight, min=1e-3)
+    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+    del weight
+    torch.cuda.empty_cache()
+
+    # 🔥 Sharpen adaptatif (CPU)
+    if sharpen_mode is not None:
+        output_rgb = output_rgb.clone()  # pour sécurité
+
+        if sharpen_mode in ["tanh", "both"]:
+            mean = output_rgb.mean(dim=[2,3], keepdim=True)
+            detail = output_rgb - mean
+            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
+            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
+            output_rgb += adapt_strength * torch.tanh(detail)
+
+        if sharpen_mode in ["edges", "both"]:
+            B, C, H, W = output_rgb.shape
+            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32)
+            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32)
+            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
+            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
+            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
+            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
+            output_rgb += sharpen_edges_strength * edges * edge_mask
+
+        output_rgb = output_rgb.clamp(-1.0, 1.0)
+
+    # Gamma adaptatif (CPU)
+    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
+    luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
+    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))
+    output_rgb_gamma = output_rgb_gamma ** adapt_gamma
+    output_rgb = output_rgb_gamma * 2 - 1
+    del output_rgb_gamma, luminance, adapt_gamma
+
+    # Micro-boost couleur
+    mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
+    color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
+    output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
+    del mean_c, color_boost
+
+    # Conversion PIL frame par frame
+    frames = [to_pil_image((output_rgb[i]+1)/2) for i in range(B)]
+    del output_rgb
+    torch.cuda.empty_cache()
+    return frames[0] if B==1 else frames
+
+def decode_latents_ultrasafe_blockwise_ultranatural_stable(
     latents, vae,
     block_size=32, overlap=16,
     device="cuda",
@@ -916,7 +1263,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
 
     out_H, out_W = H * 8, W * 8
-    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
+    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device, dtype=torch.float32)
     weight = torch.zeros_like(output_rgb)
 
     stride = block_size - overlap
@@ -959,15 +1306,20 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
             output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
             weight[:, :, iy0:iy1, ix0:ix1] += feather
 
+            # ⚡ Libération VRAM patch
+            del patch, decoded, feather
+            torch.cuda.empty_cache()
+
     # ---------------- Normalisation ----------------
     weight = torch.clamp(weight, min=1e-3)
     output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
+    del weight
+    torch.cuda.empty_cache()
 
     # =========================================================
     # 🔥 SHARPEN ADAPTATIF
     # =========================================================
     if sharpen_mode is not None:
-
         if sharpen_mode in ["tanh", "both"]:
             mean = output_rgb.mean(dim=[2,3], keepdim=True)
             detail = output_rgb - mean
@@ -994,18 +1346,25 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     # ---------------- Gamma adaptatif ----------------
     output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
     luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
-    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))  # boost plus fort pour zones un peu ternes
+    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))
     output_rgb_gamma = output_rgb_gamma ** adapt_gamma
     output_rgb = output_rgb_gamma * 2 - 1
+    del output_rgb_gamma, luminance, adapt_gamma
+    torch.cuda.empty_cache()
 
-    # ---------------- Micro-boost couleur (zones un peu plates) ----------------
+    # ---------------- Micro-boost couleur ----------------
     mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
     color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
     output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
+    del mean_c, color_boost
+    torch.cuda.empty_cache()
 
     # ---------------- To PIL ----------------
     frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+    del output_rgb
+    torch.cuda.empty_cache()
     return frames[0] if B == 1 else frames
+
 
 def decode_latents_ultrasafe_blockwise_natural(
     latents, vae,
