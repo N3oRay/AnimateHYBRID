@@ -49,8 +49,7 @@ def main(args):
     dtype = torch.float16
     # Configurable depuis ton fichier cfg
     use_mini_gpu = cfg.get("use_mini_gpu", True)
-    verbose = cfg.get("verbose", False)
-    psave = cfg.get("psave", False)
+    verbose, psave = cfg.get("verbose", False), cfg.get("psave", False)
     latent_injection = float(cfg.get("latent_injection", 0.75))
     latent_injection = min(max(latent_injection, 0.5), 0.9)  # plage sûre
     final_latent_scale = cfg.get("final_latent_scale", 1/8) # 1/8 speed, 1/4 moyen, 1/2 low
@@ -75,8 +74,8 @@ def main(args):
     use_n3r_model = cfg.get("use_n3r_model", False)
     use_n3r_pro_net = cfg.get("use_n3r_pro_net", True)
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
-    target_temp = 7800 #target_temp = 8000 reference_temp = 6000  (Froid)
-    reference_temp = 6500
+    #target_temp = 8000 reference_temp = 6000  (Froid)
+    target_temp, reference_temp = 7800, 6500
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
@@ -228,8 +227,7 @@ def main(args):
             try:
                 current_latent_single = generate_latents_robuste_4D(
                     latents=current_latent_single.to(device),
-                    pos_embeds=pos_embeds, neg_embeds=neg_embeds,
-                    unet=unet, scheduler=scheduler,
+                    pos_embeds=pos_embeds, neg_embeds=neg_embeds, unet=unet, scheduler=scheduler,
                     motion_module=None, device=device, dtype=dtype,
                     guidance_scale=current_guidance_scale,  #guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte
                     init_image_scale=current_init_image_scale, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
@@ -314,7 +312,6 @@ def main(args):
                     control_latent = base_control_latent + 0.005 * torch.randn_like(base_control_latent)
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
                     control_latent = sanitize_latents(control_latent) # Ne pas oublier !
-
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
                     use_n3r_this_frame = use_n3r_model and (frame_counter % random.choice([4,5,6]) == 0)
                     # ControlNet
@@ -352,8 +349,7 @@ def main(args):
                             debug=verbose, init_image_scale=current_init_image_scale,
                             creative_noise=current_creative_noise
                         )
-                        # ControlNet injection (PARTOUT)
-                        # Avant d’appliquer ControlNet
+                        # ControlNet injection :
                         control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
                         print(f"[DEBUG] latents: {latents.shape}, control_latent: {control_latent.shape}, control_weight_map: {control_weight_map.shape}")
                         latents = latents + control_strength * control_weight_map * control_latent
@@ -365,7 +361,6 @@ def main(args):
                             latents = latent_injection*latents_frame + (1-latent_injection)*latents
 
                     # --- Motion module propre et safe ---
-                    # Motion safe
                     if motion_module is not None:
                         latents_seq = latents.unsqueeze(2).repeat(1,1,3,1,1) if previous_latent_single is None else torch.stack([previous_latent_single.to(device), latents, latents+0.01*torch.randn_like(latents)], dim=2)
                         latents_seq = sanitize_latents(latents_seq)
@@ -390,7 +385,6 @@ def main(args):
                     previous_latent_single = latents.detach().cpu()
                     frame_counter += 1
                     pbar.update(1)
-
                     # Nettoyage VRAM
                     del latents, latents_frame, cf_embeds, n3r_latents
                     torch.cuda.empty_cache()
