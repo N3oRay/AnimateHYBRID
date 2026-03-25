@@ -9,6 +9,31 @@ import torch.nn.functional as F
 
 import torch
 
+
+# ---------------- Control -> Latent sécurisé ----------------
+def control_to_latent_safe(control_tensor, vae, device='cuda', LATENT_SCALE=1.0):
+    # Si 1 canal, dupliquer pour obtenir 3 canaux
+    if control_tensor.shape[1] == 1:
+        control_tensor = control_tensor.repeat(1, 3, 1, 1)
+
+    # Convertir dtype et device
+    control_tensor = control_tensor.to(device=device, dtype=vae.dtype)
+
+    # Normalisation [0,1] -> [-1,1]
+    control_tensor = (control_tensor - control_tensor.min()) / (control_tensor.max() - control_tensor.min())
+    control_tensor = control_tensor * 2 - 1
+
+    # Encode VAE
+    with torch.no_grad():
+        latent = vae.encode(control_tensor).latent_dist.sample()
+
+    # Appliquer LATENT_SCALE après
+    latent = latent * LATENT_SCALE
+
+    print(f"[Control->Latent] Latent shape: {latent.shape}, min: {latent.min():.4f}, max: {latent.max():.4f}, dtype: {latent.dtype}")
+
+    return latent
+
 def process_latents_streamed(control_latent, mini_latents=None, mini_weight=0.5, device="cuda"):
     """
     Fusionne ControlNet / mini-latents frame par frame, patch par patch
