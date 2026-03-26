@@ -5,34 +5,97 @@ import torch
 from diffusers import ControlNetModel
 import math
 import torch.nn.functional as F
+from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 
+def build_control_latent_debug(input_pil, vae, device="cuda", latent_scale=0.18215):
+    import torch
 
-import torch
+    print("\n================ CONTROL LATENT DEBUG ================")
 
+    # 1. Canny
+    control = create_canny_control(input_pil)
+
+    print("[STEP 1] RAW CONTROL")
+    print(" shape:", control.shape)
+    print(" dtype:", control.dtype)
+    print(" min/max:", control.min().item(), control.max().item())
+
+    # 2. 1 → 3 channels
+    if control.shape[1] == 1:
+        control = control.repeat(1, 3, 1, 1)
+
+    # 3. Normalize PROPERLY (CRUCIAL)
+    control = control.clamp(0, 1)          # sécurité
+    control = control * 2.0 - 1.0          # [-1,1]
+
+    print("[STEP 2] NORMALIZED")
+    print(" min/max:", control.min().item(), control.max().item())
+
+    # 4. Move to device FP32
+    control = control.to(device=device, dtype=torch.float32)
+
+    print("[STEP 3] DEVICE")
+    print(" device:", control.device)
+    print(" dtype:", control.dtype)
+
+    # 5. Sync VAE
+    print("[STEP 4] VAE STATE")
+    print(" vae dtype:", next(vae.parameters()).dtype)
+    print(" vae device:", next(vae.parameters()).device)
+
+    # 🔥 FORCER cohérence VAE
+    vae = vae.to(device=device, dtype=torch.float32)
+
+    # 6. Encode SAFE (no autocast)
+    with torch.no_grad():
+        try:
+            latent_dist = vae.encode(control).latent_dist
+            latent = latent_dist.sample()
+        except Exception as e:
+            print("❌ VAE ENCODE CRASH:", e)
+            raise
+
+    print("[STEP 5] LATENT RAW")
+    print(" min/max:", latent.min().item(), latent.max().item())
+    print(" NaN:", torch.isnan(latent).sum().item())
+
+    # 🚨 CHECK NaN
+    if torch.isnan(latent).any():
+        print("⚠️ NaN DETECTED → applying fallback")
+
+        # fallback 1: zero latent
+        latent = torch.zeros_like(latent)
+
+        # fallback 2 (optionnel):
+        # latent = torch.randn_like(latent) * 0.1
+
+    # 7. Scale (SD standard)
+    latent = latent * latent_scale
+
+    print("[STEP 6] SCALED LATENT")
+    print(" min/max:", latent.min().item(), latent.max().item())
+
+    # 8. Back to FP16
+    latent = latent.to(dtype=torch.float16)
+
+    print("[FINAL]")
+    print(" dtype:", latent.dtype)
+    print(" device:", latent.device)
+    print("=====================================================\n")
+
+    return latent
 
 # ---------------- Control -> Latent sécurisé ----------------
-def control_to_latent_safe(control_tensor, vae, device='cuda', LATENT_SCALE=1.0):
-    # Si 1 canal, dupliquer pour obtenir 3 canaux
-    if control_tensor.shape[1] == 1:
-        control_tensor = control_tensor.repeat(1, 3, 1, 1)
+def control_to_latent_safe(control_tensor, vae, device="cuda", LATENT_SCALE=1.0):
+    # 🔥 FORCE VAE EN FP32
+    vae = vae.to(device=device, dtype=torch.float32)
 
-    # Convertir dtype et device
-    control_tensor = control_tensor.to(device=device, dtype=vae.dtype)
+    control_tensor = control_tensor.to(device=device, dtype=torch.float32)
 
-    # Normalisation [0,1] -> [-1,1]
-    control_tensor = (control_tensor - control_tensor.min()) / (control_tensor.max() - control_tensor.min())
-    control_tensor = control_tensor * 2 - 1
-
-    # Encode VAE
     with torch.no_grad():
         latent = vae.encode(control_tensor).latent_dist.sample()
 
-    # Appliquer LATENT_SCALE après
-    latent = latent * LATENT_SCALE
-
-    print(f"[Control->Latent] Latent shape: {latent.shape}, min: {latent.min():.4f}, max: {latent.max():.4f}, dtype: {latent.dtype}")
-
-    return latent
+    return latent * LATENT_SCALE
 
 def process_latents_streamed(control_latent, mini_latents=None, mini_weight=0.5, device="cuda"):
     """
