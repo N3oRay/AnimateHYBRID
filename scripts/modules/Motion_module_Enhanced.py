@@ -5,14 +5,14 @@ import math
 class MotionModuleEnhanced(nn.Module):
     def __init__(
         self,
-        strength: float = 0.03,          # mouvement personnage
+        strength: float = 0.01,          # mouvement personnage
         hair_bias: float = 0.7,           # accentuation cheveux
         wave_speed: float = 1.5,
         wave_amplitude: float = 1.0,
-        decor_strength: float = 0.01,     # décor subtil
-        decor_wave_speed: float = 0.5,
-        decor_wave_amplitude: float = 0.2,
-        camera_shift: float = 0.02        # effet caméra léger
+        decor_strength: float = 0.1,     # décor subtil 0.03
+        decor_wave_speed: float = 0.7,      # wave 0.5
+        decor_wave_amplitude: float = 0.2,  # 0.2
+        camera_shift: float = 0.7      # effet caméra léger 0.02
     ):
         super().__init__()
         self.strength = strength
