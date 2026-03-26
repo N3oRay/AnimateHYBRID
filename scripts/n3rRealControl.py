@@ -67,7 +67,7 @@ def main(args):
     init_image_scale_end = cfg.get("init_image_scale_end", 0.9) # 0.85 ou 0.95 proche de l'init'
     creative_noise, creative_noise_end = cfg.get("creative_noise", 0.0), cfg.get("creative_noise_end", 0.08)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
-    frames_per_prompt = cfg.get("frames_per_prompt", 10)  # nombre de frames par prompt
+    frames_per_prompt = cfg.get("frames_per_prompt", 20)  # nombre de frames par prompt
     contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.15), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
     H, W = cfg.get("H", 512), cfg.get("W", 512)
     block_size = min(256, H//2, W//2)  # block_size auto selon résolution
@@ -142,12 +142,7 @@ def main(args):
 
     # ---------------- load_controlnet_openpose ----------------
     if use_openpose:
-        controlnet = load_controlnet_openpose_local(
-            device=device,
-            dtype=torch.float16,
-            use_fp16=True,
-            debug=True
-        )
+        controlnet = load_controlnet_openpose_local( device=device, dtype=torch.float16, use_fp16=True, debug=True )
 
         if hasattr(controlnet, "enable_attention_slicing"):
             controlnet.enable_attention_slicing()
@@ -184,15 +179,21 @@ def main(args):
                 if pose_sequence.shape[0] != total_frames:
                     print("⚠ Ajustement du nombre de frames OpenPose")
 
+                    # (F, C, H, W) → (1, C, F, H, W)
+                    pose_sequence = pose_sequence.permute(1, 0, 2, 3).unsqueeze(0)
+
                     pose_sequence = torch.nn.functional.interpolate(
-                        pose_sequence.unsqueeze(0),
-                        size=(total_frames, pose_sequence.shape[2], pose_sequence.shape[3]),
+                        pose_sequence,
+                        size=(total_frames, pose_sequence.shape[-2], pose_sequence.shape[-1]),
                         mode='trilinear',
                         align_corners=False
-                    ).squeeze(0)
+                    )
 
+                # retour → (F, C, H, W)
+                pose_sequence = pose_sequence.squeeze(0).permute(1, 0, 2, 3)
                 # 🔥 Fix device + dtype
                 pose_sequence = pose_sequence.to(device=device, dtype=dtype)
+                print("✅ PoseSequence final:", pose_sequence.shape, pose_sequence.device, pose_sequence.dtype)
 
         except Exception as e:
             print(f"[Load Json animation INIT ERROR] {e}")
@@ -253,8 +254,7 @@ def main(args):
             # start_pose = tensor 4D BCHW directement
             start_pose = input_image.to(device=device, dtype=dtype)
             # Pose sequence
-            pose_sequence = None
-            if use_openpose:
+            if use_openpose and pose_sequence is None:
                 pose_sequence = generate_pose_sequence(base_pose=start_pose, num_frames=total_frames, device=device, dtype=dtype, debug=True)
             # 🔥 Détection yeux (une seule fois par image)
             input_pil = tensor_to_pil(input_image)  # à créer si tu ne l'as pas
@@ -269,11 +269,7 @@ def main(args):
             base_control_latent = sanitize_latents(base_control_latent)
             base_control_latent = torch.clamp(torch.nan_to_num(base_control_latent), -1.0, 1.0)
 
-            control_latent = base_control_latent + 0.01 * torch.randn_like(
-                base_control_latent,
-                dtype=torch.float16,
-                device="cuda"
-            )
+            control_latent = base_control_latent + 0.01 * torch.randn_like(base_control_latent, dtype=torch.float16, device="cuda")
             control_latent = sanitize_latents(control_latent)
             # -----------------------------------------------------------------------------------------
             # coordonner masque eye et masque volumetrique
@@ -369,8 +365,7 @@ def main(args):
                     latents_frame = current_latent_single.to(device)
 
                     # --- Interpolation des embeddings prompts ---
-                    cf_embeds = get_interpolated_embeddings(frame_counter, frames_per_prompt,
-                                                            pos_embeds_list, neg_embeds_list, device, debug=False)
+                    cf_embeds = get_interpolated_embeddings(frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device, debug=False)
                     latents = sanitize_latents(latents_frame.clone())  # 🔥 FIX NaN / stabilité
                     # --- volume mask ---
                     volume_mask = create_volumetrique_mask(latents, coords_v, debug=False)
@@ -403,10 +398,8 @@ def main(args):
                     # ---------------- Mini-GPU diffusion ----------------
                     if use_mini_gpu:
                         mini_latents = generate_latents_mini_gpu_320(
-                            unet=unet, scheduler=scheduler, input_latents=latents_frame, embeddings=cf_embeds,
-                            motion_module=motion_module, guidance_scale=current_guidance_scale,
-                            device=device, fp16=True, steps=steps, debug=verbose,
-                            init_image_scale=current_init_image_scale, creative_noise=current_creative_noise
+                            unet=unet, scheduler=scheduler, input_latents=latents_frame, embeddings=cf_embeds, motion_module=motion_module, guidance_scale=current_guidance_scale,
+                            device=device, fp16=True, steps=steps, debug=verbose, init_image_scale=current_init_image_scale, creative_noise=current_creative_noise
                         )
                         mini_weight = (1 - frame_counter / total_frames) * (1 - latent_injection)
                         # S'assurer que les dimensions correspondent
@@ -418,7 +411,20 @@ def main(args):
 
                     # ---------------- ControlNet OpenPose ----------------
                     if use_openpose:
-                        pose = pose_sequence[frame_counter % len(pose_sequence)]
+                        pose = pose_sequence[frame_counter % pose_sequence.shape[0]]
+
+                        # ⚡ S'assurer que pose est 4D (BCHW)
+                        if pose.ndim == 3:  # CHW -> BCHW
+                            pose = pose.unsqueeze(0)
+
+                        # ⚡ Forcer 3 canaux pour ControlNet
+                        if pose.shape[1] > 3:
+                            pose = pose[:, :3, :, :]
+                        elif pose.shape[1] == 1:
+                            pose = pose.repeat(1, 3, 1, 1)
+
+                        # type et device
+                        pose = pose.to(device=device, dtype=dtype)
                         latents = apply_controlnet_openpose_step(
                             latents=latents,
                             t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
@@ -475,10 +481,8 @@ def main(args):
                     frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device,
                         frame_counter=frame_counter, latent_scale_boost=latent_scale_boost
                     )
-                    frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter,
-                                                    target_temp=target_temp, reference_temp=reference_temp,
-                                                    blur_radius=blur_radius, contrast=contrast,
-                                                    sharpen_percent=sharpen_percent, psave=psave)
+                    frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
+                                                    blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
                     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
 
                     previous_latent_single = latents.detach().cpu()
