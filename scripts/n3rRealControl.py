@@ -375,7 +375,9 @@ def main(args):
 
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
                     use_n3r_this_frame = math.sin(frame_counter * 0.2) > 0.7
-                    control_strength = 0.05 * (1 - frame_counter / total_frames) + 0.02
+                    #control_strength = 0.05 * (1 - frame_counter / total_frames) + 0.02
+                    control_strength = 0.35  # ou 0.5 pour test
+                    print(f"[DEBUG] Pose control_strength ={control_strength:.4f}")
 
                     if use_n3r_this_frame:
                         try:
@@ -447,7 +449,7 @@ def main(args):
                                 scheduler=scheduler, pose_image=pose,
                                 pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1],
                                 guidance_scale=current_guidance_scale,
-                                controlnet_scale=0.05,  # ajustable
+                                controlnet_scale=1.0,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
                                 device=device, dtype=target_dtype,
                                 debug=False
                             )
@@ -469,6 +471,7 @@ def main(args):
                         #controlnet.to("cpu")
                     # ---------------- Injection finale ControlNet ----------------
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
+                    print(f"[DEBUG] control_latent min/max={control_latent.min():.4f}/{control_latent.max():.4f}")
                     latents = latents + control_strength * control_weight_map * control_latent
                     latents = sanitize_latents(latents)
                     print(f"[DEBUG] Après Injection finale ControlNet min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
