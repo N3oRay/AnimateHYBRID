@@ -45,31 +45,6 @@ def wait_for_stop():
         stop_generation = True
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
-def slerp(t, v0, v1):
-    v0_norm = torch.nn.functional.normalize(v0, dim=1)
-    v1_norm = torch.nn.functional.normalize(v1, dim=1)
-
-    dot = (v0_norm * v1_norm).sum(1, keepdim=True)
-    dot = torch.clamp(dot, -1, 1)
-
-    theta = torch.acos(dot) * t
-    relative = torch.nn.functional.normalize(v1 - v0 * dot, dim=1)
-
-    return v0 * torch.cos(theta) + relative * torch.sin(theta)
-
-def normalize_latent_std(x, ref):
-    return x * (ref.std() / (x.std() + 1e-6))
-
-def match_distribution(source, target, eps=1e-6):
-    src_mean = source.mean(dim=(1,2,3), keepdim=True)
-    src_std  = source.std(dim=(1,2,3), keepdim=True)
-
-    tgt_mean = target.mean(dim=(1,2,3), keepdim=True)
-    tgt_std  = target.std(dim=(1,2,3), keepdim=True)
-
-    normalized = (source - src_mean) / (src_std + eps)
-    return normalized * tgt_std + tgt_mean
-
 # ---------------- MAIN FIABLE ----------------
 def main(args):
     global stop_generation
@@ -352,7 +327,6 @@ def main(args):
                     cf_embeds = get_interpolated_embeddings(frame_counter, frames_per_prompt,
                                                             pos_embeds_list, neg_embeds_list, device, debug=False)
                     latents = sanitize_latents(latents_frame.clone())  # 🔥 FIX NaN / stabilité
-
                     # --- volume mask ---
                     volume_mask = create_volumetrique_mask(latents, coords_v, debug=False)
                     control_weight_map = 0.05 + 0.25 * volume_mask**1.5
@@ -408,7 +382,6 @@ def main(args):
                             guidance_scale=current_guidance_scale, controlnet_scale=0.25, device=device, dtype=dtype, debug=False
                         )
                         controlnet.to("cpu")
-
                     # ---------------- Injection finale ControlNet ----------------
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
                     latents = latents + control_strength * control_weight_map * control_latent
@@ -429,7 +402,6 @@ def main(args):
                         latents_seq, applied = apply_motion_safe(latents_seq, motion_module)
                         latents = latents_seq[:, :, 1, :, :] if applied else latents
                         latents = sanitize_latents(latents)
-
                     # ---------------- ProNet yeux ----------------
                     if use_n3r_pro_net:
                         latents = apply_pro_net_volumetrique(latents, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
@@ -438,7 +410,6 @@ def main(args):
                         if eye_coords_latent:
                             latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength,
                                                             sanitize_fn=sanitize_latents)
-
                     # ---------------- Smoothing temporel ----------------
                     temporal_smooth = 0.15
                     if previous_latent_single is not None:
@@ -447,7 +418,6 @@ def main(args):
 
                     # ---------------- Clamp latents ----------------
                     latents = torch.clamp(latents, -1.5, 1.5)
-
                     # ---------------- Décodage final ----------------
                     # 🔥 SANITY AVANT DECODE
                     latents = sanitize_latents(latents)
