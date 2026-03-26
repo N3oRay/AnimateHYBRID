@@ -33,7 +33,7 @@ from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural_opti
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 # OpenPose :
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -210,19 +210,26 @@ def main(args):
             pose_sequence = None
             if use_openpose:
                 pose_sequence = generate_pose_sequence(base_pose=start_pose, num_frames=total_frames, device=device, dtype=dtype, debug=True)
-
             # 🔥 Détection yeux (une seule fois par image)
             input_pil = tensor_to_pil(input_image)  # à créer si tu ne l'as pas
 
-            # 🔥 n3rControlNet
-            # Convertir en 3 canaux pour VAE
-            base_control = create_canny_control(input_pil)
-            if base_control.shape[1] == 1:  # si 1 canal
-                base_control = base_control.repeat(1,3,1,1)  # dupliquer pour RGB
-            base_control = base_control.to(dtype=torch.float16, device=device)
-            base_control_latent = control_to_latent_safe(base_control, vae, device, LATENT_SCALE)
-            control_latent = base_control_latent + 0.01 * torch.randn_like(base_control_latent, dtype=torch.float16, device=device)
+            # 🔥 n3rControl - encode Canny en sécurité------------------------------------------------------------------------------------
+            base_control_latent = build_control_latent_debug(
+                input_pil,
+                vae,
+                device="cuda",
+                latent_scale=LATENT_SCALE
+            )
+            base_control_latent = sanitize_latents(base_control_latent)
+            base_control_latent = torch.clamp(torch.nan_to_num(base_control_latent), -1.0, 1.0)
 
+            control_latent = base_control_latent + 0.01 * torch.randn_like(
+                base_control_latent,
+                dtype=torch.float16,
+                device="cuda"
+            )
+            control_latent = sanitize_latents(control_latent)
+            # -----------------------------------------------------------------------------------------
             # coordonner masque eye et masque volumetrique
             eye_coords = get_eye_coords_safe(input_pil)
             coords_v = get_coords_safe( input_pil, H=cfg["H"], W=cfg["W"] )
@@ -299,6 +306,8 @@ def main(args):
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         print(f"[DEBUG] LATENT_SCALE: {LATENT_SCALE}, latents min/max: {latents.min().item():.3f}/{latents.max().item():.3f}")
                         print("Latents min/max:", latents.min().item(), latents.max().item(), latents.dtype)
+                        latents = torch.clamp(latents, -10.0, 10.0)
+                        print("FINAL LATENTS:", latents.min().item(), latents.max().item(), latents.mean().item())
                         frame_pil = decode_latents_ultrasafe_blockwise_ultranatural_opti( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter)
 
                         #Post Traitement
@@ -417,9 +426,14 @@ def main(args):
                     latents = torch.clamp(latents, -1.5, 1.5)
 
                     # ---------------- Décodage final ----------------
+                    # 🔥 SANITY AVANT DECODE
+                    latents = sanitize_latents(latents)
+                    # clamp SAFE (avant scaling)
+                    latents = torch.clamp(latents, -1.0, 1.0)
+                    print("FINAL LATENTS SAFE:", latents.min().item(), latents.max().item())
+                    # seulement maintenant scaling
                     latents = latents / LATENT_SCALE
-                    print(f"[DEBUG] LATENT_SCALE: {LATENT_SCALE}, latents min/max: {latents.min().item():.3f}/{latents.max().item():.3f}")
-                    print("Latents min/max:", latents.min().item(), latents.max().item(), latents.dtype)
+
                     frame_pil = decode_latents_ultrasafe_blockwise_ultranatural_opti(
                         latents, vae, block_size=block_size, overlap=overlap, device=device,
                         frame_counter=frame_counter
