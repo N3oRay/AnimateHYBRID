@@ -471,6 +471,7 @@ def main(args):
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
                     latents = latents + control_strength * control_weight_map * control_latent
                     latents = sanitize_latents(latents)
+                    print(f"[DEBUG] Après Injection finale ControlNet min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
                     # ---------------- Fusion frame + latent injection ----------------
                     if latent_injection > 0:
@@ -478,6 +479,8 @@ def main(args):
                             latents = torch.nn.functional.interpolate(latents, size=latents_frame.shape[-2:],
                                                                     mode='bilinear', align_corners=False).contiguous()
                         latents = latent_injection * latents_frame + (1 - latent_injection) * latents
+                        latents = sanitize_latents(latents)
+                        print(f"[DEBUG] Après Fusion frame min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
                     # ---------------- Motion module ----------------
                     if motion_module is not None:
@@ -487,19 +490,19 @@ def main(args):
                         latents_seq, applied = apply_motion_safe(latents_seq, motion_module)
                         latents = latents_seq[:, :, 1, :, :] if applied else latents
                         latents = sanitize_latents(latents)
+                        print(f"[DEBUG] Après Motion module min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
+
                     # ---------------- ProNet yeux ----------------
                     if use_n3r_pro_net:
                         latents = apply_pro_net_volumetrique(latents, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
+                        print(f"[DEBUG] Après ProNet volumetrique min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
+
                         eye_coords_latent = scale_eye_coords_to_latents(eye_coords, img_H=cfg["H"], img_W=cfg["W"],
                                                                         lat_H=latents.shape[-2], lat_W=latents.shape[-1])
                         if eye_coords_latent:
                             latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength,
                                                             sanitize_fn=sanitize_latents)
-                    # ---------------- Smoothing temporel ----------------
-                    temporal_smooth = 0.15
-                    if previous_latent_single is not None:
-                        latents = (1 - temporal_smooth) * latents + temporal_smooth * previous_latent_single.to(device)
-                        latents = sanitize_latents(latents)
+                            print(f"[DEBUG] Après ProNet yeux min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
                     # ---------------- Clamp latents ----------------
                     latents = torch.clamp(latents, -1.5, 1.5)
