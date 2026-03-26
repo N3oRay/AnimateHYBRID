@@ -304,19 +304,17 @@ def main(args):
                     alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
                     with torch.no_grad():
                         # --- Fusion adaptative avec diminution progressive de l'influence de la frame précédente
-                        injection_start = 0.8  # influence initiale de l'ancienne frame
+                        injection_start = 0.01  # influence initiale de l'ancienne frame
                         injection_end   = 0.1  # influence finale
                         denom = max(transition_frames-1, 1)
                         injection_alpha = injection_start * (1 - t/denom) + injection_end * (t/denom)
 
-                        #latent_interp = injection_alpha * previous_latent_single.to(device) + (1 - injection_alpha) * current_latent_single.to(device)
-                        latent_interp = slerp(1 - injection_alpha, previous_latent_single.to(device), current_latent_single.to(device))
+                        latent_interp = injection_alpha * previous_latent_single.to(device) + (1 - injection_alpha) * current_latent_single.to(device)
                         # 🔥 FIX NaN / stabilité
                         latent_interp = sanitize_latents(latent_interp)
 
                         if motion_module:
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
-                            latent_interp = normalize_latent_std(latent_interp, previous_latent_single)
 
                         # Application de n3r_pro_net - réutilisé pour toutes les frames - creation des masques
                         eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latent_interp.shape[-2], lat_W=latent_interp.shape[-1] )
@@ -325,28 +323,13 @@ def main(args):
                         volume_mask = create_volumetrique_mask(latent_interp, coords_v, debug=False)
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
-                            latent_interp = apply_pro_net_volumetrique(latent_interp, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
-
-                            eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latent_interp.shape[-2], lat_W=latent_interp.shape[-1] )
-
+                            latents = apply_pro_net_volumetrique(latent_interp, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
+                            eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latents.shape[-2], lat_W=latents.shape[-1] )
                             if eye_coords_latent:
-                                latent_interp = apply_pro_net_with_eyes(latent_interp, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
+                                latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
 
                         # Décodage streaming
-                        # 🔥 FIX MAJEUR : réaligner distribution avec previous frame
-                        latent_interp = match_distribution(
-                            latent_interp,
-                            previous_latent_single.to(device)
-                        )
-
-                        # 🔥 Clamp léger (pas agressif)
-                        latent_interp = torch.clamp(latent_interp, -1.2, 1.2)
-
-                        # --- Decode safe
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
-                        print("Latents min/max:", latent_interp.min().item(), latent_interp.max().item(), latent_interp.dtype)
-                        latent_interp = torch.clamp(latent_interp, -4.0, 4.0)
-                        print("FINAL LATENTS:", latent_interp.min().item(), latent_interp.max().item(), latent_interp.mean().item())
                         frame_pil = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
 
                         #Post Traitement
