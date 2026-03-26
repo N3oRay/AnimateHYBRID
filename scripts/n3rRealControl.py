@@ -45,6 +45,31 @@ def wait_for_stop():
         stop_generation = True
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
+def slerp(t, v0, v1):
+    v0_norm = torch.nn.functional.normalize(v0, dim=1)
+    v1_norm = torch.nn.functional.normalize(v1, dim=1)
+
+    dot = (v0_norm * v1_norm).sum(1, keepdim=True)
+    dot = torch.clamp(dot, -1, 1)
+
+    theta = torch.acos(dot) * t
+    relative = torch.nn.functional.normalize(v1 - v0 * dot, dim=1)
+
+    return v0 * torch.cos(theta) + relative * torch.sin(theta)
+
+def normalize_latent_std(x, ref):
+    return x * (ref.std() / (x.std() + 1e-6))
+
+def match_distribution(source, target, eps=1e-6):
+    src_mean = source.mean(dim=(1,2,3), keepdim=True)
+    src_std  = source.std(dim=(1,2,3), keepdim=True)
+
+    tgt_mean = target.mean(dim=(1,2,3), keepdim=True)
+    tgt_std  = target.std(dim=(1,2,3), keepdim=True)
+
+    normalized = (source - src_mean) / (src_std + eps)
+    return normalized * tgt_std + tgt_mean
+
 # ---------------- MAIN FIABLE ----------------
 def main(args):
     global stop_generation
@@ -284,12 +309,14 @@ def main(args):
                         denom = max(transition_frames-1, 1)
                         injection_alpha = injection_start * (1 - t/denom) + injection_end * (t/denom)
 
-                        latent_interp = injection_alpha * previous_latent_single.to(device) + (1 - injection_alpha) * current_latent_single.to(device)
+                        #latent_interp = injection_alpha * previous_latent_single.to(device) + (1 - injection_alpha) * current_latent_single.to(device)
+                        latent_interp = slerp(1 - injection_alpha, previous_latent_single.to(device), current_latent_single.to(device))
                         # 🔥 FIX NaN / stabilité
                         latent_interp = sanitize_latents(latent_interp)
 
                         if motion_module:
                             latent_interp, _ = apply_motion_safe(latent_interp, motion_module)
+                            latent_interp = normalize_latent_std(latent_interp, previous_latent_single)
 
                         # Application de n3r_pro_net - réutilisé pour toutes les frames - creation des masques
                         eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latent_interp.shape[-2], lat_W=latent_interp.shape[-1] )
@@ -299,14 +326,26 @@ def main(args):
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
                             latent_interp = apply_pro_net_volumetrique(latent_interp, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
+
                             eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latent_interp.shape[-2], lat_W=latent_interp.shape[-1] )
+
                             if eye_coords_latent:
                                 latent_interp = apply_pro_net_with_eyes(latent_interp, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
 
                         # Décodage streaming
+                        # 🔥 FIX MAJEUR : réaligner distribution avec previous frame
+                        latent_interp = match_distribution(
+                            latent_interp,
+                            previous_latent_single.to(device)
+                        )
+
+                        # 🔥 Clamp léger (pas agressif)
+                        latent_interp = torch.clamp(latent_interp, -1.2, 1.2)
+
+                        # --- Decode safe
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         print("Latents min/max:", latent_interp.min().item(), latent_interp.max().item(), latent_interp.dtype)
-                        latent_interp = torch.clamp(latent_interp, -10.0, 10.0)
+                        latent_interp = torch.clamp(latent_interp, -4.0, 4.0)
                         print("FINAL LATENTS:", latent_interp.min().item(), latent_interp.max().item(), latent_interp.mean().item())
                         frame_pil = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
 
