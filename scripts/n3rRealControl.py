@@ -5,6 +5,7 @@
 # Image input ↓ OpenPose → skeleton (frame t) ↓ ControlNet (condition pose) ↓ UNet (avec pos/neg embeds) ↓ Latents 4D (animés) ↓ N3RProNet (détails + iris + sharpen) ↓ Decode blockwise ↓ Frames animées
 # ----------------------------------------------------------------------------------------
 import os, math, threading, random
+import json
 import traceback
 import hashlib
 import torch
@@ -33,7 +34,7 @@ from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 # OpenPose :
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -135,21 +136,67 @@ def main(args):
     print(f"Pos embeds shape: {pos_embeds_list[0].shape}")
     print(f"Neg embeds shape: {neg_embeds_list[0].shape}")
 
+    # ---------- Input image -----------------------------------
+    input_paths = cfg.get("input_images") or [cfg.get("input_image")]
+    total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
+
     # ---------------- load_controlnet_openpose ----------------
     if use_openpose:
         controlnet = load_controlnet_openpose_local(
-            device="cuda",
+            device=device,
             dtype=torch.float16,
             use_fp16=True,
             debug=True
         )
+
         if hasattr(controlnet, "enable_attention_slicing"):
             controlnet.enable_attention_slicing()
         else:
             print("⚠ enable_attention_slicing non disponible sur ce modèle.")
+
         controlnet.eval()
         for p in controlnet.parameters():
             p.requires_grad = False
+
+        # ---- load json
+        pose_sequence = None
+
+        try:
+            base_dir = Path(__file__).resolve().parent
+            json_file = base_dir / "json" / "anim2.json"
+
+            with open(json_file, "r") as f:
+                anim_data = json.load(f)
+
+            print(f"✅ JSON chargé : {json_file}")
+
+            pose_sequence = convert_json_to_pose_sequence( anim_data, H=cfg["H"], W=cfg["W"], device=device, dtype=dtype, debug=True)
+
+            if pose_sequence is None:
+                print("❌ Aucun pose_sequence → OpenPose désactivé")
+                use_openpose = False
+
+            else:
+                print(f"🎞 Frames JSON: {pose_sequence.shape[0]}")
+                print(f"🎞 Frames attendues: {total_frames}")
+
+                # 🔥 Fix interpolation
+                if pose_sequence.shape[0] != total_frames:
+                    print("⚠ Ajustement du nombre de frames OpenPose")
+
+                    pose_sequence = torch.nn.functional.interpolate(
+                        pose_sequence.unsqueeze(0),
+                        size=(total_frames, pose_sequence.shape[2], pose_sequence.shape[3]),
+                        mode='trilinear',
+                        align_corners=False
+                    ).squeeze(0)
+
+                # 🔥 Fix device + dtype
+                pose_sequence = pose_sequence.to(device=device, dtype=dtype)
+
+        except Exception as e:
+            print(f"[Load Json animation INIT ERROR] {e}")
+
     # ---------------- N3RModelOptimized ----------------
     n3r_model = None
     if use_n3r_model:
@@ -173,9 +220,7 @@ def main(args):
         n3r_pro_net.eval()
         print("✅ N3RProNet activé")
 
-    # ---------------- Input images ----------------
-    input_paths = cfg.get("input_images") or [cfg.get("input_image")]
-    total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
+    # ---------------- Input  ----------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(f"./outputs/RealControl{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -381,7 +426,7 @@ def main(args):
                             scheduler=scheduler, pose_image=pose, pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1],
                             guidance_scale=current_guidance_scale, controlnet_scale=0.25, device=device, dtype=dtype, debug=False
                         )
-                        controlnet.to("cpu")
+                        #controlnet.to("cpu")
                     # ---------------- Injection finale ControlNet ----------------
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
                     latents = latents + control_strength * control_weight_map * control_latent
