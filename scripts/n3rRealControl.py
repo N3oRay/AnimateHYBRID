@@ -423,17 +423,48 @@ def main(args):
                         elif pose.shape[1] == 1:
                             pose = pose.repeat(1, 3, 1, 1)
 
-                        # type et device
-                        pose = pose.to(device=device, dtype=dtype)
-                        # Visualisation debug (optionnelle)
-                        #debug_pose_visual(pose, frame_counter, cfg, title="OpenPose Frame")
-                        latents = apply_controlnet_openpose_step(
-                            latents=latents,
-                            t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
-                            unet=unet, controlnet=controlnet,
-                            scheduler=scheduler, pose_image=pose, pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1],
-                            guidance_scale=current_guidance_scale, controlnet_scale=0.25, device=device, dtype=dtype, debug=False # controlnet_scale=0.25
-                        )
+                        # ⚡ Normaliser le squelette pour éviter valeurs trop grandes
+                        pose_min, pose_max = pose.min(), pose.max()
+                        pose = (pose - pose_min) / (pose_max - pose_min + 1e-6)
+                        print(f"[DEBUG] Pose normalisée min={pose.min().item():.4f}, max={pose.max().item():.4f}")
+
+                        # ⚡ Assurer la même dtype et device que le modèle
+                        target_dtype = next(unet.parameters()).dtype  # dtype du UNet (float16 ou float32)
+                        pose = pose.to(device=device, dtype=target_dtype)
+                        latents = latents.to(device=device, dtype=target_dtype)
+
+                        # DEBUG : Latents avant OpenPose
+                        print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
+
+                        latents_before_openpose = latents.clone()  # pour comparer après
+
+                        try:
+                            # Application OpenPose
+                            latents = apply_controlnet_openpose_step(
+                                latents=latents,
+                                t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
+                                unet=unet, controlnet=controlnet,
+                                scheduler=scheduler, pose_image=pose,
+                                pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1],
+                                guidance_scale=current_guidance_scale,
+                                controlnet_scale=0.05,  # ajustable
+                                device=device, dtype=target_dtype,
+                                debug=False
+                            )
+                            # 🔥 Protection contre NaN
+                            if torch.isnan(latents).any():
+                                print("[WARNING] NaN détecté après OpenPose, restauration des latents précédents")
+                                latents = latents_before_openpose.clone()
+
+                            latents = sanitize_latents(latents)
+
+                        except Exception as e:
+                            print(f"[ERROR] ControlNet OpenPose failed: {e}")
+                            latents = latents_before_openpose.clone()  # rollback safe
+
+                        # DEBUG : Latents après OpenPose
+                        print(f"[DEBUG] Latents après OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
+
                         save_debug_pose_image(pose, frame_counter, output_dir, cfg, prefix="openpose")
                         #controlnet.to("cpu")
                     # ---------------- Injection finale ControlNet ----------------
