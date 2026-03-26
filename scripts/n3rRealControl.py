@@ -409,7 +409,7 @@ def main(args):
                         latents = (1 - mini_weight) * latents + mini_weight * mini_latents
                         latents = sanitize_latents(latents)
 
-                    # ---------------- ControlNet OpenPose ----------------
+                    # ---------------- ControlNet OpenPose ------------------------
                     if use_openpose:
                         pose = pose_sequence[frame_counter % pose_sequence.shape[0]]
 
@@ -432,7 +432,7 @@ def main(args):
                             t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
                             unet=unet, controlnet=controlnet,
                             scheduler=scheduler, pose_image=pose, pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1],
-                            guidance_scale=current_guidance_scale, controlnet_scale=0.25, device=device, dtype=dtype, debug=False
+                            guidance_scale=current_guidance_scale, controlnet_scale=0.25, device=device, dtype=dtype, debug=False # controlnet_scale=0.25
                         )
                         save_debug_pose_image(pose, frame_counter, output_dir, cfg, prefix="openpose")
                         #controlnet.to("cpu")
