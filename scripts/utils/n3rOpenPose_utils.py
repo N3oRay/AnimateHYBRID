@@ -6,6 +6,122 @@ from diffusers import ControlNetModel
 import math
 import torch.nn.functional as F
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
+import numpy as np
+import cv2
+
+def convert_json_to_pose_sequence(anim_data, H=512, W=512, device="cuda", dtype=torch.float16, debug=False):
+    """
+    Convertit un JSON d'animation OpenPose simplifié en tensor utilisable par ControlNet.
+
+    Output:
+        pose_sequence: tensor [num_frames, 3, H, W] (RGB image type)
+    """
+
+    frames = anim_data.get("animation", [])
+    pose_images = []
+
+    for idx, frame in enumerate(frames):
+        keypoints = frame.get("keypoints", [])
+
+        # Image noire
+        canvas = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # --- Dessin des points ---
+        for kp in keypoints:
+            x = int(kp["x"])
+            y = int(kp["y"])
+            conf = kp.get("confidence", 1.0)
+
+            if conf > 0.3:
+                cv2.circle(canvas, (x, y), 4, (255, 255, 255), -1)
+
+        # --- Dessin des connexions (squelette simple) ---
+        skeleton = [
+            (0, 1),  # tête → torse
+            (1, 2),  # torse → bras gauche
+            (1, 3),  # torse → bras droit
+            (1, 4),  # torse → jambe gauche
+            (1, 5),  # torse → jambe droite
+        ]
+
+        for a, b in skeleton:
+            if a < len(keypoints) and b < len(keypoints):
+                x1, y1 = int(keypoints[a]["x"]), int(keypoints[a]["y"])
+                x2, y2 = int(keypoints[b]["x"]), int(keypoints[b]["y"])
+                cv2.line(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        # --- Conversion en tensor ---
+        img = torch.from_numpy(canvas).float() / 255.0  # [H, W, C]
+        img = img.permute(2, 0, 1)  # → [C, H, W]
+
+        pose_images.append(img)
+
+    pose_sequence = torch.stack(pose_images).to(device=device, dtype=dtype)
+
+    if debug:
+        print(f"[JSON->POSE] shape: {pose_sequence.shape}")
+        print(f"[JSON->POSE] min/max: {pose_sequence.min().item()} / {pose_sequence.max().item()}")
+
+    return pose_sequence
+
+
+def apply_controlnet_openpose_step_safe(
+    latents,
+    timestep,
+    unet,
+    controlnet,
+    scheduler,
+    pose_image,
+    pos_embeds,
+    neg_embeds,
+    guidance_scale,
+    controlnet_scale=0.25,
+    device="cuda",
+    dtype=torch.float16,
+    debug=False
+):
+    """
+    Wrapper sécurisé pour apply_controlnet_openpose_step
+    - gère CPU/GPU
+    - corrige dtype
+    - convertit timestep en long pour scheduler
+    """
+    # --- CPU float32 pour ControlNet ---
+    latents_cpu = latents.to("cpu", dtype=torch.float32)
+    unet_cpu = unet.to("cpu", dtype=torch.float32)
+    controlnet_cpu = controlnet.to("cpu", dtype=torch.float32)
+    pose_cpu = pose_image.to("cpu", dtype=torch.float32)
+    pos_embeds_cpu = pos_embeds.to("cpu", dtype=torch.float32)
+    neg_embeds_cpu = neg_embeds.to("cpu", dtype=torch.float32)
+
+    # --- Préparer timestep ---
+    if timestep.ndim == 0:
+        timestep = timestep.unsqueeze(0)
+    batch_size = latents_cpu.shape[0]
+    timestep = timestep.repeat(batch_size).to(torch.long).to("cpu")
+
+    # --- Appel ControlNet OpenPose ---
+    latents_cpu = apply_controlnet_openpose_step(
+        latents=latents_cpu,
+        t=timestep,
+        unet=unet_cpu,
+        controlnet=controlnet_cpu,
+        scheduler=scheduler,
+        pose_image=pose_cpu,
+        pos_embeds=pos_embeds_cpu,
+        neg_embeds=neg_embeds_cpu,
+        guidance_scale=guidance_scale,
+        controlnet_scale=controlnet_scale,
+        device="cpu",
+        dtype=torch.float32,
+        debug=debug
+    )
+
+    # --- Retour sur GPU et dtype final ---
+    latents_out = latents_cpu.to(device, dtype=dtype)
+    unet.to(device, dtype=dtype)
+
+    return latents_out
 
 def build_control_latent_debug(input_pil, vae, device="cuda", latent_scale=0.18215):
     import torch
