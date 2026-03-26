@@ -30,7 +30,7 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_po
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural_opti
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 # OpenPose :
 from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug
@@ -107,7 +107,8 @@ def main(args):
         print(f"[INFO] motion_module type: {type(motion_module)}")
     # ---------------- Tokenizer / Text encoder ----------------
     tokenizer = CLIPTokenizerFast.from_pretrained(os.path.join(args.pretrained_model_path,"tokenizer"))
-    text_encoder = CLIPTextModel.from_pretrained(os.path.join(args.pretrained_model_path,"text_encoder")).to(device).to(dtype)
+    #text_encoder = CLIPTextModel.from_pretrained(os.path.join(args.pretrained_model_path,"text_encoder")).to(device).to(dtype)
+    text_encoder = CLIPTextModel.from_pretrained(os.path.join(args.pretrained_model_path,"text_encoder")).to("cpu").to(dtype)
     # ---------------- VAE ----------------
     vae_path = cfg.get("vae_path")
     vae, vae_type, latent_channels, LATENT_SCALE = load_vae(vae_path, device=device, dtype=dtype)
@@ -121,7 +122,7 @@ def main(args):
     text_inputs_sample = tokenizer("test", padding="max_length", truncation=True,
                                 max_length=tokenizer.model_max_length, return_tensors="pt")
     with torch.no_grad():
-        sample_embeds = text_encoder(text_inputs_sample.input_ids.to(device)).last_hidden_state
+        sample_embeds = text_encoder(text_inputs_sample.input_ids.to("cpu")).last_hidden_state
     current_dim = sample_embeds.shape[-1]
     projection = None
     if current_dim != unet_cross_attention_dim:
@@ -129,7 +130,7 @@ def main(args):
 
     # --- Pré-calcul des embeddings pour interpolation
     # Appel de la fonction - encode_prompts_batch
-    pos_embeds_list, neg_embeds_list = encode_prompts_batch( prompts=prompts, negative_prompts=negative_prompts, tokenizer=tokenizer, text_encoder=text_encoder, device="cuda", projection=None)
+    pos_embeds_list, neg_embeds_list = encode_prompts_batch( prompts=prompts, negative_prompts=negative_prompts, tokenizer=tokenizer, text_encoder=text_encoder, device="cpu", projection=None)
     # pos_embeds_list et neg_embeds_list sont des listes de tenseurs [1, seq_len, dim]
     print(f"Pos embeds shape: {pos_embeds_list[0].shape}")
     print(f"Neg embeds shape: {neg_embeds_list[0].shape}")
@@ -297,18 +298,17 @@ def main(args):
                         volume_mask = create_volumetrique_mask(latent_interp, coords_v, debug=False)
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
-                            latents = apply_pro_net_volumetrique(latent_interp, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
-                            eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latents.shape[-2], lat_W=latents.shape[-1] )
+                            latent_interp = apply_pro_net_volumetrique(latent_interp, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
+                            eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latent_interp.shape[-2], lat_W=latent_interp.shape[-1] )
                             if eye_coords_latent:
-                                latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
+                                latent_interp = apply_pro_net_with_eyes(latent_interp, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
 
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
-                        print(f"[DEBUG] LATENT_SCALE: {LATENT_SCALE}, latents min/max: {latents.min().item():.3f}/{latents.max().item():.3f}")
-                        print("Latents min/max:", latents.min().item(), latents.max().item(), latents.dtype)
-                        latents = torch.clamp(latents, -10.0, 10.0)
-                        print("FINAL LATENTS:", latents.min().item(), latents.max().item(), latents.mean().item())
-                        frame_pil = decode_latents_ultrasafe_blockwise_ultranatural_opti( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter)
+                        print("Latents min/max:", latent_interp.min().item(), latent_interp.max().item(), latent_interp.dtype)
+                        latent_interp = torch.clamp(latent_interp, -10.0, 10.0)
+                        print("FINAL LATENTS:", latent_interp.min().item(), latent_interp.max().item(), latent_interp.mean().item())
+                        frame_pil = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
 
                         #Post Traitement
                         frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
@@ -385,6 +385,7 @@ def main(args):
                             scheduler=scheduler, pose_image=pose, pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1],
                             guidance_scale=current_guidance_scale, controlnet_scale=0.25, device=device, dtype=dtype, debug=False
                         )
+                        controlnet.to("cpu")
 
                     # ---------------- Injection finale ControlNet ----------------
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
@@ -434,9 +435,8 @@ def main(args):
                     # seulement maintenant scaling
                     latents = latents / LATENT_SCALE
 
-                    frame_pil = decode_latents_ultrasafe_blockwise_ultranatural_opti(
-                        latents, vae, block_size=block_size, overlap=overlap, device=device,
-                        frame_counter=frame_counter
+                    frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device,
+                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost
                     )
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter,
                                                     target_temp=target_temp, reference_temp=reference_temp,
