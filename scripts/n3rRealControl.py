@@ -14,6 +14,7 @@ from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 import torchvision.transforms as T
+import torch.nn.functional as F
 from torchvision.transforms.functional import to_pil_image
 from PIL import Image, ImageFilter
 import argparse
@@ -380,42 +381,36 @@ def main(args):
 
                     # ---------------- ControlNet OpenPose ------------------------
                     if use_openpose:
-                        pose = pose_sequence[frame_counter % pose_sequence.shape[0]]
+                        # ⚡ Récupérer la pose full-resolution
+                        pose_full = pose_sequence[frame_counter % pose_sequence.shape[0]]  # shape [H,W,C] ou [C,H,W]
 
                         # ⚡ S'assurer que pose est 4D (BCHW)
-                        if pose.ndim == 3:  # CHW -> BCHW
-                            pose = pose.unsqueeze(0)
+                        if pose_full.ndim == 3:
+                            pose_full = pose_full.unsqueeze(0)  # BCHW
 
-                        # ⚡ Forcer 3 canaux pour ControlNet
-                        if pose.shape[1] > 3:
-                            pose = pose[:, :3, :, :]
-                        elif pose.shape[1] == 1:
-                            pose = pose.repeat(1, 3, 1, 1)
+                        # ⚡ Forcer 3 canaux
+                        if pose_full.shape[1] > 3:
+                            pose_full = pose_full[:, :3, :, :]
+                        elif pose_full.shape[1] == 1:
+                            pose_full = pose_full.repeat(1, 3, 1, 1)
 
-                        pose = (pose - 0.5) * 2.0
-                        print(f"[DEBUG] Latents OpenPose après recalc min/max={pose.min().item()}/{pose.max().item()}")
-                        # ⚡ Normaliser le squelette pour éviter valeurs trop grandes
-                        #pose_min, pose_max = pose.min(), pose.max()
-                        #pose = (pose - pose_min) / (pose_max - pose_min + 1e-6)
-                        pose = torch.clamp(pose, -1.0, 1.0)  # ⚡ remplacement de la normalisation précédente
+                        # ⚡ Normaliser la pose pour ControlNet
+                        pose_full = (pose_full - 0.5) * 2.0
+                        pose_full = torch.clamp(pose_full, -1.0, 1.0)
 
-                        print(f"[DEBUG] Pose clamp min={pose.min().item():.4f}, max={pose.max().item():.4f}")
-                        # ⚡ Assurer la même dtype et device que le modèle
-                        #target_dtype = next(unet.parameters()).dtype  # dtype du UNet (float16 ou float32)
-                        #pose = pose.to(device=device, dtype=target_dtype)
-                        #latents = latents.to(device=device, dtype=target_dtype)
+                        # ⚡ DEBUG : vérifier taille et valeurs
+                        print(f"[DEBUG] Pose full-resolution shape={pose_full.shape}, min={pose_full.min().item():.4f}, max={pose_full.max().item():.4f}")
 
-                        pose = pose.float().to(device)
+                        # ⚡ Assurer même dtype et device que latents
+                        pose_full = pose_full.float().to(device)
                         latents = latents.float().to(device)
 
-                        # DEBUG : Latents avant OpenPose
+                        # ⚡ Sauvegarder latents avant OpenPose pour comparaison
+                        latents_before_openpose = latents.clone()
                         print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
-                        latents_before_openpose = latents.clone()  # pour comparer après
 
                         try:
-                            print(f"[CHECK] pose {pose.shape}, latents {latents.shape}")
-                            # Application OpenPose
-                            # 🔹 tile-wise application
+                            # 🔹 Définir tile-wise application
                             def controlnet_tile_fn(latent_tile, pose_tile):
                                 return apply_controlnet_openpose_step_ultrasafe(
                                     latents=latent_tile,
@@ -433,35 +428,38 @@ def main(args):
                                     debug=False
                                 )
 
-                            latents = apply_openpose_tilewise(latents, pose, controlnet_tile_fn,
-                                                            block_size=120, overlap=64, device=device)
-                            print(f"[DEBUG] Latents OpenPose min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
+                            # ⚡ Application tile-wise sur les latents
+                            latents = apply_openpose_tilewise(
+                                latents,
+                                pose_full,              # ⚠ pose full-resolution
+                                controlnet_tile_fn,
+                                block_size=block_size,
+                                overlap=overlap,
+                                device=device
+                            )
+
+                            # ⚡ Nettoyage et clamp
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
-                            latents = torch.clamp(latents, -0.85, 0.85)  # plus de marge pour le mouvement
-                            print(f"[DEBUG] Latents After nan_to_num, clamp : OpenPose min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
-                            # 🔥 Protection contre NaN
-                            if torch.isnan(latents).any():
-                                print("[WARNING] NaN détecté après OpenPose, restauration des latents précédents")
-                                latents = latents_before_openpose.clone()
+                            latents = torch.clamp(latents, -0.85, 0.85)
 
+                            # ⚡ DEBUG : impact OpenPose
                             diff = (latents - latents_before_openpose).abs().mean()
-                            print(f"[DEBUG] OpenPose impact: {diff.item():.6f}") #< 0.001	❌ aucun effet 0.01+	✅ effet réel 0.05+	🔥 fort
+                            print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
+                            print(f"[DEBUG] Latents après OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
 
                         except Exception as e:
                             print(f"[ERROR] ControlNet OpenPose failed: {e}")
                             latents = latents_before_openpose.clone()  # rollback safe
 
-                        # DEBUG : Latents après OpenPose
-                        print(f"[DEBUG] Latents après OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
-                        save_debug_pose_image(pose, frame_counter, output_dir, cfg, prefix="openpose")
-                        #controlnet.to("cpu")
+                        # ⚡ Sauvegarder la pose debug
+                        save_debug_pose_image(pose_full, frame_counter, output_dir, cfg, prefix="openpose")
+
                     # ---------------- Injection finale ControlNet ----------------
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
-                    print(f"[DEBUG] control_latent min/max={control_latent.min():.4f}/{control_latent.max():.4f}")
                     latents = latents + control_strength * control_weight_map * control_latent
                     latents = sanitize_latents(latents)
-                    latents = torch.clamp(latents, -0.85, 0.85)  # élargir la plage pour permettre plus de mouvement
+                    latents = torch.clamp(latents, -0.85, 0.85)
                     print(f"[DEBUG] Après Injection finale ControlNet min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
                     # ---------------- Fusion frame + latent injection ----------------
