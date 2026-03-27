@@ -47,6 +47,18 @@ def wait_for_stop():
         stop_generation = True
 threading.Thread(target=wait_for_stop, daemon=True).start()
 
+def fix_scheduler_device(scheduler):
+    for attr in [
+        "alphas_cumprod",
+        "final_alpha_cumprod",
+        "timesteps",
+        "sigmas"
+    ]:
+        if hasattr(scheduler, attr):
+            val = getattr(scheduler, attr)
+            if isinstance(val, torch.Tensor):
+                setattr(scheduler, attr, val.cpu())
+
 # ---------------- MAIN FIABLE ----------------
 def main(args):
     global stop_generation
@@ -88,6 +100,16 @@ def main(args):
     scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012,
                               beta_schedule="scaled_linear", num_train_timesteps=1000)
     scheduler.set_timesteps(steps, device=device)
+
+    # 🔥 FIX CRITIQUE GLOBAL
+    if hasattr(scheduler, "alphas_cumprod"):
+        scheduler.alphas_cumprod = scheduler.alphas_cumprod.cpu()
+
+    if hasattr(scheduler, "final_alpha_cumprod"):
+        scheduler.final_alpha_cumprod = scheduler.final_alpha_cumprod.cpu()
+
+    if hasattr(scheduler, "timesteps") and isinstance(scheduler.timesteps, torch.Tensor):
+        scheduler.timesteps = scheduler.timesteps.cpu()
 
     # ---------------- UNET ----------------
     unet = safe_load_unet(args.pretrained_model_path, device=device, fp16=True)
@@ -381,76 +403,140 @@ def main(args):
 
                     # ---------------- ControlNet OpenPose ------------------------
                     if use_openpose:
-                        # ⚡ Récupérer la pose full-resolution
-                        pose_full = pose_sequence[frame_counter % pose_sequence.shape[0]]  # shape [H,W,C] ou [C,H,W]
-
-                        # ⚡ S'assurer que pose est 4D (BCHW)
-                        if pose_full.ndim == 3:
-                            pose_full = pose_full.unsqueeze(0)  # BCHW
-
-                        # ⚡ Forcer 3 canaux
-                        if pose_full.shape[1] > 3:
-                            pose_full = pose_full[:, :3, :, :]
-                        elif pose_full.shape[1] == 1:
-                            pose_full = pose_full.repeat(1, 3, 1, 1)
-
-                        # ⚡ Normaliser la pose pour ControlNet
-                        pose_full = (pose_full - 0.5) * 2.0
-                        pose_full = torch.clamp(pose_full, -1.0, 1.0)
-
-                        # ⚡ DEBUG : vérifier taille et valeurs
-                        print(f"[DEBUG] Pose full-resolution shape={pose_full.shape}, min={pose_full.min().item():.4f}, max={pose_full.max().item():.4f}")
-
-                        # ⚡ Assurer même dtype et device que latents
-                        pose_full = pose_full.float().to(device)
-                        latents = latents.float().to(device)
-
-                        # ⚡ Sauvegarder latents avant OpenPose pour comparaison
-                        latents_before_openpose = latents.clone()
-                        print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
-
                         try:
-                            # 🔹 Définir tile-wise application
-                            def controlnet_tile_fn(latent_tile, pose_tile):
+                            import torch.nn.functional as F
+                            import traceback
+
+                            # 🔥 dtype cible réel (UNet)
+                            target_dtype = next(unet.parameters()).dtype
+
+                            # 🔹 ===== 1. PREPARE POSE FULL =====
+                            pose_full = pose_sequence[frame_counter % pose_sequence.shape[0]]
+
+                            # → BCHW
+                            if pose_full.ndim == 3:
+                                if pose_full.shape[0] in [1, 3]:  # C,H,W
+                                    pose_full = pose_full.unsqueeze(0)
+                                else:  # H,W,C
+                                    pose_full = pose_full.permute(2, 0, 1).unsqueeze(0)
+
+                            # → channels fix
+                            if pose_full.shape[1] > 3:
+                                pose_full = pose_full[:, :3]
+                            elif pose_full.shape[1] == 1:
+                                pose_full = pose_full.repeat(1, 3, 1, 1)
+
+                            # → normalize [-1,1]
+                            pose_full = (pose_full - 0.5) * 2.0
+                            pose_full = torch.clamp(pose_full, -1.0, 1.0)
+
+                            # → device + dtype
+                            pose_full = pose_full.to(device=device, dtype=target_dtype)
+
+                            print(f"[DEBUG] Pose full {pose_full.shape} dtype={pose_full.dtype}")
+
+                            # 🔹 ===== 2. BUILD LATENT-SPACE POSE (CRUCIAL) =====
+                            latent_h, latent_w = latents.shape[2], latents.shape[3]
+
+                            pose_latent_full = F.interpolate(
+                                pose_full,
+                                size=(latent_h, latent_w),
+                                mode='bilinear',
+                                align_corners=False
+                            ).to(device=device, dtype=target_dtype)
+
+                            print(f"[DEBUG] Pose latent {pose_latent_full.shape} dtype={pose_latent_full.dtype}")
+
+                            # 🔹 backup latents
+                            latents_before_openpose = latents.clone()
+
+                            print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
+
+                            # 🔹 ===== 3. TILE FUNCTION =====
+                            def controlnet_tile_fn(latent_tile, tile_coords):
+                                x0, y0, x1, y1 = tile_coords
+
+
+                                scale = 8  # facteur SD (IMPORTANT)
+
+                                x0_img = x0 * scale
+                                x1_img = x1 * scale
+                                y0_img = y0 * scale
+                                y1_img = y1 * scale
+
+                                pose_tile = pose_full[:, :, y0_img:y1_img, x0_img:x1_img]
+
+                                # 🔥 resize de sécurité (OBLIGATOIRE)
+                                pose_tile = F.interpolate(
+                                    pose_tile,
+                                    size=(latent_tile.shape[2] * scale, latent_tile.shape[3] * scale),
+                                    mode='bilinear',
+                                    align_corners=False
+                                )
+
+
+                                # 🔥 debug précis
+                                print(f"[TILE] latent {latent_tile.shape} {latent_tile.dtype}")
+                                print(f"[TILE] pose   {pose_tile.shape} {pose_tile.dtype}")
+
+                                # 🔥 FIX ULTIME SCHEDULER
+                                fix_scheduler_device(scheduler)
+                                timesteps = scheduler.timesteps
+
+                                if isinstance(timesteps, torch.Tensor) and timesteps.device.type != "cpu":
+                                    timesteps = timesteps.cpu()
+
+                                t = timesteps[frame_counter % len(timesteps)]
+
+                                if isinstance(t, torch.Tensor):
+                                    t = int(t.item())
+                                else:
+                                    t = int(t)
+
                                 return apply_controlnet_openpose_step_ultrasafe(
-                                    latents=latent_tile,
-                                    t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
-                                    unet=unet, controlnet=controlnet, scheduler=scheduler,
+                                    latents=latent_tile.to(dtype=target_dtype),
+                                    t=t,
+                                    unet=unet,
+                                    controlnet=controlnet,
+                                    scheduler=scheduler,
                                     pose_image=pose_tile,
                                     pos_embeds=cf_embeds[0],
                                     neg_embeds=cf_embeds[1],
                                     guidance_scale=current_guidance_scale,
                                     controlnet_scale=controlnet_scale,
                                     device=device,
-                                    dtype=torch.float32,
-                                    debug=False
+                                    dtype=target_dtype,
+                                    debug=True
                                 )
 
-                            # ⚡ Application tile-wise sur les latents
+
+
+                            # 🔹 ===== 4. TILE-WISE APPLY =====
                             latents = apply_openpose_tilewise(
-                                latents,
-                                pose_full,              # ⚠ pose full-resolution
+                                latents.to(dtype=target_dtype),
+                                pose_latent_full,
                                 controlnet_tile_fn,
                                 block_size=block_size,
                                 overlap=overlap,
                                 device=device
                             )
 
-                            # ⚡ Nettoyage et clamp
+                            # 🔹 ===== 5. CLEANUP =====
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
                             latents = torch.clamp(latents, -0.85, 0.85)
 
-                            # ⚡ DEBUG : impact OpenPose
                             diff = (latents - latents_before_openpose).abs().mean()
+
                             print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
                             print(f"[DEBUG] Latents après OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
 
-                        except Exception as e:
-                            print(f"[ERROR] ControlNet OpenPose failed: {e}")
-                            latents = latents_before_openpose.clone()  # rollback safe
+                        except Exception:
+                            print("[ERROR] ControlNet OpenPose failed:")
+                            traceback.print_exc()
+                            latents = latents_before_openpose.clone()
 
-                        # ⚡ Sauvegarder la pose debug
+                        # 🔹 debug image
                         save_debug_pose_image(pose_full, frame_counter, output_dir, cfg, prefix="openpose")
 
                     # ---------------- Injection finale ControlNet ----------------
