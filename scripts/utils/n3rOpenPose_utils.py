@@ -610,130 +610,6 @@ def apply_openpose_tilewise(latents, pose, apply_fn, block_size=64, overlap=96, 
 
     return latents_out
 
-def apply_controlnet_openpose_step_ultrasafe(
-    latents,
-    t,
-    unet,
-    controlnet,
-    scheduler,
-    pose_image,
-    pos_embeds,
-    neg_embeds=None,
-    guidance_scale=5.0,
-    controlnet_scale=0.7,
-    device="cuda",
-    dtype=torch.float16,
-    debug=False
-):
-    import traceback
-
-    # 🔥 dtype cible réel (source de vérité)
-    target_dtype = next(unet.parameters()).dtype
-
-    # 🔹 Backup latents
-    latents_prev = latents.clone().to(device=device, dtype=target_dtype)
-
-    # 🔹 Cast GLOBAL (IMPORTANT)
-    latents = latents.to(device=device, dtype=target_dtype)
-    pose_image = pose_image.to(device=device, dtype=target_dtype)
-    pos_embeds = pos_embeds.to(device=device, dtype=target_dtype)
-
-    if neg_embeds is not None:
-        neg_embeds = neg_embeds.to(device=device, dtype=target_dtype)
-
-    # 🔥 FIX timestep
-    # 🔥 FIX CORRECT DIFFUSERS
-    if isinstance(t, torch.Tensor):
-        t = int(t.item())
-    else:
-        t = int(t)
-
-    # 🔹 CFG batch
-    if neg_embeds is not None:
-        latent_model_input = torch.cat([latents] * 2)
-        encoder_states = torch.cat([neg_embeds, pos_embeds])
-        pose_input = torch.cat([pose_image] * 2)
-    else:
-        latent_model_input = latents
-        encoder_states = pos_embeds
-        pose_input = pose_image
-
-    # 🔥 FIX CRITIQUE (après concat)
-    latent_model_input = latent_model_input.to(dtype=target_dtype)
-    encoder_states = encoder_states.to(dtype=target_dtype)
-    pose_input = pose_input.to(dtype=target_dtype)
-
-    # 🔹 Scheduler scale
-    latent_model_input = scheduler.scale_model_input(latent_model_input, t)
-
-    # 🔹 ControlNet
-    try:
-        down_samples, mid_sample = controlnet(
-            latent_model_input,
-            t,
-            encoder_hidden_states=encoder_states,
-            controlnet_cond=pose_input,
-            return_dict=False
-        )
-    except Exception as e:
-        if debug:
-            print(f"[ControlNet ERROR] {e}")
-            traceback.print_exc()
-        return latents_prev
-
-    # 🔹 Normalisation
-    down_samples = [
-        #torch.nan_to_num(d / (d.abs().mean() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0)
-        torch.nan_to_num(d / (d.std() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0)
-        for d in down_samples
-    ]
-    mid_sample = torch.nan_to_num(
-        mid_sample / (mid_sample.abs().mean() + 1e-6),
-        nan=0.0, posinf=1.0, neginf=-1.0
-    )
-
-    # 🔹 UNet
-    try:
-        noise_pred = unet(
-            latent_model_input,
-            t,
-            encoder_hidden_states=encoder_states,
-            down_block_additional_residuals=[d * controlnet_scale for d in down_samples],
-            mid_block_additional_residual=mid_sample * controlnet_scale
-        ).sample
-    except Exception as e:
-        if debug:
-            print(f"[UNet ERROR] {e}")
-            traceback.print_exc()
-        return latents_prev
-
-    # 🔹 CFG
-    if neg_embeds is not None:
-        noise_uncond, noise_text = noise_pred.chunk(2)
-        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
-
-    # 🔹 Scheduler
-    latents_input = latent_model_input
-
-    try:
-        latents = scheduler.step(noise_pred, t, latents_input).prev_sample
-    except Exception as e:
-        if debug:
-            print(f"[Scheduler ERROR] {e}")
-            traceback.print_exc()
-        return latents_prev
-
-    if neg_embeds is not None:
-        latents = latents.chunk(2)[0]
-
-    # 🔹 Final safety
-    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
-    torch.clamp(latents, -0.85, 0.85)
-
-    if debug:
-        print(f"[ControlNet OK] t={t}, dtype={latents.dtype}, min/max={latents.min().item():.3f}/{latents.max().item():.3f}")
-
-    return latents
 
 def apply_controlnet_openpose_step_safe(
     latents,
@@ -1265,3 +1141,229 @@ def load_controlnet_openpose(
             )
 
         raise e
+
+def apply_controlnet_openpose_step_ultrasafe(
+    latents,
+    t,
+    unet,
+    controlnet,
+    scheduler,
+    pose_image,
+    pos_embeds,
+    neg_embeds=None,
+    guidance_scale=5.0,
+    controlnet_scale=0.7,
+    device="cuda",
+    dtype=torch.float16,
+    debug=False
+):
+    import traceback
+
+    # Backup latents
+    latents_prev = latents.clone().to(device=device, dtype=dtype)
+
+    # 🔹 Cast strict au dtype du modèle
+    latents = latents.to(device=device, dtype=dtype)
+    pose_image = pose_image.to(device=device, dtype=dtype)
+    pos_embeds = pos_embeds.to(device=device, dtype=dtype)
+    if neg_embeds is not None:
+        neg_embeds = neg_embeds.to(device=device, dtype=dtype)
+
+    # 🔹 CFG batch
+    if neg_embeds is not None:
+        latent_model_input = torch.cat([latents] * 2)
+        encoder_states = torch.cat([neg_embeds, pos_embeds])
+        pose_input = torch.cat([pose_image] * 2)
+    else:
+        latent_model_input = latents
+        encoder_states = pos_embeds
+        pose_input = pose_image
+
+    latent_model_input = latent_model_input.to(dtype=dtype)
+    encoder_states = encoder_states.to(dtype=dtype)
+    pose_input = pose_input.to(dtype=dtype)
+
+    # Scheduler scale
+    latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+
+    # ControlNet
+    try:
+        down_samples, mid_sample = controlnet(
+            latent_model_input,
+            t,
+            encoder_hidden_states=encoder_states,
+            controlnet_cond=pose_input,
+            return_dict=False
+        )
+    except Exception as e:
+        if debug:
+            print(f"[ControlNet ERROR] {e}")
+            traceback.print_exc()
+        return latents_prev
+
+    # Normalisation
+    down_samples = [torch.nan_to_num(d / (d.std() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0) for d in down_samples]
+    mid_sample = torch.nan_to_num(mid_sample / (mid_sample.abs().mean() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # UNet
+    try:
+        noise_pred = unet(
+            latent_model_input,
+            t,
+            encoder_hidden_states=encoder_states,
+            down_block_additional_residuals=[d * controlnet_scale for d in down_samples],
+            mid_block_additional_residual=mid_sample * controlnet_scale
+        ).sample
+    except Exception as e:
+        if debug:
+            print(f"[UNet ERROR] {e}")
+            traceback.print_exc()
+        return latents_prev
+
+    # CFG
+    if neg_embeds is not None:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+    # Scheduler step
+    try:
+        latents = scheduler.step(noise_pred, t, latent_model_input).prev_sample
+    except Exception as e:
+        if debug:
+            print(f"[Scheduler ERROR] {e}")
+            traceback.print_exc()
+        return latents_prev
+
+    if neg_embeds is not None:
+        latents = latents.chunk(2)[0]
+
+    # Final safety
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
+    latents = torch.clamp(latents, -0.85, 0.85)
+
+    if debug:
+        print(f"[ControlNet OK] t={t}, dtype={latents.dtype}, min/max={latents.min().item():.3f}/{latents.max().item():.3f}")
+
+    return latents
+
+import torch
+import torch.nn.functional as F
+
+def controlnet_tile_fn(latent_tile, tile_coords, frame_counter, pose_full, unet, controlnet, scheduler,
+                       cf_embeds, current_guidance_scale, controlnet_scale, device, target_dtype):
+    """
+    Applique ControlNet OpenPose sur un tile de latents, en respectant strictement le dtype du modèle
+    """
+    x0, y0, x1, y1 = tile_coords
+    scale = 8  # facteur SD
+
+    # Tile dans l'image pleine
+    x0_img, x1_img = x0 * scale, x1 * scale
+    y0_img, y1_img = y0 * scale, y1 * scale
+    pose_tile = pose_full[:, :, y0_img:y1_img, x0_img:x1_img]
+
+    # Resize sécurité (obligatoire)
+    pose_tile = F.interpolate(
+        pose_tile,
+        size=(latent_tile.shape[2]*scale, latent_tile.shape[3]*scale),
+        mode='bilinear',
+        align_corners=False
+    )
+
+    # 🔹 Convertir tous les tenseurs au dtype du modèle
+    latent_tile = latent_tile.to(dtype=target_dtype, device=device)
+    pose_tile = pose_tile.to(dtype=target_dtype, device=device)
+    pos_embeds = cf_embeds[0].to(dtype=target_dtype, device=device)
+    neg_embeds = cf_embeds[1].to(dtype=target_dtype, device=device) if cf_embeds[1] is not None else None
+
+    # 🔹 Récupération timestep
+    timesteps = scheduler.timesteps
+    t = int(timesteps[frame_counter % len(timesteps)].item())
+
+    # 🔹 Appel UltraSafe
+    return apply_controlnet_openpose_step_ultrasafe(
+        latents=latent_tile,
+        t=t,
+        unet=unet,
+        controlnet=controlnet,
+        scheduler=scheduler,
+        pose_image=pose_tile,
+        pos_embeds=pos_embeds,
+        neg_embeds=neg_embeds,
+        guidance_scale=current_guidance_scale,
+        controlnet_scale=controlnet_scale,
+        device=device,
+        dtype=target_dtype,
+        debug=True
+    )
+
+    """
+
+                            # 🔹 ===== 3. TILE FUNCTION =====
+
+                            def controlnet_tile_fn(latent_tile, tile_coords):
+                                x0, y0, x1, y1 = tile_coords
+
+
+                                scale = 8  # facteur SD (IMPORTANT)
+
+                                x0_img = x0 * scale
+                                x1_img = x1 * scale
+                                y0_img = y0 * scale
+                                y1_img = y1 * scale
+
+                                pose_tile = pose_full[:, :, y0_img:y1_img, x0_img:x1_img]
+
+                                # 🔥 resize de sécurité (OBLIGATOIRE)
+                                pose_tile = F.interpolate(
+                                    pose_tile,
+                                    size=(latent_tile.shape[2] * scale, latent_tile.shape[3] * scale),
+                                    mode='bilinear',
+                                    align_corners=False
+                                )
+
+
+                                # 🔥 debug précis
+                                print(f"[TILE] latent {latent_tile.shape} {latent_tile.dtype}")
+                                print(f"[TILE] pose   {pose_tile.shape} {pose_tile.dtype}")
+
+                                # 🔥 FIX ULTIME SCHEDULER
+                                fix_scheduler_device(scheduler)
+                                timesteps = scheduler.timesteps
+
+                                if isinstance(timesteps, torch.Tensor) and timesteps.device.type != "cpu":
+                                    timesteps = timesteps.cpu()
+
+                                t = timesteps[frame_counter % len(timesteps)]
+
+                                if isinstance(t, torch.Tensor):
+                                    t = int(t.item())
+                                else:
+                                    t = int(t)
+
+                                return apply_controlnet_openpose_step_ultrasafe(
+                                    latents=latent_tile.to(dtype=target_dtype),
+                                    t=t,
+                                    unet=unet,
+                                    controlnet=controlnet,
+                                    scheduler=scheduler,
+                                    pose_image=pose_tile,
+                                    pos_embeds=cf_embeds[0],
+                                    neg_embeds=cf_embeds[1],
+                                    guidance_scale=current_guidance_scale,
+                                    controlnet_scale=controlnet_scale,
+                                    device=device,
+                                    dtype=target_dtype,
+                                    debug=True
+                                )
+                            # 🔹 ===== 4. TILE-WISE APPLY =====
+                            latents = apply_openpose_tilewise(
+                                latents.to(dtype=target_dtype),
+                                pose_latent_full,
+                                controlnet_tile_fn,
+                                tile_fn_partial,
+                                block_size=block_size,
+                                overlap=overlap,
+                                device=device
+                            )
+    """
