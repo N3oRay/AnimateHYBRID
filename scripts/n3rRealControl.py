@@ -34,7 +34,7 @@ from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 # OpenPose :
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -339,10 +339,11 @@ def main(args):
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
                     use_n3r_this_frame = math.sin(frame_counter * 0.2) > 0.7
                     #control_strength = 0.05 * (1 - frame_counter / total_frames) + 0.02
-                    control_strength = 0.08  # ou 0.5 pour test
+                    control_strength = 0.05  # ou 0.5 pour test
                     print(f"[DEBUG] Pose control_strength ={control_strength:.4f}")
 
-                    if bool(use_n3r_this_frame) and use_n3r_model is True:
+                    if use_n3r_this_frame and use_n3r_model:
+                        print(f"[DEBUG] N3R active: {use_n3r_this_frame}")
                         try:
                             H, W = latents.shape[-2], latents.shape[-1]
                             coords = generate_n3r_coords(H, W, n3r_model.N_samples, seed, frame_counter, device)
@@ -402,15 +403,16 @@ def main(args):
 
                         try:
                             # Application OpenPose
-                            latents = apply_controlnet_openpose_step(
+                            latents = apply_controlnet_openpose_step_ultrasafe(
                                 latents=latents,
                                 t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
                                 unet=unet, controlnet=controlnet, scheduler=scheduler, pose_image=pose,
                                 pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1], guidance_scale=current_guidance_scale,
-                                controlnet_scale=1.2,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
+                                controlnet_scale=0.3,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
                                 device=device, dtype=target_dtype,
                                 debug=False
                             )
+                            latents = torch.nan_to_num(latents)
                             # 🔥 Protection contre NaN
                             if torch.isnan(latents).any():
                                 print("[WARNING] NaN détecté après OpenPose, restauration des latents précédents")
@@ -418,7 +420,7 @@ def main(args):
 
                             latents = sanitize_latents(latents)
                             diff = (latents - latents_before_openpose).abs().mean()
-                            print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
+                            print(f"[DEBUG] OpenPose impact: {diff.item():.6f}") #< 0.001	❌ aucun effet 0.01+	✅ effet réel 0.05+	🔥 fort
 
                         except Exception as e:
                             print(f"[ERROR] ControlNet OpenPose failed: {e}")
