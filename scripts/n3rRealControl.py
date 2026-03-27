@@ -73,8 +73,9 @@ def main(args):
     block_size = min(256, H//2, W//2)  # block_size auto selon résolution
     use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
     use_openpose = cfg.get("use_openpose", True)
-    controlnet_scale = cfg.get("controlnet_scale", 0.9)
-    control_strength = cfg.get("control_strength", 0.3)
+    controlnet_scale = cfg.get("controlnet_scale", 1.0)
+    control_strength = cfg.get("control_strength", 1.0)
+
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
     target_temp, reference_temp = 7800, 6500 #target_temp = 8000 reference_temp = 6000  (Froid)
 
@@ -391,10 +392,14 @@ def main(args):
                         elif pose.shape[1] == 1:
                             pose = pose.repeat(1, 3, 1, 1)
 
+                        pose = (pose - 0.5) * 2.0
+                        print(f"[DEBUG] Latents OpenPose après recalc min/max={pose.min().item()}/{pose.max().item()}")
                         # ⚡ Normaliser le squelette pour éviter valeurs trop grandes
-                        pose_min, pose_max = pose.min(), pose.max()
-                        pose = (pose - pose_min) / (pose_max - pose_min + 1e-6)
-                        print(f"[DEBUG] Pose normalisée min={pose.min().item():.4f}, max={pose.max().item():.4f}")
+                        #pose_min, pose_max = pose.min(), pose.max()
+                        #pose = (pose - pose_min) / (pose_max - pose_min + 1e-6)
+                        #pose = torch.clamp(pose, -1.0, 1.0)  # ⚡ remplacement de la normalisation précédente
+                        pose = torch.clamp(pose, 0.0, 1.0)
+                        print(f"[DEBUG] Pose clamp min={pose.min().item():.4f}, max={pose.max().item():.4f}")
                         # ⚡ Assurer la même dtype et device que le modèle
                         target_dtype = next(unet.parameters()).dtype  # dtype du UNet (float16 ou float32)
                         pose = pose.to(device=device, dtype=target_dtype)
@@ -415,9 +420,11 @@ def main(args):
                                 device=device, dtype=target_dtype,
                                 debug=False
                             )
+                            print(f"[DEBUG] Latents OpenPose min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
                             latents = torch.clamp(latents, -0.5, 0.5)
+                            print(f"[DEBUG] Latents After nan_to_num, clamp : OpenPose min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
                             # 🔥 Protection contre NaN
                             if torch.isnan(latents).any():
                                 print("[WARNING] NaN détecté après OpenPose, restauration des latents précédents")
