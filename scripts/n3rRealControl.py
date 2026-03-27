@@ -73,6 +73,8 @@ def main(args):
     block_size = min(256, H//2, W//2)  # block_size auto selon résolution
     use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
     use_openpose = cfg.get("use_openpose", True)
+    controlnet_scale = cfg.get("controlnet_scale", 0.9)
+    control_strength = cfg.get("control_strength", 0.3)
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
     target_temp, reference_temp = 7800, 6500 #target_temp = 8000 reference_temp = 6000  (Froid)
 
@@ -339,8 +341,9 @@ def main(args):
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
                     use_n3r_this_frame = math.sin(frame_counter * 0.2) > 0.7
                     #control_strength = 0.05 * (1 - frame_counter / total_frames) + 0.02
-                    control_strength = 0.05  # ou 0.5 pour test
                     print(f"[DEBUG] Pose control_strength ={control_strength:.4f}")
+                    print(f"[DEBUG] Pose controlnet_scale ={controlnet_scale:.4f}")
+
 
                     if use_n3r_this_frame and use_n3r_model:
                         print(f"[DEBUG] N3R active: {use_n3r_this_frame}")
@@ -408,12 +411,13 @@ def main(args):
                                 t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
                                 unet=unet, controlnet=controlnet, scheduler=scheduler, pose_image=pose,
                                 pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1], guidance_scale=current_guidance_scale,
-                                controlnet_scale=0.3,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
+                                controlnet_scale=controlnet_scale,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
                                 device=device, dtype=target_dtype,
                                 debug=False
                             )
                             latents = torch.nan_to_num(latents)
-                            latents = sanitize_latents(latents, clamp_min=-0.5, clamp_max=0.5)
+                            latents = sanitize_latents(latents)
+                            latents = torch.clamp(latents, -0.5, 0.5)
                             # 🔥 Protection contre NaN
                             if torch.isnan(latents).any():
                                 print("[WARNING] NaN détecté après OpenPose, restauration des latents précédents")
@@ -435,6 +439,7 @@ def main(args):
                     print(f"[DEBUG] control_latent min/max={control_latent.min():.4f}/{control_latent.max():.4f}")
                     latents = latents + control_strength * control_weight_map * control_latent
                     latents = sanitize_latents(latents)
+                    latents = torch.clamp(latents, -0.5, 0.5)
                     print(f"[DEBUG] Après Injection finale ControlNet min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
                     # ---------------- Fusion frame + latent injection ----------------
