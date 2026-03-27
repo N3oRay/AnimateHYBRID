@@ -12,9 +12,25 @@ import matplotlib.pyplot as plt
 import os
 import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
+import traceback
 
-import torch
-import torch.nn.functional as F
+def log_frame_error(img_path, error: Exception, verbose: bool = True):
+    """
+    Log propre d'une erreur sur une frame.
+
+    Args:
+        img_path: chemin de l'image/frame
+        error: exception capturée
+        verbose: afficher le traceback complet
+    """
+
+    print(f"\n[FRAME ERROR] {img_path}")
+    print(f"Type d'erreur : {type(error).__name__}")
+    print(f"Message d'erreur : {error}")
+
+    if verbose:
+        print("Traceback complet :")
+        traceback.print_exc()
 
 
 def prepare_controlnet(
