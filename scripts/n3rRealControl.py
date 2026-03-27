@@ -35,7 +35,7 @@ from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 # OpenPose :
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -46,18 +46,6 @@ def wait_for_stop():
     if inp.lower() == "²":
         stop_generation = True
 threading.Thread(target=wait_for_stop, daemon=True).start()
-
-def fix_scheduler_device(scheduler):
-    for attr in [
-        "alphas_cumprod",
-        "final_alpha_cumprod",
-        "timesteps",
-        "sigmas"
-    ]:
-        if hasattr(scheduler, attr):
-            val = getattr(scheduler, attr)
-            if isinstance(val, torch.Tensor):
-                setattr(scheduler, attr, val.cpu())
 
 # ---------------- MAIN FIABLE ----------------
 def main(args):
@@ -234,7 +222,7 @@ def main(args):
         if stop_generation: break
         try:
             # Paramètres interpolés
-            current_init_image_scale, current_creative_noise, current_guidance_scale = compute_weighted_params( frame_counter, total_frames, init_start=0.85, init_end=0.5,noise_start=0.0, noise_end=0.08, guidance_start=3.5, guidance_end=4.5, mode="cosine" )
+            current_init_image_scale, current_creative_noise, current_guidance_scale = compute_weighted_params( frame_counter, total_frames, init_start=init_image_scale, init_end=init_image_scale_end,noise_start=creative_noise, noise_end=creative_noise_end, guidance_start=guidance_scale, guidance_end=guidance_scale_end, mode="cosine" )
             print(f"[Frame {frame_counter:03d}] " f"init_image_scale={current_init_image_scale:.3f}, " f"guidance_scale={current_guidance_scale:.3f}, " f"creative_noise={current_creative_noise:.3f}")
 
             # Charger et encoder l'image sur GPU
@@ -452,74 +440,13 @@ def main(args):
 
                             print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
 
-                            # 🔹 ===== 3. TILE FUNCTION =====
-                            def controlnet_tile_fn(latent_tile, tile_coords):
-                                x0, y0, x1, y1 = tile_coords
+                            from functools import partial
 
+                            # Préparer la tile function avec tous les arguments sauf latent_tile et tile_coords
+                            tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, pose_full=pose_full, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype )
 
-                                scale = 8  # facteur SD (IMPORTANT)
-
-                                x0_img = x0 * scale
-                                x1_img = x1 * scale
-                                y0_img = y0 * scale
-                                y1_img = y1 * scale
-
-                                pose_tile = pose_full[:, :, y0_img:y1_img, x0_img:x1_img]
-
-                                # 🔥 resize de sécurité (OBLIGATOIRE)
-                                pose_tile = F.interpolate(
-                                    pose_tile,
-                                    size=(latent_tile.shape[2] * scale, latent_tile.shape[3] * scale),
-                                    mode='bilinear',
-                                    align_corners=False
-                                )
-
-
-                                # 🔥 debug précis
-                                print(f"[TILE] latent {latent_tile.shape} {latent_tile.dtype}")
-                                print(f"[TILE] pose   {pose_tile.shape} {pose_tile.dtype}")
-
-                                # 🔥 FIX ULTIME SCHEDULER
-                                fix_scheduler_device(scheduler)
-                                timesteps = scheduler.timesteps
-
-                                if isinstance(timesteps, torch.Tensor) and timesteps.device.type != "cpu":
-                                    timesteps = timesteps.cpu()
-
-                                t = timesteps[frame_counter % len(timesteps)]
-
-                                if isinstance(t, torch.Tensor):
-                                    t = int(t.item())
-                                else:
-                                    t = int(t)
-
-                                return apply_controlnet_openpose_step_ultrasafe(
-                                    latents=latent_tile.to(dtype=target_dtype),
-                                    t=t,
-                                    unet=unet,
-                                    controlnet=controlnet,
-                                    scheduler=scheduler,
-                                    pose_image=pose_tile,
-                                    pos_embeds=cf_embeds[0],
-                                    neg_embeds=cf_embeds[1],
-                                    guidance_scale=current_guidance_scale,
-                                    controlnet_scale=controlnet_scale,
-                                    device=device,
-                                    dtype=target_dtype,
-                                    debug=True
-                                )
-
-
-
-                            # 🔹 ===== 4. TILE-WISE APPLY =====
-                            latents = apply_openpose_tilewise(
-                                latents.to(dtype=target_dtype),
-                                pose_latent_full,
-                                controlnet_tile_fn,
-                                block_size=block_size,
-                                overlap=overlap,
-                                device=device
-                            )
+                            # 🔹 Appel correct de apply_openpose_tilewise
+                            latents = apply_openpose_tilewise( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device)
 
                             # 🔹 ===== 5. CLEANUP =====
                             latents = torch.nan_to_num(latents)
