@@ -150,13 +150,11 @@ def main(args):
                 anim_data = json.load(f)
 
             print(f"✅ JSON chargé : {json_file}")
-
             pose_sequence = convert_json_to_pose_sequence( anim_data, H=cfg["H"], W=cfg["W"], device=device, dtype=dtype, debug=True)
 
             if pose_sequence is None:
                 print("❌ Aucun pose_sequence → OpenPose désactivé")
                 use_openpose = False
-
             else:
                 # 🔥 Fix interpolation
                 pose_sequence = fix_pose_sequence( pose_sequence, total_frames=total_frames, device=device, dtype=dtype )
@@ -169,8 +167,7 @@ def main(args):
     if use_n3r_model:
         n3r_model = N3RModelOptimized(
             L_low=cfg.get("n3r_L_low",3), L_high=cfg.get("n3r_L_high",6),
-            N_samples=cfg.get("n3r_N_samples",32), # plus de samples pour un rendu détaillé 48
-            tile_size=cfg.get("n3r_tile_size",64), # inchangé pour VRAM raisonnable
+            N_samples=cfg.get("n3r_N_samples",32), tile_size=cfg.get("n3r_tile_size",64),
             cpu_offload=cfg.get("n3r_cpu_offload",True)
         ).to(device)
         n3r_model.eval()
