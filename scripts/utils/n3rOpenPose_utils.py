@@ -567,6 +567,47 @@ import torch
 # ****************************** A TESTER ********************************
 import torch
 
+import torch
+import torch.nn.functional as F
+
+def apply_openpose_tilewise(latents, pose, apply_fn, block_size=64, overlap=96, device='cuda'):
+    """
+    Applique OpenPose tile par tile sur le latent.
+
+    latents : torch.Tensor [B, 4, H_latent, W_latent] (diffusion latents)
+    pose    : torch.Tensor [B, 3, H_img, W_img] (full OpenPose)
+    apply_fn: fonction qui applique ControlNet sur un tile
+    """
+    B, C_lat, H_lat, W_lat = latents.shape
+    B, C_pose, H_img, W_img = pose.shape
+
+    # Redimensionner le pose pour matcher le latent full size
+    pose_resized = F.interpolate(pose, size=(H_lat, W_lat), mode='bilinear', align_corners=False)
+
+    # Créer une copie pour modification
+    latents_out = latents.clone()
+
+    stride = block_size - overlap
+    for i in range(0, H_lat, stride):
+        for j in range(0, W_lat, stride):
+            # Limites du tile (clip si dépasse)
+            i_end = min(i + block_size, H_lat)
+            j_end = min(j + block_size, W_lat)
+            i_start = i_end - block_size if i_end - i < block_size else i
+            j_start = j_end - block_size if j_end - j < block_size else j
+
+            # Extraire tile latent et tile pose
+            latent_tile = latents[:, :, i_start:i_end, j_start:j_end]
+            pose_tile = pose_resized[:, :, i_start:i_end, j_start:j_end]
+
+            # Appliquer ControlNet sur le tile
+            latent_tile_processed = apply_fn(latent_tile, pose_tile)
+
+            # Écraser dans latents_out
+            latents_out[:, :, i_start:i_end, j_start:j_end] = latent_tile_processed
+
+    return latents_out
+
 def apply_controlnet_openpose_step_ultrasafe(
     latents,
     t,
