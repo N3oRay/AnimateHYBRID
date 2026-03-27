@@ -413,12 +413,12 @@ def main(args):
                                 debug=False
                             )
                             latents = torch.nan_to_num(latents)
+                            latents = sanitize_latents(latents, clamp_min=-0.5, clamp_max=0.5)
                             # 🔥 Protection contre NaN
                             if torch.isnan(latents).any():
                                 print("[WARNING] NaN détecté après OpenPose, restauration des latents précédents")
                                 latents = latents_before_openpose.clone()
 
-                            latents = sanitize_latents(latents)
                             diff = (latents - latents_before_openpose).abs().mean()
                             print(f"[DEBUG] OpenPose impact: {diff.item():.6f}") #< 0.001	❌ aucun effet 0.01+	✅ effet réel 0.05+	🔥 fort
 
