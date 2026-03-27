@@ -406,7 +406,6 @@ def main(args):
                         mini_weight = (1 - frame_counter / total_frames) * (1 - latent_injection)
                         # S'assurer que les dimensions correspondent
                         mini_latents = match_latent_size(latents, mini_latents)
-
                         # Fusion pondérée
                         latents = (1 - mini_weight) * latents + mini_weight * mini_latents
                         latents = sanitize_latents(latents)
@@ -429,7 +428,6 @@ def main(args):
                         pose_min, pose_max = pose.min(), pose.max()
                         pose = (pose - pose_min) / (pose_max - pose_min + 1e-6)
                         print(f"[DEBUG] Pose normalisée min={pose.min().item():.4f}, max={pose.max().item():.4f}")
-
                         # ⚡ Assurer la même dtype et device que le modèle
                         target_dtype = next(unet.parameters()).dtype  # dtype du UNet (float16 ou float32)
                         pose = pose.to(device=device, dtype=target_dtype)
@@ -437,7 +435,6 @@ def main(args):
 
                         # DEBUG : Latents avant OpenPose
                         print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
-
                         latents_before_openpose = latents.clone()  # pour comparer après
 
                         try:
@@ -466,7 +463,6 @@ def main(args):
 
                         # DEBUG : Latents après OpenPose
                         print(f"[DEBUG] Latents après OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
-
                         save_debug_pose_image(pose, frame_counter, output_dir, cfg, prefix="openpose")
                         #controlnet.to("cpu")
                     # ---------------- Injection finale ControlNet ----------------
