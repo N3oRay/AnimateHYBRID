@@ -8,6 +8,274 @@ import torch.nn.functional as F
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 import numpy as np
 import cv2
+import matplotlib.pyplot as plt
+import os
+import torchvision.transforms.functional as TF
+from PIL import Image, ImageDraw
+
+import torch
+import torch.nn.functional as F
+
+
+def prepare_controlnet(
+    controlnet,
+    freeze: bool = True,
+    enable_slicing: bool = True,
+    device=None,
+    dtype=None,
+    verbose: bool = True
+):
+    """
+    Prépare un ControlNet :
+    - eval mode
+    - freeze des poids
+    - attention slicing (si dispo)
+    - move device / dtype
+    - init pose_sequence
+
+    Returns:
+        controlnet, pose_sequence (None par défaut)
+    """
+
+    # ---- eval mode
+    controlnet.eval()
+    if verbose:
+        print("✅ ControlNet en mode eval")
+
+    # ---- freeze
+    if freeze:
+        for p in controlnet.parameters():
+            p.requires_grad = False
+        if verbose:
+            print("✅ Paramètres gelés")
+
+    # ---- attention slicing
+    if enable_slicing:
+        fn = getattr(controlnet, "enable_attention_slicing", None)
+        if callable(fn):
+            fn()
+            if verbose:
+                print("✅ Attention slicing activé")
+        else:
+            if verbose:
+                print("⚠ enable_attention_slicing non disponible")
+
+    # ---- device / dtype
+    if device is not None or dtype is not None:
+        controlnet = controlnet.to(device=device, dtype=dtype)
+        if verbose:
+            print(f"✅ Déplacé sur {device} / {dtype}")
+
+    # ---- init pose
+    pose_sequence = None
+
+    return controlnet, pose_sequence
+
+def fix_pose_sequence(
+    pose_sequence: torch.Tensor,
+    total_frames: int,
+    device=None,
+    dtype=None,
+    verbose: bool = True
+) -> torch.Tensor:
+    """
+    Ajuste une séquence de poses au bon nombre de frames avec interpolation.
+
+    Args:
+        pose_sequence: Tensor (F, C, H, W)
+        total_frames: nombre de frames cible
+        device: device cible (optionnel)
+        dtype: dtype cible (optionnel)
+        verbose: afficher logs
+
+    Returns:
+        Tensor (F, C, H, W)
+    """
+    print(f"🎞 fix_pose_sequence - Frames JSON: {pose_sequence.shape[0]}")
+    print(f"🎞 fix_pose_sequence - Frames attendues: {total_frames}")
+
+    if pose_sequence.shape[0] != total_frames:
+        if verbose:
+            print("⚠ Ajustement du nombre de frames OpenPose")
+
+        # (F, C, H, W) → (1, C, F, H, W)
+        pose_sequence = pose_sequence.permute(1, 0, 2, 3).unsqueeze(0)
+
+        pose_sequence = F.interpolate(
+            pose_sequence,
+            size=(total_frames, pose_sequence.shape[-2], pose_sequence.shape[-1]),
+            mode='trilinear',
+            align_corners=False
+        )
+
+        # retour → (F, C, H, W)
+        pose_sequence = pose_sequence.squeeze(0).permute(1, 0, 2, 3)
+
+    # Fix device + dtype
+    if device is not None or dtype is not None:
+        pose_sequence = pose_sequence.to(device=device, dtype=dtype)
+
+    if verbose:
+        print(
+            "✅ PoseSequence final:",
+            pose_sequence.shape,
+            pose_sequence.device,
+            pose_sequence.dtype
+        )
+
+    return pose_sequence
+
+
+
+def tensor_to_pil(tensor):
+    """
+    Convertit un tensor torch [C,H,W] ou [H,W] en PIL.Image RGB.
+    """
+    if tensor.dim() == 3:
+        C, H, W = tensor.shape
+        if C == 1:
+            array = tensor[0].cpu().numpy()  # [H,W]
+            pil_img = Image.fromarray(array).convert("RGB")
+        elif C == 3:
+            array = tensor.permute(1, 2, 0).cpu().numpy()  # [H,W,C]
+            pil_img = Image.fromarray(array)
+        else:
+            raise ValueError(f"Tensor avec {C} canaux non supporté")
+    elif tensor.dim() == 2:
+        pil_img = Image.fromarray(tensor.cpu().numpy()).convert("RGB")
+    else:
+        raise ValueError(f"Tensor shape non supportée: {tensor.shape}")
+    return pil_img
+
+import os
+from PIL import Image
+import torch
+
+def save_debug_pose_image(pose_tensor, frame_counter, output_dir, cfg=None, prefix="openpose"):
+    """
+    Sauvegarde une image de pose pour contrôle visuel.
+
+    pose_tensor : torch.Tensor [C,H,W] ou [H,W]
+    frame_counter : int, numéro de frame
+    output_dir : str, dossier où sauvegarder
+    cfg : dict ou None, peut contenir paramètre 'visual_debug' pour activer/désactiver
+    prefix : str, préfixe du fichier
+    """
+
+    # Vérifie si le debug visuel est activé
+    if cfg is not None and cfg.get("visual_debug") is False:
+        return
+
+    # Convertir tensor en uint8 [0,255]
+    pose_img = (pose_tensor * 255).clamp(0, 255).byte()
+
+    # Fonction interne pour gérer tous les formats [C,H,W], [H,W]
+    def tensor_to_pil(tensor):
+        if tensor.dim() == 3:
+            C, H, W = tensor.shape
+            if C == 1:
+                array = tensor[0].cpu().numpy()  # [H,W]
+                pil_img = Image.fromarray(array).convert("RGB")
+            elif C == 3:
+                array = tensor.permute(1, 2, 0).cpu().numpy()  # [H,W,C]
+                pil_img = Image.fromarray(array)
+            else:
+                raise ValueError(f"Tensor avec {C} canaux non supporté")
+        elif tensor.dim() == 2:
+            pil_img = Image.fromarray(tensor.cpu().numpy()).convert("RGB")
+        else:
+            # Si la tensor a une forme inattendue, on essaie de la "squeezer"
+            tensor = tensor.squeeze()
+            if tensor.dim() in [2, 3]:
+                return tensor_to_pil(tensor)
+            raise ValueError(f"Tensor shape non supportée: {tensor.shape}")
+        return pil_img
+
+    pil_pose = tensor_to_pil(pose_img)
+
+    # Création du dossier si nécessaire
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Nom du fichier : openpose_00001.png
+    filename = f"{prefix}_{frame_counter:05d}.png"
+    path = os.path.join(output_dir, filename)
+
+    pil_pose.save(path)
+    print(f"[DEBUG] Pose sauvegardée : {path}")
+
+def save_debug_pose_image_mini(pose_tensor, frame_counter, output_dir, cfg=None, prefix="openpose"):
+    """
+    Sauvegarde la pose détectée pour vérification visuelle.
+
+    Args:
+        pose_tensor (torch.Tensor): Tensor BCHW ou CHW (1,3,H,W ou 3,H,W)
+        frame_counter (int): numéro de la frame
+        output_dir (Path): dossier de sortie pour sauvegarde
+        cfg (dict, optional): configuration, active si cfg.get("debug_pose_visual", False) est True
+        prefix (str): préfixe du fichier image (default: 'openpose')
+    """
+    if cfg is None or not cfg.get("debug_pose_visual", False):
+        return
+
+    # S'assurer que le tensor est BCHW
+    if pose_tensor.ndim == 3:  # CHW -> BCHW
+        pose_tensor = pose_tensor.unsqueeze(0)
+
+    pose_tensor = pose_tensor[0]  # retirer batch
+
+    # Limiter à 3 canaux
+    if pose_tensor.shape[0] > 3:
+        pose_tensor = pose_tensor[:3, :, :]
+
+    # CHW -> HWC
+    pose_np = pose_tensor.permute(1, 2, 0).cpu().numpy()
+    # Normalisation 0-255
+    pose_np = (pose_np - pose_np.min()) / (pose_np.max() - pose_np.min() + 1e-8) * 255.0
+    pose_np = pose_np.astype("uint8")
+    img = Image.fromarray(pose_np)
+
+    # Nom de fichier : openpose_0001.png
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = output_dir / f"{prefix}_{frame_counter:04d}.png"
+    img.save(filename)
+
+def debug_pose_visual(pose_tensor, frame_counter, cfg=None, title="Pose Debug"):
+    """
+    Affiche la pose détectée pour vérification visuelle.
+
+    Args:
+        pose_tensor (torch.Tensor): Tensor BCHW ou CHW (1,3,H,W ou 3,H,W)
+        frame_counter (int): numéro de la frame
+        cfg (dict, optional): configuration, active si cfg.get("debug_pose_visual", False) est True
+        title (str): titre pour l'affichage
+    """
+    if cfg is None or not cfg.get("debug_pose_visual", False):
+        return
+
+    # S'assurer que le tensor est BCHW
+    if pose_tensor.ndim == 3:  # CHW -> BCHW
+        pose_tensor = pose_tensor.unsqueeze(0)
+
+    pose_tensor = pose_tensor[0]  # retirer batch
+
+    # Limiter à 3 canaux
+    if pose_tensor.shape[0] > 3:
+        pose_tensor = pose_tensor[:3, :, :]
+
+    # CHW -> HWC pour PIL
+    pose_np = pose_tensor.permute(1, 2, 0).cpu().numpy()
+    pose_np = (pose_np - pose_np.min()) / (pose_np.max() - pose_np.min() + 1e-8) * 255.0
+    pose_np = pose_np.astype("uint8")
+    img = Image.fromarray(pose_np)
+
+    # Affichage rapide avec matplotlib
+    plt.figure(figsize=(4, 4))
+    plt.imshow(img)
+    plt.axis("off")
+    plt.title(f"{title} - Frame {frame_counter}")
+    plt.show(block=False)
+    plt.pause(0.1)  # court délai pour rafraîchir
+    plt.close()
 
 def convert_json_to_pose_sequence(anim_data, H=512, W=512, device="cuda", dtype=torch.float16, debug=False):
     """
