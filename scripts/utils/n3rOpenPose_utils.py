@@ -601,7 +601,9 @@ def apply_openpose_tilewise(latents, pose, apply_fn, block_size=64, overlap=96, 
             pose_tile = pose_resized[:, :, i_start:i_end, j_start:j_end]
 
             # Appliquer ControlNet sur le tile
-            latent_tile_processed = apply_fn(latent_tile, pose_tile)
+            #latent_tile_processed = apply_fn(latent_tile, pose_tile)
+            tile_coords = (j_start, i_start, j_end, i_end)  # ⚠️ ordre important
+            latent_tile_processed = apply_fn(latent_tile, tile_coords)
 
             # Écraser dans latents_out
             latents_out[:, :, i_start:i_end, j_start:j_end] = latent_tile_processed
@@ -623,14 +625,30 @@ def apply_controlnet_openpose_step_ultrasafe(
     dtype=torch.float16,
     debug=False
 ):
-    # 🔹 Backup latents pour sécurité
-    latents_prev = latents.clone().to(device=device, dtype=dtype)
+    import traceback
 
-    # 🔹 Déplacement device/dtype
-    latents = latents.to(device=device, dtype=dtype)
-    pose_image = pose_image.to(device=device, dtype=dtype)
+    # 🔥 dtype cible réel (source de vérité)
+    target_dtype = next(unet.parameters()).dtype
 
-    # 🔹 Préparer batch pour CFG
+    # 🔹 Backup latents
+    latents_prev = latents.clone().to(device=device, dtype=target_dtype)
+
+    # 🔹 Cast GLOBAL (IMPORTANT)
+    latents = latents.to(device=device, dtype=target_dtype)
+    pose_image = pose_image.to(device=device, dtype=target_dtype)
+    pos_embeds = pos_embeds.to(device=device, dtype=target_dtype)
+
+    if neg_embeds is not None:
+        neg_embeds = neg_embeds.to(device=device, dtype=target_dtype)
+
+    # 🔥 FIX timestep
+    # 🔥 FIX CORRECT DIFFUSERS
+    if isinstance(t, torch.Tensor):
+        t = int(t.item())
+    else:
+        t = int(t)
+
+    # 🔹 CFG batch
     if neg_embeds is not None:
         latent_model_input = torch.cat([latents] * 2)
         encoder_states = torch.cat([neg_embeds, pos_embeds])
@@ -640,9 +658,15 @@ def apply_controlnet_openpose_step_ultrasafe(
         encoder_states = pos_embeds
         pose_input = pose_image
 
+    # 🔥 FIX CRITIQUE (après concat)
+    latent_model_input = latent_model_input.to(dtype=target_dtype)
+    encoder_states = encoder_states.to(dtype=target_dtype)
+    pose_input = pose_input.to(dtype=target_dtype)
+
+    # 🔹 Scheduler scale
     latent_model_input = scheduler.scale_model_input(latent_model_input, t)
 
-    # 🔹 ControlNet forward
+    # 🔹 ControlNet
     try:
         down_samples, mid_sample = controlnet(
             latent_model_input,
@@ -653,15 +677,22 @@ def apply_controlnet_openpose_step_ultrasafe(
         )
     except Exception as e:
         if debug:
-            print(f"[ControlNet ERROR] {e}, returning previous latents")
+            print(f"[ControlNet ERROR] {e}")
+            traceback.print_exc()
         return latents_prev
 
-    # 🔹 Normalisation safe des résidus
-    down_samples = [torch.nan_to_num(d / (d.abs().mean() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0)
-                    for d in down_samples]
-    mid_sample = torch.nan_to_num(mid_sample / (mid_sample.abs().mean() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0)
+    # 🔹 Normalisation
+    down_samples = [
+        #torch.nan_to_num(d / (d.abs().mean() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0)
+        torch.nan_to_num(d / (d.std() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0)
+        for d in down_samples
+    ]
+    mid_sample = torch.nan_to_num(
+        mid_sample / (mid_sample.abs().mean() + 1e-6),
+        nan=0.0, posinf=1.0, neginf=-1.0
+    )
 
-    # 🔹 UNet forward
+    # 🔹 UNet
     try:
         noise_pred = unet(
             latent_model_input,
@@ -672,7 +703,8 @@ def apply_controlnet_openpose_step_ultrasafe(
         ).sample
     except Exception as e:
         if debug:
-            print(f"[UNet ERROR] {e}, returning previous latents")
+            print(f"[UNet ERROR] {e}")
+            traceback.print_exc()
         return latents_prev
 
     # 🔹 CFG
@@ -680,25 +712,26 @@ def apply_controlnet_openpose_step_ultrasafe(
         noise_uncond, noise_text = noise_pred.chunk(2)
         noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
 
-    # 🔹 Scheduler step
-    latents_input = torch.cat([latents] * 2) if neg_embeds is not None else latents
+    # 🔹 Scheduler
+    latents_input = latent_model_input
+
     try:
         latents = scheduler.step(noise_pred, t, latents_input).prev_sample
     except Exception as e:
         if debug:
-            print(f"[Scheduler ERROR] {e}, returning previous latents")
+            print(f"[Scheduler ERROR] {e}")
+            traceback.print_exc()
         return latents_prev
 
-    # 🔹 Récupérer batch original si CFG
     if neg_embeds is not None:
         latents = latents.chunk(2)[0]
 
-    # 🔹 Clamp final et NaN safety
+    # 🔹 Final safety
     latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
-    latents = torch.clamp(latents, -1.0, 1.0)
+    torch.clamp(latents, -0.85, 0.85)
 
     if debug:
-        print(f"[ControlNet ULTRA-SAFE] t={t}, latents min/max: {latents.min().item():.3f}/{latents.max().item():.3f}")
+        print(f"[ControlNet OK] t={t}, dtype={latents.dtype}, min/max={latents.min().item():.3f}/{latents.max().item():.3f}")
 
     return latents
 
