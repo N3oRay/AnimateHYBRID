@@ -73,7 +73,7 @@ def main(args):
     block_size = min(256, H//2, W//2)  # block_size auto selon résolution
     use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
     use_openpose = cfg.get("use_openpose", True)
-    controlnet_scale = cfg.get("controlnet_scale", 1.0)
+    controlnet_scale = cfg.get("controlnet_scale", 0.8) # typiquement 0.5 → 1.0
     control_strength = cfg.get("control_strength", 1.0)
 
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
@@ -397,19 +397,23 @@ def main(args):
                         # ⚡ Normaliser le squelette pour éviter valeurs trop grandes
                         #pose_min, pose_max = pose.min(), pose.max()
                         #pose = (pose - pose_min) / (pose_max - pose_min + 1e-6)
-                        #pose = torch.clamp(pose, -1.0, 1.0)  # ⚡ remplacement de la normalisation précédente
-                        pose = torch.clamp(pose, 0.0, 1.0)
+                        pose = torch.clamp(pose, -1.0, 1.0)  # ⚡ remplacement de la normalisation précédente
+
                         print(f"[DEBUG] Pose clamp min={pose.min().item():.4f}, max={pose.max().item():.4f}")
                         # ⚡ Assurer la même dtype et device que le modèle
-                        target_dtype = next(unet.parameters()).dtype  # dtype du UNet (float16 ou float32)
-                        pose = pose.to(device=device, dtype=target_dtype)
-                        latents = latents.to(device=device, dtype=target_dtype)
+                        #target_dtype = next(unet.parameters()).dtype  # dtype du UNet (float16 ou float32)
+                        #pose = pose.to(device=device, dtype=target_dtype)
+                        #latents = latents.to(device=device, dtype=target_dtype)
+
+                        pose = pose.float().to(device)
+                        latents = latents.float().to(device)
 
                         # DEBUG : Latents avant OpenPose
                         print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
                         latents_before_openpose = latents.clone()  # pour comparer après
 
                         try:
+                            print(f"[CHECK] pose {pose.shape}, latents {latents.shape}")
                             # Application OpenPose
                             latents = apply_controlnet_openpose_step_ultrasafe(
                                 latents=latents,
@@ -417,7 +421,9 @@ def main(args):
                                 unet=unet, controlnet=controlnet, scheduler=scheduler, pose_image=pose,
                                 pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1], guidance_scale=current_guidance_scale,
                                 controlnet_scale=controlnet_scale,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
-                                device=device, dtype=target_dtype,
+                                device=device,
+                                #dtype=target_dtype,
+                                dtype=torch.float32,
                                 debug=False
                             )
                             print(f"[DEBUG] Latents OpenPose min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
