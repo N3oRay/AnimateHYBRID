@@ -34,7 +34,7 @@ from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 # OpenPose :
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -108,7 +108,6 @@ def main(args):
         print(f"[INFO] motion_module type: {type(motion_module)}")
     # ---------------- Tokenizer / Text encoder ----------------
     tokenizer = CLIPTokenizerFast.from_pretrained(os.path.join(args.pretrained_model_path,"tokenizer"))
-    #text_encoder = CLIPTextModel.from_pretrained(os.path.join(args.pretrained_model_path,"text_encoder")).to(device).to(dtype)
     text_encoder = CLIPTextModel.from_pretrained(os.path.join(args.pretrained_model_path,"text_encoder")).to("cpu").to(dtype)
     # ---------------- VAE ----------------
     vae_path = cfg.get("vae_path")
@@ -143,18 +142,7 @@ def main(args):
     # ---------------- load_controlnet_openpose ----------------
     if use_openpose:
         controlnet = load_controlnet_openpose_local( device=device, dtype=torch.float16, use_fp16=True, debug=True )
-
-        if hasattr(controlnet, "enable_attention_slicing"):
-            controlnet.enable_attention_slicing()
-        else:
-            print("⚠ enable_attention_slicing non disponible sur ce modèle.")
-
-        controlnet.eval()
-        for p in controlnet.parameters():
-            p.requires_grad = False
-
-        # ---- load json
-        pose_sequence = None
+        controlnet, pose_sequence = prepare_controlnet( controlnet, device=device, dtype=dtype )
 
         try:
             base_dir = Path(__file__).resolve().parent
@@ -172,28 +160,8 @@ def main(args):
                 use_openpose = False
 
             else:
-                print(f"🎞 Frames JSON: {pose_sequence.shape[0]}")
-                print(f"🎞 Frames attendues: {total_frames}")
-
                 # 🔥 Fix interpolation
-                if pose_sequence.shape[0] != total_frames:
-                    print("⚠ Ajustement du nombre de frames OpenPose")
-
-                    # (F, C, H, W) → (1, C, F, H, W)
-                    pose_sequence = pose_sequence.permute(1, 0, 2, 3).unsqueeze(0)
-
-                    pose_sequence = torch.nn.functional.interpolate(
-                        pose_sequence,
-                        size=(total_frames, pose_sequence.shape[-2], pose_sequence.shape[-1]),
-                        mode='trilinear',
-                        align_corners=False
-                    )
-
-                # retour → (F, C, H, W)
-                pose_sequence = pose_sequence.squeeze(0).permute(1, 0, 2, 3)
-                # 🔥 Fix device + dtype
-                pose_sequence = pose_sequence.to(device=device, dtype=dtype)
-                print("✅ PoseSequence final:", pose_sequence.shape, pose_sequence.device, pose_sequence.dtype)
+                pose_sequence = fix_pose_sequence( pose_sequence, total_frames=total_frames, device=device, dtype=dtype )
 
         except Exception as e:
             print(f"[Load Json animation INIT ERROR] {e}")
@@ -442,10 +410,8 @@ def main(args):
                             latents = apply_controlnet_openpose_step(
                                 latents=latents,
                                 t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
-                                unet=unet, controlnet=controlnet,
-                                scheduler=scheduler, pose_image=pose,
-                                pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1],
-                                guidance_scale=current_guidance_scale,
+                                unet=unet, controlnet=controlnet, scheduler=scheduler, pose_image=pose,
+                                pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1], guidance_scale=current_guidance_scale,
                                 controlnet_scale=1.0,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
                                 device=device, dtype=target_dtype,
                                 debug=False
@@ -508,10 +474,8 @@ def main(args):
                     # ---------------- Décodage final ----------------
                     # 🔥 SANITY AVANT DECODE
                     latents = sanitize_latents(latents)
-                    # clamp SAFE (avant scaling)
                     latents = torch.clamp(latents, -1.0, 1.0)
                     print("FINAL LATENTS SAFE:", latents.min().item(), latents.max().item())
-                    # seulement maintenant scaling
                     latents = latents / LATENT_SCALE
 
                     frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device,
