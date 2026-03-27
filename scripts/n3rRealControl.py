@@ -339,10 +339,10 @@ def main(args):
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
                     use_n3r_this_frame = math.sin(frame_counter * 0.2) > 0.7
                     #control_strength = 0.05 * (1 - frame_counter / total_frames) + 0.02
-                    control_strength = 0.35  # ou 0.5 pour test
+                    control_strength = 0.08  # ou 0.5 pour test
                     print(f"[DEBUG] Pose control_strength ={control_strength:.4f}")
 
-                    if use_n3r_this_frame:
+                    if bool(use_n3r_this_frame) and use_n3r_model is True:
                         try:
                             H, W = latents.shape[-2], latents.shape[-1]
                             coords = generate_n3r_coords(H, W, n3r_model.N_samples, seed, frame_counter, device)
@@ -407,7 +407,7 @@ def main(args):
                                 t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
                                 unet=unet, controlnet=controlnet, scheduler=scheduler, pose_image=pose,
                                 pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1], guidance_scale=current_guidance_scale,
-                                controlnet_scale=1.0,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
+                                controlnet_scale=1.2,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
                                 device=device, dtype=target_dtype,
                                 debug=False
                             )
@@ -417,6 +417,8 @@ def main(args):
                                 latents = latents_before_openpose.clone()
 
                             latents = sanitize_latents(latents)
+                            diff = (latents - latents_before_openpose).abs().mean()
+                            print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
 
                         except Exception as e:
                             print(f"[ERROR] ControlNet OpenPose failed: {e}")
