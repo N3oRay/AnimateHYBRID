@@ -34,7 +34,7 @@ from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 # OpenPose :
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -73,8 +73,8 @@ def main(args):
     block_size = min(256, H//2, W//2)  # block_size auto selon résolution
     use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
     use_openpose = cfg.get("use_openpose", True)
-    controlnet_scale = cfg.get("controlnet_scale", 0.8) # typiquement 0.5 → 1.0
-    control_strength = cfg.get("control_strength", 1.0)
+    controlnet_scale = cfg.get("controlnet_scale", 1.0) # typiquement 0.5 → 1.0
+    control_strength = cfg.get("control_strength", 1.5)
 
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
     target_temp, reference_temp = 7800, 6500 #target_temp = 8000 reference_temp = 6000  (Froid)
@@ -342,8 +342,8 @@ def main(args):
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
                     use_n3r_this_frame = math.sin(frame_counter * 0.2) > 0.7
                     #control_strength = 0.05 * (1 - frame_counter / total_frames) + 0.02
-                    print(f"[DEBUG] Pose control_strength ={control_strength:.4f}")
-                    print(f"[DEBUG] Pose controlnet_scale ={controlnet_scale:.4f}")
+                    print(f"[DEBUG] 🧠 Pose control_strength ={control_strength:.4f}")
+                    print(f"[DEBUG] 🧠 Pose controlnet_scale ={controlnet_scale:.4f}")
 
 
                     if use_n3r_this_frame and use_n3r_model:
@@ -415,21 +415,30 @@ def main(args):
                         try:
                             print(f"[CHECK] pose {pose.shape}, latents {latents.shape}")
                             # Application OpenPose
-                            latents = apply_controlnet_openpose_step_ultrasafe(
-                                latents=latents,
-                                t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
-                                unet=unet, controlnet=controlnet, scheduler=scheduler, pose_image=pose,
-                                pos_embeds=cf_embeds[0], neg_embeds=cf_embeds[1], guidance_scale=current_guidance_scale,
-                                controlnet_scale=controlnet_scale,  # ajustable typiquement entre 0.5 et 1.0 selon ton modèle et la force désirée.
-                                device=device,
-                                #dtype=target_dtype,
-                                dtype=torch.float32,
-                                debug=False
-                            )
+                            # 🔹 tile-wise application
+                            def controlnet_tile_fn(latent_tile, pose_tile):
+                                return apply_controlnet_openpose_step_ultrasafe(
+                                    latents=latent_tile,
+                                    t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
+                                    unet=unet,
+                                    controlnet=controlnet,
+                                    scheduler=scheduler,
+                                    pose_image=pose_tile,
+                                    pos_embeds=cf_embeds[0],
+                                    neg_embeds=cf_embeds[1],
+                                    guidance_scale=current_guidance_scale,
+                                    controlnet_scale=controlnet_scale,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    debug=False
+                                )
+
+                            latents = apply_openpose_tilewise(latents, pose, controlnet_tile_fn,
+                                                            block_size=120, overlap=64, device=device)
                             print(f"[DEBUG] Latents OpenPose min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
-                            latents = torch.clamp(latents, -0.5, 0.5)
+                            latents = torch.clamp(latents, -0.85, 0.85)  # plus de marge pour le mouvement
                             print(f"[DEBUG] Latents After nan_to_num, clamp : OpenPose min/max={latents.min().item():.4f}/{latents.max().item():.4f}")
                             # 🔥 Protection contre NaN
                             if torch.isnan(latents).any():
@@ -452,7 +461,7 @@ def main(args):
                     print(f"[DEBUG] control_latent min/max={control_latent.min():.4f}/{control_latent.max():.4f}")
                     latents = latents + control_strength * control_weight_map * control_latent
                     latents = sanitize_latents(latents)
-                    latents = torch.clamp(latents, -0.5, 0.5)
+                    latents = torch.clamp(latents, -0.85, 0.85)  # élargir la plage pour permettre plus de mouvement
                     print(f"[DEBUG] Après Injection finale ControlNet min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
                     # ---------------- Fusion frame + latent injection ----------------
