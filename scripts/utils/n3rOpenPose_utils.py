@@ -563,6 +563,180 @@ def match_latent_size_v1(latents_main, latents_mini):
     return latents_mini
 
 
+import torch
+# ****************************** A TESTER ********************************
+import torch
+
+def apply_controlnet_openpose_step_ultrasafe(
+    latents,
+    t,
+    unet,
+    controlnet,
+    scheduler,
+    pose_image,
+    pos_embeds,
+    neg_embeds=None,
+    guidance_scale=5.0,
+    controlnet_scale=0.7,
+    device="cuda",
+    dtype=torch.float16,
+    debug=False
+):
+    # 🔹 Backup latents pour sécurité
+    latents_prev = latents.clone().to(device=device, dtype=dtype)
+
+    # 🔹 Déplacement device/dtype
+    latents = latents.to(device=device, dtype=dtype)
+    pose_image = pose_image.to(device=device, dtype=dtype)
+
+    # 🔹 Préparer batch pour CFG
+    if neg_embeds is not None:
+        latent_model_input = torch.cat([latents] * 2)
+        encoder_states = torch.cat([neg_embeds, pos_embeds])
+        pose_input = torch.cat([pose_image] * 2)
+    else:
+        latent_model_input = latents
+        encoder_states = pos_embeds
+        pose_input = pose_image
+
+    latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+
+    # 🔹 ControlNet forward
+    try:
+        down_samples, mid_sample = controlnet(
+            latent_model_input,
+            t,
+            encoder_hidden_states=encoder_states,
+            controlnet_cond=pose_input,
+            return_dict=False
+        )
+    except Exception as e:
+        if debug:
+            print(f"[ControlNet ERROR] {e}, returning previous latents")
+        return latents_prev
+
+    # 🔹 Normalisation safe des résidus
+    down_samples = [torch.nan_to_num(d / (d.abs().mean() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0)
+                    for d in down_samples]
+    mid_sample = torch.nan_to_num(mid_sample / (mid_sample.abs().mean() + 1e-6), nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # 🔹 UNet forward
+    try:
+        noise_pred = unet(
+            latent_model_input,
+            t,
+            encoder_hidden_states=encoder_states,
+            down_block_additional_residuals=[d * controlnet_scale for d in down_samples],
+            mid_block_additional_residual=mid_sample * controlnet_scale
+        ).sample
+    except Exception as e:
+        if debug:
+            print(f"[UNet ERROR] {e}, returning previous latents")
+        return latents_prev
+
+    # 🔹 CFG
+    if neg_embeds is not None:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+    # 🔹 Scheduler step
+    latents_input = torch.cat([latents] * 2) if neg_embeds is not None else latents
+    try:
+        latents = scheduler.step(noise_pred, t, latents_input).prev_sample
+    except Exception as e:
+        if debug:
+            print(f"[Scheduler ERROR] {e}, returning previous latents")
+        return latents_prev
+
+    # 🔹 Récupérer batch original si CFG
+    if neg_embeds is not None:
+        latents = latents.chunk(2)[0]
+
+    # 🔹 Clamp final et NaN safety
+    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=-1.0)
+    latents = torch.clamp(latents, -1.0, 1.0)
+
+    if debug:
+        print(f"[ControlNet ULTRA-SAFE] t={t}, latents min/max: {latents.min().item():.3f}/{latents.max().item():.3f}")
+
+    return latents
+
+def apply_controlnet_openpose_step_safe(
+    latents,
+    t,
+    unet,
+    controlnet,
+    scheduler,
+    pose_image,
+    pos_embeds,
+    neg_embeds=None,
+    guidance_scale=5.0,
+    controlnet_scale=0.7,
+    device="cuda",
+    dtype=torch.float16,
+    debug=False
+):
+    # 🔹 Déplacement sur device / dtype
+    latents = latents.to(device=device, dtype=dtype)
+    pose_image = pose_image.to(device=device, dtype=dtype)
+
+    # 🔹 Préparer batch pour classifier-free guidance
+    if neg_embeds is not None:
+        latent_model_input = torch.cat([latents] * 2)
+        encoder_states = torch.cat([neg_embeds, pos_embeds])
+        pose_input = torch.cat([pose_image] * 2)
+    else:
+        latent_model_input = latents
+        encoder_states = pos_embeds
+        pose_input = pose_image
+
+    # 🔹 Scheduler scale
+    latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+
+    # 🔹 ControlNet
+    down_samples, mid_sample = controlnet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=encoder_states,
+        controlnet_cond=pose_input,
+        return_dict=False
+    )
+
+    # 🔹 Safe normalization des résidus ControlNet
+    down_samples = [d / (d.abs().mean() + 1e-6) for d in down_samples]
+    mid_sample = mid_sample / (mid_sample.abs().mean() + 1e-6)
+
+    # 🔹 UNet avec ControlNet
+    noise_pred = unet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=encoder_states,
+        down_block_additional_residuals=[d * controlnet_scale for d in down_samples],
+        mid_block_additional_residual=mid_sample * controlnet_scale
+    ).sample
+
+    # 🔹 Classifier-Free Guidance
+    if neg_embeds is not None:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+    # 🔹 Scheduler step avec batch safe
+    latents_input = torch.cat([latents] * 2) if neg_embeds is not None else latents
+    latents = scheduler.step(noise_pred, t, latents_input).prev_sample
+
+    # 🔹 Récupérer batch original si CFG
+    if neg_embeds is not None:
+        latents = latents.chunk(2)[0]
+
+    # 🔹 Clamp final pour sécurité
+    latents = torch.clamp(latents, -1.0, 1.0)
+
+    if debug:
+        print(f"[ControlNet SAFE] t={t}, latents min/max: {latents.min().item():.3f}/{latents.max().item():.3f}")
+
+    return latents
+
+
 def apply_controlnet_openpose_step(
     latents,
     t,
