@@ -415,9 +415,7 @@ def main(args):
                                 return apply_controlnet_openpose_step_ultrasafe(
                                     latents=latent_tile,
                                     t=scheduler.timesteps[frame_counter % len(scheduler.timesteps)],
-                                    unet=unet,
-                                    controlnet=controlnet,
-                                    scheduler=scheduler,
+                                    unet=unet, controlnet=controlnet, scheduler=scheduler,
                                     pose_image=pose_tile,
                                     pos_embeds=cf_embeds[0],
                                     neg_embeds=cf_embeds[1],
