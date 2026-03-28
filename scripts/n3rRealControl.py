@@ -322,6 +322,7 @@ def main(args):
 
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
+                        print(f"Dimention frame inter: Shape de latent_interp :", latent_interp.shape)
                         frame_pil = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
 
                         #Post Traitement
@@ -339,7 +340,7 @@ def main(args):
                     break
                 with torch.no_grad():
                     latents_frame = current_latent_single.to(device)
-                    print("Dimention inital: Shape de latents_frame :", latents_frame.shape)
+                    print(f"Dimention inital: Shape de latents_frame :", latents_frame.shape)
 
                     # --- Interpolation des embeddings prompts ---
                     cf_embeds = get_interpolated_embeddings(frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device, debug=False)
@@ -512,7 +513,7 @@ def main(args):
                     latents = torch.clamp(latents, -1.0, 1.0)
                     print("FINAL LATENTS SAFE:", latents.min().item(), latents.max().item())
                     latents = latents / LATENT_SCALE
-
+                    print(f"Dimention : Shape de latents :", latents.shape)
                     frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device,
                         frame_counter=frame_counter, latent_scale_boost=latent_scale_boost
                     )
