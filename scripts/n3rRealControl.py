@@ -4,20 +4,19 @@
 #Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
 # Image input ↓ OpenPose → skeleton (frame t) ↓ ControlNet (condition pose) ↓ UNet (avec pos/neg embeds) ↓ Latents 4D (animés) ↓ N3RProNet (détails + iris + sharpen) ↓ Decode blockwise ↓ Frames animées
 # ----------------------------------------------------------------------------------------
-import os, math, threading, random
-import json
-import traceback
-import hashlib
-import torch
-import pickle
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+
+import math, threading, random, json, traceback, hashlib, pickle, argparse
 from pathlib import Path
 from datetime import datetime
-from tqdm import tqdm
-import torchvision.transforms as T
+
+import torch
 import torch.nn.functional as F
+import torchvision.transforms as T
 from torchvision.transforms.functional import to_pil_image
+from tqdm import tqdm
 from PIL import Image, ImageFilter
-import argparse
 from diffusers import PNDMScheduler
 from transformers import CLIPTokenizerFast, CLIPTextModel
 from scripts.utils.lora_utils import apply_lora_smart
@@ -340,6 +339,7 @@ def main(args):
                     break
                 with torch.no_grad():
                     latents_frame = current_latent_single.to(device)
+                    print("Dimention inital: Shape de latents_frame :", latents_frame.shape)
 
                     # --- Interpolation des embeddings prompts ---
                     cf_embeds = get_interpolated_embeddings(frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device, debug=False)
