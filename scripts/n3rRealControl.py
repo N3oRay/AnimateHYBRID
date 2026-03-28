@@ -70,7 +70,10 @@ def main(args):
     frames_per_prompt = cfg.get("frames_per_prompt", 20)  # nombre de frames par prompt
     contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.15), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
     H, W = cfg.get("H", 512), cfg.get("W", 512)
-    block_size = min(256, H//2, W//2)  # block_size auto selon résolution
+    block_size = min(128, H//2, W//2)  # block_size auto selon résolution
+    overlap = compute_overlap(cfg["W"], cfg["H"], block_size) # overlap = 64
+
+
     use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
     use_openpose = cfg.get("use_openpose", True)
     controlnet_scale = cfg.get("controlnet_scale", 1.0) # typiquement 0.5 → 1.0
@@ -78,6 +81,7 @@ def main(args):
 
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
     target_temp, reference_temp = 7800, 6500 #target_temp = 8000 reference_temp = 6000  (Froid)
+    facteur = cfg.get("facteur", 4) # 8, 6, 4
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
@@ -202,7 +206,7 @@ def main(args):
     output_dir = Path(f"./outputs/RealControl{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     out_video = output_dir / f"output_{timestamp}.mp4"
-    overlap = compute_overlap(cfg["W"], cfg["H"], block_size)
+
 
     previous_latent_single = None
     frame_counter = 0
@@ -214,7 +218,7 @@ def main(args):
     # Charger latent externe avant la génération
     external_path = "/mnt/62G/huggingface/cyber-fp16/pt/KnxCOmiXNeg.safetensors"
     external_latent = load_external_embedding_as_latent(
-        external_path, (1, 4, cfg["H"]//8, cfg["W"]//8)
+        external_path, (1, 4, cfg["H"]//facteur, cfg["W"]//facteur)
     ).to(device)
 
     for img_idx, img_path in enumerate(input_paths):
@@ -260,7 +264,7 @@ def main(args):
 
             current_latent_single = encode_images_to_latents_hybrid(input_image, vae, device=device, latent_scale=LATENT_SCALE)
             current_latent_single = torch.nn.functional.interpolate(
-                current_latent_single, size=(cfg["H"]//8, cfg["W"]//8),
+                current_latent_single, size=(cfg["H"]//facteur, cfg["W"]//facteur),
                 #current_latent_single, size=(cfg["H"]//6, cfg["W"]//6),
                 mode='bilinear', align_corners=False
             )
