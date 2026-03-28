@@ -14,6 +14,34 @@ import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
 import traceback
 
+import torch
+import torch.nn.functional as F
+
+def gaussian_blur_tensor(x, kernel_size=5, sigma=1.0):
+    """Applique un flou gaussien sur un tensor 2D ou 4D (B,C,H,W)."""
+    if x.ndim == 2:
+        x = x.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    elif x.ndim == 3:
+        x = x.unsqueeze(0)  # [1,C,H,W]
+
+    # créer kernel gaussien 1D
+    coords = torch.arange(kernel_size).float() - (kernel_size - 1) / 2
+    gauss = torch.exp(-(coords**2) / (2 * sigma**2))
+    gauss = gauss / gauss.sum()
+
+    # kernel 2D par produit extérieur
+    kernel2d = gauss[:, None] * gauss[None, :]
+    kernel2d = kernel2d.unsqueeze(0).unsqueeze(0)  # [1,1,K,K]
+    kernel2d = kernel2d.to(x.device, dtype=x.dtype)
+
+    # padding "same"
+    pad = kernel_size // 2
+    x = F.conv2d(x, kernel2d, padding=pad)
+
+    if x.shape[0] == 1 and x.shape[1] == 1:
+        x = x.squeeze()
+    return x
+
 def log_frame_error(img_path, error: Exception, verbose: bool = True):
     """
     Log propre d'une erreur sur une frame.
@@ -565,12 +593,300 @@ def match_latent_size_v1(latents_main, latents_mini):
 
 import torch
 # ****************************** A TESTER ********************************
-import torch
-
-import torch
-import torch.nn.functional as F
 
 def apply_openpose_tilewise(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=0,
+    full_res=(960, 512)  # résolution originale pour l'impact map
+):
+    import torch
+    import torch.nn.functional as F
+    import os
+    import numpy as np
+    from PIL import Image
+
+    B, C_lat, H_lat, W_lat = latents.shape
+
+    # 🔹 Redimensionner le pose à la résolution des latents et clamp
+    pose_resized = F.interpolate(
+        pose, size=(H_lat, W_lat),
+        mode='bilinear', align_corners=False
+    ).clamp(0.0, 1.0)
+
+    latents_out = latents.clone()
+
+    # 🔹 DEBUG MAP (impact spatial)
+    if debug:
+        impact_map = torch.zeros((H_lat, W_lat), device=device)
+
+    stride = block_size - overlap
+    tile_id = 0
+
+    for i in range(0, H_lat, stride):
+        for j in range(0, W_lat, stride):
+
+            i_end = min(i + block_size, H_lat)
+            j_end = min(j + block_size, W_lat)
+
+            i_start = max(0, i_end - block_size)
+            j_start = max(0, j_end - block_size)
+
+            latent_tile = latents[:, :, i_start:i_end, j_start:j_end].to(device=device, dtype=torch.float16)
+            tile_coords = (j_start, i_start, j_end, i_end)
+
+            # 🔹 APPLY avec fallback en cas de crash
+            try:
+                latent_tile_processed = apply_fn(latent_tile, tile_coords)
+                latent_tile_processed = latent_tile_processed.clamp(-5.0, 5.0)
+            except Exception as e:
+                print(f"[WARNING] Tile {tile_id} ({i_start}:{i_end},{j_start}:{j_end}) failed: {e}")
+                latent_tile_processed = latent_tile  # fallback
+
+            # 🔹 DEBUG METRICS
+            if debug:
+                diff_map = (latent_tile_processed - latent_tile).abs().mean(dim=1)
+                impact_map[i_start:i_end, j_start:j_end] += diff_map.squeeze(0)
+
+                diff_mean = diff_map.mean().item()
+                min_val = latent_tile_processed.min().item()
+                max_val = latent_tile_processed.max().item()
+                print(f"[TILE {tile_id}] ({i_start}:{i_end},{j_start}:{j_end}) "
+                      f"diff={diff_mean:.6f} min={min_val:.4f} max={max_val:.4f}")
+
+            # 🔹 BLEND au lieu d'overwrite
+            latents_out[:, :, i_start:i_end, j_start:j_end] = (
+                0.7 * latents_out[:, :, i_start:i_end, j_start:j_end] +
+                0.3 * latent_tile_processed
+            )
+
+            tile_id += 1
+
+    # 🔹 VISUAL DEBUG GLOBAL
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+
+        # 🔹 Upsample à la résolution originale
+        impact_map_full = F.interpolate(
+            impact_map.unsqueeze(0).unsqueeze(0),
+            size=full_res,
+            mode='bilinear',
+            align_corners=False
+        ).squeeze()
+
+        # 🔹 Lissage pour réduire le bruit
+        impact_map_full = gaussian_blur_tensor(impact_map_full, kernel_size=5, sigma=1.0)
+
+        # 🔹 Normalisation pour visualisation
+        impact_np = impact_map_full.detach().cpu().numpy()
+        impact_np = impact_np - impact_np.min()
+        if impact_np.max() > 0:
+            impact_np = impact_np / impact_np.max()
+        impact_img = (impact_np * 255).astype(np.uint8)
+        impact_img = Image.fromarray(impact_img)
+
+        impact_img.save(os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png"))
+        print(f"[DEBUG] Impact map saved")
+
+    return latents_out
+
+def apply_openpose_tilewise_v2(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=0,
+    full_res=(960, 512)  # résolution originale pour l'impact map
+):
+    import torch
+    import torch.nn.functional as F
+    import os
+    import numpy as np
+    from PIL import Image
+
+    B, C_lat, H_lat, W_lat = latents.shape
+
+    # 🔹 Redimensionner le pose à la résolution des latents
+    pose_resized = F.interpolate(
+        pose, size=(H_lat, W_lat),
+        mode='bilinear', align_corners=False
+    )
+
+    latents_out = latents.clone()
+
+    # 🔹 DEBUG MAP (impact spatial)
+    if debug:
+        impact_map = torch.zeros((H_lat, W_lat), device=device)
+
+    stride = block_size - overlap
+    tile_id = 0
+
+    for i in range(0, H_lat, stride):
+        for j in range(0, W_lat, stride):
+
+            i_end = min(i + block_size, H_lat)
+            j_end = min(j + block_size, W_lat)
+
+            i_start = max(0, i_end - block_size)
+            j_start = max(0, j_end - block_size)
+
+            latent_tile = latents[:, :, i_start:i_end, j_start:j_end]
+            tile_coords = (j_start, i_start, j_end, i_end)
+
+            # 🔹 APPLY
+            latent_tile_processed = apply_fn(latent_tile, tile_coords)
+
+            # 🔹 DEBUG METRICS
+            if debug:
+                diff_map = (latent_tile_processed - latent_tile).abs().mean(dim=1)
+                impact_map[i_start:i_end, j_start:j_end] += diff_map.squeeze(0)
+
+                diff_mean = diff_map.mean().item()
+                min_val = latent_tile_processed.min().item()
+                max_val = latent_tile_processed.max().item()
+                print(f"[TILE {tile_id}] ({i_start}:{i_end},{j_start}:{j_end}) "
+                      f"diff={diff_mean:.6f} min={min_val:.4f} max={max_val:.4f}")
+
+            # 🔹 BLEND au lieu d'overwrite
+            latents_out[:, :, i_start:i_end, j_start:j_end] = (
+                0.7 * latents_out[:, :, i_start:i_end, j_start:j_end] +
+                0.3 * latent_tile_processed
+            )
+
+            tile_id += 1
+
+    # 🔹 VISUAL DEBUG GLOBAL
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+
+        # 🔹 Upsample à la résolution originale
+        impact_map_full = F.interpolate(
+            impact_map.unsqueeze(0).unsqueeze(0),
+            size=full_res,
+            mode='bilinear',
+            align_corners=False
+        ).squeeze()
+
+        # 🔹 Lissage pour réduire le bruit
+        impact_map_full = gaussian_blur_tensor(impact_map_full, kernel_size=5, sigma=1.0)
+
+        # 🔹 Normalisation pour visualisation
+        impact_np = impact_map_full.detach().cpu().numpy()
+        impact_np = impact_np - impact_np.min()
+        if impact_np.max() > 0:
+            impact_np = impact_np / impact_np.max()
+        impact_img = (impact_np * 255).astype(np.uint8)
+        impact_img = Image.fromarray(impact_img)
+
+        impact_img.save(os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png"))
+        print(f"[DEBUG] Impact map saved")
+
+    return latents_out
+
+
+def apply_openpose_tilewise_v1(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=0
+):
+    import torch
+    import torch.nn.functional as F
+    import os
+    import numpy as np
+    from PIL import Image
+
+    B, C_lat, H_lat, W_lat = latents.shape
+
+    # 🔹 Redimensionner pose pour matcher les latents
+    pose_resized = F.interpolate(
+        pose, size=(H_lat, W_lat),
+        mode='bilinear', align_corners=False
+    )
+
+    latents_out = latents.clone()
+
+    # 🔹 DEBUG MAP (impact spatial)
+    if debug:
+        impact_map = torch.zeros((H_lat, W_lat), device=device)
+
+    stride = block_size - overlap
+    tile_id = 0
+
+    for i in range(0, H_lat, stride):
+        for j in range(0, W_lat, stride):
+            i_end = min(i + block_size, H_lat)
+            j_end = min(j + block_size, W_lat)
+            i_start = max(0, i_end - block_size)
+            j_start = max(0, j_end - block_size)
+
+            latent_tile = latents[:, :, i_start:i_end, j_start:j_end]
+            pose_tile = pose_resized[:, :, i_start:i_end, j_start:j_end]
+
+            tile_coords = (j_start, i_start, j_end, i_end)
+
+            # 🔹 APPLY
+            latent_tile_processed = apply_fn(latent_tile, tile_coords)
+
+            # 🔹 DEBUG METRICS
+            if debug:
+                # Diff par pixel (moyenne sur canaux)
+                diff_map = (latent_tile_processed - latent_tile).abs().mean(dim=1).squeeze(0)
+                impact_map[i_start:i_end, j_start:j_end] += diff_map
+
+                diff_scalar = diff_map.mean().item()
+                min_val = latent_tile_processed.min().item()
+                max_val = latent_tile_processed.max().item()
+
+                print(f"[TILE {tile_id}] ({i_start}:{i_end},{j_start}:{j_end}) "
+                      f"diff={diff_scalar:.6f} min={min_val:.4f} max={max_val:.4f}")
+
+                # Détecter tile mort
+                if max_val == 0 and min_val == 0:
+                    print(f"[⚠️ ZERO TILE] {tile_id}")
+
+            # 🔹 BLEND au lieu d'overwrite
+            latents_out[:, :, i_start:i_end, j_start:j_end] = (
+                0.7 * latents_out[:, :, i_start:i_end, j_start:j_end] +
+                0.3 * latent_tile_processed
+            )
+
+            tile_id += 1
+
+    # 🔹 VISUAL DEBUG GLOBAL
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+
+        impact_np = impact_map.detach().float().cpu().numpy()
+        # normalisation visuelle
+        impact_np = impact_np - impact_np.min()
+        if impact_np.max() > 0:
+            impact_np = impact_np / impact_np.max()
+
+        impact_img = (impact_np * 255).astype(np.uint8)
+        impact_img = Image.fromarray(impact_img)
+        impact_img.save(os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png"))
+
+        print(f"[DEBUG] Impact map saved")
+
+    return latents_out
+
+def apply_openpose_tilewise_old(
     latents,
     pose,
     apply_fn,

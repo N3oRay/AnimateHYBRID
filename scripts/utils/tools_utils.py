@@ -435,9 +435,11 @@ def get_interpolated_embeddings_s(frame_idx, frames_per_prompt, pos_list, neg_li
     return pos.to(device), neg.to(device)
 
 
-def compute_overlap(W, H, block_size, max_overlap_ratio=0.6):
+def compute_overlap(W, H, block_size, max_overlap_ratio=0.5, min_overlap=8):
     overlap = int(block_size * max_overlap_ratio)
-    return min(overlap, min(W,H)//4)
+    overlap = min(overlap, min(W, H) // 4)
+    overlap = max(overlap, min_overlap)
+    return overlap
 
 # ---------------- DEBUG UTILS ----------------
 def log_debug(message, level="INFO", verbose=True):
