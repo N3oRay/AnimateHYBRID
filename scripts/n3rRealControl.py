@@ -380,7 +380,7 @@ def main(args):
                     # ---------------- Mini-GPU diffusion ----------------
                     if use_mini_gpu:
                         mini_latents = generate_latents_mini_gpu_320(
-                            unet=unet, scheduler=scheduler, input_latents=latents_frame, embeddings=cf_embeds, motion_module=motion_module, guidance_scale=current_guidance_scale,
+                            unet=unet, scheduler=scheduler, input_latents=latents, embeddings=cf_embeds, motion_module=motion_module, guidance_scale=current_guidance_scale,
                             device=device, fp16=True, steps=steps, debug=verbose, init_image_scale=current_init_image_scale, creative_noise=current_creative_noise
                         )
                         mini_weight = (1 - frame_counter / total_frames) * (1 - latent_injection)
@@ -447,7 +447,7 @@ def main(args):
                             tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, pose_full=pose_full, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype )
 
                             # 🔹 Appel correct de apply_openpose_tilewise
-                            latents = apply_openpose_tilewise( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device)
+                            latents = apply_openpose_tilewise( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
 
                             # 🔹 ===== 5. CLEANUP =====
                             latents = torch.nan_to_num(latents)
