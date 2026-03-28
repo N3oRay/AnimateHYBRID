@@ -1,8 +1,8 @@
 # PyTorch + CUDA 12
-torch>=2.4.0,<2.5
-torchvision>=0.18.0,<0.19
-triton>=2.4.0,<2.5
-xformers==0.0.27
+torch>=2.5.1,<2.6
+torchvision>=0.20.1,<0.21
+triton>=3.1.0,<3.2
+xformers==0.0.33  # compatible torch 2.5+
 
 # Core ML / SD
 diffusers==0.37.0
