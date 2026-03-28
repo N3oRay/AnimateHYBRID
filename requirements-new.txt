@@ -1,0 +1,46 @@
+# PyTorch + CUDA 12
+torch>=2.4.0,<2.5
+torchvision>=0.18.0,<0.19
+triton>=2.4.0,<2.5
+xformers==0.0.27
+
+# Core ML / SD
+diffusers==0.37.0
+transformers==5.3.0
+safetensors==0.7.0
+accelerate==0.22.0
+huggingface_hub==1.6.0
+
+# Utilities
+numpy<2
+pillow==12.1.1
+matplotlib==3.10.8
+einops==0.8.2
+omegaconf==2.3.0
+scipy==1.17.1
+pandas==2.3.3
+mediapipe==0.10.14
+
+# Web / API / GUI
+gradio==3.36.1
+fastapi==0.135.1
+uvicorn==0.41.0
+httpx==0.28.1
+starlette==0.52.1
+
+# Audio / Video
+decord==0.6.0
+ffmpeg-python==0.2.0
+pydub==0.25.1
+imageio==2.27.0
+imageio-ffmpeg==0.4.9
+
+# Misc
+typing-extensions==4.15.0
+setuptools==82.0.0
+packaging==26.0
+python-dateutil==2.9.0.post0
+requests==2.32.5
+tqdm==4.67.3
+rich==14.3.3
+protobuf>=4.25.3,<5
