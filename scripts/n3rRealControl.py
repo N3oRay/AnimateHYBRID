@@ -70,9 +70,9 @@ def main(args):
     frames_per_prompt = cfg.get("frames_per_prompt", 20)  # nombre de frames par prompt
     contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.15), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
     H, W = cfg.get("H", 512), cfg.get("W", 512)
-    block_size = cfg.get("block_size", 64)  # block_size auto selon résolution 64
-    overlap = compute_overlap(cfg["W"], cfg["H"], block_size) # overlap = 64
-    overlap = 16 #16
+    block_size = cfg.get("block_size", 128)  # block_size auto selon résolution 64
+    overlap = compute_overlap(cfg["W"], cfg["H"], block_size) # overlap = 16
+    overlap = 64 #16
     print(f"Dimention : overlap :", overlap)
 
 
