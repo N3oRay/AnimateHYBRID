@@ -83,7 +83,7 @@ def main(args):
 
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
     target_temp, reference_temp = 7800, 6500 #target_temp = 8000 reference_temp = 6000  (Froid)
-    facteur = cfg.get("facteur", 4) # 8, 6, 4
+    facteur = cfg.get("facteur", 8) # 8, 6, 4
 
     # Seed aléatoire
     seed = torch.randint(0, 100000, (1,)).item()
@@ -302,7 +302,7 @@ def main(args):
                     alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
                     with torch.no_grad():
                         # --- Fusion adaptative avec diminution progressive de l'influence de la frame précédente
-                        injection_start = 0.01  # influence initiale de l'ancienne frame
+                        injection_start = 0.9  # influence initiale de l'ancienne frame
                         injection_end   = 0.1  # influence finale
                         denom = max(transition_frames-1, 1)
                         injection_alpha = injection_start * (1 - t/denom) + injection_end * (t/denom)
@@ -358,7 +358,8 @@ def main(args):
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
 
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
-                    use_n3r_this_frame = math.sin(frame_counter * 0.2) > 0.7
+                    #use_n3r_this_frame = math.sin(frame_counter * 0.2) > 0.7
+                    use_n3r_this_frame = use_n3r_model and (frame_counter % random.choice([4,5,6]) == 0)
                     #control_strength = 0.05 * (1 - frame_counter / total_frames) + 0.02
                     print(f"[DEBUG] 🧠 Pose control_strength ={control_strength:.4f}")
                     print(f"[DEBUG] 🧠 Pose controlnet_scale ={controlnet_scale:.4f}")
@@ -384,17 +385,25 @@ def main(args):
                             save_memory(memory_dict, memory_file)
 
                     # ---------------- Mini-GPU diffusion ----------------
-                    if use_mini_gpu:
-                        mini_latents = generate_latents_mini_gpu_320(
-                            unet=unet, scheduler=scheduler, input_latents=latents, embeddings=cf_embeds, motion_module=motion_module, guidance_scale=current_guidance_scale,
-                            device=device, fp16=True, steps=steps, debug=verbose, init_image_scale=current_init_image_scale, creative_noise=current_creative_noise
+                    elif use_mini_gpu:
+                        latents = generate_latents_mini_gpu_320(
+                            unet=unet, scheduler=scheduler,
+                            input_latents=latents_frame, embeddings=cf_embeds,
+                            motion_module=motion_module, guidance_scale=current_guidance_scale,
+                            device=device, fp16=True, steps=steps,
+                            debug=verbose, init_image_scale=current_init_image_scale,
+                            creative_noise=current_creative_noise
                         )
-                        mini_weight = (1 - frame_counter / total_frames) * (1 - latent_injection)
-                        # S'assurer que les dimensions correspondent
-                        mini_latents = match_latent_size(latents, mini_latents)
-                        # Fusion pondérée
-                        latents = (1 - mini_weight) * latents + mini_weight * mini_latents
+                        # ControlNet injection :
+                        control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
+                        print(f"[DEBUG] latents: {latents.shape}, control_latent: {control_latent.shape}, control_weight_map: {control_weight_map.shape}")
+                        latents = latents + control_strength * control_weight_map * control_latent
                         latents = sanitize_latents(latents)
+
+                        if latent_injection > 0:
+                            if latents.shape[-2:] != latents_frame.shape[-2:]:
+                                latents = torch.nn.functional.interpolate( latents, size=latents_frame.shape[-2:], mode='bilinear', align_corners=False ).contiguous()
+                            latents = latent_injection*latents_frame + (1-latent_injection)*latents
 
                     # ---------------- ControlNet OpenPose ------------------------
                     if use_openpose:
@@ -480,15 +489,6 @@ def main(args):
                     latents = torch.clamp(latents, -0.85, 0.85)
                     print(f"[DEBUG] Après Injection finale ControlNet min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
-                    # ---------------- Fusion frame + latent injection ----------------
-                    if latent_injection > 0:
-                        if latents.shape[-2:] != latents_frame.shape[-2:]:
-                            latents = torch.nn.functional.interpolate(latents, size=latents_frame.shape[-2:],
-                                                                    mode='bilinear', align_corners=False).contiguous()
-                        latents = latent_injection * latents_frame + (1 - latent_injection) * latents
-                        latents = sanitize_latents(latents)
-                        print(f"[DEBUG] Après Fusion frame min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
-
                     # ---------------- Motion module ----------------
                     if motion_module is not None:
                         latents_seq = latents.unsqueeze(2).repeat(1, 1, 3, 1, 1) if previous_latent_single is None \
@@ -512,12 +512,12 @@ def main(args):
                             print(f"[DEBUG] Après ProNet yeux min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
                     # ---------------- Clamp latents ----------------
-                    latents = torch.clamp(latents, -1.5, 1.5)
+                    #latents = torch.clamp(latents, -1.5, 1.5)
                     # ---------------- Décodage final ----------------
                     # 🔥 SANITY AVANT DECODE
-                    latents = sanitize_latents(latents)
-                    latents = torch.clamp(latents, -1.0, 1.0)
-                    print("FINAL LATENTS SAFE:", latents.min().item(), latents.max().item())
+                    #latents = sanitize_latents(latents)
+                    #latents = torch.clamp(latents, -1.0, 1.0)
+                    #print("FINAL LATENTS SAFE:", latents.min().item(), latents.max().item())
                     latents = latents / LATENT_SCALE
                     print(f"Dimention : Shape de latents :", latents.shape)
                     frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device,
