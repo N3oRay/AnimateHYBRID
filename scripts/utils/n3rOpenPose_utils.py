@@ -3021,6 +3021,8 @@ def apply_openpose_tilewise_safe(
                 if debug:
                     print(f"[DEBUG] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
                 latent_tile_processed = latent_tile  # fallback
+            finally:
+                torch.cuda.empty_cache()
 
             # Retirer le padding
             latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
