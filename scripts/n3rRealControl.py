@@ -70,9 +70,9 @@ def main(args):
     frames_per_prompt = cfg.get("frames_per_prompt", 20)  # nombre de frames par prompt
     contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.15), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
     H, W = cfg.get("H", 512), cfg.get("W", 512)
-    block_size = cfg.get("block_size", 128)  # block_size auto selon résolution 64
+    block_size = cfg.get("block_size", 64)  # block_size auto selon résolution 64
     overlap = compute_overlap(cfg["W"], cfg["H"], block_size) # overlap = 16
-    overlap = 64 #16
+    overlap = 32 #16
     print(f"Dimention : overlap :", overlap)
 
 
@@ -459,7 +459,9 @@ def main(args):
                             from functools import partial
 
                             # Préparer la tile function avec tous les arguments sauf latent_tile et tile_coords
-                            tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, pose_full=pose_full, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, scale=facteur )
+                            #tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, pose_full=pose_full, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, scale=facteur )
+
+                            tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, )
 
                             # 🔹 Appel correct de apply_openpose_tilewise
                             latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
