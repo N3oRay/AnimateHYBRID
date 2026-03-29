@@ -2557,7 +2557,7 @@ def apply_openpose_tilewise(
 import torch
 import torch.nn.functional as F
 
-def controlnet_tile_fn(
+def controlnet_tile_fn_test(
     latent_tile,
     tile_coords,
     frame_counter,
@@ -2860,6 +2860,123 @@ def apply_openpose_tilewise_safe_v1(
 
 
 
+def controlnet_tile_fn(
+    latent_tile,
+    pose_tile,
+    frame_counter,
+    unet,
+    controlnet,
+    scheduler,
+    cf_embeds,
+    current_guidance_scale,
+    controlnet_scale,
+    device,
+    target_dtype,
+    **kwargs
+):
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H_latent, W_latent = latent_tile.shape
+    _, _, H_pose, W_pose = pose_tile.shape
+
+    # 🔥 AUTO-DETECTION SCALE (évite tous les bugs)
+    scale_y = H_pose / H_latent
+    scale_x = W_pose / W_latent
+
+    # Cas 1 : pose déjà en full res (ex: 1024 vs 128 → scale 8)
+    if scale_y >= 4:
+        pose_resized = F.interpolate(
+            pose_tile,
+            size=(H_latent * 8, W_latent * 8),
+            mode='bilinear',
+            align_corners=False
+        )
+
+    # Cas 2 : pose en latent (ex: 128x64)
+    else:
+        pose_resized = F.interpolate(
+            pose_tile,
+            size=(H_latent * 8, W_latent * 8),
+            mode='bilinear',
+            align_corners=False
+        )
+
+    # --- Préparation embeddings ---
+    pos_embeds, neg_embeds = cf_embeds
+
+    latent_tile_fp32 = latent_tile.to(device=device, dtype=torch.float32)
+    pose_tile_fp32 = pose_resized.to(device=device, dtype=torch.float32)
+
+    pos_embeds_fp32 = pos_embeds.to(device=device, dtype=torch.float32)
+    neg_embeds_fp32 = (
+        neg_embeds.to(device=device, dtype=torch.float32)
+        if neg_embeds is not None else None
+    )
+
+    # --- Scheduler noise ---
+    timesteps = scheduler.timesteps
+    t = timesteps[min(frame_counter, len(timesteps)-1)]
+
+    noise = torch.randn_like(latent_tile_fp32)
+    latent_noisy = scheduler.add_noise(latent_tile_fp32, noise, t)
+    latent_noisy = torch.clamp(latent_noisy, -20, 20)
+
+    latent_model_input = scheduler.scale_model_input(latent_noisy, t)
+
+    # --- CFG ---
+    if neg_embeds_fp32 is not None:
+        latent_model_input = torch.cat([latent_model_input] * 2)
+        embeds = torch.cat([neg_embeds_fp32, pos_embeds_fp32])
+    else:
+        embeds = pos_embeds_fp32
+
+    latent_model_input = latent_model_input.to(target_dtype)
+    embeds = embeds.to(target_dtype)
+    pose_tile_fp32 = pose_tile_fp32.to(target_dtype)
+
+    # 🔥 DEBUG CRUCIAL
+    # print("latent:", latent_model_input.shape, "pose:", pose_tile_fp32.shape)
+
+    # --- ControlNet ---
+    down_samples, mid_sample = controlnet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=embeds,
+        controlnet_cond=pose_tile_fp32,
+        return_dict=False
+    )
+
+    # --- UNet ---
+    noise_pred = unet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=embeds,
+        down_block_additional_residuals=down_samples,
+        mid_block_additional_residual=mid_sample,
+        return_dict=False
+    )[0]
+
+    noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # --- CFG merge ---
+    if neg_embeds_fp32 is not None:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + current_guidance_scale * (noise_text - noise_uncond)
+
+    latents_out = scheduler.step(noise_pred, t, latent_noisy).prev_sample
+
+    # --- Delta safe ---
+    delta = latents_out - latent_noisy
+    delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
+    delta = torch.clamp(delta, -0.25, 0.25)
+    delta = delta * controlnet_scale
+
+    return (latent_tile_fp32 + delta).to(target_dtype)
+
+
+
+
 def apply_openpose_tilewise_safe(
     latents,
     pose,
@@ -2942,3 +3059,8 @@ def apply_openpose_tilewise_safe(
         Image.fromarray(impact_img).save(os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png"))
 
     return latents_out
+
+
+
+
+
