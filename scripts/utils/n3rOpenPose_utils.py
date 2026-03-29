@@ -860,6 +860,8 @@ def apply_openpose_tilewise(
                 latent_tile_processed = latent_tile_processed.clamp(-5.0, 5.0)
             except Exception as e:
                 print(f"[WARNING] Tile {tile_id} ({i_start}:{i_end},{j_start}:{j_end}) failed: {e}")
+                traceback.print_exc()
+
                 latent_tile_processed = latent_tile  # fallback
 
             # 🔹 DEBUG METRICS
@@ -1893,6 +1895,20 @@ def controlnet_tile_fn(
 
     x0, y0, x1, y1 = tile_coords
     scale = 8
+    # 🔥 CLAMP SAFE (CRITIQUE)
+    H_full, W_full = pose_full.shape[-2:]
+
+    x0 = max(0, x0)
+    y0 = max(0, y0)
+    x1 = min(W_full // scale, x1)
+    y1 = min(H_full // scale, y1)
+
+    # 🔥 ÉVITER TILE VIDE
+    if x1 <= x0 or y1 <= y0:
+        print(f"[SKIP] Empty tile coords: {(x0,y0,x1,y1)}")
+        return latent_tile
+
+
 
     # 🔹 SAFE coords
     x0, y0 = max(0, x0), max(0, y0)
