@@ -807,7 +807,149 @@ def apply_openpose_tilewise_32(
 
     return latents_out
 
-def apply_openpose_tilewise(
+
+
+
+
+def apply_openpose_tilewise_scale8(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=0,
+    full_res=(1024, 512)
+):
+    import torch
+    import torch.nn.functional as F
+    import os
+    import numpy as np
+    from PIL import Image
+
+    B, C, H, W = latents.shape
+
+    stride = block_size - overlap
+
+    # =========================================================
+    # 🔥 GAUSSIAN WEIGHT MASK (clé du rendu propre)
+    # =========================================================
+    def make_weight_mask(size):
+        coords = torch.linspace(-1, 1, size, device=device)
+        yy, xx = torch.meshgrid(coords, coords, indexing='ij')
+        dist = torch.sqrt(xx**2 + yy**2)
+        sigma = 0.5
+        mask = torch.exp(-(dist**2) / (2 * sigma**2))
+        return mask  # [H, W]
+
+    weight_mask_full = make_weight_mask(block_size)  # [bs, bs]
+
+    # =========================================================
+    # 🔥 ACCUMULATION BUFFERS
+    # =========================================================
+    latents_accum = torch.zeros_like(latents, device=device)
+    weight_accum = torch.zeros((1, 1, H, W), device=device)
+
+    # DEBUG MAP
+    if debug:
+        impact_map = torch.zeros((H, W), device=device)
+
+    tiles = []
+
+    # =========================================================
+    # 🔥 TILE GENERATION (ROBUSTE)
+    # =========================================================
+    for i in range(0, H, stride):
+        for j in range(0, W, stride):
+
+            i_start = i
+            j_start = j
+            i_end = i + block_size
+            j_end = j + block_size
+
+            if i_end > H:
+                i_end = H
+                i_start = max(0, H - block_size)
+
+            if j_end > W:
+                j_end = W
+                j_start = max(0, W - block_size)
+
+            if i_end <= i_start or j_end <= j_start:
+                continue
+
+            tiles.append((i_start, i_end, j_start, j_end))
+
+    tiles = list(set(tiles))  # remove duplicates
+
+    # =========================================================
+    # 🔥 PROCESS TILES
+    # =========================================================
+    for tile_id, (i_start, i_end, j_start, j_end) in enumerate(tiles):
+
+        latent_tile = latents[:, :, i_start:i_end, j_start:j_end].to(device)
+
+        tile_coords = (j_start, i_start, j_end, i_end)
+
+        try:
+            latent_tile_processed = apply_fn(latent_tile, tile_coords)
+        except Exception as e:
+            print(f"[WARNING] Tile {tile_id} failed: {e}")
+            latent_tile_processed = latent_tile
+
+        # =====================================================
+        # 🔥 WEIGHT MASK ADAPTATION (bord)
+        # =====================================================
+        h = i_end - i_start
+        w = j_end - j_start
+
+        weight_mask = weight_mask_full[:h, :w]  # crop si bord
+        weight_mask = weight_mask.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+
+        # =====================================================
+        # 🔥 ACCUMULATION
+        # =====================================================
+        latents_accum[:, :, i_start:i_end, j_start:j_end] += latent_tile_processed * weight_mask
+        weight_accum[:, :, i_start:i_end, j_start:j_end] += weight_mask
+
+        # DEBUG
+        if debug:
+            diff = (latent_tile_processed - latent_tile).abs().mean().item()
+            impact_map[i_start:i_end, j_start:j_end] += diff
+
+    # =========================================================
+    # 🔥 NORMALISATION FINALE (clé)
+    # =========================================================
+    latents_out = latents_accum / (weight_accum + 1e-8)
+
+    # =========================================================
+    # 🔹 DEBUG VISU
+    # =========================================================
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+
+        impact_map_full = F.interpolate(
+            impact_map.unsqueeze(0).unsqueeze(0),
+            size=full_res,
+            mode='bilinear',
+            align_corners=False
+        ).squeeze()
+
+        impact_np = impact_map_full.detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+
+        impact_img = (impact_np * 255).astype(np.uint8)
+        Image.fromarray(impact_img).save(
+            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
+        )
+
+    return latents_out
+
+def apply_openpose_tilewise_good(
     latents,
     pose,
     apply_fn,
@@ -1875,8 +2017,136 @@ def apply_controlnet_openpose_step_ultrasafe(
 
     return latents
 
+def apply_openpose_tilewise_good(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=0,
+    full_res=(1024, 512),
+    scale=8  # 🔹 nouveau paramètre scale
+):
+    import torch
+    import torch.nn.functional as F
+    import os
+    import numpy as np
+    from PIL import Image
 
-def controlnet_tile_fn(
+    B, C, H, W = latents.shape
+    stride = block_size - overlap
+
+    # =========================================================
+    # 🔹 GAUSSIAN WEIGHT MASK (clé du rendu propre)
+    # =========================================================
+    def make_weight_mask(size):
+        coords = torch.linspace(-1, 1, size, device=device)
+        yy, xx = torch.meshgrid(coords, coords, indexing='ij')
+        dist = torch.sqrt(xx**2 + yy**2)
+        sigma = 0.5
+        mask = torch.exp(-(dist**2) / (2 * sigma**2))
+        return mask  # [H, W]
+
+    weight_mask_full = make_weight_mask(block_size)
+
+    # =========================================================
+    # 🔹 ACCUMULATION BUFFERS
+    # =========================================================
+    latents_accum = torch.zeros_like(latents, device=device)
+    weight_accum = torch.zeros((1, 1, H, W), device=device)
+
+    if debug:
+        impact_map = torch.zeros((H, W), device=device)
+
+    tiles = []
+
+    # =========================================================
+    # 🔹 TILE GENERATION
+    # =========================================================
+    for i in range(0, H, stride):
+        for j in range(0, W, stride):
+            i_start = i
+            j_start = j
+            i_end = i + block_size
+            j_end = j + block_size
+
+            if i_end > H:
+                i_end = H
+                i_start = max(0, H - block_size)
+            if j_end > W:
+                j_end = W
+                j_start = max(0, W - block_size)
+            if i_end <= i_start or j_end <= j_start:
+                continue
+            tiles.append((i_start, i_end, j_start, j_end))
+
+    tiles = list(set(tiles))
+
+    # =========================================================
+    # 🔹 PROCESS TILES
+    # =========================================================
+    for tile_id, (i_start, i_end, j_start, j_end) in enumerate(tiles):
+
+        latent_tile = latents[:, :, i_start:i_end, j_start:j_end].to(device)
+
+        # 🔹 scale passé à apply_fn
+        tile_coords = (j_start, i_start, j_end, i_end)
+        try:
+            latent_tile_processed = apply_fn(latent_tile, tile_coords)
+        except Exception as e:
+            print(f"[WARNING] Tile {tile_id} failed: {e}")
+            traceback.print_exc()
+            latent_tile_processed = latent_tile
+
+        # =====================================================
+        # 🔹 WEIGHT MASK ADAPTATION (bord)
+        # =====================================================
+        h = i_end - i_start
+        w = j_end - j_start
+        weight_mask = weight_mask_full[:h, :w].unsqueeze(0).unsqueeze(0)
+
+        # =====================================================
+        # 🔹 ACCUMULATION
+        # =====================================================
+        latents_accum[:, :, i_start:i_end, j_start:j_end] += latent_tile_processed * weight_mask
+        weight_accum[:, :, i_start:i_end, j_start:j_end] += weight_mask
+
+        if debug:
+            diff = (latent_tile_processed - latent_tile).abs().mean().item()
+            impact_map[i_start:i_end, j_start:j_end] += diff
+
+    # =========================================================
+    # 🔹 NORMALISATION FINALE
+    # =========================================================
+    latents_out = latents_accum / (weight_accum + 1e-8)
+
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        impact_map_full = F.interpolate(
+            impact_map.unsqueeze(0).unsqueeze(0),
+            size=full_res,
+            mode='bilinear',
+            align_corners=False
+        ).squeeze()
+
+        impact_np = impact_map_full.detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+
+        impact_img = (impact_np * 255).astype(np.uint8)
+        Image.fromarray(impact_img).save(
+            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
+        )
+
+    return latents_out
+
+
+
+def controlnet_tile_fn_good(
     latent_tile,
     tile_coords,
     frame_counter,
@@ -1888,13 +2158,14 @@ def controlnet_tile_fn(
     current_guidance_scale,
     controlnet_scale,
     device,
-    target_dtype
+    target_dtype,
+    scale=8
 ):
     import torch
     import torch.nn.functional as F
 
     x0, y0, x1, y1 = tile_coords
-    scale = 8
+
     # 🔥 CLAMP SAFE (CRITIQUE)
     H_full, W_full = pose_full.shape[-2:]
 
@@ -1909,7 +2180,7 @@ def controlnet_tile_fn(
         return latent_tile
 
 
-
+    print("latent_tile:", latent_tile.shape)
     # 🔹 SAFE coords
     x0, y0 = max(0, x0), max(0, y0)
 
@@ -1960,6 +2231,8 @@ def controlnet_tile_fn(
     else:
         embeds = pos_embeds_fp32
 
+    print("[DEBUG] latent_model_input:", latent_model_input.shape)
+    print("[DEBUG] pose_tile_fp32:", pose_tile_fp32.shape)
     # =========================================================
     # 🔹 CONTROLNET
     # =========================================================
@@ -2006,12 +2279,20 @@ def controlnet_tile_fn(
     # =========================================================
     # 🔥 FIX 5 — DELTA SAFE
     # =========================================================
-    delta = latents_out - latent_tile_fp32
+    #delta = latents_out - latent_tile_fp32
+    #delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
+    #delta = torch.clamp(delta, -0.15, 0.15)
+    #delta = delta * controlnet_scale
+
+    delta = latents_out - latent_noisy  # ← CRITIQUE (meilleur signal)
+
     delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
 
-    delta = controlnet_scale * delta
-    #delta = torch.clamp(delta, -0.5, 0.5)
-    delta = torch.clamp(delta, -0.15, 0.15)
+    max_delta = 0.25
+    delta = torch.clamp(delta, -max_delta, max_delta)
+
+    delta = delta * controlnet_scale
+
 
     # 🔹 DEBUG minimal
     if torch.isnan(delta).any():
@@ -2022,9 +2303,470 @@ def controlnet_tile_fn(
     # =========================================================
     # 🔥 FIX 6 — RETOUR FP16
     # =========================================================
+    #return (latent_tile_fp32 + delta).to(dtype=target_dtype)
+    #return (latents_out).to(dtype=target_dtype)
     return (latent_tile_fp32 + delta).to(dtype=target_dtype)
 
 
 
+def controlnet_tile_fn_test(
+    latent_tile,
+    tile_coords,
+    frame_counter,
+    pose_full,
+    unet,
+    controlnet,
+    scheduler,
+    cf_embeds,
+    current_guidance_scale,
+    controlnet_scale,
+    device,
+    target_dtype,
+    scale=4  # Adapté à 4
+):
+    import torch
+    import torch.nn.functional as F
+
+    x0, y0, x1, y1 = tile_coords
+
+    # -----------------------------
+    # Clamp bord-friendly
+    # -----------------------------
+    H_full, W_full = pose_full.shape[-2:]
+
+    # s'assurer que le tile correspond exactement à latent_tile * scale
+    tile_H = latent_tile.shape[2]
+    tile_W = latent_tile.shape[3]
+
+    x0 = max(0, x0)
+    y0 = max(0, y0)
+    # Crop exact même si on dépasse les bords
+    x1 = x0 + tile_W
+    y1 = y0 + tile_H
+
+    # Pad si nécessaire
+    pad_right = max(0, x1*scale - W_full)
+    pad_bottom = max(0, y1*scale - H_full)
+
+    pose_tile = pose_full[:, :, y0*scale:y1*scale, x0*scale:x1*scale]
+
+    if pad_right > 0 or pad_bottom > 0:
+        pose_tile = F.pad(pose_tile, (0, pad_right, 0, pad_bottom), mode='replicate')
+
+    if x1 <= x0 or y1 <= y0:
+        print(f"[SKIP] Empty tile coords: {(x0, y0, x1, y1)}")
+        return latent_tile
+
+    # -----------------------------
+    # Crop pose_tile
+    # -----------------------------
+    pose_tile = pose_full[:, :, y0*scale:y1*scale, x0*scale:x1*scale]
+
+    # 🔹 Interpoler exactement à latent_tile*scale
+    pose_tile = F.interpolate(
+        pose_tile,
+        size=(tile_H*scale, tile_W*scale),
+        mode='bilinear',
+        align_corners=False
+    )
+
+    # 🔹 Embeddings
+    pos_embeds = cf_embeds[0]
+    neg_embeds = cf_embeds[1] if cf_embeds[1] is not None else None
+
+    # 🔹 Cast FP32 pour stabilité
+    latent_tile_fp32 = latent_tile.to(device=device, dtype=torch.float32)
+    pose_tile_fp32 = pose_tile.to(device=device, dtype=torch.float32)
+    pos_embeds_fp32 = pos_embeds.to(device=device, dtype=torch.float32)
+    neg_embeds_fp32 = neg_embeds.to(device=device, dtype=torch.float32) if neg_embeds is not None else None
+
+    # 🔹 Timestep safe
+    timesteps = scheduler.timesteps
+    t = timesteps[min(frame_counter, len(timesteps)-1)]
+
+    # 🔹 Add noise + clamp
+    noise = torch.randn_like(latent_tile_fp32)
+    latent_noisy = scheduler.add_noise(latent_tile_fp32, noise, t)
+    latent_noisy = torch.clamp(latent_noisy, -20, 20)
+
+    # 🔹 Scale model input
+    latent_model_input = scheduler.scale_model_input(latent_noisy, t)
+
+    # 🔹 CFG setup
+    if neg_embeds_fp32 is not None:
+        latent_model_input = torch.cat([latent_model_input] * 2)
+        embeds = torch.cat([neg_embeds_fp32, pos_embeds_fp32])
+    else:
+        embeds = pos_embeds_fp32
+
+    print("[DEBUG] latent_model_input:", latent_model_input.shape)
+    print("[DEBUG] pose_tile_fp32:", pose_tile_fp32.shape)
+
+    # 🔹 Cast final dtype pour modèle
+    latent_model_input = latent_model_input.to(target_dtype)
+    embeds = embeds.to(target_dtype)
+    pose_tile_fp32 = pose_tile_fp32.to(target_dtype)
+
+    # 🔹 Forward ControlNet
+    down_samples, mid_sample = controlnet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=embeds,
+        controlnet_cond=pose_tile_fp32,
+        return_dict=False
+    )
+
+    # 🔹 Forward UNet
+    noise_pred = unet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=embeds,
+        down_block_additional_residuals=down_samples,
+        mid_block_additional_residual=mid_sample,
+        return_dict=False
+    )[0]
+
+    # 🔹 Fix NaN
+    noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # 🔹 CFG merge
+    if neg_embeds_fp32 is not None:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + current_guidance_scale * (noise_text - noise_uncond)
+
+    # 🔹 Step diffusion
+    latents_out = scheduler.step(noise_pred, t, latent_noisy).prev_sample
+
+    # 🔹 Delta safe
+    delta = latents_out - latent_tile_fp32
+    delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
+    delta = controlnet_scale * delta
+    delta = torch.clamp(delta, -0.15, 0.15)
+
+    if torch.isnan(delta).any():
+        print("[⚠️ NaN détecté dans delta]")
+    else:
+        print(f"[ControlNet OK] delta min/max: {delta.min().item():.4f}/{delta.max().item():.4f}")
+
+    # 🔹 Retour en target dtype
+    return (latent_tile_fp32 + delta).to(dtype=target_dtype)
 
 
+import torch
+import torch.nn.functional as F
+import os
+import numpy as np
+from PIL import Image
+import traceback
+
+def apply_openpose_tilewise(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=0,
+    full_res=(1024, 512),
+    scale=4
+):
+    """
+    Applique une fonction tile-wise ControlNet/UNet sur les latents
+    en gérant correctement les bords et la taille des tiles.
+    """
+    B, C, H, W = latents.shape
+    stride = block_size - overlap
+
+    # --- Gaussian weight mask ---
+    def make_weight_mask(size):
+        coords = torch.linspace(-1, 1, size, device=device)
+        yy, xx = torch.meshgrid(coords, coords, indexing='ij')
+        dist = torch.sqrt(xx**2 + yy**2)
+        sigma = 0.5
+        mask = torch.exp(-(dist**2) / (2 * sigma**2))
+        return mask
+
+    weight_mask_full = make_weight_mask(block_size)
+
+    # --- Accumulation buffers ---
+    latents_accum = torch.zeros_like(latents, device=device)
+    weight_accum = torch.zeros((1, 1, H, W), device=device)
+
+    if debug:
+        impact_map = torch.zeros((H, W), device=device)
+
+    tiles = []
+
+    # --- Generate tiles ---
+    for i in range(0, H, stride):
+        for j in range(0, W, stride):
+            i_start = i
+            j_start = j
+            i_end = min(i_start + block_size, H)
+            j_end = min(j_start + block_size, W)
+            tiles.append((i_start, i_end, j_start, j_end))
+
+    # --- Process tiles ---
+    for tile_id, (i_start, i_end, j_start, j_end) in enumerate(tiles):
+        latent_tile = latents[:, :, i_start:i_end, j_start:j_end].to(device)
+        tile_coords = (j_start, i_start, j_end, i_end)
+        try:
+            latent_tile_processed = apply_fn(latent_tile, tile_coords)
+        except Exception as e:
+            print(f"[WARNING] Tile {tile_id} failed: {e}")
+            traceback.print_exc()
+            latent_tile_processed = latent_tile
+
+        # Adapt weight mask for edges
+        h, w = i_end - i_start, j_end - j_start
+        weight_mask = weight_mask_full[:h, :w].unsqueeze(0).unsqueeze(0)
+
+        # Accumulate
+        latents_accum[:, :, i_start:i_end, j_start:j_end] += latent_tile_processed * weight_mask
+        weight_accum[:, :, i_start:i_end, j_start:j_end] += weight_mask
+
+        if debug:
+            diff = (latent_tile_processed - latent_tile).abs().mean().item()
+            impact_map[i_start:i_end, j_start:j_end] += diff
+
+    # --- Normalize ---
+    latents_out = latents_accum / (weight_accum + 1e-8)
+
+    # --- Debug map ---
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        impact_map_full = F.interpolate(
+            impact_map.unsqueeze(0).unsqueeze(0),
+            size=full_res,
+            mode='bilinear',
+            align_corners=False
+        ).squeeze()
+        impact_np = impact_map_full.detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        Image.fromarray((impact_np * 255).astype(np.uint8)).save(
+            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
+        )
+
+    return latents_out
+
+
+import torch
+import torch.nn.functional as F
+
+def controlnet_tile_fn(
+    latent_tile,
+    tile_coords,
+    frame_counter,
+    pose_full,
+    unet,
+    controlnet,
+    scheduler,
+    cf_embeds,
+    current_guidance_scale,
+    controlnet_scale,
+    device,
+    target_dtype,
+    **kwargs
+):
+    """
+    Applique ControlNet sur un tile et retourne le latent modifié.
+    Correction safe des dimensions pour éviter les erreurs de tile.
+    """
+    x0, y0, x1, y1 = tile_coords
+    H_latent, W_latent = latent_tile.shape[2], latent_tile.shape[3]
+    H_full, W_full = pose_full.shape[-2], pose_full.shape[-1]
+
+    # --- Calcul des coordonnées full-res ---
+    x0_full = max(0, int(x0 * (W_full / W_latent)))
+    x1_full = min(W_full, int(x1 * (W_full / W_latent)))
+    y0_full = max(0, int(y0 * (H_full / H_latent)))
+    y1_full = min(H_full, int(y1 * (H_full / H_latent)))
+
+    if x1_full <= x0_full or y1_full <= y0_full:
+        # Tile vide
+        print(f"[SKIP] Empty tile coords: {(x0_full, y0_full, x1_full, y1_full)}")
+        return latent_tile
+
+    # --- Crop & resize pose tile ---
+    pose_tile = pose_full[:, :, y0_full:y1_full, x0_full:x1_full]
+    if pose_tile.numel() == 0:
+        return latent_tile
+
+    # Forcer la correspondance exacte avec le tile latent
+    pose_tile = F.interpolate(
+        pose_tile,
+        size=(H_latent, W_latent),
+        mode='bilinear',
+        align_corners=False
+    )
+
+    # --- Préparation embeddings ---
+    pos_embeds, neg_embeds = cf_embeds
+    latent_tile_fp32 = latent_tile.to(device=device, dtype=torch.float32)
+    pose_tile_fp32 = pose_tile.to(device=device, dtype=torch.float32)
+    pos_embeds_fp32 = pos_embeds.to(device=device, dtype=torch.float32)
+    neg_embeds_fp32 = neg_embeds.to(device=device, dtype=torch.float32) if neg_embeds is not None else None
+
+    # --- Scheduler noise ---
+    timesteps = scheduler.timesteps
+    t = timesteps[min(frame_counter, len(timesteps)-1)]
+    noise = torch.randn_like(latent_tile_fp32)
+    latent_noisy = scheduler.add_noise(latent_tile_fp32, noise, t)
+    latent_noisy = torch.clamp(latent_noisy, -20, 20)
+    latent_model_input = scheduler.scale_model_input(latent_noisy, t)
+
+    # --- Embeddings pour CFG ---
+    if neg_embeds_fp32 is not None:
+        latent_model_input = torch.cat([latent_model_input]*2)
+        embeds = torch.cat([neg_embeds_fp32, pos_embeds_fp32])
+    else:
+        embeds = pos_embeds_fp32
+
+    latent_model_input = latent_model_input.to(target_dtype)
+    embeds = embeds.to(target_dtype)
+    pose_tile_fp32 = pose_tile_fp32.to(target_dtype)
+
+    # --- ControlNet ---
+    down_samples, mid_sample = controlnet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=embeds,
+        controlnet_cond=pose_tile_fp32,
+        return_dict=False
+    )
+
+    # --- UNet ---
+    noise_pred = unet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=embeds,
+        down_block_additional_residuals=down_samples,
+        mid_block_additional_residual=mid_sample,
+        return_dict=False
+    )[0]
+
+    noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # --- CFG merge ---
+    if neg_embeds_fp32 is not None:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + current_guidance_scale * (noise_text - noise_uncond)
+
+    latents_out = scheduler.step(noise_pred, t, latent_noisy).prev_sample
+
+    # --- Delta safe ---
+    delta = latents_out - latent_noisy
+    delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
+    delta = torch.clamp(delta, -0.25, 0.25)
+    delta = delta * controlnet_scale
+
+    return (latent_tile_fp32 + delta).to
+
+
+
+
+import torch
+import torch.nn.functional as F
+
+def pad_to_multiple(x, mult=8):
+    B, C, H, W = x.shape
+    pad_H = (mult - H % mult) % mult
+    pad_W = (mult - W % mult) % mult
+    if pad_H == 0 and pad_W == 0:
+        return x
+    return F.pad(x, (0, pad_W, 0, pad_H))  # pad right & bottom
+
+def gaussian_blend_mask(H, W, overlap):
+    """Crée un masque gaussien pour fusionner les tiles avec overlap."""
+    import numpy as np
+    y = np.linspace(-1,1,H)
+    x = np.linspace(-1,1,W)
+    xv, yv = np.meshgrid(x,y)
+    mask = np.exp(-(xv**2 + yv**2) / 0.5)  # ajuste le sigma si nécessaire
+    mask = torch.tensor(mask, dtype=torch.float32)
+    return mask
+
+import torch
+import torch.nn.functional as F
+from torchvision.utils import save_image
+import os
+
+def apply_openpose_tilewise_safe(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=None
+):
+    """
+    Applique un OpenPose/ControlNet sur des latents en tiles de manière robuste.
+
+    Arguments:
+        latents: torch.Tensor [B, C, H, W] - latents à traiter
+        pose: torch.Tensor [B, 3, H_full, W_full] - pose ou condition
+        apply_fn: fonction à appliquer sur chaque tile (latent_tile, pose_tile)
+        block_size: taille de la tile
+        overlap: superposition des tiles
+        device: 'cuda' ou 'cpu'
+        debug: True pour afficher logs
+        debug_dir: dossier pour sauvegarder les tiles debug
+        frame_idx: index de frame pour debug
+    """
+    B, C, H, W = latents.shape
+    latents_out = torch.zeros_like(latents)
+    weight_map = torch.zeros_like(latents)
+
+    stride = block_size - overlap
+
+    for i in range(0, H, stride):
+        for j in range(0, W, stride):
+            # Coordonnées du tile
+            i_end = min(i + block_size, H)
+            j_end = min(j + block_size, W)
+            tile_h = i_end - i
+            tile_w = j_end - j
+
+            latent_tile = latents[:, :, i:i_end, j:j_end]
+            pose_tile = pose[:, :, i:i_end, j:j_end]
+
+            # Padding si nécessaire
+            pad_h = block_size - tile_h
+            pad_w = block_size - tile_w
+            if pad_h > 0 or pad_w > 0:
+                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
+                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
+
+            try:
+                # Application de la tile
+                latent_tile_processed = apply_fn(latent_tile, pose_tile)
+            except Exception as e:
+                if debug:
+                    print(f"[DEBUG] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
+                latent_tile_processed = latent_tile  # fallback
+
+            # Retirer le padding pour fusion
+            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
+
+            # Fusion avec weight_map pour overlap
+            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
+            weight_map[:, :, i:i_end, j:j_end] += 1.0
+
+            # Sauvegarde debug si demandé
+            if debug and debug_dir is not None:
+                os.makedirs(debug_dir, exist_ok=True)
+                tile_save_path = os.path.join(debug_dir, f"tile_{frame_idx}_{i}_{j}.png")
+                save_image((latent_tile_processed[0] + 1) / 2, tile_save_path)
+
+    # Moyenne sur les overlaps
+    weight_map[weight_map == 0] = 1.0  # éviter division par 0
+    latents_out = latents_out / weight_map
+
+    return latents_out
