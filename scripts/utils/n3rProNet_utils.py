@@ -871,6 +871,156 @@ def apply_pro_net_with_eyes(
     n3r_pro_net,
     n3r_pro_strength,
     sanitize_fn,
+    iris_radius_ratio=0.04,
+    mask_blur_kernel=13,
+    shade_strength=0.04,   # profondeur (ombres)
+    light_strength=0.025   # lumière douce
+):
+    """
+    Version anime :
+    - aucun sharp
+    - aucun bruit
+    - volume doux (ombre + lumière)
+    - iris lisse et propre
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet (léger uniquement)
+    with torch.no_grad():
+        latents_prot = apply_n3r_pro_net(
+            latents,
+            model=n3r_pro_net,
+            strength=n3r_pro_strength,
+            sanitize_fn=sanitize_fn
+        ).to(dtype)
+
+    if not eye_coords:
+        return latents_prot
+
+    # 2️⃣ Masque iris (ellipse douce)
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    iris_mask = torch.zeros((1,1,H,W), device=device, dtype=dtype)
+
+    for x, y in eye_coords:
+        rx = max(1, int(W * iris_radius_ratio))
+        ry = max(1, int(H * iris_radius_ratio))
+
+        dist = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
+        iris_mask[0,0] += (dist <= 1).float()
+
+    iris_mask = iris_mask.clamp(0,1)
+
+    # 3️⃣ Flou très large → style anime (hyper important)
+    if mask_blur_kernel > 1:
+        iris_mask = F.avg_pool2d(
+            iris_mask,
+            kernel_size=mask_blur_kernel,
+            stride=1,
+            padding=mask_blur_kernel // 2
+        ).clamp(0,1)
+
+    # 4️⃣ Base lissée (anime = surfaces propres)
+    smooth = F.avg_pool2d(latents_prot, 5, stride=1, padding=2)
+
+    # 5️⃣ Volume (ombres)
+    shadow = (smooth - latents_prot) * shade_strength
+
+    # 6️⃣ Lumière douce (pas de brûlé)
+    light = torch.relu(latents_prot - smooth) * light_strength
+
+    # 7️⃣ Fusion anime (très stable)
+    iris_effect = shadow + light
+
+    latents_out = latents_prot + iris_effect * iris_mask
+
+    return latents_out.clamp(-1.0, 1.0)
+
+def apply_pro_net_with_eyes_sd(
+    latents,
+    eye_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    iris_radius_ratio=0.03,   # très ciblé iris
+    mask_blur_kernel=13,       # très doux (clé anti contour)
+    eye_strength=0.015          # ultra subtil
+):
+    """
+    Version clean :
+    - aucun sharp
+    - aucun bruit amplifié
+    - aucun contour paupière
+    - effet naturel (quasi invisible)
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet (léger)
+    with torch.no_grad():
+        latents_prot = apply_n3r_pro_net(
+            latents,
+            model=n3r_pro_net,
+            strength=n3r_pro_strength,
+            sanitize_fn=sanitize_fn
+        ).to(dtype)
+
+    if not eye_coords:
+        return latents_prot
+
+    # 2️⃣ Masque iris (simple + propre)
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    iris_mask = torch.zeros((1,1,H,W), device=device, dtype=dtype)
+
+    for x, y in eye_coords:
+        rx = max(1, int(W * iris_radius_ratio))
+        ry = max(1, int(H * iris_radius_ratio))
+
+        dist = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
+        iris_mask[0,0] += (dist <= 1).float()
+
+    iris_mask = iris_mask.clamp(0,1)
+
+    # 3️⃣ Flou large → supprime totalement les contours durs
+    if mask_blur_kernel > 1:
+        iris_mask = F.avg_pool2d(
+            iris_mask,
+            kernel_size=mask_blur_kernel,
+            stride=1,
+            padding=mask_blur_kernel // 2
+        ).clamp(0,1)
+
+    print("👁 HDR détails appliqué sur iris avec contours adoucis")
+
+    # 4️⃣ Blend ultra doux (pas de détails artificiels)
+    latents_out = latents_prot + (latents_prot - latents) * eye_strength * iris_mask
+
+    return latents_out.clamp(-1.0, 1.0)
+
+def apply_pro_net_with_eyes_power(
+    latents,
+    eye_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
     detail_strength=0.03,       # très doux
     blur_kernel=4,
     iris_radius_ratio=0.03,     # cible encore plus précis iris
@@ -3633,7 +3783,108 @@ def soft_tone_map1(img):
     arr = np.clip(arr, 0, 1)
     return Image.fromarray((arr * 255).astype(np.uint8))
 
-def apply_n3r_pro_net(latents, model=None, strength=0.3, sanitize_fn=None):
+#---------------------------------------------
+# version optimiser - soft et net
+#--------------------------------------------
+def apply_n3r_pro_net(latents, model=None, strength=0.15, sanitize_fn=None):
+    """
+    Version ultra-subtile de ProNet :
+    - réduit fortement le bruit
+    - amplification très douce
+    - très rapide GPU
+    - évite halos / sur-détails
+    """
+    detail_smoothing=0.7
+    clamp_range=1.0
+
+    if model is None or strength <= 0:
+        return latents
+
+    try:
+        dtype = next(model.parameters()).dtype
+        latents = latents.to(dtype)
+
+        # 🔹 Inference optimisée (no grad = VRAM ↓)
+        with torch.no_grad():
+            refined = model(latents)
+
+        # 🔹 Detail map
+        detail = refined - latents
+
+        # 🔹 🔥 Suppression du bruit AVANT amplification
+        # mélange entre brut et lissé
+        if detail_smoothing > 0:
+            smooth = F.avg_pool2d(detail, kernel_size=3, stride=1, padding=1)
+            detail = (1 - detail_smoothing) * detail + detail_smoothing * smooth
+
+        # 🔹 🔥 Limiteur de détails extrêmes (très important)
+        detail = torch.tanh(detail)
+
+        # 🔹 🔥 Injection très douce
+        latents_out = latents + strength * detail
+
+        # 🔹 Sanitize léger
+        if sanitize_fn:
+            latents_out = sanitize_fn(latents_out)
+
+        # 🔹 Clamp sécurisé
+        return latents_out.clamp(-clamp_range, clamp_range)
+
+    except Exception as e:
+        print(f"[N3RProNet ERROR] {e}")
+        return latents
+
+#---------------------------------------------
+# version optimiser - soft
+#--------------------------------------------
+
+def apply_n3r_pro_net_soft(latents, model=None, strength=0.05, sanitize_fn=None):
+    """
+    N3R ProNet simplifié et optimisé :
+    - amplification de détail très douce
+    - lissage du détail pour réduire le bruit
+    - contrôle mémoire via no_grad()
+    """
+
+    if model is None or strength <= 0:
+        return latents
+
+    try:
+        device = latents.device
+        dtype = next(model.parameters()).dtype
+
+        latents = latents.to(dtype)
+
+        # 🔹 Inference sans gradient pour économiser VRAM
+        with torch.no_grad():
+            refined = model(latents)
+
+        # 🔹 Calcul de la carte de détail
+        detail = refined - latents
+
+        # 🔹 Lissage pour limiter le bruit
+        #    avg_pool plus léger ou conv 3x3 si besoin
+        detail = F.avg_pool2d(detail, kernel_size=3, stride=1, padding=1)
+
+        # 🔹 Injection contrôlée et réduite
+        latents = latents + strength * detail
+
+        # 🔹 Optionnel : fonction de sanitation très légère
+        if sanitize_fn:
+            latents = sanitize_fn(latents)
+
+        # 🔹 Clamp final pour éviter les extrêmes
+        return latents.clamp(-1.0, 1.0)
+
+    except Exception as e:
+        print(f"[N3RProNet ERROR] {e}")
+        return latents
+
+#---------------------------------------------
+# version optimiser - boost eclat
+#--------------------------------------------
+
+def apply_n3r_pro_net_boot(latents, model=None, strength=0.3, sanitize_fn=None):
     if model is None or strength <= 0:
         return latents
 
