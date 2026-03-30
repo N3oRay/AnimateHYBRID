@@ -353,6 +353,7 @@ def main(args):
                     #use_n3r_this_frame = math.sin(frame_counter * 0.2) > 0.7
                     use_n3r_this_frame = use_n3r_model and (frame_counter % random.choice([4,5,6]) == 0)
                     #control_strength = 0.05 * (1 - frame_counter / total_frames) + 0.02
+                    controlnet_scale = 1.0 + 0.1 * torch.sin(torch.tensor(frame_counter * 0.1))
                     print(f"[DEBUG] 🧠 Pose control_strength ={control_strength:.4f}")
                     print(f"[DEBUG] 🧠 Pose controlnet_scale ={controlnet_scale:.4f}")
 
@@ -430,7 +431,8 @@ def main(args):
 
                             # 🔹 ===== 2. BUILD LATENT-SPACE POSE (CRUCIAL) =====
                             latent_h, latent_w = latents.shape[2], latents.shape[3]
-                            pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype)
+                            #pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype) # ou bilinear
+                            pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='nearest').to(device=device, dtype=target_dtype)
                             print(f"[DEBUG] Pose latent {pose_latent_full.shape} dtype={pose_latent_full.dtype}")
 
                             # 🔹 backup latents
@@ -448,7 +450,8 @@ def main(args):
                             # 🔹 ===== 5. CLEANUP =====
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
-                            latents = torch.clamp(latents, -1.0, 1.0)
+                            #latents = torch.clamp(latents, -1.0, 1.0)
+                            latents = torch.tanh(latents * 1.3)
 
                             diff = (latents - latents_before_openpose).abs().mean()
                             print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
@@ -465,7 +468,7 @@ def main(args):
                     # ---------------- Motion module ----------------
                     if motion_module is not None:
                         latents_seq = latents.unsqueeze(2).repeat(1, 1, 3, 1, 1) if previous_latent_single is None \
-                                    else torch.stack([previous_latent_single.to(device), latents, latents + 0.01 * torch.randn_like(latents)], dim=2)
+                                    else torch.stack([previous_latent_single.to(device), latents, latents + 0.003 * torch.randn_like(latents)], dim=2)
                         latents_seq = sanitize_latents(latents_seq)
                         latents_seq, applied = apply_motion_safe(latents_seq, motion_module)
                         latents = latents_seq[:, :, 1, :, :] if applied else latents
