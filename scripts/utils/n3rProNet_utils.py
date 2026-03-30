@@ -11,6 +11,87 @@ from pathlib import Path
 from torchvision.transforms.functional import to_pil_image
 
 
+def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
+    """
+    Convertit des coordonnées de bouche dans l'image originale
+    vers l'espace latent correspondant.
+
+    mouth_coords : liste de tuples [(x, y), ...] ou None
+    img_H, img_W : dimensions de l'image d'origine
+    lat_H, lat_W : dimensions du latent
+    """
+    # 🔥 FIX : gérer None ou liste vide
+    if not mouth_coords:
+        return None
+
+    scale_x = lat_W / img_W
+    scale_y = lat_H / img_H
+
+    return [(int(x * scale_x), int(y * scale_y)) for x, y in mouth_coords]
+
+
+def get_mouth_coords_safe(image_pil, H=None, W=None):
+    """
+    Détecte les coordonnées de la bouche de manière sécurisée.
+    Renvoie None si aucun visage n'est détecté ou en cas d'erreur.
+    """
+    try:
+        coords = get_mouth_coords(image_pil)
+        if coords is None:
+            print("⚠️ Aucun visage détecté ou bouche non détectée")
+            return None
+        print(f"👄 Mouth detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Mouth detection ERROR] {e}")
+        return None
+
+
+def get_mouth_coords(image_pil):
+    """
+    Détecte les coordonnées de la bouche avec MediaPipe FaceMesh.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+
+    Returns:
+        list[(x, y)]: coins ou centre de la bouche en coordonnées image
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    mp_face_mesh = mp.solutions.face_mesh
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True
+    ) as face_mesh:
+
+        results = face_mesh.process(image)
+        if not results.multi_face_landmarks:
+            return None
+
+        face_landmarks = results.multi_face_landmarks[0]
+
+        # 🔹 Indices MediaPipe pour la bouche (Outer lips)
+        MOUTH_OUTER = [61, 291, 0, 17, 37, 267, 78, 308]
+
+        def get_center(indices):
+            xs, ys = [], []
+            for idx in indices:
+                lm = face_landmarks.landmark[idx]
+                xs.append(lm.x * w)
+                ys.append(lm.y * h)
+            return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+        mouth_center = get_center(MOUTH_OUTER)
+        return [mouth_center]
+
+
 
 def scale_eye_coords_to_latents(eye_coords, img_H, img_W, lat_H, lat_W):
     """
@@ -500,6 +581,93 @@ def apply_pro_net_with_eyes(
 
     return latents_out
 
+#---------- Mask bouche:
+#----------
+def apply_pro_net_with_mouth(
+    latents,
+    mouth_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    detail_strength=0.35,       # intensité HDR
+    blur_kernel=5,              # kernel pour détails
+    mouth_radius_ratio=0.08,    # taille du masque relatif à l'image
+    mask_blur_kernel=5           # flou du masque pour adoucir les contours
+):
+    """
+    ProNet optimisé + amplification HDR des détails sur la bouche
+    avec fusion douce pour éviter halo sur les contours.
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ Appliquer ProNet standard
+    latents_prot = apply_n3r_pro_net(
+        latents,
+        model=n3r_pro_net,
+        strength=n3r_pro_strength,
+        sanitize_fn=sanitize_fn
+    ).to(dtype)
+
+    # 2️⃣ Si pas de bouche détectée → fallback
+    if not mouth_coords:
+        return latents_prot
+
+    # 3️⃣ Création masque bouche
+    mouth_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    for x, y in mouth_coords:
+        rx = int(W * mouth_radius_ratio)
+        ry = int(H * mouth_radius_ratio)
+        dist = ((X - x)**2) / (rx**2 + 1e-6) + ((Y - y)**2) / (ry**2 + 1e-6)
+        mouth_mask[0, 0] += (dist <= 1).float()
+
+    mouth_mask = mouth_mask.clamp(0, 1)
+
+    # 4️⃣ Flouter le masque pour adoucir les contours
+    if mask_blur_kernel > 1:
+        sigma = mask_blur_kernel / 3
+        ax = torch.arange(-mask_blur_kernel // 2 + 1., mask_blur_kernel // 2 + 1., device=device, dtype=dtype)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        mask_kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        mask_kernel_2d /= mask_kernel_2d.sum()
+        mask_kernel = mask_kernel_2d.view(1, 1, mask_blur_kernel, mask_blur_kernel)
+        mouth_mask = F.conv2d(mouth_mask, mask_kernel, padding=mask_blur_kernel // 2)
+        mouth_mask = mouth_mask.clamp(0, 1)
+
+    # 5️⃣ Blur pour récupérer les détails (high-frequency)
+    sigma = blur_kernel / 3
+    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device, dtype=dtype)
+    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    kernel_2d /= kernel_2d.sum()
+    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1).to(dtype)
+    blurred = F.conv2d(latents_prot, kernel, padding=blur_kernel // 2, groups=C)
+    details = latents_prot - blurred
+
+    # 6️⃣ Amplification HDR adaptative selon le masque flou
+    detail_strength_map = detail_strength * mouth_mask
+    enhanced = latents_prot + details * detail_strength_map
+
+    # 7️⃣ Fusion douce
+    latents_out = latents_prot * (1 - mouth_mask) + enhanced * mouth_mask
+
+    # 8️⃣ Clamp final pour sécurité
+    latents_out = torch.clamp(latents_out, -1.0, 1.0)
+
+    print("👄 HDR détails appliqué sur la bouche avec contours adoucis")
+
+    return latents_out
+
 #------------ Stable version mais un peu fort ----
 def apply_pro_net_with_eyes_boost(
     latents,
@@ -877,6 +1045,39 @@ def create_eye_mask(latents, eye_coords, eye_radius=8, falloff=4):
                 mask[0, 0, y, x] = torch.maximum(mask[0, 0, y, x], torch.tensor(value, device=latents.device))
 
     return mask.repeat(B, C, 1, 1)
+
+def create_mouth_mask(latents, mouth_coords, mouth_radius=8, falloff=4):
+    """
+    Crée un masque gaussien doux autour des coordonnées de la bouche.
+    Args:
+        latents (torch.Tensor): tenseur des latents [B, C, H, W]
+        mouth_coords (list[(y,x)]): centre(s) de la bouche en coords latents
+        mouth_radius (int): rayon principal du masque
+        falloff (int): transition douce
+    Returns:
+        torch.Tensor: masque [B, C, H, W] avec valeurs entre 0 et 1
+    """
+    if mouth_coords is None or len(mouth_coords) == 0:
+        return None
+
+    B, C, H, W = latents.shape
+    mask = torch.zeros((1, 1, H, W), device=latents.device)
+
+    for y_c, x_c in mouth_coords:
+        # 🔹 Si coords image -> latents, elles doivent déjà être scalées
+        y_lat = int(y_c)
+        x_lat = int(x_c)
+
+        # 🔹 Création d'une grille
+        yy, xx = torch.meshgrid(torch.arange(H, device=latents.device),
+                                torch.arange(W, device=latents.device),
+                                indexing='ij')
+        dist = ((yy - y_lat)**2 + (xx - x_lat)**2).sqrt()
+        value = torch.clamp(1 - dist / (mouth_radius + falloff), min=0.0)
+        mask[0, 0] = torch.maximum(mask[0, 0], value)
+
+    return mask.repeat(B, C, 1, 1)
+
 
 def detect_eyes_auto(frame_pil):
     """Retourne les coordonnées (y,x) approximatives des yeux"""
