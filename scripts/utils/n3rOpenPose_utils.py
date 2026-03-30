@@ -321,7 +321,7 @@ def debug_pose_visual(pose_tensor, frame_counter, cfg=None, title="Pose Debug"):
     plt.pause(0.1)  # court délai pour rafraîchir
     plt.close()
 
-def convert_json_to_pose_sequence(anim_data, H=512, W=512, device="cuda", dtype=torch.float16, debug=False):
+def convert_json_to_pose_sequence_v1(anim_data, H=512, W=512, device="cuda", dtype=torch.float16, debug=False):
     """
     Convertit un JSON d'animation OpenPose simplifié en tensor utilisable par ControlNet.
 
@@ -369,6 +369,161 @@ def convert_json_to_pose_sequence(anim_data, H=512, W=512, device="cuda", dtype=
         pose_images.append(img)
 
     pose_sequence = torch.stack(pose_images).to(device=device, dtype=dtype)
+
+    if debug:
+        print(f"[JSON->POSE] shape: {pose_sequence.shape}")
+        print(f"[JSON->POSE] min/max: {pose_sequence.min().item()} / {pose_sequence.max().item()}")
+
+    return pose_sequence
+
+import torch
+import numpy as np
+import cv2
+
+def convert_json_to_pose_sequence(anim_data, H=512, W=512,
+                                  device="cuda", dtype=torch.float16,
+                                  debug=False, output_dir=None):
+    """
+    Convertit un JSON d'animation OpenPose en tensor ControlNet, avec centrage et scaling automatique.
+    Output : [num_frames, 3, H, W], dtype et device configurables.
+    """
+    frames = anim_data.get("animation", [])
+    pose_images = []
+
+    # --- Détecter le bounding box global des keypoints ---
+    all_x = []
+    all_y = []
+    for frame in frames:
+        for kp in frame.get("keypoints", []):
+            all_x.append(kp["x"])
+            all_y.append(kp["y"])
+
+    if len(all_x) == 0 or len(all_y) == 0:
+        raise ValueError("Aucun keypoint trouvé dans le JSON.")
+
+    min_x, max_x = min(all_x), max(all_x)
+    min_y, max_y = min(all_y), max(all_y)
+
+    # Scale et translation pour centrer et remplir le canvas
+    scale_x = (W - 20) / (max_x - min_x + 1e-6)  # marge 10px
+    scale_y = (H - 20) / (max_y - min_y + 1e-6)
+    scale = min(scale_x, scale_y)
+
+    offset_x = (W - (max_x - min_x) * scale) / 2 - min_x * scale
+    offset_y = (H - (max_y - min_y) * scale) / 2 - min_y * scale
+
+    for idx, frame in enumerate(frames):
+        keypoints = frame.get("keypoints", [])
+        canvas = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # --- Dessin des points ---
+        for kp in keypoints:
+            x = int(kp["x"] * scale + offset_x)
+            y = int(kp["y"] * scale + offset_y)
+            conf = kp.get("confidence", 1.0)
+            if conf > 0.3:
+                cv2.circle(canvas, (x, y), 4, (255, 255, 255), -1)
+
+        # --- Dessin des connexions ---
+        skeleton = [
+            (0, 1),  # tête → torse
+            (1, 2),  # torse → bras gauche
+            (1, 3),  # torse → bras droit
+            (1, 4),  # torse → jambe gauche
+            (1, 5),  # torse → jambe droite
+        ]
+        for a, b in skeleton:
+            if a < len(keypoints) and b < len(keypoints):
+                x1 = int(keypoints[a]["x"] * scale + offset_x)
+                y1 = int(keypoints[a]["y"] * scale + offset_y)
+                x2 = int(keypoints[b]["x"] * scale + offset_x)
+                y2 = int(keypoints[b]["y"] * scale + offset_y)
+                cv2.line(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        img = torch.from_numpy(canvas).float() / 255.0
+        img = img.permute(2, 0, 1)  # C,H,W
+        pose_images.append(img)
+
+        # Debug
+        if debug and output_dir is not None:
+            cv2.imwrite(f"{output_dir}/debug_pose_{idx:03d}.png", canvas)
+
+    pose_sequence = torch.stack(pose_images).to(device=device, dtype=dtype)
+    pose_sequence = pose_sequence * 2.0 - 1.0  # [-1,1]
+
+    if debug:
+        print(f"[JSON->POSE] shape: {pose_sequence.shape}")
+        print(f"[JSON->POSE] min/max: {pose_sequence.min().item()} / {pose_sequence.max().item()}")
+
+    return pose_sequence
+
+def convert_json_to_pose_sequence_debug(anim_data, H=512, W=512, original_w=512, original_h=512,
+                                  device="cuda", dtype=torch.float16, debug=False, output_dir=None):
+    """
+    Convertit un JSON d'animation OpenPose simplifié en tensor utilisable par ControlNet.
+
+    Args:
+        anim_data: dict JSON avec "animation" -> frames -> keypoints
+        H, W: résolution finale du canvas
+        original_w, original_h: résolution originale des keypoints
+        device: "cuda" ou "cpu"
+        dtype: torch dtype (ex: torch.float16)
+        debug: bool, sauvegarde les images pour visualisation
+        output_dir: chemin pour debug images (optionnel)
+
+    Returns:
+        pose_sequence: tensor [num_frames, 3, H, W] (RGB type)
+    """
+    frames = anim_data.get("animation", [])
+    pose_images = []
+
+    for idx, frame in enumerate(frames):
+        keypoints = frame.get("keypoints", [])
+
+        # Image noire
+        canvas = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # --- Dessin des points ---
+        for kp in keypoints:
+            # remapping keypoints vers la résolution finale
+            x = int(kp["x"] * W / original_w)
+            y = int(kp["y"] * H / original_h)
+            conf = kp.get("confidence", 1.0)
+
+            if conf > 0.3:
+                cv2.circle(canvas, (x, y), 4, (255, 255, 255), -1)
+
+        # --- Dessin des connexions (squelette simple) ---
+        skeleton = [
+            (0, 1),  # tête → torse
+            (1, 2),  # torse → bras gauche
+            (1, 3),  # torse → bras droit
+            (1, 4),  # torse → jambe gauche
+            (1, 5),  # torse → jambe droite
+        ]
+
+        for a, b in skeleton:
+            if a < len(keypoints) and b < len(keypoints):
+                x1 = int(keypoints[a]["x"] * W / original_w)
+                y1 = int(keypoints[a]["y"] * H / original_h)
+                x2 = int(keypoints[b]["x"] * W / original_w)
+                y2 = int(keypoints[b]["y"] * H / original_h)
+                cv2.line(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        # --- Conversion en tensor ---
+        img = torch.from_numpy(canvas).float() / 255.0  # [H, W, C]
+        img = img.permute(2, 0, 1)  # → [C, H, W]
+
+        pose_images.append(img)
+
+        # --- Debug save ---
+        if debug and output_dir is not None:
+            debug_path = f"{output_dir}/debug_pose_{idx:03d}.png"
+            cv2.imwrite(debug_path, (canvas).astype(np.uint8))
+
+    # --- Stack frames + normalisation [-1,1] ---
+    pose_sequence = torch.stack(pose_images).to(device=device, dtype=dtype)
+    pose_sequence = pose_sequence * 2.0 - 1.0  # [0,1] → [-1,1]
 
     if debug:
         print(f"[JSON->POSE] shape: {pose_sequence.shape}")
