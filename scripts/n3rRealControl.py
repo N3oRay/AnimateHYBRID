@@ -399,8 +399,6 @@ def main(args):
                     # ---------------- ControlNet OpenPose ------------------------
                     if use_openpose:
                         try:
-
-
                             # 🔥 dtype cible réel (UNet)
                             target_dtype = next(unet.parameters()).dtype
 
@@ -431,8 +429,8 @@ def main(args):
 
                             # 🔹 ===== 2. BUILD LATENT-SPACE POSE (CRUCIAL) =====
                             latent_h, latent_w = latents.shape[2], latents.shape[3]
-                            #pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype) # ou bilinear
-                            pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='nearest').to(device=device, dtype=target_dtype)
+                            pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype) # ou bilinear
+                            #pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='nearest').to(device=device, dtype=target_dtype)
                             print(f"[DEBUG] Pose latent {pose_latent_full.shape} dtype={pose_latent_full.dtype}")
 
                             # 🔹 backup latents
@@ -447,11 +445,22 @@ def main(args):
                             # 🔹 Appel correct de apply_openpose_tilewise
                             latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
 
+                            # BOOST
+                            latents_after = latents  # sortie de apply_openpose
+                            delta = latents_after - latents_before_openpose
+                            # garder magnitude réelle + amplification douce
+                            pose_mask = (pose_latent_full.abs().mean(dim=1, keepdim=True) > 0.05).float()
+
+                            latents = latents_before_openpose + 2.2 * delta * pose_mask
                             # 🔹 ===== 5. CLEANUP =====
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
-                            #latents = torch.clamp(latents, -1.0, 1.0)
-                            latents = torch.tanh(latents * 1.3)
+                            #latents = torch.tanh(latents * 1.3)
+                            # clamp beaucoup plus permissif
+                            #latents = torch.clamp(latents, -1.5, 1.5)
+                            latents_max = latents.abs().amax(dim=(1,2,3), keepdim=True)
+                            latents = latents / (latents_max + 1e-6)
+                            latents = latents * 1.1
 
                             diff = (latents - latents_before_openpose).abs().mean()
                             print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
