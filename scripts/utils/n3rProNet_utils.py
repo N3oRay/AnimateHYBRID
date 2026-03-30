@@ -317,6 +317,107 @@ import matplotlib.pyplot as plt
 #--------------------------------------------------
 def apply_pro_net_volumetrique(
     latents,
+    coords_v=None,
+    n3r_pro_net=None,
+    n3r_pro_strength=0.3,
+    sanitize_fn=None,
+    volume_strength=0.03,     # relief global doux
+    shadow_strength=0.06,     # ombres (clé anime)
+    highlight_strength=0.01, # lumière très contrôlée
+    iris_light=0.02,          # glow iris doux
+    iris_radius_ratio=0.04,
+    mask_blur_kernel=13,
+    debug=False
+):
+    """
+    Version anime volumétrique :
+    - low frequency uniquement (pas de bruit)
+    - ombres renforcées (style anime)
+    - lumière douce (jamais cramée)
+    - iris propre (pas de sharp)
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet (léger)
+    if n3r_pro_net is not None:
+        with torch.no_grad():
+            latents_prot = apply_n3r_pro_net(
+                latents,
+                model=n3r_pro_net,
+                strength=n3r_pro_strength,
+                sanitize_fn=sanitize_fn
+            ).to(dtype)
+    else:
+        latents_prot = latents
+
+    # 2️⃣ LOW FREQUENCY = base anime propre
+    smooth = F.avg_pool2d(latents_prot, 5, stride=1, padding=2)
+
+    # 3️⃣ Volume (relief global, sans bruit)
+    volume = (latents_prot - smooth) * volume_strength
+
+    # 4️⃣ Ombres (important pour effet 3D anime)
+    shadows = torch.relu(smooth - latents_prot) * shadow_strength
+
+    # 5️⃣ Lumière douce (jamais cramée)
+    highlights = torch.relu(latents_prot - smooth) * highlight_strength
+
+    latents_3D = latents_prot + volume + shadows + highlights
+
+    # 6️⃣ Iris (optionnel, ultra clean)
+    if coords_v:
+        Y, X = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing='ij'
+        )
+
+        iris_mask = torch.zeros((1,1,H,W), device=device, dtype=dtype)
+
+        for x, y in coords_v:
+            rx = max(1, int(W * iris_radius_ratio))
+            ry = max(1, int(H * iris_radius_ratio))
+            dist = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
+            iris_mask[0,0] += (dist <= 1).float()
+
+        iris_mask = iris_mask.clamp(0,1)
+
+        # flou large = pas de contour paupière
+        if mask_blur_kernel > 1:
+            iris_mask = F.avg_pool2d(
+                iris_mask,
+                kernel_size=mask_blur_kernel,
+                stride=1,
+                padding=mask_blur_kernel // 2
+            ).clamp(0,1)
+
+        # glow très propre basé sur low-freq
+        iris_glow = torch.relu(latents_prot - smooth) * iris_light
+
+        latents_3D = latents_3D * (1 - iris_mask) + (latents_3D + iris_glow) * iris_mask
+
+    # 7️⃣ Clamp final (sécurité)
+    latents_out = latents_3D.clamp(-1.0, 1.0)
+
+    if debug:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12,4))
+        plt.subplot(1,3,1); plt.imshow(latents_prot[0,0].detach().cpu(), cmap='gray'); plt.title("ProNet")
+        plt.subplot(1,3,2); plt.imshow(smooth[0,0].detach().cpu(), cmap='gray'); plt.title("Low-Freq (Anime)")
+        if coords_v:
+            plt.subplot(1,3,3); plt.imshow(iris_mask[0,0].detach().cpu(), cmap='Reds'); plt.title("Iris Mask")
+        plt.tight_layout(); plt.show()
+    print("🎨 Anime volumetric applied")
+
+    return latents_out
+
+def apply_pro_net_volumetrique_high(
+    latents,
     coords_v=None,                # optionnel pour iris
     n3r_pro_net=None,
     n3r_pro_strength=0.5,
@@ -942,6 +1043,8 @@ def apply_pro_net_with_eyes(
     iris_effect = shadow + light
 
     latents_out = latents_prot + iris_effect * iris_mask
+
+    print("👁 HDR détails appliqué sur iris avec contours adoucis")
 
     return latents_out.clamp(-1.0, 1.0)
 
