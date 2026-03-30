@@ -31,7 +31,7 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_po
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe
 
@@ -252,6 +252,8 @@ def main(args):
             # -----------------------------------------------------------------------------------------
             # coordonner masque eye et masque volumetrique
             eye_coords = get_eye_coords_safe(input_pil)
+            mouth_coords = get_mouth_coords_safe(input_pil)
+            # coordonner globale
             coords_v = get_coords_safe( input_pil, H=cfg["H"], W=cfg["W"] )
             input_image = ensure_4_channels(input_image)
             if frame_counter > 0:
@@ -310,15 +312,21 @@ def main(args):
 
                         # Application de n3r_pro_net - réutilisé pour toutes les frames - creation des masques
                         eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latent_interp.shape[-2], lat_W=latent_interp.shape[-1] )
+                        mouth_coords_latent = scale_mouth_coords_to_latents( mouth_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latent_interp.shape[-2], lat_W=latent_interp.shape[-1] )
                         if eye_coords_latent:
                             eye_mask = create_eye_mask(latent_interp, eye_coords_latent)
+                        if mouth_coords_latent:
+                            mouth_mask = create_mouth_mask(latent_interp, mouth_coords_latent)
                         volume_mask = create_volumetrique_mask(latent_interp, coords_v, debug=False)
                         # Application du ProNet tout en protégeant les yeux
                         if use_n3r_pro_net:
                             latents = apply_pro_net_volumetrique(latent_interp, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
                             eye_coords_latent = scale_eye_coords_to_latents( eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latents.shape[-2], lat_W=latents.shape[-1] )
+                            mouth_coords_latent = scale_mouth_coords_to_latents( mouth_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latents.shape[-2], lat_W=latents.shape[-1] )
                             if eye_coords_latent:
                                 latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
+                            if mouth_coords_latent:
+                                latents = apply_pro_net_with_mouth(latents, mouth_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
 
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
@@ -501,6 +509,13 @@ def main(args):
                             latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength,
                                                             sanitize_fn=sanitize_latents)
                             print(f"[DEBUG] Après ProNet yeux min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
+
+                        mouth_coords_latent = scale_mouth_coords_to_latents(eye_coords, img_H=cfg["H"], img_W=cfg["W"],
+                                                                        lat_H=latents.shape[-2], lat_W=latents.shape[-1])
+                        if mouth_coords_latent:
+                            latents = apply_pro_net_with_mouth(latents, mouth_coords_latent, n3r_pro_net, n3r_pro_strength,
+                                                            sanitize_fn=sanitize_latents)
+                            print(f"[DEBUG] Après ProNet Bouche min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
                     # ---------------- Décodage final ----------------
                     # 🔥 SANITY AVANT DECODE
