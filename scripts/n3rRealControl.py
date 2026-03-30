@@ -457,12 +457,16 @@ def main(args):
                             # 🔹 ===== 5. CLEANUP =====
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
-                            #latents = torch.tanh(latents * 1.3)
-                            # clamp beaucoup plus permissif
-                            #latents = torch.clamp(latents, -1.5, 1.5)
-                            latents_max = latents.abs().amax(dim=(1,2,3), keepdim=True)
-                            latents = latents / (latents_max + 1e-6)
-                            latents = latents * 1.1
+
+                            #latents_max = latents.abs().amax(dim=(1,2,3), keepdim=True)
+                            #latents = latents / (latents_max + 1e-6)
+                            #latents = latents * 1.1
+
+                            # boost relatif léger
+                            latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
+                            latents = latents / (latents_max + 1e-6) * 1.05
+                            # clamp pour éviter les valeurs extrêmes
+                            latents = torch.clamp(latents, -1.3, 1.3)
 
                             diff = (latents - latents_before_openpose).abs().mean()
                             print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
