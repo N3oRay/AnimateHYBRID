@@ -502,10 +502,10 @@ def apply_pro_net_with_eyes(
     n3r_pro_net,
     n3r_pro_strength,
     sanitize_fn,
-    detail_strength=0.35,       # intensité HDR
+    detail_strength=0.15,       # intensité HDR
     blur_kernel=5,              # kernel pour détails
-    iris_radius_ratio=0.06,     # plus petit = cible mieux iris
-    mask_blur_kernel=3          # flou du masque pour adoucir les contours
+    iris_radius_ratio=0.05,     # plus petit = cible mieux iris
+    mask_blur_kernel=5          # flou du masque pour adoucir les contours
 ):
     """
     ProNet optimisé + amplification HDR des détails sur l’iris (pas glow)
