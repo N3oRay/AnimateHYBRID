@@ -152,6 +152,12 @@ def main(args):
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
     total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
 
+    # ---------------- Input  ----------------
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(f"./outputs/RealControl{timestamp}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_video = output_dir / f"output_{timestamp}.mp4"
+
     # ---------------- load_controlnet_openpose ----------------
     if use_openpose:
         controlnet = load_controlnet_openpose_local( device=device, dtype=torch.float16, use_fp16=True, debug=True )
@@ -165,7 +171,7 @@ def main(args):
                 anim_data = json.load(f)
 
             print(f"✅ JSON chargé : {json_file}")
-            pose_sequence = convert_json_to_pose_sequence( anim_data, H=cfg["H"], W=cfg["W"], device=device, dtype=dtype, debug=True)
+            pose_sequence = convert_json_to_pose_sequence( anim_data, H=cfg["H"], W=cfg["W"], device=device, dtype=dtype, debug=True, output_dir=output_dir)
 
             if pose_sequence is None:
                 print("❌ Aucun pose_sequence → OpenPose désactivé")
@@ -198,11 +204,7 @@ def main(args):
         n3r_pro_net.eval()
         print("✅ N3RProNet activé")
 
-    # ---------------- Input  ----------------
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"./outputs/RealControl{timestamp}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_video = output_dir / f"output_{timestamp}.mp4"
+
 
 
     previous_latent_single = None
