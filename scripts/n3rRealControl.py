@@ -3,6 +3,7 @@
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
 #Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
 # Image input ↓ OpenPose → skeleton (frame t) ↓ ControlNet (condition pose) ↓ UNet (avec pos/neg embeds) ↓ Latents 4D (animés) ↓ N3RProNet (détails + iris + sharpen) ↓ Decode blockwise ↓ Frames animées
+#use_n3r_model: True # Amélioration de la qualité use_n3r_pro_net: False # Augmentation des détails à mettre au point use_mini_gpu: False # Génération rapide use_openpose: False # Pas encore au point
 # ----------------------------------------------------------------------------------------
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
@@ -383,6 +384,7 @@ def main(args):
                             latents = sanitize_latents(latents)
                         except Exception as e:
                             print(f"[N3R ERROR] {e}")
+                            traceback.print_exc()
 
                         if frame_counter % 30 == 0:
                             save_memory(memory_dict, memory_file)
@@ -516,7 +518,7 @@ def main(args):
                             latents = apply_pro_net_with_mouth(latents, mouth_coords_latent, n3r_pro_net, n3r_pro_strength,
                                                             sanitize_fn=sanitize_latents)
                             print(f"[DEBUG] Après ProNet Bouche min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
-
+                        latents = sanitize_latents(latents)
                     # ---------------- Décodage final ----------------
                     # 🔥 SANITY AVANT DECODE
                     latents = latents / LATENT_SCALE
