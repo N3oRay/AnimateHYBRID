@@ -1,7 +1,7 @@
 # ----------------------------------------------------------------------------------------
 # n3rRealControl.py - AnimateDiff stables, ProNet + HDR ultra-light ~2Go VRAM - pipeline 4D
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
-#Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM, ultra léger ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
+#Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
 # Image input ↓ OpenPose → skeleton (frame t) ↓ ControlNet (condition pose) ↓ UNet (avec pos/neg embeds) ↓ Latents 4D (animés) ↓ N3RProNet (détails + iris + sharpen) ↓ Decode blockwise ↓ Frames animées
 # ----------------------------------------------------------------------------------------
 import os
@@ -10,7 +10,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size
 import math, threading, random, json, traceback, hashlib, pickle, argparse
 from pathlib import Path
 from datetime import datetime
-
+import traceback
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
@@ -33,7 +33,6 @@ from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RM
 from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
-# OpenPose :
 from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe
 
 LATENT_SCALE = 0.18215
@@ -71,16 +70,13 @@ def main(args):
     contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.15), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
     H, W = cfg.get("H", 512), cfg.get("W", 512)
     block_size = cfg.get("block_size", 64)  # block_size auto selon résolution 64
-    overlap = compute_overlap(cfg["W"], cfg["H"], block_size)
-    overlap = 32 #32
+    overlap = compute_overlap(cfg["W"], cfg["H"], block_size) #overlap = 32 #32
     print(f"Dimention : overlap :", overlap)
-
 
     use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
     use_openpose = cfg.get("use_openpose", True)
     controlnet_scale = cfg.get("controlnet_scale", 1.0) # typiquement 0.5 → 1.0
     control_strength = cfg.get("control_strength", 1.5)
-
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
     target_temp, reference_temp = 7800, 6500 #target_temp = 8000 reference_temp = 6000  (Froid)
     facteur = cfg.get("facteur", 8) # 8, 6, 4
@@ -185,8 +181,7 @@ def main(args):
     n3r_model = None
     if use_n3r_model:
         n3r_model = N3RModelOptimized(
-            L_low=cfg.get("n3r_L_low",3), L_high=cfg.get("n3r_L_high",6),
-            N_samples=cfg.get("n3r_N_samples",32), tile_size=cfg.get("n3r_tile_size",64),
+            L_low=cfg.get("n3r_L_low",3), L_high=cfg.get("n3r_L_high",6), N_samples=cfg.get("n3r_N_samples",32), tile_size=cfg.get("n3r_tile_size",64),
             cpu_offload=cfg.get("n3r_cpu_offload",True)
         ).to(device)
         n3r_model.eval()
@@ -233,8 +228,7 @@ def main(args):
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
             # ---------------- Pose sequence ---------------------------------------------
-            # start_pose = tensor 4D BCHW directement
-            start_pose = input_image.to(device=device, dtype=dtype)
+            start_pose = input_image.to(device=device, dtype=dtype) # start_pose = tensor 4D BCHW directement
             # Pose sequence
             if use_openpose and pose_sequence is None:
                 pose_sequence = generate_pose_sequence(base_pose=start_pose, num_frames=total_frames, device=device, dtype=dtype, debug=True)
@@ -267,7 +261,6 @@ def main(args):
             current_latent_single = encode_images_to_latents_hybrid(input_image, vae, device=device, latent_scale=LATENT_SCALE)
             current_latent_single = torch.nn.functional.interpolate(
                 current_latent_single, size=(cfg["H"]//facteur, cfg["W"]//facteur),
-                #current_latent_single, size=(cfg["H"]//6, cfg["W"]//6),
                 mode='bilinear', align_corners=False
             )
 
@@ -279,8 +272,7 @@ def main(args):
                 current_latent_single = generate_latents_robuste_4D(
                     latents=current_latent_single.to(device),
                     pos_embeds=pos_embeds, neg_embeds=neg_embeds, unet=unet, scheduler=scheduler,
-                    motion_module=None, device=device, dtype=dtype,
-                    guidance_scale=current_guidance_scale,  #guidance_scale: 1.5      # un peu plus strict pour que le chat ressorte
+                    motion_module=None, device=device, dtype=dtype, guidance_scale=current_guidance_scale,
                     init_image_scale=current_init_image_scale, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
                     creative_noise=current_creative_noise, seed=seed  # 42, 1234, 2026, 5555
                 )
@@ -389,10 +381,8 @@ def main(args):
                         latents = generate_latents_mini_gpu_320(
                             unet=unet, scheduler=scheduler,
                             input_latents=latents_frame, embeddings=cf_embeds,
-                            motion_module=motion_module, guidance_scale=current_guidance_scale,
-                            device=device, fp16=True, steps=steps,
-                            debug=verbose, init_image_scale=current_init_image_scale,
-                            creative_noise=current_creative_noise
+                            motion_module=motion_module, guidance_scale=current_guidance_scale, device=device, fp16=True, steps=steps,
+                            debug=verbose, init_image_scale=current_init_image_scale, creative_noise=current_creative_noise
                         )
                         # ControlNet injection :
                         control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
@@ -408,8 +398,7 @@ def main(args):
                     # ---------------- ControlNet OpenPose ------------------------
                     if use_openpose:
                         try:
-                            import torch.nn.functional as F
-                            import traceback
+
 
                             # 🔥 dtype cible réel (UNet)
                             target_dtype = next(unet.parameters()).dtype
@@ -441,26 +430,16 @@ def main(args):
 
                             # 🔹 ===== 2. BUILD LATENT-SPACE POSE (CRUCIAL) =====
                             latent_h, latent_w = latents.shape[2], latents.shape[3]
-
-                            pose_latent_full = F.interpolate(
-                                pose_full,
-                                size=(latent_h, latent_w),
-                                mode='bilinear',
-                                align_corners=False
-                            ).to(device=device, dtype=target_dtype)
-
+                            pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype)
                             print(f"[DEBUG] Pose latent {pose_latent_full.shape} dtype={pose_latent_full.dtype}")
 
                             # 🔹 backup latents
                             latents_before_openpose = latents.clone()
-
                             print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
 
                             from functools import partial
 
                             # Préparer la tile function avec tous les arguments sauf latent_tile et tile_coords
-                            #tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, pose_full=pose_full, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, scale=facteur )
-
                             tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, )
 
                             # 🔹 Appel correct de apply_openpose_tilewise
@@ -469,10 +448,9 @@ def main(args):
                             # 🔹 ===== 5. CLEANUP =====
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
-                            latents = torch.clamp(latents, -0.85, 0.85)
+                            latents = torch.clamp(latents, -1.0, 1.0)
 
                             diff = (latents - latents_before_openpose).abs().mean()
-
                             print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
                             print(f"[DEBUG] Latents après OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
 
@@ -483,13 +461,6 @@ def main(args):
 
                         # 🔹 debug image
                         save_debug_pose_image(pose_full, frame_counter, output_dir, cfg, prefix="openpose")
-
-                    # ---------------- Injection finale ControlNet ----------------
-                    control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
-                    latents = latents + control_strength * control_weight_map * control_latent
-                    latents = sanitize_latents(latents)
-                    latents = torch.clamp(latents, -0.85, 0.85)
-                    print(f"[DEBUG] Après Injection finale ControlNet min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
                     # ---------------- Motion module ----------------
                     if motion_module is not None:
@@ -513,13 +484,8 @@ def main(args):
                                                             sanitize_fn=sanitize_latents)
                             print(f"[DEBUG] Après ProNet yeux min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
 
-                    # ---------------- Clamp latents ----------------
-                    #latents = torch.clamp(latents, -1.5, 1.5)
                     # ---------------- Décodage final ----------------
                     # 🔥 SANITY AVANT DECODE
-                    #latents = sanitize_latents(latents)
-                    #latents = torch.clamp(latents, -1.0, 1.0)
-                    #print("FINAL LATENTS SAFE:", latents.min().item(), latents.max().item())
                     latents = latents / LATENT_SCALE
                     print(f"Dimention : Shape de latents :", latents.shape)
                     frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device,
