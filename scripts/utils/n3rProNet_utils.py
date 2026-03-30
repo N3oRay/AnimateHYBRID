@@ -412,7 +412,7 @@ def apply_pro_net_volumetrique(
 
     return latents_out
 
-def apply_pro_net_volumetrique_glow(
+def apply_pro_net_volumetrique_ice(
     latents,
     coords_v,
     n3r_pro_net,
@@ -498,7 +498,7 @@ def apply_pro_net_volumetrique_glow(
 
     return latents_out
 
-def apply_pro_net_volumetrique_ori(
+def apply_pro_net_volumetrique_glow(
     latents,
     coords_v,
     n3r_pro_net,
@@ -679,8 +679,97 @@ def apply_pro_net_volumetrique_good(
 
     return latents_out
 
-#----- Amplification des détails des yeux
+#----- Amplification des détails des yeux - version optimisé
 def apply_pro_net_with_eyes(
+    latents,
+    eye_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    detail_strength=0.03,       # très doux
+    blur_kernel=3,
+    iris_radius_ratio=0.04,     # cible encore plus précis iris
+    mask_blur_kernel=9,         # flou large pour éviter contours durs
+    contrast=1.05                # léger contraste
+):
+    """
+    Amplification douce de l’iris seulement.
+    Contours de l’œil / paupière adoucis au maximum.
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # 1️⃣ ProNet inference
+    with torch.no_grad():
+        latents_prot = apply_n3r_pro_net(
+            latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn
+        ).to(dtype)
+
+    if not eye_coords:
+        return latents_prot
+
+    # 2️⃣ Masque iris vectorisé
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    iris_mask = torch.zeros((1,1,H,W), device=device, dtype=dtype)
+    for x, y in eye_coords:
+        rx = max(1, int(W * iris_radius_ratio))
+        ry = max(1, int(H * iris_radius_ratio))
+        dist2 = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
+        iris_mask[0,0] += (dist2 <= 1).float()
+    iris_mask = iris_mask.clamp(0,1)
+
+    # 3️⃣ Flou important pour fusion douce (1D separable)
+    if mask_blur_kernel > 1:
+        sigma = mask_blur_kernel / 3
+        ax = torch.arange(-mask_blur_kernel//2 + 1., mask_blur_kernel//2 + 1., device=device, dtype=dtype)
+        gauss_1d = torch.exp(-(ax**2)/(2*sigma**2))
+        gauss_1d /= gauss_1d.sum()
+        kx = gauss_1d.view(1,1,1,mask_blur_kernel)
+        ky = gauss_1d.view(1,1,mask_blur_kernel,1)
+        pad_x = (kx.shape[-1]-1)//2
+        pad_y = (ky.shape[-2]-1)//2
+        iris_mask = F.conv2d(F.conv2d(iris_mask, kx, padding=(0,pad_x)),
+                             ky, padding=(pad_y,0)).clamp(0,1)
+
+    # 4️⃣ High-frequency details blur
+    if blur_kernel > 1:
+        sigma = blur_kernel / 3
+        ax = torch.arange(-blur_kernel//2+1., blur_kernel//2+1., device=device, dtype=dtype)
+        g1d = torch.exp(-(ax**2)/(2*sigma**2))
+        g1d /= g1d.sum()
+        kx = g1d.view(1,1,1,blur_kernel).repeat(C,1,1,1)
+        ky = g1d.view(1,1,blur_kernel,1).repeat(C,1,1,1)
+        pad_x = (kx.shape[-1]-1)//2
+        pad_y = (ky.shape[-2]-1)//2
+        blurred = F.conv2d(F.conv2d(latents_prot, kx, padding=(0,pad_x), groups=C),
+                           ky, padding=(pad_y,0), groups=C)
+        if blurred.shape != latents_prot.shape:
+            blurred = F.interpolate(blurred, size=latents_prot.shape[-2:], mode='bilinear', align_corners=False)
+    else:
+        blurred = latents_prot
+
+    details = latents_prot - blurred
+
+    # 5️⃣ Amplification douce et contraste léger
+    detail_map = torch.tanh(details * detail_strength) * iris_mask
+    enhanced = latents_prot + detail_map
+    iris_enhanced = (enhanced - enhanced.mean()) * contrast + enhanced.mean()
+    latents_out = latents_prot * (1 - iris_mask) + iris_enhanced * iris_mask
+
+    print("👁 HDR détails appliqué sur iris avec contours adoucis")
+
+    # 6️⃣ Clamp final
+    return latents_out.clamp(-1.0,1.0)
+
+def apply_pro_net_with_eyes_glow(
     latents,
     eye_coords,
     n3r_pro_net,
@@ -760,6 +849,8 @@ def apply_pro_net_with_eyes(
 
     # 7️⃣ Fusion douce
     latents_out = latents_prot * (1 - iris_mask) + enhanced * iris_mask
+
+    print("👁 HDR détails appliqué sur iris avec contours adoucis")
 
     # 8️⃣ Clamp final pour sécurité
     return torch.clamp(latents_out, -1.0, 1.0)
