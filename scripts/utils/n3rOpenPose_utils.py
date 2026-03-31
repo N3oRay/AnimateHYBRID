@@ -1566,7 +1566,8 @@ from PIL import Image
 #--------------------------------------------------------
 # Version stable -  Tester et valide - controlnet_tile_fn
 #--------------------------------------------------------
-
+# Version stable -  Applique correctement les volumes
+#--------------------------------------------------------
 
 def controlnet_tile_fn(
     latent_tile,
@@ -1582,33 +1583,31 @@ def controlnet_tile_fn(
     target_dtype,
     **kwargs
 ):
+    import torch
+    import torch.nn.functional as F
 
     B, C, H_latent, W_latent = latent_tile.shape
     _, _, H_pose, W_pose = pose_tile.shape
 
-    # 🔥 AUTO-DETECTION SCALE (évite tous les bugs)
-    scale_y = H_pose / H_latent
-    scale_x = W_pose / W_latent
+    # =========================================================
+    # 1️⃣ Resize intelligent (évite destruction du signal)
+    # =========================================================
+    target_h = H_latent * 8
+    target_w = W_latent * 8
 
-    # Cas 1 : pose déjà en full res (ex: 1024 vs 128 → scale 8)
-    if scale_y >= 4:
+    if (H_pose, W_pose) != (target_h, target_w):
         pose_resized = F.interpolate(
             pose_tile,
-            size=(H_latent * 8, W_latent * 8),
+            size=(target_h, target_w),
             mode='bilinear',
             align_corners=False
         )
-
-    # Cas 2 : pose en latent (ex: 128x64)
     else:
-        pose_resized = F.interpolate(
-            pose_tile,
-            size=(H_latent * 8, W_latent * 8),
-            mode='bilinear',
-            align_corners=False
-        )
+        pose_resized = pose_tile
 
-    # --- Préparation embeddings ---
+    # =========================================================
+    # 2️⃣ Préparation embeddings
+    # =========================================================
     pos_embeds, neg_embeds = cf_embeds
 
     latent_tile_fp32 = latent_tile.to(device=device, dtype=torch.float32)
@@ -1620,17 +1619,24 @@ def controlnet_tile_fn(
         if neg_embeds is not None else None
     )
 
-    # --- Scheduler noise ---
+    # =========================================================
+    # 3️⃣ Scheduler timestep
+    # =========================================================
     timesteps = scheduler.timesteps
-    t = timesteps[min(frame_counter, len(timesteps)-1)]
+    t = timesteps[min(frame_counter, len(timesteps) - 1)]
 
-    noise = torch.randn_like(latent_tile_fp32)
+    # =========================================================
+    # 4️⃣ Noise injection (soft pour préserver volume)
+    # =========================================================
+    noise = torch.randn_like(latent_tile_fp32) * 0.5
     latent_noisy = scheduler.add_noise(latent_tile_fp32, noise, t)
     latent_noisy = torch.clamp(latent_noisy, -20, 20)
 
     latent_model_input = scheduler.scale_model_input(latent_noisy, t)
 
-    # --- CFG ---
+    # =========================================================
+    # 5️⃣ CFG setup
+    # =========================================================
     if neg_embeds_fp32 is not None:
         latent_model_input = torch.cat([latent_model_input] * 2)
         embeds = torch.cat([neg_embeds_fp32, pos_embeds_fp32])
@@ -1641,10 +1647,9 @@ def controlnet_tile_fn(
     embeds = embeds.to(target_dtype)
     pose_tile_fp32 = pose_tile_fp32.to(target_dtype)
 
-    # 🔥 DEBUG CRUCIAL
-    # print("latent:", latent_model_input.shape, "pose:", pose_tile_fp32.shape)
-
-    # --- ControlNet ---
+    # =========================================================
+    # 6️⃣ ControlNet
+    # =========================================================
     down_samples, mid_sample = controlnet(
         latent_model_input,
         t,
@@ -1653,7 +1658,9 @@ def controlnet_tile_fn(
         return_dict=False
     )
 
-    # --- UNet ---
+    # =========================================================
+    # 7️⃣ UNet
+    # =========================================================
     noise_pred = unet(
         latent_model_input,
         t,
@@ -1665,20 +1672,37 @@ def controlnet_tile_fn(
 
     noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
 
-    # --- CFG merge ---
+    # =========================================================
+    # 8️⃣ CFG merge
+    # =========================================================
     if neg_embeds_fp32 is not None:
         noise_uncond, noise_text = noise_pred.chunk(2)
         noise_pred = noise_uncond + current_guidance_scale * (noise_text - noise_uncond)
 
+    # =========================================================
+    # 9️⃣ Step scheduler
+    # =========================================================
     latents_out = scheduler.step(noise_pred, t, latent_noisy).prev_sample
 
-    # --- Delta safe ---
-    delta = latents_out - latent_noisy
+    # =========================================================
+    # 🔥 10️⃣ DELTA FIX (clé pour volume)
+    # =========================================================
+    delta = latents_out - latent_tile_fp32
+
     delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
-    delta = torch.clamp(delta, -0.25, 0.25)
+
+    # soft clamp → évite effet "plat"
+    delta = torch.tanh(delta) * 0.15
+
+    # scaling controlnet
     delta = delta * controlnet_scale
 
-    return (latent_tile_fp32 + delta).to(target_dtype)
+    # =========================================================
+    # 11️⃣ Fusion finale (propre)
+    # =========================================================
+    latents_final = latent_tile_fp32 + delta
+
+    return latents_final.to(target_dtype)
 
 #-----------------------------------------
 # Version stable -  Tester et valide - v1
