@@ -6,6 +6,7 @@ from diffusers import ControlNetModel
 import math
 import torch.nn.functional as F
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
+from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
@@ -2465,6 +2466,11 @@ def gaussian_blur_tensor2(x, kernel_size=3, sigma=0.5):
     return F.conv2d(x, kernel2d, groups=x.shape[1])
 
 
+def gaussian_blur_tensor2_soft(x, kernel_size=3, sigma=0.5, strength=0.5):
+    blurred = gaussian_blur_tensor2(x, kernel_size, sigma)
+    return x * (1 - strength) + blurred * strength
+
+
 
 def unsharp_mask(latents, blur_kernel=3, blur_sigma=0.5, strength=1.0):
     """
@@ -2478,8 +2484,17 @@ def unsharp_mask(latents, blur_kernel=3, blur_sigma=0.5, strength=1.0):
     latents_sharp = latents + strength * high_freq
     return torch.clamp(latents_sharp, -1.5, 1.5)  # clamp pour éviter saturation
 
+def unsharp_mask_adaptive(x, blur_kernel=3, blur_sigma=0.5, strength=1.0):
+    """Unsharp adaptatif basé sur variance locale pour contours et volumes"""
+    blurred = gaussian_blur_tensor2(x, kernel_size=blur_kernel, sigma=blur_sigma)
+    detail = x - blurred
+    # pondération adaptative selon variance locale
+    local_var = F.avg_pool2d(detail**2, kernel_size=3, stride=1, padding=1)
+    adaptive_strength = torch.clamp(local_var * 10.0, 0.0, 1.0) * strength
+    return x + detail * adaptive_strength
 
-def apply_openpose_tilewise_safe(
+
+def apply_openpose_tilewise_safe_good(
     latents,
     pose,
     apply_fn,
@@ -2577,3 +2592,148 @@ def apply_openpose_tilewise_safe(
         )
 
     return latents_out
+
+def apply_openpose_tilewise_safe(
+    latents,
+    pose,
+    apply_fn,
+    past_latents=None,
+    temporal_smoothing=0.3,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=None,
+    savetile=False
+):
+    B, C, H_latent, W_latent = latents.shape
+    H_full, W_full = pose.shape[2], pose.shape[3]
+    latents_out = torch.zeros_like(latents)
+    weight_map = torch.zeros_like(latents)
+    stride = block_size - overlap
+
+    # Tile-wise processing
+    for i in range(0, H_latent, stride):
+        for j in range(0, W_latent, stride):
+            i_end = min(i + block_size, H_latent)
+            j_end = min(j + block_size, W_latent)
+            tile_h, tile_w = i_end - i, j_end - j
+            latent_tile = latents[:, :, i:i_end, j:j_end]
+            i_full_start, i_full_end = int(i * H_full / H_latent), int(i_end * H_full / H_latent)
+            j_full_start, j_full_end = int(j * W_full / W_latent), int(j_end * W_full / W_latent)
+            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
+            pad_h, pad_w = block_size - tile_h, block_size - tile_w
+            if pad_h > 0 or pad_w > 0:
+                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
+                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
+            try:
+                latent_tile_processed = apply_fn(latent_tile, pose_tile)
+            except Exception as e:
+                if debug:
+                    print(f"[DEBUG] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
+                latent_tile_processed = latent_tile
+            finally:
+                torch.cuda.empty_cache()
+            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
+            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
+            weight_map[:, :, i:i_end, j:j_end] += 1.0
+
+    # Moyenne sur overlaps
+    weight_map[weight_map == 0] = 1.0
+    latents_out = latents_out / weight_map
+
+    # Post-traitement multi-échelle
+    latents_out = gaussian_blur_tensor2_soft(latents_out, kernel_size=3, sigma=0.5, strength=0.3)
+    latents_out = unsharp_mask_adaptive(latents_out, blur_kernel=3, blur_sigma=0.5, strength=1.0)
+    latents_out = unsharp_mask_adaptive(latents_out, blur_kernel=5, blur_sigma=1.0, strength=0.7)
+
+    # --- Shadow / volume boost (ultra subtil) ---
+    luminance = latents_out.mean(dim=1, keepdim=True)
+    shadow_mask = torch.clamp((0.5 - luminance) * 2.0, 0.0, 1.0)
+    latents_out = latents_out + shadow_mask * (latents_out - gaussian_blur_tensor2_soft(latents_out, 3, 0.5, 0.5)) * 0.3
+
+
+
+    # Clamp et ajustement delta pour éviter saturation
+    min_val, max_val = latents.min().item() - 0.3, latents.max().item() + 0.3
+    latents_out = torch.clamp(latents_out, min_val, max_val)
+    delta = latents_out - latents
+    latents_out = latents + torch.sigmoid(delta*2.0) * delta
+
+    # Lissage temporel
+    if past_latents and temporal_smoothing > 0.0:
+        smoothed = sum(past_latents[-3:] + [latents_out]) / (len(past_latents[-3:]) + 1)
+        latents_out = latents_out * (1 - temporal_smoothing) + smoothed * temporal_smoothing
+
+    # Impact map debug
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)
+        impact_map_full = F.interpolate(impact_map, size=(H_full, W_full),
+                                        mode='bilinear', align_corners=False)
+        impact_np = impact_map_full[0,0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        impact_img = (impact_np * 255).astype(np.uint8)
+        Image.fromarray(impact_img).save(
+            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
+        )
+
+    return latents_out
+
+
+
+#---------------------------------
+def apply_breathing_latents(
+    latents: torch.Tensor,
+    previous_latent: torch.Tensor | None,
+    latents_before_openpose: torch.Tensor | None = None,
+    latents_after_openpose: torch.Tensor | None = None,
+    frame_counter: int = 0,
+    device: torch.device = torch.device("cuda"),
+    alpha_base: float = 0.15,
+    alpha_amp: float = 0.05,
+    noise_strength: float = 0.0005,
+    delta_clamp: float = 0.05,
+) -> torch.Tensor:
+    """
+    Applique un effet de "respiration" sur les latents d'une frame,
+    en interpolant avec la frame précédente et en limitant l'impact d'OpenPose.
+
+    latents: latents actuels
+    previous_latent: latents de la frame précédente
+    latents_before_openpose: latents avant OpenPose (optionnel)
+    latents_after_openpose: latents après OpenPose (optionnel)
+    frame_counter: index de la frame pour oscillation
+    device: device PyTorch
+    alpha_base / alpha_amp: paramètres de respiration
+    noise_strength: bruit aléatoire pour fluidité
+    delta_clamp: clamp du delta OpenPose pour éviter artefacts
+    """
+
+    # ------------------- Calcul alpha respiration -------------------
+    alpha = alpha_base + alpha_amp * math.sin(frame_counter * 0.2)
+
+    # ------------------- Interpolation avec frame précédente -------------------
+    if previous_latent is not None:
+        latents = alpha * previous_latent.to(device) + (1 - alpha) * latents
+
+    # ------------------- Petit bruit pour éviter rigidité -------------------
+    latents = latents + noise_strength * torch.randn_like(latents)
+
+    # ------------------- Clamp général -------------------
+    latents = torch.clamp(latents, -1.0, 1.0)
+
+    # ------------------- Si OpenPose utilisé, limiter delta -------------------
+    if latents_before_openpose is not None and latents_after_openpose is not None:
+        delta = latents_after_openpose - latents_before_openpose
+        delta = torch.clamp(delta, -delta_clamp, delta_clamp)
+        latents = latents_before_openpose + delta
+
+    # ------------------- Nettoyage final -------------------
+    latents = torch.nan_to_num(latents)
+    latents = sanitize_latents(latents)
+
+    return latents
