@@ -343,6 +343,7 @@ def main(args):
 
             # ---------------- Frames principales ----------------
             prev_keypoints = None # motion Open Pose
+            current_keypoints = None # init None
             for f in range(num_fraps_per_image):
                 if stop_generation:
                     break
@@ -459,15 +460,18 @@ def main(args):
                             latents_after = latents.clone()  # sortie OpenPose
 
 
-                            #new code fonction ----------------------------------------------------------
+                            #new code fonction --------------------------------------------------------------------------------------
 
                             # Extraire keypoints + debug visuel
-                            current_keypoints = extract_keypoints_from_pose(
-                                pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter
-                            )
+                            if current_keypoints is None:
+                                current_keypoints = extract_keypoints_from_pose(
+                                    pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter
+                                )
 
-                            # Mettre à jour la pose sequence
-                            update_pose_sequence_from_keypoints(pose_sequence, current_keypoints, frame_counter)
+                            # Mettre à jour la pose_sequence et récupérer les keypoints éventuellement modifiés
+                            #current_keypoints = update_pose_sequence_from_keypoints( pose_sequence, current_keypoints, frame_counter)
+                            # interpolation avec la frame précédente pour mouvement fluide
+                            current_keypoints = update_pose_sequence_from_keypoints( pose_sequence, current_keypoints, frame_counter, prev_keypoints=prev_keypoints, alpha=0.5)
 
                             # Appliquer le mouvement du haut du corps
                             """
@@ -492,7 +496,7 @@ def main(args):
                             latents = sanitize_latents(latents)
                             prev_keypoints = current_keypoints.clone()
 
-                            #-------------------------------------------------------------------------
+                            #-------------------------------------------------------------------------------------------------------------
                             delta = latents_after - latents_before_openpose
                             # 🔥 masque pose plus agressif mais propre
                             pose_strength = pose_latent_full.abs().mean(dim=1, keepdim=True)
