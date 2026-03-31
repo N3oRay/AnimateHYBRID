@@ -2737,3 +2737,204 @@ def apply_breathing_latents(
     latents = sanitize_latents(latents)
 
     return latents
+
+
+# ---------------------------
+# Masque haut du corps basé sur keypoints OpenPose
+# ---------------------------
+import torch
+import torch.nn.functional as F
+import math
+import cv2
+import numpy as np
+
+# ---------------------------
+# 1️⃣ Build upper body mask from OpenPose keypoints
+# ---------------------------
+def build_upper_body_mask_v1(keypoints, latent_shape, margin=0.15, device='cpu'):
+    """
+    keypoints : tensor [B,25,3] OpenPose COCO format (x, y, confidence)
+    latent_shape : (B, C, H, W)
+    margin : proportion de l'image pour étendre le masque autour du point
+    """
+    B, C, H, W = latent_shape
+    mask = torch.zeros((B, 1, H, W), dtype=torch.float32, device=keypoints.device)
+
+    # indices COCO OpenPose pour haut du corps
+    upper_body_joints = [0, 1, 2, 5, 6, 7, 8, 11, 12]  # nez, yeux, épaules, coudes, hanches
+
+    for b in range(B):
+        for joint_idx in upper_body_joints:
+            x, y, conf = keypoints[b, joint_idx]
+            if conf < 0.1:
+                continue
+            xi = int(x * W)
+            yi = int(y * H)
+            dx = max(1, int(W * margin))
+            dy = max(1, int(H * margin))
+            x0, x1 = max(0, xi - dx), min(W, xi + dx)
+            y0, y1 = max(0, yi - dy), min(H, yi + dy)
+            mask[b, 0, y0:y1, x0:x1] = 1.0
+
+    # lissage pour transitions douces
+    #mask = F.gaussian_blur(mask, kernel_size=(7,7))
+    mask_np = mask.cpu().numpy()[0]  # [H,W]
+    mask_np = cv2.GaussianBlur(mask_np, (7,7), sigmaX=1.0)
+    mask = torch.tensor(mask_np, device=device).unsqueeze(0)  # back to tensor
+
+    return mask
+
+import torch
+
+
+def build_upper_body_mask(keypoints, latent_shape, margin=0.05, device='cpu', debug_dir=None, frame_counter=None):
+    """
+    Crée un mask pour le haut du corps (torse, bras, épaules, tête) à partir des keypoints OpenPose.
+
+    Args:
+        keypoints : tensor [B, num_joints, 3] (x, y, confidence), valeurs normalisées [0,1]
+        latent_shape : tuple (B, C, H, W)
+        margin : proportion pour étendre le masque autour du point
+        device : torch device
+        debug_dir : dossier pour sauvegarde debug mask
+        frame_counter : numéro de frame pour debug
+
+    Returns:
+        mask : tensor [B,1,H,W] float32
+    """
+    B, C, H, W = latent_shape
+    mask = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
+
+    # indices COCO OpenPose pour haut du corps
+    upper_body_joints = [0, 1, 2, 5, 6, 7, 8, 11, 12]  # nez, yeux, épaules, coudes, hanches
+
+    for b in range(B):
+        for joint_idx in upper_body_joints:
+            x, y, conf = keypoints[b, joint_idx]
+            if conf < 0.1:
+                continue
+            # points en pixels dans le latent
+            xi = int(x * W)
+            yi = int(y * H)
+            dx = max(1, int(W * margin))
+            dy = max(1, int(H * margin))
+            x0, x1 = max(0, xi - dx), min(W, xi + dx)
+            y0, y1 = max(0, yi - dy), min(H, yi + dy)
+            mask[b, 0, y0:y1, x0:x1] = 1.0
+
+    # Gaussian blur via OpenCV (appliquer par batch si besoin)
+    mask_np = mask.cpu().numpy()
+    for b in range(B):
+        mask_np[b, 0] = cv2.GaussianBlur(mask_np[b, 0], (7,7), sigmaX=1.0)
+
+    mask = torch.tensor(mask_np, device=device)
+
+    # Debug sauvegarde
+    if debug_dir is not None and frame_counter is not None:
+        import os
+        os.makedirs(debug_dir, exist_ok=True)
+        for b in range(B):
+            vis = (mask[b,0].cpu().numpy()*255).astype(np.uint8)
+            save_path = f"{debug_dir}/upper_body_mask_{frame_counter:05d}_b{b}.png"
+            cv2.imwrite(save_path, vis)
+
+    return mask
+
+
+# ---------------------------
+# 2️⃣ Apply breathing + upper body motion
+# ---------------------------
+def apply_upper_body_motion(latents, previous_latent, latents_before_openpose, latents_after_openpose,
+                            keypoints, frame_counter, device, breathing=True, debug=False, debug_dir=None, ):
+    """
+    latents : current latents [B,C,H,W]
+    previous_latent : previous frame latents [B,C,H,W] or None
+    latents_before_openpose, latents_after_openpose : latents frame delta
+    keypoints : OpenPose keypoints [B,25,3]
+    frame_counter : int
+    """
+    B, C, H, W = latents.shape
+
+    # ------------------- respiration légère -------------------
+    if breathing and previous_latent is not None:
+        # forte respiration sinusoidale
+        alpha = 0.5 + 0.4 * math.sin(frame_counter * 0.2)
+        latents = alpha * previous_latent.to(device) + (1 - alpha) * latents
+        latents = latents + 0.001 * torch.randn_like(latents)
+        latents = torch.clamp(latents, -1.0, 1.0)
+
+    # ------------------- masque haut du corps -------------------
+    #mask = build_upper_body_mask(keypoints, latents.shape, device=device).to(device)
+    mask = build_upper_body_mask(keypoints, latents.shape, device=device, debug_dir=debug_dir, frame_counter=frame_counter).to(device)
+
+    # ------------------- appliquer delta OpenPose sur haut du corps -------------------
+    if latents_before_openpose is not None and latents_after_openpose is not None:
+        delta = latents_after_openpose - latents_before_openpose
+        motion_energy = delta.abs().mean(dim=1, keepdim=True)
+        motion_boost = 1.0 + torch.pow(torch.clamp(motion_energy * 3.0, 0.0, 1.0), 0.7)
+        latents = latents_before_openpose + delta * mask * motion_boost
+
+    # ------------------- cleanup -------------------
+    latents = torch.nan_to_num(latents)
+    latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
+    latents = latents / (latents_max + 1e-6) * 1.05
+    latents = torch.clamp(latents, -1.3, 1.3)
+
+    return latents
+
+
+#------extract_keypoints_from_pose
+
+import torch
+import matplotlib.pyplot as plt
+import cv2
+import numpy as np
+
+def extract_keypoints_from_pose(pose_full_image, debug=False, debug_dir=None, frame_counter=None):
+    """
+    Extrait des keypoints OpenPose depuis une image de pose.
+    Compatible batch (B=1 ou plus).
+
+    Args:
+        pose_full_image (torch.Tensor): BCHW, valeurs normalisées [-1,1] ou [0,1].
+        debug (bool): si True, sauvegarde une visualisation des keypoints.
+        debug_dir (str): dossier pour sauvegarder l'image de debug.
+        frame_counter (int): index de la frame pour nom de fichier.
+
+    Returns:
+        torch.Tensor: keypoints, shape [B, num_joints, 3] (x, y, confidence)
+    """
+    B, C, H, W = pose_full_image.shape
+    num_joints = 18  # Exemple COCO
+
+    keypoints_list = []
+
+    for b in range(B):
+        # --- Conversion tensor -> HWC numpy ---
+        pose_img = pose_full_image[b].permute(1, 2, 0).cpu().numpy()  # HWC
+        pose_img = (pose_img + 1.0) / 2.0  # [-1,1] -> [0,1]
+        pose_img = (pose_img * 255).astype(np.uint8)
+
+        # --- Simulation extraction keypoints ---
+        kp_frame = []
+        for i in range(num_joints):
+            x = W * (0.1 + 0.8 * np.random.rand())
+            y = H * (0.1 + 0.8 * np.random.rand())
+            conf = np.random.rand()  # confiance
+            kp_frame.append([x, y, conf])
+        kp_frame = np.array(kp_frame)
+        keypoints_list.append(kp_frame)
+
+        # --- Debug visuel sauvegardé ---
+        if debug and debug_dir is not None and frame_counter is not None:
+            vis = pose_img.copy()
+            for (x, y, c) in kp_frame:
+                if c > 0.1:
+                    cv2.circle(vis, (int(x), int(y)), 5, (0, 255, 0), -1)
+            save_path = f"{debug_dir}/keypoints_{frame_counter:05d}_b{b}.png"
+            cv2.imwrite(save_path, vis)
+            print(f"[DEBUG] Keypoints frame {frame_counter}, batch {b} sauvegardés : {save_path}")
+
+    # --- Conversion finale en tensor ---
+    keypoints_tensor = torch.tensor(keypoints_list, dtype=torch.float32, device=pose_full_image.device)  # [B, num_joints, 3]
+    return keypoints_tensor
