@@ -406,7 +406,7 @@ def main(args):
                             latents = latent_injection*latents_frame + (1-latent_injection)*latents
 
 
-                    # ---------------- ControlNet OpenPose ------------------------
+                    # ---------------- ControlNet OpenPose ----------------------------------------------------------
                     # 🔹 Si motion_module est None, injecter un léger bruit temporel
                     if motion_module is None:
                         latents = apply_breathing_latents(
@@ -505,7 +505,7 @@ def main(args):
                         save_debug_pose_image(pose_full, frame_counter, output_dir, cfg, prefix="openpose")
 
 
-                    # ---------------- Motion module ----------------
+                    # ---------------- Motion module --------------------------------------------------------------------------------------------------
                     if motion_module is not None:
                         latents_seq = latents.unsqueeze(2).repeat(1, 1, 3, 1, 1) if previous_latent_single is None \
                                     else torch.stack([previous_latent_single.to(device), latents, latents + 0.003 * torch.randn_like(latents)], dim=2)
