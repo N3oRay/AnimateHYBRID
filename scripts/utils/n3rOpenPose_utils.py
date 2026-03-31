@@ -3381,7 +3381,7 @@ def apply_pose_driven_motion(
     return latents
 
 #------------------------------------------------------------------
-def update_pose_sequence_from_keypoints(pose_seq, keypoints_tensor, frame_idx):
+def update_pose_sequence_from_keypoints_v1(pose_seq, keypoints_tensor, frame_idx):
     """
     Remplace le frame_idx de pose_seq par les keypoints manuels.
 
@@ -3419,6 +3419,176 @@ def update_pose_sequence_from_keypoints(pose_seq, keypoints_tensor, frame_idx):
     # Convert back to tensor [3,H,W] normalized [-1,1]
     pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()/127.5 - 1.0
     pose_seq[frame_idx] = pose_img_tensor.to(pose_seq.device)
+
+
+def update_pose_sequence_from_keypoints_v2(pose_seq, keypoints_tensor, frame_idx):
+    """
+    Remplace le frame_idx de pose_seq par les keypoints manuels et retourne keypoints_tensor.
+
+    pose_seq : tensor [B,3,H,W]
+    keypoints_tensor : [B,18,3] avec x,y ∈ [0,1]
+    frame_idx : index de la frame à mettre à jour
+    """
+    import cv2
+    import numpy as np
+
+    B, C, H, W = pose_seq.shape
+    keypoints = keypoints_tensor[0].cpu().numpy()  # suppose B=1
+
+    # Création d'une image vide [H,W,3]
+    pose_img = np.zeros((H,W,3), dtype=np.uint8)
+
+    # Convertir keypoints en pixels et dessiner
+    for x, y, conf in keypoints:
+        if conf < 0.1:
+            continue
+        px, py = int(x*W), int(y*H)
+        cv2.circle(pose_img, (px, py), 5, (255,255,255), -1)
+
+    # Ajouter les lignes du squelette
+    skeleton = [
+        (0,1),(1,2),(2,3),(3,4),(1,5),(5,6),(6,7),
+        (1,8),(1,11),(14,0),(15,0),(16,14),(17,15)
+    ]
+    for i,j in skeleton:
+        xi, yi, ci = keypoints[i]
+        xj, yj, cj = keypoints[j]
+        if ci < 0.1 or cj < 0.1:
+            continue
+        cv2.line(pose_img, (int(xi*W), int(yi*H)), (int(xj*W), int(yj*H)), (255,255,255), 2)
+
+    # Convert back to tensor [3,H,W] normalized [-1,1]
+    pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()/127.5 - 1.0
+    pose_seq[frame_idx] = pose_img_tensor.to(pose_seq.device)
+
+    # 🔹 Retourner les keypoints pour continuer à les utiliser
+    return keypoints_tensor
+
+
+def update_pose_sequence_from_keypoints_v3(pose_seq, keypoints_tensor, frame_idx, prev_keypoints=None, alpha=0.5):
+    """
+    Met à jour le frame_idx de pose_seq avec les keypoints, et permet une interpolation avec prev_keypoints.
+
+    pose_seq : tensor [B,3,H,W]
+    keypoints_tensor : [B,18,3] avec x,y ∈ [0,1]
+    frame_idx : index de la frame à mettre à jour
+    prev_keypoints : torch.Tensor [B,18,3] ou None, pour interpolation
+    alpha : float, poids d'interpolation (0 = prev, 1 = actuel)
+    """
+    import cv2
+    import numpy as np
+    import torch
+
+    B, C, H, W = pose_seq.shape
+    keypoints = keypoints_tensor.clone().cpu().numpy()  # suppose B=1
+
+    # Si prev_keypoints fourni, interpoler pour fluidité
+    if prev_keypoints is not None:
+        prev_kp = prev_keypoints.clone().cpu().numpy()
+        keypoints = alpha * keypoints + (1 - alpha) * prev_kp
+
+    # Création d'une image vide [H,W,3]
+    pose_img = np.zeros((H, W, 3), dtype=np.uint8)
+
+    # Convertir keypoints en pixels et dessiner
+    for x, y, conf in keypoints[0]:
+        if conf < 0.1:
+            continue
+        px, py = int(x*W), int(y*H)
+        cv2.circle(pose_img, (px, py), 5, (255,255,255), -1)
+
+    # Ajouter les lignes du squelette
+    skeleton = [
+        (0,1),(1,2),(2,3),(3,4),(1,5),(5,6),(6,7),
+        (1,8),(1,11),(14,0),(15,0),(16,14),(17,15)
+    ]
+    for i,j in skeleton:
+        xi, yi, ci = keypoints[0][i]
+        xj, yj, cj = keypoints[0][j]
+        if ci < 0.1 or cj < 0.1:
+            continue
+        cv2.line(pose_img, (int(xi*W), int(yi*H)), (int(xj*W), int(yj*H)), (255,255,255), 2)
+
+    # Convert back to tensor [3,H,W] normalized [-1,1]
+    pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()/127.5 - 1.0
+    pose_seq[frame_idx] = pose_img_tensor.to(pose_seq.device)
+
+    # 🔹 Retourner les keypoints éventuellement interpolés
+    return torch.from_numpy(keypoints).to(keypoints_tensor.device)
+#--------------------------------------------------------------------------------------------------------------
+def update_pose_sequence_from_keypoints(pose_seq, keypoints_tensor, frame_idx, prev_keypoints=None, alpha=0.5):
+    """
+    Met à jour le frame_idx de pose_seq avec les keypoints, et permet une interpolation fluide.
+    La pose existante dans pose_seq guide les keypoints pour continuité.
+
+    Args:
+        pose_seq : torch.Tensor [B,3,H,W] image de pose
+        keypoints_tensor : torch.Tensor [B,18,3] x,y∈[0,1], conf
+        frame_idx : int, index de frame
+        prev_keypoints : torch.Tensor [B,18,3] ou None, pour interpolation
+        alpha : float, interpolation poids (0=prev, 1=keypoints)
+
+    Returns:
+        torch.Tensor [B,18,3] : keypoints éventuellement mis à jour
+    """
+    import cv2
+    import numpy as np
+    import torch
+
+    B, C, H, W = pose_seq.shape
+    keypoints = keypoints_tensor.clone().cpu().numpy()  # [B,18,3]
+
+    # 🔹 Interpolation avec prev_keypoints si fourni
+    if prev_keypoints is not None:
+        prev_kp = prev_keypoints.clone().cpu().numpy()
+        keypoints = alpha * keypoints + (1 - alpha) * prev_kp
+
+    # 🔹 Extraction des keypoints depuis pose_seq[frame_idx] si frame non vide
+    pose_img_tensor = pose_seq[frame_idx]
+    if pose_img_tensor.abs().sum() > 0.1:  # image non vide
+        # Convert [-1,1] -> [0,255]
+        pose_img = ((pose_img_tensor.cpu().numpy().transpose(1,2,0) + 1.0) * 127.5).astype(np.uint8)
+        gray = cv2.cvtColor(pose_img, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
+        # Trouver les contours (zones blanches)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        extracted_kp = np.zeros_like(keypoints)
+        for idx, cnt in enumerate(contours[:18]):  # max 18 keypoints
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = M["m10"]/M["m00"]
+                cy = M["m01"]/M["m00"]
+                extracted_kp[0, idx, 0] = cx / W
+                extracted_kp[0, idx, 1] = cy / H
+                extracted_kp[0, idx, 2] = 1.0  # confiance max
+        # Interpolation : guide keypoints par pose_seq
+        keypoints = alpha * keypoints + (1 - alpha) * extracted_kp
+
+    # 🔹 Dessiner keypoints sur une image
+    pose_img = np.zeros((H, W, 3), dtype=np.uint8)
+    for x, y, conf in keypoints[0]:
+        if conf < 0.1:
+            continue
+        px, py = int(x*W), int(y*H)
+        cv2.circle(pose_img, (px, py), 5, (255,255,255), -1)
+
+    # 🔹 Dessiner le squelette
+    skeleton = [
+        (0,1),(1,2),(2,3),(3,4),(1,5),(5,6),(6,7),
+        (1,8),(1,11),(14,0),(15,0),(16,14),(17,15)
+    ]
+    for i,j in skeleton:
+        xi, yi, ci = keypoints[0][i]
+        xj, yj, cj = keypoints[0][j]
+        if ci < 0.1 or cj < 0.1:
+            continue
+        cv2.line(pose_img, (int(xi*W), int(yi*H)), (int(xj*W), int(yj*H)), (255,255,255), 2)
+
+    # 🔹 Convert back to tensor [-1,1]
+    pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()/127.5 - 1.0
+    pose_seq[frame_idx] = pose_img_tensor.to(pose_seq.device)
+
+    return torch.from_numpy(keypoints).to(keypoints_tensor.device)
 #------------------------------------------------------------------
 
 def save_debug_pose_image_with_skeleton(
