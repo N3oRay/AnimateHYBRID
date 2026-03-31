@@ -17,6 +17,202 @@ import traceback
 import torch
 import torch.nn.functional as F
 
+#----------------------------------------------------------------------------------------------------------------
+
+def resize_pose(pose_tile, H_latent, W_latent):
+    import torch.nn.functional as F
+
+    target_h = H_latent * 8
+    target_w = W_latent * 8
+
+    if pose_tile.shape[-2:] != (target_h, target_w):
+        return F.interpolate(
+            pose_tile,
+            size=(target_h, target_w),
+            mode='bilinear',
+            align_corners=False
+        )
+    return pose_tile
+
+
+def prepare_inputs(latent_tile, pose_tile, cf_embeds, device):
+    import torch
+
+    pos_embeds, neg_embeds = cf_embeds
+
+    latent_fp32 = latent_tile.to(device=device, dtype=torch.float32)
+    pose_fp32 = pose_tile.to(device=device, dtype=torch.float32)
+
+    pos_fp32 = pos_embeds.to(device=device, dtype=torch.float32)
+    neg_fp32 = neg_embeds.to(device=device, dtype=torch.float32) if neg_embeds is not None else None
+
+    return latent_fp32, pose_fp32, pos_fp32, neg_fp32
+
+
+def add_noise(latent, scheduler, t, noise_strength=0.5):
+    import torch
+
+    noise = torch.randn_like(latent) * noise_strength
+    latent_noisy = scheduler.add_noise(latent, noise, t)
+    return torch.clamp(latent_noisy, -20, 20)
+
+
+def apply_cfg(latent_input, pos_embeds, neg_embeds, guidance_scale):
+    import torch
+
+    if neg_embeds is not None:
+        latent_input = torch.cat([latent_input] * 2)
+        embeds = torch.cat([neg_embeds, pos_embeds])
+        return latent_input, embeds, True
+    return latent_input, pos_embeds, False
+
+
+def compute_noise_pred(unet, controlnet, latent_input, t, embeds, pose):
+    import torch
+
+    down_samples, mid_sample = controlnet(
+        latent_input,
+        t,
+        encoder_hidden_states=embeds,
+        controlnet_cond=pose,
+        return_dict=False
+    )
+
+    noise_pred = unet(
+        latent_input,
+        t,
+        encoder_hidden_states=embeds,
+        down_block_additional_residuals=down_samples,
+        mid_block_additional_residual=mid_sample,
+        return_dict=False
+    )[0]
+
+    return torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+
+
+def merge_cfg(noise_pred, guidance_scale, use_cfg):
+    if use_cfg:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        return noise_uncond + guidance_scale * (noise_text - noise_uncond)
+    return noise_pred
+
+
+def compute_adaptive_importance(latent):
+    import torch
+    import torch.nn.functional as F
+
+    with torch.no_grad():
+        blurred = F.avg_pool2d(latent, kernel_size=3, stride=1, padding=1)
+        high_freq = torch.abs(latent - blurred)
+
+        importance = high_freq.mean(dim=1, keepdim=True)
+
+        # normalisation douce
+        importance = importance / (importance.mean() + 1e-6)
+
+        # compression pour éviter extrêmes
+        importance = torch.sqrt(importance)
+
+        return torch.clamp(importance, 0.7, 1.3)
+
+
+def compute_delta(latents_out, latent_ref, controlnet_scale, importance):
+    import torch
+
+    delta = latents_out - latent_ref
+    delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    # 🔥 adaptive blending ici
+    delta = torch.tanh(delta) * 0.15 * importance
+
+    return delta * controlnet_scale
+
+
+def controlnet_tile_fn(
+    latent_tile,
+    pose_tile,
+    frame_counter,
+    unet,
+    controlnet,
+    scheduler,
+    cf_embeds,
+    current_guidance_scale,
+    controlnet_scale,
+    device,
+    target_dtype,
+    **kwargs
+):
+    import torch
+
+    B, C, H_latent, W_latent = latent_tile.shape
+
+    # =========================================================
+    # 1️⃣ Resize pose
+    # =========================================================
+    pose_resized = resize_pose(pose_tile, H_latent, W_latent)
+
+    # =========================================================
+    # 2️⃣ Inputs
+    # =========================================================
+    latent_fp32, pose_fp32, pos_embeds, neg_embeds = prepare_inputs(
+        latent_tile, pose_resized, cf_embeds, device
+    )
+
+    # =========================================================
+    # 3️⃣ Timestep
+    # =========================================================
+    t = scheduler.timesteps[min(frame_counter, len(scheduler.timesteps) - 1)]
+
+    # =========================================================
+    # 4️⃣ Noise
+    # =========================================================
+    latent_noisy = add_noise(latent_fp32, scheduler, t)
+
+    latent_input = scheduler.scale_model_input(latent_noisy, t)
+
+    # =========================================================
+    # 5️⃣ CFG
+    # =========================================================
+    latent_input, embeds, use_cfg = apply_cfg(
+        latent_input, pos_embeds, neg_embeds, current_guidance_scale
+    )
+
+    latent_input = latent_input.to(target_dtype)
+    embeds = embeds.to(target_dtype)
+    pose_fp32 = pose_fp32.to(target_dtype)
+
+    # =========================================================
+    # 6️⃣ UNet + ControlNet
+    # =========================================================
+    noise_pred = compute_noise_pred(
+        unet, controlnet, latent_input, t, embeds, pose_fp32
+    )
+
+    noise_pred = merge_cfg(noise_pred, current_guidance_scale, use_cfg)
+
+    # =========================================================
+    # 7️⃣ Scheduler step
+    # =========================================================
+    latents_out = scheduler.step(noise_pred, t, latent_noisy).prev_sample
+
+    # =========================================================
+    # 🔥 8️⃣ Adaptive blending (clé)
+    # =========================================================
+    importance = compute_adaptive_importance(latent_fp32)
+
+    delta = compute_delta(
+        latents_out,
+        latent_fp32,
+        controlnet_scale,
+        importance
+    )
+
+    latents_final = latent_fp32 + delta
+
+    return latents_final.to(target_dtype)
+
+#---------------------------------------------------------------------------------------------------------------------------------------------
+
 def gaussian_blur_tensor(x, kernel_size=5, sigma=1.0):
     """Applique un flou gaussien sur un tensor 2D ou 4D (B,C,H,W)."""
     if x.ndim == 2:
@@ -1569,7 +1765,7 @@ from PIL import Image
 # Version stable -  Applique correctement les volumes
 #--------------------------------------------------------
 
-def controlnet_tile_fn(
+def controlnet_tile_fn_stable(
     latent_tile,
     pose_tile,
     frame_counter,
