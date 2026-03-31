@@ -35,7 +35,7 @@ from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RM
 from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, apply_breathing_latents, apply_upper_body_motion, extract_keypoints_from_pose
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, apply_breathing_latents, apply_upper_body_motion, extract_keypoints_from_pose, apply_pose_driven_motion
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -342,6 +342,7 @@ def main(args):
                     torch.cuda.empty_cache()
 
             # ---------------- Frames principales ----------------
+            prev_keypoints = None # motion Open Pose
             for f in range(num_fraps_per_image):
                 if stop_generation:
                     break
@@ -466,6 +467,7 @@ def main(args):
                             )
 
                             # Appliquer le mouvement du haut du corps
+                            """
                             latents = apply_upper_body_motion(
                                 latents=latents,
                                 previous_latent=previous_latent_single,
@@ -476,6 +478,19 @@ def main(args):
                                 device=device,
                                 breathing=True,   # respiration
                             )
+                            """
+                            latents = apply_pose_driven_motion(
+                                latents=latents,
+                                previous_latent=previous_latent_single,
+                                latents_before_openpose=latents_before_openpose if 'latents_before_openpose' in locals() else None,
+                                latents_after_openpose=latents_after if 'latents_after' in locals() else None,
+                                keypoints=current_keypoints,
+                                prev_keypoints=prev_keypoints,
+                                frame_counter=frame_counter,
+                                device=device,
+                            )
+
+                            prev_keypoints = current_keypoints.clone()
 
                             #-------------------------------------------------------------------------
                             delta = latents_after - latents_before_openpose
@@ -491,7 +506,9 @@ def main(args):
                             motion_boost = 1.0 + torch.pow(torch.clamp(motion_energy * 3.0, 0.0, 1.0), 0.7)
 
                             # 🔥 application finale (plus naturelle)
-                            latents = latents_before_openpose + 2.2 * delta * pose_mask * motion_boost
+                            #latents = latents_before_openpose + 2.2 * delta * pose_mask * motion_boost
+                            # Fusion intelligente (NE PAS écraser)
+                            latents = latents + 1.2 * delta * pose_mask * motion_boost
 
                             # 🔹 ===== 5. CLEANUP =====
                             latents = torch.nan_to_num(latents)
