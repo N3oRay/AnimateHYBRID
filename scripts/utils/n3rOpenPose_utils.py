@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 
 
+
+
 def debug_draw_openpose_skeleton(
     pose_full_image,
     keypoints_tensor,
@@ -3377,3 +3379,98 @@ def apply_pose_driven_motion(
     latents = torch.clamp(latents, -1.2, 1.2)
 
     return latents
+
+#------------------------------------------------------------------
+def update_pose_sequence_from_keypoints(pose_seq, keypoints_tensor, frame_idx):
+    """
+    Remplace le frame_idx de pose_seq par les keypoints manuels.
+
+    pose_seq : tensor [B,3,H,W]
+    keypoints_tensor : [B,18,3] avec x,y ∈ [0,1]
+    """
+    import cv2
+    import numpy as np
+
+    B, C, H, W = pose_seq.shape
+    keypoints = keypoints_tensor[0].cpu().numpy()  # suppose B=1
+
+    # Création d'une image vide [H,W,3]
+    pose_img = np.zeros((H,W,3), dtype=np.uint8)
+
+    # Convertir keypoints en pixels et dessiner
+    for x, y, conf in keypoints:
+        if conf < 0.1:
+            continue
+        px, py = int(x*W), int(y*H)
+        cv2.circle(pose_img, (px, py), 5, (255,255,255), -1)
+
+    # Facultatif: ajouter les lignes du squelette
+    skeleton = [
+        (0,1),(1,2),(2,3),(3,4),(1,5),(5,6),(6,7),
+        (1,8),(1,11),(14,0),(15,0),(16,14),(17,15)
+    ]
+    for i,j in skeleton:
+        xi, yi, ci = keypoints[i]
+        xj, yj, cj = keypoints[j]
+        if ci < 0.1 or cj < 0.1:
+            continue
+        cv2.line(pose_img, (int(xi*W), int(yi*H)), (int(xj*W), int(yj*H)), (255,255,255), 2)
+
+    # Convert back to tensor [3,H,W] normalized [-1,1]
+    pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()/127.5 - 1.0
+    pose_seq[frame_idx] = pose_img_tensor.to(pose_seq.device)
+#------------------------------------------------------------------
+
+def save_debug_pose_image_with_skeleton(
+    pose_tensor,
+    keypoints_tensor,
+    frame_counter,
+    output_dir,
+    cfg=None,
+    prefix="openpose"
+):
+    """
+    Sauvegarde une image de pose ET un squelette OpenPose pour contrôle visuel.
+
+    Args:
+        pose_tensor (torch.Tensor): [B,3,H,W] normalisé [-1,1] ou [C,H,W]
+        keypoints_tensor (torch.Tensor): [B,18,3] (x,y,conf) normalisé [0,1]
+        frame_counter (int): numéro de frame
+        output_dir (str): dossier où sauvegarder
+        cfg (dict, optional): peut contenir 'visual_debug' pour activer/désactiver
+        prefix (str, optional): préfixe du fichier
+    """
+    import os
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    if cfg is not None and cfg.get("visual_debug") is False:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ---------------------------
+    # 🔹 Convertir pose_tensor en image RGB [0,255]
+    # ---------------------------
+    pose_img = pose_tensor[0].detach().cpu()
+    if pose_img.ndim == 3 and pose_img.shape[0] == 3:
+        pose_img = pose_img.permute(1,2,0)  # H,W,C
+    pose_img = ((pose_img + 1.0)/2.0 * 255).clamp(0,255).byte().numpy()
+
+    # Sauvegarde simple de l'image de pose
+    filename_pose = f"{prefix}_{frame_counter:05d}.png"
+    path_pose = os.path.join(output_dir, filename_pose)
+    cv2.imwrite(path_pose, cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+    print(f"[DEBUG] Pose sauvegardée : {path_pose}")
+
+    # ---------------------------
+    # 🔹 Dessin du squelette via debug_draw_openpose_skeleton
+    # ---------------------------
+    if keypoints_tensor is not None:
+        debug_draw_openpose_skeleton(
+            pose_full_image=pose_tensor.unsqueeze(0) if pose_tensor.ndim==3 else pose_tensor,
+            keypoints_tensor=keypoints_tensor,
+            debug_dir=output_dir,
+            frame_counter=frame_counter
+        )
