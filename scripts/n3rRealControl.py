@@ -35,7 +35,7 @@ from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RM
 from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, apply_breathing_latents, apply_upper_body_motion, extract_keypoints_from_pose, apply_pose_driven_motion
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, apply_breathing_latents, apply_upper_body_motion, extract_keypoints_from_pose, apply_pose_driven_motion, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -414,7 +414,7 @@ def main(args):
                         try:
                             # 🔥 dtype cible réel (UNet)
                             target_dtype = next(unet.parameters()).dtype
-
+                            # ------------------- Load pose frame -------------------
                             pose_full = pose_sequence[frame_counter % pose_sequence.shape[0]]
                             # Format BCHW et channels fix
                             if pose_full.ndim == 3:
@@ -444,19 +444,19 @@ def main(args):
                             #pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='nearest').to(device=device, dtype=target_dtype)
                             print(f"[DEBUG] Pose latent {pose_latent_full.shape} dtype={pose_latent_full.dtype}")
 
-                            # 🔹 backup latents
+                            # ------------------- Backup latents -------------------
                             latents_before_openpose = latents.clone()
                             print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
 
 
-                            # Préparer la tile function avec tous les arguments sauf latent_tile et tile_coords
+                            # ------------------- Tile-wise OpenPose -------------------
                             tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, )
 
                             # 🔹 Appel correct de apply_openpose_tilewise
                             latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
 
                             # BOOST
-                            latents_after = latents  # sortie de apply_openpose
+                            latents_after = latents.clone()  # sortie OpenPose
 
 
                             #new code fonction ----------------------------------------------------------
@@ -466,16 +466,16 @@ def main(args):
                                 pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter
                             )
 
+                            # Mettre à jour la pose sequence
+                            update_pose_sequence_from_keypoints(pose_sequence, current_keypoints, frame_counter)
+
                             # Appliquer le mouvement du haut du corps
                             """
                             latents = apply_upper_body_motion(
-                                latents=latents,
-                                previous_latent=previous_latent_single,
+                                latents=latents, previous_latent=previous_latent_single,
                                 latents_before_openpose=latents_before_openpose if 'latents_before_openpose' in locals() else None,
                                 latents_after_openpose=latents_after if 'latents_after' in locals() else None,
-                                keypoints=current_keypoints,  # tensor OpenPose pour la frame
-                                frame_counter=frame_counter,
-                                device=device,
+                                keypoints=current_keypoints, frame_counter=frame_counter, device=device,
                                 breathing=True,   # respiration
                             )
                             """
@@ -489,12 +489,11 @@ def main(args):
                                 frame_counter=frame_counter,
                                 device=device,
                             )
-
+                            latents = sanitize_latents(latents)
                             prev_keypoints = current_keypoints.clone()
 
                             #-------------------------------------------------------------------------
                             delta = latents_after - latents_before_openpose
-
                             # 🔥 masque pose plus agressif mais propre
                             pose_strength = pose_latent_full.abs().mean(dim=1, keepdim=True)
                             pose_mask = torch.clamp(pose_strength * 4.0, 0.0, 1.0)
@@ -505,19 +504,13 @@ def main(args):
                             # 🔥 amplification NON linéaire (clé)
                             motion_boost = 1.0 + torch.pow(torch.clamp(motion_energy * 3.0, 0.0, 1.0), 0.7)
 
-                            # 🔥 application finale (plus naturelle)
-                            #latents = latents_before_openpose + 2.2 * delta * pose_mask * motion_boost
-                            # Fusion intelligente (NE PAS écraser)
+                            # Fusion intelligente
                             latents = latents + 1.2 * delta * pose_mask * motion_boost
-
-                            # 🔹 ===== 5. CLEANUP =====
+                            # ------------------- Cleanup -------------------
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
-
-                            # boost relatif léger
                             latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
                             latents = latents / (latents_max + 1e-6) * 1.05
-                            # clamp pour éviter les valeurs extrêmes
                             latents = torch.clamp(latents, -1.3, 1.3)
 
                             diff = (latents - latents_before_openpose).abs().mean()
@@ -530,7 +523,8 @@ def main(args):
                             latents = latents_before_openpose.clone()
 
                         # 🔹 debug image
-                        save_debug_pose_image(pose_full, frame_counter, output_dir, cfg, prefix="openpose")
+                        #save_debug_pose_image(pose_full, frame_counter, output_dir, cfg, prefix="openpose")
+                        save_debug_pose_image_with_skeleton( pose_tensor=pose_full, keypoints_tensor=current_keypoints, frame_counter=frame_counter, output_dir=output_dir, cfg=cfg, prefix="openpose" )
 
 
                     # ---------------- Motion module --------------------------------------------------------------------------------------------------
