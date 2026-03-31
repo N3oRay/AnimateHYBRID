@@ -232,29 +232,25 @@ def controlnet_tile_fn(
 
 #---------------------------------------------------------------------------------------------------------------------------------------------
 
-def gaussian_blur_tensor(x, kernel_size=5, sigma=1.0):
-    """Applique un flou gaussien sur un tensor 2D ou 4D (B,C,H,W)."""
-    if x.ndim == 2:
-        x = x.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-    elif x.ndim == 3:
-        x = x.unsqueeze(0)  # [1,C,H,W]
+def gaussian_blur_tensor(x, kernel_size=3, sigma=1.0):
+    # x: [B,C,H,W]
+    B, C, H, W = x.shape
+    import math
+    import torch.nn.functional as F
 
-    # créer kernel gaussien 1D
-    coords = torch.arange(kernel_size).float() - (kernel_size - 1) / 2
-    gauss = torch.exp(-(coords**2) / (2 * sigma**2))
-    gauss = gauss / gauss.sum()
+    # Générer un kernel 1D
+    def gauss1d(k, sigma):
+        a = torch.arange(k).float() - (k - 1) / 2
+        g = torch.exp(-(a**2)/(2*sigma**2))
+        return g / g.sum()
 
-    # kernel 2D par produit extérieur
-    kernel2d = gauss[:, None] * gauss[None, :]
-    kernel2d = kernel2d.unsqueeze(0).unsqueeze(0)  # [1,1,K,K]
+    k = kernel_size
+    g = gauss1d(k, sigma)
+    kernel2d = g[:,None] * g[None,:]      # [k,k]
     kernel2d = kernel2d.to(x.device, dtype=x.dtype)
-
-    # padding "same"
-    pad = kernel_size // 2
-    x = F.conv2d(x, kernel2d, padding=pad)
-
-    if x.shape[0] == 1 and x.shape[1] == 1:
-        x = x.squeeze()
+    kernel2d = kernel2d.expand(C, 1, k, k)  # [C,1,k,k] pour grouped conv
+    pad = k // 2
+    x = F.conv2d(x, kernel2d, padding=pad, groups=C)
     return x
 
 def log_frame_error(img_path, error: Exception, verbose: bool = True):
@@ -2237,7 +2233,7 @@ def apply_openpose_tilewise_test(
 
 #-----------------------------
 
-def apply_openpose_tilewise_safe(
+def apply_openpose_tilewise_safe_blur(
     latents,
     pose,
     apply_fn,
@@ -2346,6 +2342,231 @@ def apply_openpose_tilewise_safe(
             align_corners=False
         )
 
+        impact_np = impact_map_full[0,0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        impact_img = (impact_np * 255).astype(np.uint8)
+        Image.fromarray(impact_img).save(
+            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
+        )
+
+    return latents_out
+
+def apply_openpose_tilewise_safe_v2(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=None,
+    savetile=False
+):
+    """
+    Version allégée : applique OpenPose/ControlNet en tiles avec clamp post-tile
+    pour réduire le bruit, sans blur.
+    """
+    B, C, H_latent, W_latent = latents.shape
+    H_full, W_full = pose.shape[2], pose.shape[3]
+
+    latents_out = torch.zeros_like(latents)
+    weight_map = torch.zeros_like(latents)
+
+    stride = block_size - overlap
+
+    for i in range(0, H_latent, stride):
+        for j in range(0, W_latent, stride):
+            i_end = min(i + block_size, H_latent)
+            j_end = min(j + block_size, W_latent)
+            tile_h = i_end - i
+            tile_w = j_end - j
+
+            latent_tile = latents[:, :, i:i_end, j:j_end]
+            i_full_start = int(i * H_full / H_latent)
+            i_full_end = int(i_end * H_full / H_latent)
+            j_full_start = int(j * W_full / W_latent)
+            j_full_end = int(j_end * W_full / W_latent)
+            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
+
+            pad_h = block_size - tile_h
+            pad_w = block_size - tile_w
+            if pad_h > 0 or pad_w > 0:
+                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
+                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
+
+            try:
+                latent_tile_processed = apply_fn(latent_tile, pose_tile)
+            except Exception as e:
+                if debug:
+                    import traceback
+                    print(f"[ERROR] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
+                    traceback.print_exc()
+                latent_tile_processed = latent_tile
+            finally:
+                torch.cuda.empty_cache()
+
+            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
+            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
+            weight_map[:, :, i:i_end, j:j_end] += 1.0
+
+            if debug and savetile and debug_dir is not None:
+                import os
+                os.makedirs(debug_dir, exist_ok=True)
+                tile_save_path = os.path.join(debug_dir, f"tile_{frame_idx}_{i}_{j}.png")
+                save_image((latent_tile_processed[0] + 1) / 2, tile_save_path)
+
+    weight_map[weight_map == 0] = 1.0
+    latents_out = latents_out / weight_map
+
+    # --- Reduction de bruit simple ---
+    latents_out = torch.clamp(latents_out, -1.2, 1.2)  # limiter les valeurs extrêmes
+
+    # --- Impact map debug ---
+    if debug and debug_dir is not None:
+        import os, numpy as np
+        from PIL import Image
+        os.makedirs(debug_dir, exist_ok=True)
+
+        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)
+        impact_map_full = F.interpolate(impact_map, size=(H_full, W_full),
+                                        mode='bilinear', align_corners=False)
+        impact_np = impact_map_full[0,0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        impact_img = (impact_np * 255).astype(np.uint8)
+        Image.fromarray(impact_img).save(
+            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
+        )
+
+    return latents_out
+
+
+import torch
+import torch.nn.functional as F
+
+def gaussian_blur_tensor2(x, kernel_size=3, sigma=0.5):
+    """Applique un blur gaussien 2D sur un tensor [B,C,H,W]"""
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    # créer kernel 1D
+    coords = torch.arange(kernel_size) - kernel_size // 2
+    g = torch.exp(-(coords**2) / (2*sigma**2))
+    g /= g.sum()
+    # kernel 2D
+    kernel2d = g[:, None] @ g[None, :]
+    kernel2d = kernel2d.to(x.device, x.dtype)
+    kernel2d = kernel2d.unsqueeze(0).unsqueeze(0)  # shape [1,1,K,K]
+    kernel2d = kernel2d.repeat(x.shape[1], 1, 1, 1)  # [C,1,K,K]
+    x = F.pad(x, (kernel_size//2,)*4, mode='reflect')
+    return F.conv2d(x, kernel2d, groups=x.shape[1])
+
+
+
+def unsharp_mask(latents, blur_kernel=3, blur_sigma=0.5, strength=1.0):
+    """
+    Renforce la netteté des latents après flou.
+    - latents : tensor [B,C,H,W]
+    - blur_kernel, blur_sigma : pour générer le flou
+    - strength : poids du renforcement des détails
+    """
+    latents_blur = gaussian_blur_tensor(latents, kernel_size=blur_kernel, sigma=blur_sigma)
+    high_freq = latents - latents_blur
+    latents_sharp = latents + strength * high_freq
+    return torch.clamp(latents_sharp, -1.5, 1.5)  # clamp pour éviter saturation
+
+
+def apply_openpose_tilewise_safe(
+    latents,
+    pose,
+    apply_fn,
+    past_latents=None,       # liste des latents précédents [frame-1, frame-2...]
+    temporal_smoothing=0.3,  # poids du lissage sur les frames précédentes
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=None,
+    savetile=False
+):
+    """
+    Tile-wise OpenPose avec post-traitement + lissage temporel pour réduire bruit.
+    past_latents: liste de tensors [B,C,H,W] des frames précédentes
+    temporal_smoothing: poids du lissage temporel (0.0 = pas de lissage)
+    """
+    B, C, H_latent, W_latent = latents.shape
+    H_full, W_full = pose.shape[2], pose.shape[3]
+
+    latents_out = torch.zeros_like(latents)
+    weight_map = torch.zeros_like(latents)
+
+    stride = block_size - overlap
+
+    # 1️⃣ Tile-wise processing
+    for i in range(0, H_latent, stride):
+        for j in range(0, W_latent, stride):
+            i_end = min(i + block_size, H_latent)
+            j_end = min(j + block_size, W_latent)
+            tile_h = i_end - i
+            tile_w = j_end - j
+
+            latent_tile = latents[:, :, i:i_end, j:j_end]
+            i_full_start = int(i * H_full / H_latent)
+            i_full_end = int(i_end * H_full / H_latent)
+            j_full_start = int(j * W_full / W_latent)
+            j_full_end = int(j_end * W_full / W_latent)
+            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
+
+            pad_h = block_size - tile_h
+            pad_w = block_size - tile_w
+            if pad_h > 0 or pad_w > 0:
+                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
+                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
+
+            try:
+                latent_tile_processed = apply_fn(latent_tile, pose_tile)
+            except Exception as e:
+                if debug:
+                    print(f"[DEBUG] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
+                latent_tile_processed = latent_tile
+            finally:
+                torch.cuda.empty_cache()
+
+            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
+            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
+            weight_map[:, :, i:i_end, j:j_end] += 1.0
+
+    # 2️⃣ Moyenne sur les overlaps
+    weight_map[weight_map == 0] = 1.0
+    latents_out = latents_out / weight_map
+
+    # 3️⃣ Post-traitement spatial
+    latents_out = gaussian_blur_tensor2(latents_out, kernel_size=3, sigma=0.5)
+    latents_out = unsharp_mask(latents_out, blur_kernel=3, blur_sigma=0.5, strength=0.8)
+    min_val, max_val = latents.min().item() - 0.3, latents.max().item() + 0.3
+    latents_out = torch.clamp(latents_out, min_val, max_val)
+    delta = latents_out - latents
+    latents_out = latents + torch.sigmoid(delta*2.0) * delta
+
+    # 4️⃣ Lissage temporel
+    if past_latents and temporal_smoothing > 0.0:
+        smoothed = sum(past_latents[-3:] + [latents_out]) / (len(past_latents[-3:]) + 1)
+        latents_out = latents_out * (1 - temporal_smoothing) + smoothed * temporal_smoothing
+
+    # 5️⃣ Impact map debug
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)
+        impact_map_full = F.interpolate(
+            impact_map,
+            size=(H_full, W_full),
+            mode='bilinear',
+            align_corners=False
+        )
         impact_np = impact_map_full[0,0].detach().cpu().numpy()
         impact_np -= impact_np.min()
         if impact_np.max() > 0:
