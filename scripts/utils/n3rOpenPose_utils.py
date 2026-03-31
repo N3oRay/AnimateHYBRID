@@ -17,6 +17,25 @@ import traceback
 import torch
 import torch.nn.functional as F
 
+def build_feather_mask(H, W, device, dtype, strength=1.0):
+    import torch
+
+    y = torch.linspace(-1, 1, H, device=device, dtype=dtype)
+    x = torch.linspace(-1, 1, W, device=device, dtype=dtype)
+
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+
+    dist = torch.sqrt(xx**2 + yy**2)
+
+    # masque radial inversé (centre fort, bords faibles)
+    mask = 1.0 - dist
+    mask = torch.clamp(mask, 0.0, 1.0)
+
+    # courbe douce (important pour éviter les rings)
+    mask = mask ** 2
+
+    return mask.view(1, 1, H, W) * strength
+
 #----------------------------------------------------------------------------------------------------------------
 
 def resize_pose(pose_tile, H_latent, W_latent):
@@ -1994,7 +2013,7 @@ def apply_openpose_tilewise_safe_TEST_GOOD(
 # Version stable -  Tester et valide
 #----------------------------------------
 
-def apply_openpose_tilewise_safe(
+def apply_openpose_tilewise_stable(
     latents,
     pose,
     apply_fn,
@@ -2103,3 +2122,237 @@ def apply_openpose_tilewise_safe(
 
     return latents_out
 
+
+
+#-------------------------------------------
+
+
+import torch
+import torch.nn.functional as F
+import os
+import numpy as np
+from PIL import Image
+
+def get_tile_feather_mask_test(h, w, device, dtype):
+    """Crée un mask de feathering pour adoucir les bords de la tile"""
+    y = torch.linspace(-1, 1, steps=h, device=device, dtype=dtype).unsqueeze(1)
+    x = torch.linspace(-1, 1, steps=w, device=device, dtype=dtype).unsqueeze(0)
+    mask = (1 - x.abs()) * (1 - y.abs())
+    mask = mask.clamp(0.0, 1.0)
+    return mask.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+
+
+
+def apply_openpose_tilewise_test(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=None,
+    savetile=False
+):
+    """
+    Applique OpenPose/ControlNet sur des latents en tiles de manière robuste.
+    Corrige automatiquement les mismatches de taille sur les bords.
+    """
+    import torch
+    import torch.nn.functional as F
+    import os
+    from PIL import Image
+    import numpy as np
+    import traceback
+
+    B, C, H_latent, W_latent = latents.shape
+    H_full, W_full = pose.shape[2], pose.shape[3]
+
+    latents_out = torch.zeros_like(latents)
+    weight_map = torch.zeros_like(latents)
+    stride = block_size - overlap
+
+    for i in range(0, H_latent, stride):
+        for j in range(0, W_latent, stride):
+            i_end = min(i + block_size, H_latent)
+            j_end = min(j + block_size, W_latent)
+            tile_h = i_end - i
+            tile_w = j_end - j
+
+            latent_tile = latents[:, :, i:i_end, j:j_end]
+            i_full_start = int(i * H_full / H_latent)
+            i_full_end = int(i_end * H_full / H_latent)
+            j_full_start = int(j * W_full / W_latent)
+            j_full_end = int(j_end * W_full / W_latent)
+            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
+
+            # Pad si nécessaire pour que la tile soit carrée
+            pad_h = block_size - tile_h
+            pad_w = block_size - tile_w
+            if pad_h > 0 or pad_w > 0:
+                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
+                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
+
+            try:
+                latent_tile_processed = apply_fn(latent_tile, pose_tile)
+                # ⚡ REDIMENSIONNER pour correspondre exactement à tile_h, tile_w
+                latent_tile_processed = F.interpolate(
+                    latent_tile_processed, size=(tile_h, tile_w),
+                    mode='bilinear', align_corners=False
+                )
+            except Exception as e:
+                if debug:
+                    print(f"[ERROR] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
+                    traceback.print_exc()
+                latent_tile_processed = latent_tile[:, :, :tile_h, :tile_w]
+
+            # Ajouter au output avec average map
+            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
+            weight_map[:, :, i:i_end, j:j_end] += 1.0
+
+            # Sauvegarde debug tile
+            if debug and savetile and debug_dir is not None:
+                os.makedirs(debug_dir, exist_ok=True)
+                tile_save_path = os.path.join(debug_dir, f"tile_{frame_idx}_{i}_{j}.png")
+                save_image((latent_tile_processed[0] + 1) / 2, tile_save_path)
+
+    # Moyenne sur les overlaps
+    weight_map[weight_map == 0] = 1.0
+    latents_out = latents_out / weight_map
+
+    # Debug impact map full-res
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)
+        impact_map_full = F.interpolate(impact_map, size=(H_full, W_full), mode='bilinear', align_corners=False)
+        impact_np = impact_map_full[0,0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        impact_img = (impact_np * 255).astype(np.uint8)
+        Image.fromarray(impact_img).save(os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png"))
+
+    return latents_out
+
+#-----------------------------
+
+def apply_openpose_tilewise_safe(
+    latents,
+    pose,
+    apply_fn,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=None,
+    savetile=False
+):
+    """
+    Applique un OpenPose/ControlNet sur des latents en tiles et génère une impact_map
+    correctement alignée avec l'image full-res.
+
+    Args:
+        latents: [B,C,H,W] tensor latents
+        pose: [B,C,H_full,W_full] tensor full-res
+        apply_fn: fonction tile -> tile_processed
+        block_size: taille d'une tile
+        overlap: chevauchement entre tiles
+        debug: activer debug
+        debug_dir: dossier sauvegarde debug
+        frame_idx: index frame
+        savetile: sauvegarde tiles traitées
+    """
+    B, C, H_latent, W_latent = latents.shape
+    H_full, W_full = pose.shape[2], pose.shape[3]
+
+    latents_out = torch.zeros_like(latents)
+    weight_map = torch.zeros_like(latents)
+
+    stride = block_size - overlap
+
+    for i in range(0, H_latent, stride):
+        for j in range(0, W_latent, stride):
+            i_end = min(i + block_size, H_latent)
+            j_end = min(j + block_size, W_latent)
+            tile_h = i_end - i
+            tile_w = j_end - j
+
+            latent_tile = latents[:, :, i:i_end, j:j_end]
+
+            # Correspondance proportionnelle dans le pose full-res
+            i_full_start = int(i * H_full / H_latent)
+            i_full_end = int(i_end * H_full / H_latent)
+            j_full_start = int(j * W_full / W_latent)
+            j_full_end = int(j_end * W_full / W_latent)
+            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
+
+            # Padding si bordures
+            pad_h = block_size - tile_h
+            pad_w = block_size - tile_w
+            if pad_h > 0 or pad_w > 0:
+                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
+                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
+
+            try:
+                latent_tile_processed = apply_fn(latent_tile, pose_tile)
+            except Exception as e:
+                if debug:
+                    import traceback
+                    print(f"[ERROR] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
+                    traceback.print_exc()
+                latent_tile_processed = latent_tile  # fallback
+            finally:
+                torch.cuda.empty_cache()
+
+            # Retirer padding
+            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
+
+            # Fusion tile
+            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
+            weight_map[:, :, i:i_end, j:j_end] += 1.0
+
+            # Sauvegarde debug tile si besoin
+            if debug and savetile and debug_dir is not None:
+                import os
+                os.makedirs(debug_dir, exist_ok=True)
+                tile_save_path = os.path.join(debug_dir, f"tile_{frame_idx}_{i}_{j}.png")
+                save_image((latent_tile_processed[0] + 1) / 2, tile_save_path)
+
+    # Moyenne sur les overlaps
+    weight_map[weight_map == 0] = 1.0
+    latents_out = latents_out / weight_map
+
+    # --- Réduction du bruit (post-tile) ---
+    diff = latents_out - latents
+    diff = torch.clamp(diff, -0.1, 0.1)  # limiter variations extrêmes
+    latents_out = latents + diff
+    # léger blur pour lisser les bordures de tiles
+    latents_out = F.avg_pool2d(latents_out, kernel_size=3, stride=1, padding=1)
+
+    # --- Impact map pour debug ---
+    if debug and debug_dir is not None:
+        import os
+        import numpy as np
+        from PIL import Image
+        os.makedirs(debug_dir, exist_ok=True)
+
+        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)  # [B,1,H_latent,W_latent]
+        impact_map_full = F.interpolate(
+            impact_map,
+            size=(H_full, W_full),
+            mode='bilinear',
+            align_corners=False
+        )
+
+        impact_np = impact_map_full[0,0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        impact_img = (impact_np * 255).astype(np.uint8)
+        Image.fromarray(impact_img).save(
+            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
+        )
+
+    return latents_out
