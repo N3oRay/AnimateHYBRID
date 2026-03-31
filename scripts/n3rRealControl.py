@@ -205,9 +205,6 @@ def main(args):
         n3r_pro_net.eval()
         print("✅ N3RProNet activé")
 
-
-
-
     previous_latent_single = None
     frame_counter = 0
     pbar = tqdm(total=total_frames, ncols=120)
@@ -408,6 +405,16 @@ def main(args):
                                 latents = torch.nn.functional.interpolate( latents, size=latents_frame.shape[-2:], mode='bilinear', align_corners=False ).contiguous()
                             latents = latent_injection*latents_frame + (1-latent_injection)*latents
 
+                    # ---------------- Motion module ----------------
+                    if motion_module is not None:
+                        latents_seq = latents.unsqueeze(2).repeat(1, 1, 3, 1, 1) if previous_latent_single is None \
+                                    else torch.stack([previous_latent_single.to(device), latents, latents + 0.003 * torch.randn_like(latents)], dim=2)
+                        latents_seq = sanitize_latents(latents_seq)
+                        latents_seq, applied = apply_motion_safe(latents_seq, motion_module)
+                        latents = latents_seq[:, :, 1, :, :] if applied else latents
+                        latents = sanitize_latents(latents)
+                        print(f"[DEBUG] Après Motion module min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
+
                     # ---------------- ControlNet OpenPose ------------------------
                     if use_openpose:
                         try:
@@ -460,19 +467,18 @@ def main(args):
                             # BOOST
                             latents_after = latents  # sortie de apply_openpose
                             delta = latents_after - latents_before_openpose
-                            # garder magnitude réelle + amplification douce
-                            #pose_mask = (pose_latent_full.abs().mean(dim=1, keepdim=True) > 0.05).float()
 
+                            # garder magnitude réelle + amplification douce -
                             pose_mask = torch.clamp( pose_latent_full.abs().mean(dim=1, keepdim=True) * 3.0, 0.0, 1.0 )
 
-                            latents = latents_before_openpose + 2.2 * delta * pose_mask
+                            #Pour augmenter l influence de Open Pose motion_energy = 2.0	très safe 3.0	équilibré (recommandé) 4.0	plus dynamique
+                            motion_energy = delta.abs().mean(dim=1, keepdim=True)
+                            motion_boost = 1.0 + torch.clamp(motion_energy * 3.0, 0.0, 1.0)
+                            latents = latents_before_openpose + 2.0 * delta * pose_mask * motion_boost
+
                             # 🔹 ===== 5. CLEANUP =====
                             latents = torch.nan_to_num(latents)
                             latents = sanitize_latents(latents)
-
-                            #latents_max = latents.abs().amax(dim=(1,2,3), keepdim=True)
-                            #latents = latents / (latents_max + 1e-6)
-                            #latents = latents * 1.1
 
                             # boost relatif léger
                             latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
@@ -492,15 +498,7 @@ def main(args):
                         # 🔹 debug image
                         save_debug_pose_image(pose_full, frame_counter, output_dir, cfg, prefix="openpose")
 
-                    # ---------------- Motion module ----------------
-                    if motion_module is not None:
-                        latents_seq = latents.unsqueeze(2).repeat(1, 1, 3, 1, 1) if previous_latent_single is None \
-                                    else torch.stack([previous_latent_single.to(device), latents, latents + 0.003 * torch.randn_like(latents)], dim=2)
-                        latents_seq = sanitize_latents(latents_seq)
-                        latents_seq, applied = apply_motion_safe(latents_seq, motion_module)
-                        latents = latents_seq[:, :, 1, :, :] if applied else latents
-                        latents = sanitize_latents(latents)
-                        print(f"[DEBUG] Après Motion module min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
+
 
                     # ---------------- ProNet yeux ----------------
                     if use_n3r_pro_net:
