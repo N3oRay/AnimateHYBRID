@@ -3246,3 +3246,134 @@ def extract_keypoints_from_pose(
         )
 
     return keypoints_tensor
+
+
+
+def apply_pose_driven_motion(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+):
+    """
+    Motion basé sur keypoints OpenPose (épaule / torse / tête)
+
+    Args:
+        latents: [B,C,H,W]
+        keypoints: [B,18,3] (x,y,conf) normalized
+        prev_keypoints: previous frame keypoints
+    """
+
+    import torch
+    import math
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+
+    # ============================
+    # 1️⃣ RESPIRATION (propre)
+    # ============================
+    if breathing and previous_latent is not None:
+        breath = 0.03 * math.sin(frame_counter * 0.15)
+        latents = latents + breath * latents
+
+    # ============================
+    # 2️⃣ EXTRACTION POINTS CLÉS
+    # ============================
+    kp = keypoints
+
+    def get_point(idx):
+        return kp[:, idx, :2]  # [B,2]
+
+    neck = get_point(1)
+    r_shoulder = get_point(2)
+    l_shoulder = get_point(5)
+
+    # centre torse
+    torso_center = (r_shoulder + l_shoulder) * 0.5
+
+    # ============================
+    # 3️⃣ MOUVEMENT RELATIF (frame-to-frame)
+    # ============================
+    if prev_keypoints is not None:
+        prev_kp = prev_keypoints
+
+        def get_prev(idx):
+            return prev_kp[:, idx, :2]
+
+        prev_torso = (get_prev(2) + get_prev(5)) * 0.5
+
+        # déplacement torse
+        delta_torso = torso_center - prev_torso  # [B,2]
+
+    else:
+        delta_torso = torch.zeros_like(torso_center)
+
+    # ============================
+    # 4️⃣ CONVERSION → LATENT SPACE
+    # ============================
+    dx = delta_torso[:, 0].view(B,1,1,1) * W
+    dy = delta_torso[:, 1].view(B,1,1,1) * H
+
+    # ============================
+    # 5️⃣ WARP LATENT (clé du mouvement)
+    # ============================
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1,1,H,device=device),
+        torch.linspace(-1,1,W,device=device),
+        indexing="ij"
+    )
+
+    grid = torch.stack((grid_x, grid_y), dim=-1)  # [H,W,2]
+    grid = grid.unsqueeze(0).repeat(B,1,1,1)
+
+    # appliquer translation
+    grid[..., 0] += dx.squeeze() / W
+    grid[..., 1] += dy.squeeze() / H
+
+    latents_warped = F.grid_sample(
+        latents,
+        grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True
+    )
+
+    # ============================
+    # 6️⃣ MASQUE HAUT DU CORPS
+    # ============================
+    mask = build_upper_body_mask(keypoints, latents.shape, device=device)
+
+    # ============================
+    # 7️⃣ FUSION MOTION
+    # ============================
+    motion_strength = 0.6
+    latents = (1 - mask * motion_strength) * latents + (mask * motion_strength) * latents_warped
+
+    # ============================
+    # 8️⃣ DELTA OPENPOSE (garder cohérence)
+    # ============================
+    if latents_before_openpose is not None and latents_after_openpose is not None:
+        delta = latents_after_openpose - latents_before_openpose
+        energy = delta.abs().mean(dim=1, keepdim=True)
+
+        boost = 1.0 + torch.pow(torch.clamp(energy * 2.0, 0.0, 1.0), 0.7)
+
+        latents = latents + delta * mask * boost * 0.8
+
+    # ============================
+    # 9️⃣ STABILISATION (CRITIQUE)
+    # ============================
+    latents = torch.nan_to_num(latents)
+
+    latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
+    latents = latents / (latents_max + 1e-6)
+
+    latents = torch.clamp(latents, -1.2, 1.2)
+
+    return latents
