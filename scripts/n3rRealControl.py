@@ -78,7 +78,7 @@ def main(args):
     use_openpose = cfg.get("use_openpose", True)
     controlnet_scale = cfg.get("controlnet_scale", 1.0) # typiquement 0.5 → 1.0
     control_strength = cfg.get("control_strength", 1.5)
-    n3r_pro_strength = cfg.get("n3r_pro_strength", 0.2) # 0.1, 0.2, 0.3
+    n3r_pro_strength = cfg.get("n3r_pro_strength", 0.001) # 0.1, 0.2, 0.3
     target_temp, reference_temp = 7800, 6500 #target_temp = 8000 reference_temp = 6000  (Froid)
     facteur = cfg.get("facteur", 8) # 8, 6, 4
 
@@ -461,7 +461,9 @@ def main(args):
                             latents_after = latents  # sortie de apply_openpose
                             delta = latents_after - latents_before_openpose
                             # garder magnitude réelle + amplification douce
-                            pose_mask = (pose_latent_full.abs().mean(dim=1, keepdim=True) > 0.05).float()
+                            #pose_mask = (pose_latent_full.abs().mean(dim=1, keepdim=True) > 0.05).float()
+
+                            pose_mask = torch.clamp( pose_latent_full.abs().mean(dim=1, keepdim=True) * 3.0, 0.0, 1.0 )
 
                             latents = latents_before_openpose + 2.2 * delta * pose_mask
                             # 🔹 ===== 5. CLEANUP =====
