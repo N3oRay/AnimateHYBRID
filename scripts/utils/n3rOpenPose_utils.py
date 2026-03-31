@@ -18,6 +18,123 @@ import traceback
 import torch
 import torch.nn.functional as F
 
+
+def debug_draw_openpose_skeleton(
+    pose_full_image,
+    keypoints_tensor,
+    debug_dir,
+    frame_counter,
+):
+    """
+    Dessine les keypoints + squelette OpenPose sur l'image de pose.
+
+    Args:
+        pose_full_image (torch.Tensor): [B,3,H,W] normalisé [-1,1]
+        keypoints_tensor (torch.Tensor): [B,18,3] (x,y,conf) normalisé [0,1]
+        debug_dir (str): dossier de sauvegarde
+        frame_counter (int): index frame
+    """
+
+    import os
+    import cv2
+    import numpy as np
+
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # ---------------------------
+    # 🔹 Convert tensor → image
+    # ---------------------------
+    pose_img = pose_full_image[0].permute(1, 2, 0).detach().cpu().numpy()
+    pose_img = (pose_img + 1.0) / 2.0
+    pose_img = (pose_img * 255).astype(np.uint8).copy()
+
+    H, W, _ = pose_img.shape
+
+    keypoints = keypoints_tensor[0].detach().cpu().numpy()
+
+    def to_pixel(x, y):
+        return int(x * W), int(y * H)
+
+    # ---------------------------
+    # 🎨 Couleurs
+    # ---------------------------
+    COLORS = {
+        "head": (255, 0, 255),   # rose
+        "eyes": (0, 0, 255),     # rouge
+        "nose": (128, 0, 128),   # violet
+        "arms": (0, 255, 0),     # vert
+        "torso": (255, 0, 0),    # bleu
+        "default": (200, 200, 200)
+    }
+
+    # ---------------------------
+    # 🔹 Draw points
+    # ---------------------------
+    for i, (x, y, conf) in enumerate(keypoints):
+        if conf < 0.1:
+            continue
+
+        px, py = to_pixel(x, y)
+
+        if i in [16, 17]:        # ears
+            color = COLORS["head"]
+        elif i in [14, 15]:      # eyes
+            color = COLORS["eyes"]
+        elif i == 0:             # nose
+            color = COLORS["nose"]
+        elif i in [2,3,4,5,6,7]: # arms
+            color = COLORS["arms"]
+        elif i in [1,8,11]:      # torso
+            color = COLORS["torso"]
+        else:
+            color = COLORS["default"]
+
+        cv2.circle(pose_img, (px, py), 6, color, -1)
+
+    # ---------------------------
+    # 🔹 Skeleton connections
+    # ---------------------------
+    skeleton = [
+        (0,1),        # nose → neck
+        (1,2), (2,3), (3,4),   # right arm
+        (1,5), (5,6), (6,7),   # left arm
+        (1,8), (1,11),         # torso
+        (14,0), (15,0),        # eyes → nose
+        (16,14), (17,15),      # ears → eyes
+    ]
+
+    for i, j in skeleton:
+        xi, yi, ci = keypoints[i]
+        xj, yj, cj = keypoints[j]
+
+        if ci < 0.1 or cj < 0.1:
+            continue
+
+        p1 = to_pixel(xi, yi)
+        p2 = to_pixel(xj, yj)
+
+        # couleurs par type de lien
+        if (i, j) == (0,1):
+            color = (128, 0, 128)  # nez → cou (violet)
+        elif i in [2,3,4,5,6,7]:
+            color = (0,255,0)      # bras
+        elif i in [1,8,11]:
+            color = (255,0,0)      # torse
+        else:
+            color = (255,255,255)
+
+        cv2.line(pose_img, p1, p2, color, 2)
+
+    # ---------------------------
+    # 💾 Save
+    # ---------------------------
+    save_path = f"{debug_dir}/skeleton_{frame_counter:05d}.png"
+    cv2.imwrite(save_path, cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+
+    print(f"[DEBUG] Skeleton sauvegardé : {save_path}")
+
+# --------------------------------------------------------------------
+
 def build_feather_mask(H, W, device, dtype, strength=1.0):
     import torch
 
@@ -2890,20 +3007,8 @@ import matplotlib.pyplot as plt
 import cv2
 import numpy as np
 
-def extract_keypoints_from_pose(pose_full_image, debug=False, debug_dir=None, frame_counter=None):
-    """
-    Extrait des keypoints OpenPose depuis une image de pose.
-    Compatible batch (B=1 ou plus).
+def extract_keypoints_from_pose_v1(pose_full_image, debug=False, debug_dir=None, frame_counter=None):
 
-    Args:
-        pose_full_image (torch.Tensor): BCHW, valeurs normalisées [-1,1] ou [0,1].
-        debug (bool): si True, sauvegarde une visualisation des keypoints.
-        debug_dir (str): dossier pour sauvegarder l'image de debug.
-        frame_counter (int): index de la frame pour nom de fichier.
-
-    Returns:
-        torch.Tensor: keypoints, shape [B, num_joints, 3] (x, y, confidence)
-    """
     B, C, H, W = pose_full_image.shape
     num_joints = 18  # Exemple COCO
 
@@ -2937,4 +3042,207 @@ def extract_keypoints_from_pose(pose_full_image, debug=False, debug_dir=None, fr
 
     # --- Conversion finale en tensor ---
     keypoints_tensor = torch.tensor(keypoints_list, dtype=torch.float32, device=pose_full_image.device)  # [B, num_joints, 3]
+    return keypoints_tensor
+
+
+def extract_keypoints_from_pose_test(pose_full_image, debug=False, debug_dir=None, frame_counter=None):
+    """
+    Extrait des keypoints OpenPose depuis une image de pose et propose un debug visuel.
+
+    Args:
+        pose_full_image (torch.Tensor): BCHW, valeurs normalisées [-1,1] ou [0,1].
+        debug (bool): si True, sauvegarde la visualisation des keypoints.
+        debug_dir (str): dossier pour sauvegarder l'image de debug.
+        frame_counter (int): index de la frame pour nom de fichier.
+
+    Returns:
+        torch.Tensor: keypoints, shape [B, num_joints, 3] (x, y, confidence)
+    """
+
+    # --- Conversion tensor -> HWC numpy ---
+    B, C, H, W = pose_full_image.shape
+    keypoints_list = []
+
+    for b in range(B):
+        pose_img = pose_full_image[b].permute(1,2,0).cpu().numpy()  # HWC
+        pose_img = (pose_img + 1.0) / 2.0  # [-1,1] -> [0,1]
+        pose_img = (pose_img * 255).astype(np.uint8)
+
+        # --- Hypothétique extraction keypoints ---
+        num_joints = 18  # exemple COCO
+        keypoints = []
+        for i in range(num_joints):
+            x = W * (0.1 + 0.8 * np.random.rand())
+            y = H * (0.1 + 0.8 * np.random.rand())
+            conf = np.random.rand()
+            keypoints.append([x, y, conf])
+        keypoints_list.append(np.array(keypoints))  # [num_joints, 3]
+
+        # --- debug visuel ---
+        if debug and debug_dir is not None and frame_counter is not None:
+            vis = pose_img.copy()
+            for (x, y, c) in keypoints_list[-1]:
+                if c > 0.1:
+                    cv2.circle(vis, (int(x), int(y)), 5, (0,255,0), -1)
+            save_path = f"{debug_dir}/keypoints_{frame_counter:05d}_b{b}.png"
+            cv2.imwrite(save_path, vis)
+            print(f"[DEBUG] Keypoints frame {frame_counter}, batch {b} sauvegardés : {save_path}")
+
+    # --- conversion en tensor batch ---
+    keypoints_np = np.array(keypoints_list)  # shape [B, num_joints, 3]
+    keypoints_tensor = torch.tensor(keypoints_np, dtype=torch.float32, device=pose_full_image.device)
+
+    return keypoints_tensor
+
+
+def extract_keypoints_from_pose_expert_test(pose_full_image, debug=False, debug_dir=None, frame_counter=None):
+    """
+    Extraction des keypoints OpenPose depuis un pose map BCHW.
+    Chaque canal de pose_full_image correspond à une articulation (COCO / OpenPose).
+
+    Args:
+        pose_full_image (torch.Tensor): BCHW, valeurs normalisées [-1,1] ou [0,1].
+        debug (bool): si True, sauvegarde une visualisation.
+        debug_dir (str): dossier pour sauvegarder l'image de debug.
+        frame_counter (int): index de la frame pour nom de fichier.
+
+    Returns:
+        torch.Tensor: keypoints, shape [B, num_joints, 3] (x, y, confidence)
+    """
+    B, C, H, W = pose_full_image.shape
+    device = pose_full_image.device
+    keypoints_list = []
+
+    # --- Préparer image pour debug ---
+    pose_img = (pose_full_image[0].permute(1,2,0).cpu().numpy() + 1) / 2.0  # HWC, [0,1]
+    pose_img = (pose_img * 255).astype(np.uint8)
+    pose_img = np.ascontiguousarray(pose_img)  # ✅ rendre contigu pour OpenCV
+    if pose_img.shape[2] > 3:
+        pose_img = pose_img[:, :, :3]
+
+    for b in range(B):
+        keypoints = []
+        for c in range(C):  # chaque articulation / canal
+            heatmap = pose_full_image[b, c]
+            max_val = heatmap.max()
+            yx = torch.nonzero(heatmap == max_val, as_tuple=False)
+            if yx.numel() == 0:
+                x = 0.5
+                y = 0.5
+                conf = 0.0
+            else:
+                y_idx, x_idx = yx[0].float()  # premier max
+                x = x_idx / W
+                y = y_idx / H
+                conf = max_val.clamp(0.0, 1.0)
+            keypoints.append([x.item(), y.item(), conf.item()])
+
+            # debug visuel
+            if debug and b == 0:
+                if conf > 0.05:
+                    cv2.circle(pose_img, (int(x*W), int(y*H)), 5, (0,255,0), -1)
+
+        keypoints_list.append(keypoints)
+
+    keypoints_tensor = torch.tensor(keypoints_list, dtype=torch.float32, device=device)  # [B, num_joints, 3]
+
+    # --- Debug save ---
+    if debug and debug_dir is not None and frame_counter is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        save_path = f"{debug_dir}/keypoints_{frame_counter:05d}_b0.png"
+        cv2.imwrite(save_path, cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+        print(f"[DEBUG] Keypoints frame {frame_counter}, batch 0 sauvegardés : {save_path}")
+
+    return keypoints_tensor
+
+def extract_keypoints_from_pose(
+    pose_full_image,
+    device="cuda",
+    debug=False,
+    debug_dir=None,
+    frame_counter=None
+):
+    """
+    FR:
+    Extraction MANUELLE des keypoints (format COCO 18 points).
+    Les coordonnées sont normalisées entre [0,1] dans l'espace IMAGE.
+
+    EN:
+    MANUAL keypoints extraction (COCO 18 format).
+    Coordinates are normalized in [0,1] in IMAGE space.
+
+    Output:
+        keypoints_tensor: [B, 18, 3]  (x, y, confidence)
+    """
+
+    B, C, H, W = pose_full_image.shape  # H=height, W=width
+
+    # ---------------------------
+    # 🔥 KEYPOINTS MANUELS / MANUAL KEYPOINTS
+    # ---------------------------
+    # FR:
+    # x = pixel_x / image_width
+    # y = pixel_y / image_height
+    # IMPORTANT: utiliser la taille de l'image originale (pose_full), PAS le latent
+
+    # EN:
+    # x = pixel_x / image_width
+    # y = pixel_y / image_height
+    # IMPORTANT: use original image size (pose_full), NOT latent size
+
+    keypoints_template = [
+        [418/896, 418/1280, 1.0],  # 0 nose / nez
+        [383/896, 515/1280, 1.0],  # 1 neck / cou
+
+        [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite
+        [612/896, 838/1280, 1.0],  # 3 right_elbow / coude droit
+        [488/896, 1040/1280, 1.0], # 4 right_wrist / poignet droit
+
+        [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche
+        [197/896, 944/1280, 1.0],  # 6 left_elbow / coude gauche
+        [431/896, 1087/1280, 1.0], # 7 left_wrist / poignet gauche
+
+        [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite
+        [0.0, 0.0, 0.0],           # 9 right_knee (absent)
+        [0.0, 0.0, 0.0],           # 10 right_ankle (absent)
+
+        [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche
+        [0.0, 0.0, 0.0],           # 12 left_knee (absent)
+        [0.0, 0.0, 0.0],           # 13 left_ankle (absent)
+
+        [498/896, 360/1280, 1.0],  # 14 right_eye / œil droit
+        [373/896, 324/1280, 1.0],  # 15 left_eye / œil gauche
+
+        [608/896, 304/1280, 1.0],  # 16 right_ear / oreille droite
+        [290/896, 244/1280, 1.0],  # 17 left_ear / oreille gauche
+    ]
+
+    # ---------------------------
+    # 🔹 Conversion numpy → tensor
+    # ---------------------------
+    keypoints_np = np.array(keypoints_template, dtype=np.float32)
+
+    # FR: sécurité pour éviter valeurs hors [0,1]
+    # EN: safety clamp to keep values in [0,1]
+    keypoints_np = np.clip(keypoints_np, 0.0, 1.0)
+
+    # FR: duplication pour batch
+    # EN: repeat for batch
+    keypoints_np = np.expand_dims(keypoints_np, axis=0)  # [1,18,3]
+    keypoints_np = np.repeat(keypoints_np, B, axis=0)    # [B,18,3]
+
+    keypoints_tensor = torch.from_numpy(keypoints_np).to(device)
+
+    # ---------------------------
+    # 🔹 DEBUG VISUEL / VISUAL DEBUG
+    # ---------------------------
+    if debug and debug_dir is not None and frame_counter is not None:
+        # Affichage des points en debug
+        debug_draw_openpose_skeleton(
+            pose_full_image=pose_full_image,
+            keypoints_tensor=keypoints_tensor,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
+        )
+
     return keypoints_tensor
