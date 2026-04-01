@@ -461,16 +461,9 @@ def main(args):
 
 
                             #new code fonction --------------------------------------------------------------------------------------
-
-                            # Extraire keypoints + debug visuel
                             # 🔹 Extraction / update des keypoints
                             current_keypoints = extract_keypoints_from_pose( pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter)
-                            """
-                            if current_keypoints is None:
-                                current_keypoints = extract_keypoints_from_pose(
-                                    pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter
-                                )
-                            """
+
                             # Mettre à jour les keypoints éventuellement modifiés
                             current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints, prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
 
