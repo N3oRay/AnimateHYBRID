@@ -2185,8 +2185,28 @@ def apply_pose_driven_motion(
     mask_rotated = rotate_mask_around_point(mask, torso_center_pixels, angle, H, W, device)
 
     # -------------------- Fusion latents --------------------
-    latents = latents * (1 - mask_rotated) + latents_warped * mask_rotated
+    #latents = latents * (1 - mask_rotated) + latents_warped * mask_rotated
+    mask_boosted = mask_rotated ** 0.7   # rehausse légèrement les valeurs
+    mask_boosted = mask_boosted * 1.5    # amplifie globalement
+    mask_boosted = torch.clamp(mask_boosted, 0, 1)  # on reste dans [0,1]
+    latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
     if debug: print("[DEBUG] Upper body mask fusion applied (inclined)")
+    # -------------------- Debug log pour contribution --------------------
+    if debug:
+        mask_mean = mask_rotated.mean().item()
+        mask_max = mask_rotated.max().item()
+        mask_min = mask_rotated.min().item()
+
+        mask_boosted_mean = mask_boosted.mean().item()
+        mask_boosted_max = mask_boosted.max().item()
+        mask_boosted_min = mask_boosted.min().item()
+
+        print(f"[DEBUG] mask_rotated: min={mask_min:.3f}, max={mask_max:.3f}, mean={mask_mean:.3f}")
+        print(f"[DEBUG] mask_boosted: min={mask_boosted_min:.3f}, max={mask_boosted_max:.3f}, mean={mask_boosted_mean:.3f}")
+
+        # Estimation contribution latents_warped
+        warped_contribution = (latents_warped * mask_boosted).mean().item()
+        print(f"[DEBUG] Approx. latents_warped contribution (mean): {warped_contribution:.3f}")
 
     # -------------------- OpenPose delta --------------------
     latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
@@ -2289,7 +2309,6 @@ def apply_pose_driven_motion_v2(
 
 
 #------------------------------------------------------------------------------------------
-#------------------------------------------------------------------
 def update_pose_sequence_from_keypoints_batch(
     keypoints_tensor,
     prev_keypoints=None,
