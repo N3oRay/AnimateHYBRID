@@ -15,11 +15,6 @@ import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
 import traceback
 
-import torch
-import torch.nn.functional as F
-
-
-
 
 def debug_draw_openpose_skeleton(
     pose_full_image,
@@ -36,10 +31,6 @@ def debug_draw_openpose_skeleton(
         debug_dir (str): dossier de sauvegarde
         frame_counter (int): index frame
     """
-
-    import os
-    import cv2
-    import numpy as np
 
     os.makedirs(debug_dir, exist_ok=True)
 
@@ -135,32 +126,10 @@ def debug_draw_openpose_skeleton(
 
     print(f"[DEBUG] Skeleton sauvegardé : {save_path}")
 
-# --------------------------------------------------------------------
-
-def build_feather_mask(H, W, device, dtype, strength=1.0):
-    import torch
-
-    y = torch.linspace(-1, 1, H, device=device, dtype=dtype)
-    x = torch.linspace(-1, 1, W, device=device, dtype=dtype)
-
-    yy, xx = torch.meshgrid(y, x, indexing='ij')
-
-    dist = torch.sqrt(xx**2 + yy**2)
-
-    # masque radial inversé (centre fort, bords faibles)
-    mask = 1.0 - dist
-    mask = torch.clamp(mask, 0.0, 1.0)
-
-    # courbe douce (important pour éviter les rings)
-    mask = mask ** 2
-
-    return mask.view(1, 1, H, W) * strength
 
 #----------------------------------------------------------------------------------------------------------------
 
 def resize_pose(pose_tile, H_latent, W_latent):
-    import torch.nn.functional as F
-
     target_h = H_latent * 8
     target_w = W_latent * 8
 
@@ -175,8 +144,6 @@ def resize_pose(pose_tile, H_latent, W_latent):
 
 
 def prepare_inputs(latent_tile, pose_tile, cf_embeds, device):
-    import torch
-
     pos_embeds, neg_embeds = cf_embeds
 
     latent_fp32 = latent_tile.to(device=device, dtype=torch.float32)
@@ -189,16 +156,12 @@ def prepare_inputs(latent_tile, pose_tile, cf_embeds, device):
 
 
 def add_noise(latent, scheduler, t, noise_strength=0.5):
-    import torch
-
     noise = torch.randn_like(latent) * noise_strength
     latent_noisy = scheduler.add_noise(latent, noise, t)
     return torch.clamp(latent_noisy, -20, 20)
 
 
 def apply_cfg(latent_input, pos_embeds, neg_embeds, guidance_scale):
-    import torch
-
     if neg_embeds is not None:
         latent_input = torch.cat([latent_input] * 2)
         embeds = torch.cat([neg_embeds, pos_embeds])
@@ -207,8 +170,6 @@ def apply_cfg(latent_input, pos_embeds, neg_embeds, guidance_scale):
 
 
 def compute_noise_pred(unet, controlnet, latent_input, t, embeds, pose):
-    import torch
-
     down_samples, mid_sample = controlnet(
         latent_input,
         t,
@@ -237,9 +198,6 @@ def merge_cfg(noise_pred, guidance_scale, use_cfg):
 
 
 def compute_adaptive_importance(latent):
-    import torch
-    import torch.nn.functional as F
-
     with torch.no_grad():
         blurred = F.avg_pool2d(latent, kernel_size=3, stride=1, padding=1)
         high_freq = torch.abs(latent - blurred)
@@ -256,8 +214,6 @@ def compute_adaptive_importance(latent):
 
 
 def compute_delta(latents_out, latent_ref, controlnet_scale, importance):
-    import torch
-
     delta = latents_out - latent_ref
     delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
 
@@ -281,7 +237,6 @@ def controlnet_tile_fn(
     target_dtype,
     **kwargs
 ):
-    import torch
 
     B, C, H_latent, W_latent = latent_tile.shape
 
@@ -289,14 +244,12 @@ def controlnet_tile_fn(
     # 1️⃣ Resize pose
     # =========================================================
     pose_resized = resize_pose(pose_tile, H_latent, W_latent)
-
     # =========================================================
     # 2️⃣ Inputs
     # =========================================================
     latent_fp32, pose_fp32, pos_embeds, neg_embeds = prepare_inputs(
         latent_tile, pose_resized, cf_embeds, device
     )
-
     # =========================================================
     # 3️⃣ Timestep
     # =========================================================
@@ -355,8 +308,6 @@ def controlnet_tile_fn(
 def gaussian_blur_tensor(x, kernel_size=3, sigma=1.0):
     # x: [B,C,H,W]
     B, C, H, W = x.shape
-    import math
-    import torch.nn.functional as F
 
     # Générer un kernel 1D
     def gauss1d(k, sigma):
@@ -653,9 +604,7 @@ def debug_pose_visual(pose_tensor, frame_counter, cfg=None, title="Pose Debug"):
     plt.close()
 
 
-import torch
-import numpy as np
-import cv2
+#------------- JSON TO POSE SEQUENCE --------------------
 
 def convert_json_to_pose_sequence(anim_data, H=512, W=512,
                                   device="cuda", dtype=torch.float16,
@@ -809,63 +758,6 @@ def convert_json_to_pose_sequence_debug(anim_data, H=512, W=512, original_w=512,
     return pose_sequence
 
 
-def apply_controlnet_openpose_step_safe_cpu(
-    latents,
-    timestep,
-    unet,
-    controlnet,
-    scheduler,
-    pose_image,
-    pos_embeds,
-    neg_embeds,
-    guidance_scale,
-    controlnet_scale=0.25,
-    device="cuda",
-    dtype=torch.float16,
-    debug=False
-):
-    """
-    Wrapper sécurisé pour apply_controlnet_openpose_step
-    - gère CPU/GPU
-    - corrige dtype
-    - convertit timestep en long pour scheduler
-    """
-    # --- CPU float32 pour ControlNet ---
-    latents_cpu = latents.to("cpu", dtype=torch.float32)
-    unet_cpu = unet.to("cpu", dtype=torch.float32)
-    controlnet_cpu = controlnet.to("cpu", dtype=torch.float32)
-    pose_cpu = pose_image.to("cpu", dtype=torch.float32)
-    pos_embeds_cpu = pos_embeds.to("cpu", dtype=torch.float32)
-    neg_embeds_cpu = neg_embeds.to("cpu", dtype=torch.float32)
-
-    # --- Préparer timestep ---
-    if timestep.ndim == 0:
-        timestep = timestep.unsqueeze(0)
-    batch_size = latents_cpu.shape[0]
-    timestep = timestep.repeat(batch_size).to(torch.long).to("cpu")
-
-    # --- Appel ControlNet OpenPose ---
-    latents_cpu = apply_controlnet_openpose_step(
-        latents=latents_cpu,
-        t=timestep,
-        unet=unet_cpu,
-        controlnet=controlnet_cpu,
-        scheduler=scheduler,
-        pose_image=pose_cpu,
-        pos_embeds=pos_embeds_cpu,
-        neg_embeds=neg_embeds_cpu,
-        guidance_scale=guidance_scale,
-        controlnet_scale=controlnet_scale,
-        device="cpu",
-        dtype=torch.float32,
-        debug=debug
-    )
-
-    # --- Retour sur GPU et dtype final ---
-    latents_out = latents_cpu.to(device, dtype=dtype)
-    unet.to(device, dtype=dtype)
-
-    return latents_out
 
 def build_control_latent_debug(input_pil, vae, device="cuda", latent_scale=0.18215):
     import torch
@@ -1007,190 +899,6 @@ def match_latent_size(latents_main, *tensors):
             t = F.interpolate(t, size=latents_main.shape[2:], mode='bilinear', align_corners=False)
         matched.append(t)
     return matched if len(matched) > 1 else matched[0]
-
-
-# ****************************** A TESTER ********************************
-
-def apply_openpose_tilewise_good(
-    latents,
-    pose,
-    apply_fn,
-    block_size=64,
-    overlap=32,
-    device='cuda',
-    debug=False,
-    debug_dir=None,
-    frame_idx=0,
-    full_res=(1024, 512)  # résolution originale pour l'impact map
-):
-    import torch
-    import torch.nn.functional as F
-    import os
-    import numpy as np
-    from PIL import Image
-
-    B, C_lat, H_lat, W_lat = latents.shape
-
-    # 🔹 Redimensionner le pose à la résolution des latents et clamp
-    pose_resized = F.interpolate(
-        pose, size=(H_lat, W_lat),
-        mode='bilinear', align_corners=False
-    ).clamp(0.0, 1.0)
-
-    latents_out = latents.clone()
-
-    # 🔹 DEBUG MAP (impact spatial)
-    if debug:
-        impact_map = torch.zeros((H_lat, W_lat), device=device)
-
-    stride = block_size - overlap
-    tile_id = 0
-
-    for i in range(0, H_lat, stride):
-        for j in range(0, W_lat, stride):
-
-            i_end = min(i + block_size, H_lat)
-            j_end = min(j + block_size, W_lat)
-
-            i_start = max(0, i_end - block_size)
-            j_start = max(0, j_end - block_size)
-
-            latent_tile = latents[:, :, i_start:i_end, j_start:j_end].to(device=device, dtype=torch.float16)
-            tile_coords = (j_start, i_start, j_end, i_end)
-
-            # 🔹 APPLY avec fallback en cas de crash
-            try:
-                latent_tile_processed = apply_fn(latent_tile, tile_coords)
-                latent_tile_processed = latent_tile_processed.clamp(-5.0, 5.0)
-            except Exception as e:
-                print(f"[WARNING] Tile {tile_id} ({i_start}:{i_end},{j_start}:{j_end}) failed: {e}")
-                traceback.print_exc()
-
-                latent_tile_processed = latent_tile  # fallback
-
-            # 🔹 DEBUG METRICS
-            if debug:
-                diff_map = (latent_tile_processed - latent_tile).abs().mean(dim=1)
-                impact_map[i_start:i_end, j_start:j_end] += diff_map.squeeze(0)
-
-                diff_mean = diff_map.mean().item()
-                min_val = latent_tile_processed.min().item()
-                max_val = latent_tile_processed.max().item()
-                print(f"[TILE {tile_id}] ({i_start}:{i_end},{j_start}:{j_end}) "
-                      f"diff={diff_mean:.6f} min={min_val:.4f} max={max_val:.4f}")
-
-            # 🔹 BLEND au lieu d'overwrite
-            latents_out[:, :, i_start:i_end, j_start:j_end] = (
-                0.7 * latents_out[:, :, i_start:i_end, j_start:j_end] +
-                0.3 * latent_tile_processed
-            )
-
-            tile_id += 1
-
-    # 🔹 VISUAL DEBUG GLOBAL
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-
-        # 🔹 Upsample à la résolution originale
-        impact_map_full = F.interpolate(
-            impact_map.unsqueeze(0).unsqueeze(0),
-            size=full_res,
-            mode='bilinear',
-            align_corners=False
-        ).squeeze()
-
-        # 🔹 Lissage pour réduire le bruit
-        impact_map_full = gaussian_blur_tensor(impact_map_full, kernel_size=5, sigma=1.0)
-
-        # 🔹 Normalisation pour visualisation
-        impact_np = impact_map_full.detach().cpu().numpy()
-        impact_np = impact_np - impact_np.min()
-        if impact_np.max() > 0:
-            impact_np = impact_np / impact_np.max()
-        impact_img = (impact_np * 255).astype(np.uint8)
-        impact_img = Image.fromarray(impact_img)
-
-        impact_img.save(os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png"))
-        print(f"[DEBUG] Impact map saved")
-
-    return latents_out
-
-
-
-def apply_controlnet_openpose_step_safe(
-    latents,
-    t,
-    unet,
-    controlnet,
-    scheduler,
-    pose_image,
-    pos_embeds,
-    neg_embeds=None,
-    guidance_scale=5.0,
-    controlnet_scale=0.7,
-    device="cuda",
-    dtype=torch.float16,
-    debug=False
-):
-    # 🔹 Déplacement sur device / dtype
-    latents = latents.to(device=device, dtype=dtype)
-    pose_image = pose_image.to(device=device, dtype=dtype)
-
-    # 🔹 Préparer batch pour classifier-free guidance
-    if neg_embeds is not None:
-        latent_model_input = torch.cat([latents] * 2)
-        encoder_states = torch.cat([neg_embeds, pos_embeds])
-        pose_input = torch.cat([pose_image] * 2)
-    else:
-        latent_model_input = latents
-        encoder_states = pos_embeds
-        pose_input = pose_image
-
-    # 🔹 Scheduler scale
-    latent_model_input = scheduler.scale_model_input(latent_model_input, t)
-
-    # 🔹 ControlNet
-    down_samples, mid_sample = controlnet(
-        latent_model_input,
-        t,
-        encoder_hidden_states=encoder_states,
-        controlnet_cond=pose_input,
-        return_dict=False
-    )
-
-    # 🔹 Safe normalization des résidus ControlNet
-    down_samples = [d / (d.abs().mean() + 1e-6) for d in down_samples]
-    mid_sample = mid_sample / (mid_sample.abs().mean() + 1e-6)
-
-    # 🔹 UNet avec ControlNet
-    noise_pred = unet(
-        latent_model_input,
-        t,
-        encoder_hidden_states=encoder_states,
-        down_block_additional_residuals=[d * controlnet_scale for d in down_samples],
-        mid_block_additional_residual=mid_sample * controlnet_scale
-    ).sample
-
-    # 🔹 Classifier-Free Guidance
-    if neg_embeds is not None:
-        noise_uncond, noise_text = noise_pred.chunk(2)
-        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
-
-    # 🔹 Scheduler step avec batch safe
-    latents_input = torch.cat([latents] * 2) if neg_embeds is not None else latents
-    latents = scheduler.step(noise_pred, t, latents_input).prev_sample
-
-    # 🔹 Récupérer batch original si CFG
-    if neg_embeds is not None:
-        latents = latents.chunk(2)[0]
-
-    # 🔹 Clamp final pour sécurité
-    latents = torch.clamp(latents, -1.0, 1.0)
-
-    if debug:
-        print(f"[ControlNet SAFE] t={t}, latents min/max: {latents.min().item():.3f}/{latents.max().item():.3f}")
-
-    return latents
 
 
 def apply_controlnet_openpose_step(
@@ -1634,142 +1342,6 @@ def apply_controlnet_openpose_step_ultrasafe(
 
     return latents
 
-def apply_openpose_tilewise_good(
-    latents,
-    pose,
-    apply_fn,
-    block_size=64,
-    overlap=32,
-    device='cuda',
-    debug=False,
-    debug_dir=None,
-    frame_idx=0,
-    full_res=(1024, 512),
-    scale=8  # 🔹 nouveau paramètre scale
-):
-    import torch
-    import torch.nn.functional as F
-    import os
-    import numpy as np
-    from PIL import Image
-
-    B, C, H, W = latents.shape
-    stride = block_size - overlap
-
-    # =========================================================
-    # 🔹 GAUSSIAN WEIGHT MASK (clé du rendu propre)
-    # =========================================================
-    def make_weight_mask(size):
-        coords = torch.linspace(-1, 1, size, device=device)
-        yy, xx = torch.meshgrid(coords, coords, indexing='ij')
-        dist = torch.sqrt(xx**2 + yy**2)
-        sigma = 0.5
-        mask = torch.exp(-(dist**2) / (2 * sigma**2))
-        return mask  # [H, W]
-
-    weight_mask_full = make_weight_mask(block_size)
-
-    # =========================================================
-    # 🔹 ACCUMULATION BUFFERS
-    # =========================================================
-    latents_accum = torch.zeros_like(latents, device=device)
-    weight_accum = torch.zeros((1, 1, H, W), device=device)
-
-    if debug:
-        impact_map = torch.zeros((H, W), device=device)
-
-    tiles = []
-
-    # =========================================================
-    # 🔹 TILE GENERATION
-    # =========================================================
-    for i in range(0, H, stride):
-        for j in range(0, W, stride):
-            i_start = i
-            j_start = j
-            i_end = i + block_size
-            j_end = j + block_size
-
-            if i_end > H:
-                i_end = H
-                i_start = max(0, H - block_size)
-            if j_end > W:
-                j_end = W
-                j_start = max(0, W - block_size)
-            if i_end <= i_start or j_end <= j_start:
-                continue
-            tiles.append((i_start, i_end, j_start, j_end))
-
-    tiles = list(set(tiles))
-
-    # =========================================================
-    # 🔹 PROCESS TILES
-    # =========================================================
-    for tile_id, (i_start, i_end, j_start, j_end) in enumerate(tiles):
-
-        latent_tile = latents[:, :, i_start:i_end, j_start:j_end].to(device)
-
-        # 🔹 scale passé à apply_fn
-        tile_coords = (j_start, i_start, j_end, i_end)
-        try:
-            latent_tile_processed = apply_fn(latent_tile, tile_coords)
-        except Exception as e:
-            print(f"[WARNING] Tile {tile_id} failed: {e}")
-            traceback.print_exc()
-            latent_tile_processed = latent_tile
-
-        # =====================================================
-        # 🔹 WEIGHT MASK ADAPTATION (bord)
-        # =====================================================
-        h = i_end - i_start
-        w = j_end - j_start
-        weight_mask = weight_mask_full[:h, :w].unsqueeze(0).unsqueeze(0)
-
-        # =====================================================
-        # 🔹 ACCUMULATION
-        # =====================================================
-        latents_accum[:, :, i_start:i_end, j_start:j_end] += latent_tile_processed * weight_mask
-        weight_accum[:, :, i_start:i_end, j_start:j_end] += weight_mask
-
-        if debug:
-            diff = (latent_tile_processed - latent_tile).abs().mean().item()
-            impact_map[i_start:i_end, j_start:j_end] += diff
-
-    # =========================================================
-    # 🔹 NORMALISATION FINALE
-    # =========================================================
-    latents_out = latents_accum / (weight_accum + 1e-8)
-
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-        impact_map_full = F.interpolate(
-            impact_map.unsqueeze(0).unsqueeze(0),
-            size=full_res,
-            mode='bilinear',
-            align_corners=False
-        ).squeeze()
-
-        impact_np = impact_map_full.detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-
-        impact_img = (impact_np * 255).astype(np.uint8)
-        Image.fromarray(impact_img).save(
-            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
-        )
-
-    return latents_out
-
-
-
-
-import torch
-import torch.nn.functional as F
-import os
-import numpy as np
-from PIL import Image
-import traceback
 
 def apply_openpose_tilewise(
     latents,
@@ -1895,678 +1467,6 @@ import os
 from PIL import Image
 
 #--------------------------------------------------------
-# Version stable -  Tester et valide - controlnet_tile_fn
-#--------------------------------------------------------
-# Version stable -  Applique correctement les volumes
-#--------------------------------------------------------
-
-def controlnet_tile_fn_stable(
-    latent_tile,
-    pose_tile,
-    frame_counter,
-    unet,
-    controlnet,
-    scheduler,
-    cf_embeds,
-    current_guidance_scale,
-    controlnet_scale,
-    device,
-    target_dtype,
-    **kwargs
-):
-    import torch
-    import torch.nn.functional as F
-
-    B, C, H_latent, W_latent = latent_tile.shape
-    _, _, H_pose, W_pose = pose_tile.shape
-
-    # =========================================================
-    # 1️⃣ Resize intelligent (évite destruction du signal)
-    # =========================================================
-    target_h = H_latent * 8
-    target_w = W_latent * 8
-
-    if (H_pose, W_pose) != (target_h, target_w):
-        pose_resized = F.interpolate(
-            pose_tile,
-            size=(target_h, target_w),
-            mode='bilinear',
-            align_corners=False
-        )
-    else:
-        pose_resized = pose_tile
-
-    # =========================================================
-    # 2️⃣ Préparation embeddings
-    # =========================================================
-    pos_embeds, neg_embeds = cf_embeds
-
-    latent_tile_fp32 = latent_tile.to(device=device, dtype=torch.float32)
-    pose_tile_fp32 = pose_resized.to(device=device, dtype=torch.float32)
-
-    pos_embeds_fp32 = pos_embeds.to(device=device, dtype=torch.float32)
-    neg_embeds_fp32 = (
-        neg_embeds.to(device=device, dtype=torch.float32)
-        if neg_embeds is not None else None
-    )
-
-    # =========================================================
-    # 3️⃣ Scheduler timestep
-    # =========================================================
-    timesteps = scheduler.timesteps
-    t = timesteps[min(frame_counter, len(timesteps) - 1)]
-
-    # =========================================================
-    # 4️⃣ Noise injection (soft pour préserver volume)
-    # =========================================================
-    noise = torch.randn_like(latent_tile_fp32) * 0.5
-    latent_noisy = scheduler.add_noise(latent_tile_fp32, noise, t)
-    latent_noisy = torch.clamp(latent_noisy, -20, 20)
-
-    latent_model_input = scheduler.scale_model_input(latent_noisy, t)
-
-    # =========================================================
-    # 5️⃣ CFG setup
-    # =========================================================
-    if neg_embeds_fp32 is not None:
-        latent_model_input = torch.cat([latent_model_input] * 2)
-        embeds = torch.cat([neg_embeds_fp32, pos_embeds_fp32])
-    else:
-        embeds = pos_embeds_fp32
-
-    latent_model_input = latent_model_input.to(target_dtype)
-    embeds = embeds.to(target_dtype)
-    pose_tile_fp32 = pose_tile_fp32.to(target_dtype)
-
-    # =========================================================
-    # 6️⃣ ControlNet
-    # =========================================================
-    down_samples, mid_sample = controlnet(
-        latent_model_input,
-        t,
-        encoder_hidden_states=embeds,
-        controlnet_cond=pose_tile_fp32,
-        return_dict=False
-    )
-
-    # =========================================================
-    # 7️⃣ UNet
-    # =========================================================
-    noise_pred = unet(
-        latent_model_input,
-        t,
-        encoder_hidden_states=embeds,
-        down_block_additional_residuals=down_samples,
-        mid_block_additional_residual=mid_sample,
-        return_dict=False
-    )[0]
-
-    noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    # =========================================================
-    # 8️⃣ CFG merge
-    # =========================================================
-    if neg_embeds_fp32 is not None:
-        noise_uncond, noise_text = noise_pred.chunk(2)
-        noise_pred = noise_uncond + current_guidance_scale * (noise_text - noise_uncond)
-
-    # =========================================================
-    # 9️⃣ Step scheduler
-    # =========================================================
-    latents_out = scheduler.step(noise_pred, t, latent_noisy).prev_sample
-
-    # =========================================================
-    # 🔥 10️⃣ DELTA FIX (clé pour volume)
-    # =========================================================
-    delta = latents_out - latent_tile_fp32
-
-    delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
-
-    # soft clamp → évite effet "plat"
-    delta = torch.tanh(delta) * 0.15
-
-    # scaling controlnet
-    delta = delta * controlnet_scale
-
-    # =========================================================
-    # 11️⃣ Fusion finale (propre)
-    # =========================================================
-    latents_final = latent_tile_fp32 + delta
-
-    return latents_final.to(target_dtype)
-
-#-----------------------------------------
-# Version stable -  Tester et valide - v1
-#----------------------------------------
-
-def apply_openpose_tilewise_safe_TEST_GOOD(
-    latents,
-    pose,
-    apply_fn,
-    block_size=64,
-    overlap=32,
-    device='cuda',
-    debug=False,
-    debug_dir=None,
-    frame_idx=None,
-    savetile=False
-):
-    """
-    Applique un OpenPose/ControlNet sur des latents en tiles et génère une impact_map
-    à la taille finale de l'image (en tenant compte du scale de decoding, ici 4).
-    """
-    B, C, H, W = latents.shape
-    latents_out = torch.zeros_like(latents)
-    weight_map = torch.zeros_like(latents)
-
-    stride = block_size - overlap
-
-    for i in range(0, H, stride):
-        for j in range(0, W, stride):
-            i_end = min(i + block_size, H)
-            j_end = min(j + block_size, W)
-            tile_h = i_end - i
-            tile_w = j_end - j
-
-            latent_tile = latents[:, :, i:i_end, j:j_end]
-            pose_tile = pose[:, :, i:i_end, j:j_end]
-
-            pad_h = block_size - tile_h
-            pad_w = block_size - tile_w
-            if pad_h > 0 or pad_w > 0:
-                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
-                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
-
-            try:
-                latent_tile_processed = apply_fn(latent_tile, pose_tile)
-            except Exception as e:
-                if debug:
-                    print(f"[DEBUG] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
-                latent_tile_processed = latent_tile  # fallback
-            finally:
-                torch.cuda.empty_cache()
-
-            # Retirer le padding
-            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
-
-            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
-            weight_map[:, :, i:i_end, j:j_end] += 1.0
-
-            # Sauvegarde debug tile si besoin
-            if debug and savetile and debug_dir is not None:
-                os.makedirs(debug_dir, exist_ok=True)
-                tile_save_path = os.path.join(debug_dir, f"tile_{frame_idx}_{i}_{j}.png")
-                save_image((latent_tile_processed[0] + 1) / 2, tile_save_path)
-
-    # Moyenne sur les overlaps
-    weight_map[weight_map == 0] = 1.0
-    latents_out = latents_out / weight_map
-
-    # --- Impact map à la taille finale ---
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-
-        # différence moyenne sur les canaux
-        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)  # [B,1,H_latent,W_latent]
-
-        # Redimensionner selon le scale final utilisé dans decode_latents
-        final_H, final_W = H * 4, W * 4  # 🔹 scale=4
-        impact_map_full = F.interpolate(impact_map, size=(final_H, final_W), mode='bilinear', align_corners=False)
-
-        # Normalisation 0-255
-        impact_np = impact_map_full[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        impact_img = (impact_np * 255).astype(np.uint8)
-
-        Image.fromarray(impact_img).save(os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png"))
-
-    return latents_out
-
-
-#-----------------------------------------
-# Version stable -  Tester et valide
-#----------------------------------------
-
-def apply_openpose_tilewise_stable(
-    latents,
-    pose,
-    apply_fn,
-    block_size=64,
-    overlap=32,
-    device='cuda',
-    debug=False,
-    debug_dir=None,
-    frame_idx=None,
-    savetile=False
-):
-    """
-    Applique un OpenPose/ControlNet sur des latents en tiles et génère une impact_map
-    correctement alignée avec l'image full-res.
-
-    Args:
-        latents: [B,C,H,W] tensor latents
-        pose: [B,C,H_full,W_full] tensor full-res
-        apply_fn: fonction tile -> tile_processed
-        block_size: taille d'une tile
-        overlap: chevauchement entre tiles
-        debug: activer debug
-        debug_dir: dossier sauvegarde debug
-        frame_idx: index frame
-        savetile: sauvegarde tiles traitées
-    """
-    B, C, H_latent, W_latent = latents.shape
-    H_full, W_full = pose.shape[2], pose.shape[3]
-
-    latents_out = torch.zeros_like(latents)
-    weight_map = torch.zeros_like(latents)
-
-    stride = block_size - overlap
-
-    for i in range(0, H_latent, stride):
-        for j in range(0, W_latent, stride):
-            i_end = min(i + block_size, H_latent)
-            j_end = min(j + block_size, W_latent)
-            tile_h = i_end - i
-            tile_w = j_end - j
-
-            latent_tile = latents[:, :, i:i_end, j:j_end]
-            # On prend la correspondance proportionnelle dans le pose full-res
-            i_full_start = int(i * H_full / H_latent)
-            i_full_end = int(i_end * H_full / H_latent)
-            j_full_start = int(j * W_full / W_latent)
-            j_full_end = int(j_end * W_full / W_latent)
-            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
-
-            pad_h = block_size - tile_h
-            pad_w = block_size - tile_w
-            if pad_h > 0 or pad_w > 0:
-                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
-                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
-
-            try:
-                latent_tile_processed = apply_fn(latent_tile, pose_tile)
-            except Exception as e:
-                if debug:
-                    print(f"[DEBUG] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
-                latent_tile_processed = latent_tile  # fallback
-            finally:
-                torch.cuda.empty_cache()
-
-            # Retirer le padding
-            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
-
-            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
-            weight_map[:, :, i:i_end, j:j_end] += 1.0
-
-            # Sauvegarde debug tile si besoin
-            if debug and savetile and debug_dir is not None:
-                os.makedirs(debug_dir, exist_ok=True)
-                tile_save_path = os.path.join(debug_dir, f"tile_{frame_idx}_{i}_{j}.png")
-                save_image((latent_tile_processed[0] + 1) / 2, tile_save_path)
-
-    # Moyenne sur les overlaps
-    weight_map[weight_map == 0] = 1.0
-    latents_out = latents_out / weight_map
-
-    # --- Impact map à la taille finale ---
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-
-        # différence moyenne sur les canaux
-        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)  # [B,1,H_latent,W_latent]
-
-        # Redimensionnement proportionnel pour correspondre au full-res
-        impact_map_full = F.interpolate(
-            impact_map,
-            size=(H_full, W_full),
-            mode='bilinear',
-            align_corners=False
-        )
-
-        # Normalisation 0-255
-        impact_np = impact_map_full[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        impact_img = (impact_np * 255).astype(np.uint8)
-
-        Image.fromarray(impact_img).save(
-            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
-        )
-
-    return latents_out
-
-
-
-#-------------------------------------------
-
-
-import torch
-import torch.nn.functional as F
-import os
-import numpy as np
-from PIL import Image
-
-def get_tile_feather_mask_test(h, w, device, dtype):
-    """Crée un mask de feathering pour adoucir les bords de la tile"""
-    y = torch.linspace(-1, 1, steps=h, device=device, dtype=dtype).unsqueeze(1)
-    x = torch.linspace(-1, 1, steps=w, device=device, dtype=dtype).unsqueeze(0)
-    mask = (1 - x.abs()) * (1 - y.abs())
-    mask = mask.clamp(0.0, 1.0)
-    return mask.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-
-
-
-def apply_openpose_tilewise_test(
-    latents,
-    pose,
-    apply_fn,
-    block_size=64,
-    overlap=32,
-    device='cuda',
-    debug=False,
-    debug_dir=None,
-    frame_idx=None,
-    savetile=False
-):
-    """
-    Applique OpenPose/ControlNet sur des latents en tiles de manière robuste.
-    Corrige automatiquement les mismatches de taille sur les bords.
-    """
-    import torch
-    import torch.nn.functional as F
-    import os
-    from PIL import Image
-    import numpy as np
-    import traceback
-
-    B, C, H_latent, W_latent = latents.shape
-    H_full, W_full = pose.shape[2], pose.shape[3]
-
-    latents_out = torch.zeros_like(latents)
-    weight_map = torch.zeros_like(latents)
-    stride = block_size - overlap
-
-    for i in range(0, H_latent, stride):
-        for j in range(0, W_latent, stride):
-            i_end = min(i + block_size, H_latent)
-            j_end = min(j + block_size, W_latent)
-            tile_h = i_end - i
-            tile_w = j_end - j
-
-            latent_tile = latents[:, :, i:i_end, j:j_end]
-            i_full_start = int(i * H_full / H_latent)
-            i_full_end = int(i_end * H_full / H_latent)
-            j_full_start = int(j * W_full / W_latent)
-            j_full_end = int(j_end * W_full / W_latent)
-            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
-
-            # Pad si nécessaire pour que la tile soit carrée
-            pad_h = block_size - tile_h
-            pad_w = block_size - tile_w
-            if pad_h > 0 or pad_w > 0:
-                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
-                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
-
-            try:
-                latent_tile_processed = apply_fn(latent_tile, pose_tile)
-                # ⚡ REDIMENSIONNER pour correspondre exactement à tile_h, tile_w
-                latent_tile_processed = F.interpolate(
-                    latent_tile_processed, size=(tile_h, tile_w),
-                    mode='bilinear', align_corners=False
-                )
-            except Exception as e:
-                if debug:
-                    print(f"[ERROR] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
-                    traceback.print_exc()
-                latent_tile_processed = latent_tile[:, :, :tile_h, :tile_w]
-
-            # Ajouter au output avec average map
-            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
-            weight_map[:, :, i:i_end, j:j_end] += 1.0
-
-            # Sauvegarde debug tile
-            if debug and savetile and debug_dir is not None:
-                os.makedirs(debug_dir, exist_ok=True)
-                tile_save_path = os.path.join(debug_dir, f"tile_{frame_idx}_{i}_{j}.png")
-                save_image((latent_tile_processed[0] + 1) / 2, tile_save_path)
-
-    # Moyenne sur les overlaps
-    weight_map[weight_map == 0] = 1.0
-    latents_out = latents_out / weight_map
-
-    # Debug impact map full-res
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)
-        impact_map_full = F.interpolate(impact_map, size=(H_full, W_full), mode='bilinear', align_corners=False)
-        impact_np = impact_map_full[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        impact_img = (impact_np * 255).astype(np.uint8)
-        Image.fromarray(impact_img).save(os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png"))
-
-    return latents_out
-
-#-----------------------------
-
-def apply_openpose_tilewise_safe_blur(
-    latents,
-    pose,
-    apply_fn,
-    block_size=64,
-    overlap=32,
-    device='cuda',
-    debug=False,
-    debug_dir=None,
-    frame_idx=None,
-    savetile=False
-):
-    """
-    Applique un OpenPose/ControlNet sur des latents en tiles et génère une impact_map
-    correctement alignée avec l'image full-res.
-
-    Args:
-        latents: [B,C,H,W] tensor latents
-        pose: [B,C,H_full,W_full] tensor full-res
-        apply_fn: fonction tile -> tile_processed
-        block_size: taille d'une tile
-        overlap: chevauchement entre tiles
-        debug: activer debug
-        debug_dir: dossier sauvegarde debug
-        frame_idx: index frame
-        savetile: sauvegarde tiles traitées
-    """
-    B, C, H_latent, W_latent = latents.shape
-    H_full, W_full = pose.shape[2], pose.shape[3]
-
-    latents_out = torch.zeros_like(latents)
-    weight_map = torch.zeros_like(latents)
-
-    stride = block_size - overlap
-
-    for i in range(0, H_latent, stride):
-        for j in range(0, W_latent, stride):
-            i_end = min(i + block_size, H_latent)
-            j_end = min(j + block_size, W_latent)
-            tile_h = i_end - i
-            tile_w = j_end - j
-
-            latent_tile = latents[:, :, i:i_end, j:j_end]
-
-            # Correspondance proportionnelle dans le pose full-res
-            i_full_start = int(i * H_full / H_latent)
-            i_full_end = int(i_end * H_full / H_latent)
-            j_full_start = int(j * W_full / W_latent)
-            j_full_end = int(j_end * W_full / W_latent)
-            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
-
-            # Padding si bordures
-            pad_h = block_size - tile_h
-            pad_w = block_size - tile_w
-            if pad_h > 0 or pad_w > 0:
-                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
-                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
-
-            try:
-                latent_tile_processed = apply_fn(latent_tile, pose_tile)
-            except Exception as e:
-                if debug:
-                    import traceback
-                    print(f"[ERROR] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
-                    traceback.print_exc()
-                latent_tile_processed = latent_tile  # fallback
-            finally:
-                torch.cuda.empty_cache()
-
-            # Retirer padding
-            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
-
-            # Fusion tile
-            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
-            weight_map[:, :, i:i_end, j:j_end] += 1.0
-
-            # Sauvegarde debug tile si besoin
-            if debug and savetile and debug_dir is not None:
-                import os
-                os.makedirs(debug_dir, exist_ok=True)
-                tile_save_path = os.path.join(debug_dir, f"tile_{frame_idx}_{i}_{j}.png")
-                save_image((latent_tile_processed[0] + 1) / 2, tile_save_path)
-
-    # Moyenne sur les overlaps
-    weight_map[weight_map == 0] = 1.0
-    latents_out = latents_out / weight_map
-
-    # --- Réduction du bruit (post-tile) ---
-    diff = latents_out - latents
-    diff = torch.clamp(diff, -0.1, 0.1)  # limiter variations extrêmes
-    latents_out = latents + diff
-    # léger blur pour lisser les bordures de tiles
-    latents_out = F.avg_pool2d(latents_out, kernel_size=3, stride=1, padding=1)
-
-    # --- Impact map pour debug ---
-    if debug and debug_dir is not None:
-        import os
-        import numpy as np
-        from PIL import Image
-        os.makedirs(debug_dir, exist_ok=True)
-
-        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)  # [B,1,H_latent,W_latent]
-        impact_map_full = F.interpolate(
-            impact_map,
-            size=(H_full, W_full),
-            mode='bilinear',
-            align_corners=False
-        )
-
-        impact_np = impact_map_full[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        impact_img = (impact_np * 255).astype(np.uint8)
-        Image.fromarray(impact_img).save(
-            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
-        )
-
-    return latents_out
-
-def apply_openpose_tilewise_safe_v2(
-    latents,
-    pose,
-    apply_fn,
-    block_size=64,
-    overlap=32,
-    device='cuda',
-    debug=False,
-    debug_dir=None,
-    frame_idx=None,
-    savetile=False
-):
-    """
-    Version allégée : applique OpenPose/ControlNet en tiles avec clamp post-tile
-    pour réduire le bruit, sans blur.
-    """
-    B, C, H_latent, W_latent = latents.shape
-    H_full, W_full = pose.shape[2], pose.shape[3]
-
-    latents_out = torch.zeros_like(latents)
-    weight_map = torch.zeros_like(latents)
-
-    stride = block_size - overlap
-
-    for i in range(0, H_latent, stride):
-        for j in range(0, W_latent, stride):
-            i_end = min(i + block_size, H_latent)
-            j_end = min(j + block_size, W_latent)
-            tile_h = i_end - i
-            tile_w = j_end - j
-
-            latent_tile = latents[:, :, i:i_end, j:j_end]
-            i_full_start = int(i * H_full / H_latent)
-            i_full_end = int(i_end * H_full / H_latent)
-            j_full_start = int(j * W_full / W_latent)
-            j_full_end = int(j_end * W_full / W_latent)
-            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
-
-            pad_h = block_size - tile_h
-            pad_w = block_size - tile_w
-            if pad_h > 0 or pad_w > 0:
-                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
-                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
-
-            try:
-                latent_tile_processed = apply_fn(latent_tile, pose_tile)
-            except Exception as e:
-                if debug:
-                    import traceback
-                    print(f"[ERROR] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
-                    traceback.print_exc()
-                latent_tile_processed = latent_tile
-            finally:
-                torch.cuda.empty_cache()
-
-            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
-            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
-            weight_map[:, :, i:i_end, j:j_end] += 1.0
-
-            if debug and savetile and debug_dir is not None:
-                import os
-                os.makedirs(debug_dir, exist_ok=True)
-                tile_save_path = os.path.join(debug_dir, f"tile_{frame_idx}_{i}_{j}.png")
-                save_image((latent_tile_processed[0] + 1) / 2, tile_save_path)
-
-    weight_map[weight_map == 0] = 1.0
-    latents_out = latents_out / weight_map
-
-    # --- Reduction de bruit simple ---
-    latents_out = torch.clamp(latents_out, -1.2, 1.2)  # limiter les valeurs extrêmes
-
-    # --- Impact map debug ---
-    if debug and debug_dir is not None:
-        import os, numpy as np
-        from PIL import Image
-        os.makedirs(debug_dir, exist_ok=True)
-
-        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)
-        impact_map_full = F.interpolate(impact_map, size=(H_full, W_full),
-                                        mode='bilinear', align_corners=False)
-        impact_np = impact_map_full[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        impact_img = (impact_np * 255).astype(np.uint8)
-        Image.fromarray(impact_img).save(
-            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
-        )
-
-    return latents_out
-
-
-import torch
-import torch.nn.functional as F
 
 def gaussian_blur_tensor2(x, kernel_size=3, sigma=0.5):
     """Applique un blur gaussien 2D sur un tensor [B,C,H,W]"""
@@ -2613,104 +1513,6 @@ def unsharp_mask_adaptive(x, blur_kernel=3, blur_sigma=0.5, strength=1.0):
     return x + detail * adaptive_strength
 
 
-def apply_openpose_tilewise_safe_good(
-    latents,
-    pose,
-    apply_fn,
-    past_latents=None,       # liste des latents précédents [frame-1, frame-2...]
-    temporal_smoothing=0.3,  # poids du lissage sur les frames précédentes
-    block_size=64,
-    overlap=32,
-    device='cuda',
-    debug=False,
-    debug_dir=None,
-    frame_idx=None,
-    savetile=False
-):
-    """
-    Tile-wise OpenPose avec post-traitement + lissage temporel pour réduire bruit.
-    past_latents: liste de tensors [B,C,H,W] des frames précédentes
-    temporal_smoothing: poids du lissage temporel (0.0 = pas de lissage)
-    """
-    B, C, H_latent, W_latent = latents.shape
-    H_full, W_full = pose.shape[2], pose.shape[3]
-
-    latents_out = torch.zeros_like(latents)
-    weight_map = torch.zeros_like(latents)
-
-    stride = block_size - overlap
-
-    # 1️⃣ Tile-wise processing
-    for i in range(0, H_latent, stride):
-        for j in range(0, W_latent, stride):
-            i_end = min(i + block_size, H_latent)
-            j_end = min(j + block_size, W_latent)
-            tile_h = i_end - i
-            tile_w = j_end - j
-
-            latent_tile = latents[:, :, i:i_end, j:j_end]
-            i_full_start = int(i * H_full / H_latent)
-            i_full_end = int(i_end * H_full / H_latent)
-            j_full_start = int(j * W_full / W_latent)
-            j_full_end = int(j_end * W_full / W_latent)
-            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
-
-            pad_h = block_size - tile_h
-            pad_w = block_size - tile_w
-            if pad_h > 0 or pad_w > 0:
-                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
-                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
-
-            try:
-                latent_tile_processed = apply_fn(latent_tile, pose_tile)
-            except Exception as e:
-                if debug:
-                    print(f"[DEBUG] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
-                latent_tile_processed = latent_tile
-            finally:
-                torch.cuda.empty_cache()
-
-            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
-            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
-            weight_map[:, :, i:i_end, j:j_end] += 1.0
-
-    # 2️⃣ Moyenne sur les overlaps
-    weight_map[weight_map == 0] = 1.0
-    latents_out = latents_out / weight_map
-
-    # 3️⃣ Post-traitement spatial
-    latents_out = gaussian_blur_tensor2(latents_out, kernel_size=3, sigma=0.5)
-    latents_out = unsharp_mask(latents_out, blur_kernel=3, blur_sigma=0.5, strength=0.8)
-    min_val, max_val = latents.min().item() - 0.3, latents.max().item() + 0.3
-    latents_out = torch.clamp(latents_out, min_val, max_val)
-    delta = latents_out - latents
-    latents_out = latents + torch.sigmoid(delta*2.0) * delta
-
-    # 4️⃣ Lissage temporel
-    if past_latents and temporal_smoothing > 0.0:
-        smoothed = sum(past_latents[-3:] + [latents_out]) / (len(past_latents[-3:]) + 1)
-        latents_out = latents_out * (1 - temporal_smoothing) + smoothed * temporal_smoothing
-
-    # 5️⃣ Impact map debug
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)
-        impact_map_full = F.interpolate(
-            impact_map,
-            size=(H_full, W_full),
-            mode='bilinear',
-            align_corners=False
-        )
-        impact_np = impact_map_full[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        impact_img = (impact_np * 255).astype(np.uint8)
-        Image.fromarray(impact_img).save(
-            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
-        )
-
-    return latents_out
 
 def apply_openpose_tilewise_safe(
     latents,
@@ -2861,51 +1663,9 @@ def apply_breathing_latents(
 # ---------------------------
 # Masque haut du corps basé sur keypoints OpenPose
 # ---------------------------
-import torch
-import torch.nn.functional as F
-import math
-import cv2
-import numpy as np
-
 # ---------------------------
 # 1️⃣ Build upper body mask from OpenPose keypoints
 # ---------------------------
-def build_upper_body_mask_v1(keypoints, latent_shape, margin=0.15, device='cpu'):
-    """
-    keypoints : tensor [B,25,3] OpenPose COCO format (x, y, confidence)
-    latent_shape : (B, C, H, W)
-    margin : proportion de l'image pour étendre le masque autour du point
-    """
-    B, C, H, W = latent_shape
-    mask = torch.zeros((B, 1, H, W), dtype=torch.float32, device=keypoints.device)
-
-    # indices COCO OpenPose pour haut du corps
-    upper_body_joints = [0, 1, 2, 5, 6, 7, 8, 11, 12]  # nez, yeux, épaules, coudes, hanches
-
-    for b in range(B):
-        for joint_idx in upper_body_joints:
-            x, y, conf = keypoints[b, joint_idx]
-            if conf < 0.1:
-                continue
-            xi = int(x * W)
-            yi = int(y * H)
-            dx = max(1, int(W * margin))
-            dy = max(1, int(H * margin))
-            x0, x1 = max(0, xi - dx), min(W, xi + dx)
-            y0, y1 = max(0, yi - dy), min(H, yi + dy)
-            mask[b, 0, y0:y1, x0:x1] = 1.0
-
-    # lissage pour transitions douces
-    #mask = F.gaussian_blur(mask, kernel_size=(7,7))
-    mask_np = mask.cpu().numpy()[0]  # [H,W]
-    mask_np = cv2.GaussianBlur(mask_np, (7,7), sigmaX=1.0)
-    mask = torch.tensor(mask_np, device=device).unsqueeze(0)  # back to tensor
-
-    return mask
-
-import torch
-
-
 def build_upper_body_mask(keypoints, latent_shape, margin=0.05, device='cpu', debug_dir=None, frame_counter=None):
     """
     Crée un mask pour le haut du corps (torse, bras, épaules, tête) à partir des keypoints OpenPose.
@@ -3004,159 +1764,6 @@ def apply_upper_body_motion(latents, previous_latent, latents_before_openpose, l
 
 #------extract_keypoints_from_pose
 
-import torch
-import matplotlib.pyplot as plt
-import cv2
-import numpy as np
-
-def extract_keypoints_from_pose_v1(pose_full_image, debug=False, debug_dir=None, frame_counter=None):
-
-    B, C, H, W = pose_full_image.shape
-    num_joints = 18  # Exemple COCO
-
-    keypoints_list = []
-
-    for b in range(B):
-        # --- Conversion tensor -> HWC numpy ---
-        pose_img = pose_full_image[b].permute(1, 2, 0).cpu().numpy()  # HWC
-        pose_img = (pose_img + 1.0) / 2.0  # [-1,1] -> [0,1]
-        pose_img = (pose_img * 255).astype(np.uint8)
-
-        # --- Simulation extraction keypoints ---
-        kp_frame = []
-        for i in range(num_joints):
-            x = W * (0.1 + 0.8 * np.random.rand())
-            y = H * (0.1 + 0.8 * np.random.rand())
-            conf = np.random.rand()  # confiance
-            kp_frame.append([x, y, conf])
-        kp_frame = np.array(kp_frame)
-        keypoints_list.append(kp_frame)
-
-        # --- Debug visuel sauvegardé ---
-        if debug and debug_dir is not None and frame_counter is not None:
-            vis = pose_img.copy()
-            for (x, y, c) in kp_frame:
-                if c > 0.1:
-                    cv2.circle(vis, (int(x), int(y)), 5, (0, 255, 0), -1)
-            save_path = f"{debug_dir}/keypoints_{frame_counter:05d}_b{b}.png"
-            cv2.imwrite(save_path, vis)
-            print(f"[DEBUG] Keypoints frame {frame_counter}, batch {b} sauvegardés : {save_path}")
-
-    # --- Conversion finale en tensor ---
-    keypoints_tensor = torch.tensor(keypoints_list, dtype=torch.float32, device=pose_full_image.device)  # [B, num_joints, 3]
-    return keypoints_tensor
-
-
-def extract_keypoints_from_pose_test(pose_full_image, debug=False, debug_dir=None, frame_counter=None):
-    """
-    Extrait des keypoints OpenPose depuis une image de pose et propose un debug visuel.
-
-    Args:
-        pose_full_image (torch.Tensor): BCHW, valeurs normalisées [-1,1] ou [0,1].
-        debug (bool): si True, sauvegarde la visualisation des keypoints.
-        debug_dir (str): dossier pour sauvegarder l'image de debug.
-        frame_counter (int): index de la frame pour nom de fichier.
-
-    Returns:
-        torch.Tensor: keypoints, shape [B, num_joints, 3] (x, y, confidence)
-    """
-
-    # --- Conversion tensor -> HWC numpy ---
-    B, C, H, W = pose_full_image.shape
-    keypoints_list = []
-
-    for b in range(B):
-        pose_img = pose_full_image[b].permute(1,2,0).cpu().numpy()  # HWC
-        pose_img = (pose_img + 1.0) / 2.0  # [-1,1] -> [0,1]
-        pose_img = (pose_img * 255).astype(np.uint8)
-
-        # --- Hypothétique extraction keypoints ---
-        num_joints = 18  # exemple COCO
-        keypoints = []
-        for i in range(num_joints):
-            x = W * (0.1 + 0.8 * np.random.rand())
-            y = H * (0.1 + 0.8 * np.random.rand())
-            conf = np.random.rand()
-            keypoints.append([x, y, conf])
-        keypoints_list.append(np.array(keypoints))  # [num_joints, 3]
-
-        # --- debug visuel ---
-        if debug and debug_dir is not None and frame_counter is not None:
-            vis = pose_img.copy()
-            for (x, y, c) in keypoints_list[-1]:
-                if c > 0.1:
-                    cv2.circle(vis, (int(x), int(y)), 5, (0,255,0), -1)
-            save_path = f"{debug_dir}/keypoints_{frame_counter:05d}_b{b}.png"
-            cv2.imwrite(save_path, vis)
-            print(f"[DEBUG] Keypoints frame {frame_counter}, batch {b} sauvegardés : {save_path}")
-
-    # --- conversion en tensor batch ---
-    keypoints_np = np.array(keypoints_list)  # shape [B, num_joints, 3]
-    keypoints_tensor = torch.tensor(keypoints_np, dtype=torch.float32, device=pose_full_image.device)
-
-    return keypoints_tensor
-
-
-def extract_keypoints_from_pose_expert_test(pose_full_image, debug=False, debug_dir=None, frame_counter=None):
-    """
-    Extraction des keypoints OpenPose depuis un pose map BCHW.
-    Chaque canal de pose_full_image correspond à une articulation (COCO / OpenPose).
-
-    Args:
-        pose_full_image (torch.Tensor): BCHW, valeurs normalisées [-1,1] ou [0,1].
-        debug (bool): si True, sauvegarde une visualisation.
-        debug_dir (str): dossier pour sauvegarder l'image de debug.
-        frame_counter (int): index de la frame pour nom de fichier.
-
-    Returns:
-        torch.Tensor: keypoints, shape [B, num_joints, 3] (x, y, confidence)
-    """
-    B, C, H, W = pose_full_image.shape
-    device = pose_full_image.device
-    keypoints_list = []
-
-    # --- Préparer image pour debug ---
-    pose_img = (pose_full_image[0].permute(1,2,0).cpu().numpy() + 1) / 2.0  # HWC, [0,1]
-    pose_img = (pose_img * 255).astype(np.uint8)
-    pose_img = np.ascontiguousarray(pose_img)  # ✅ rendre contigu pour OpenCV
-    if pose_img.shape[2] > 3:
-        pose_img = pose_img[:, :, :3]
-
-    for b in range(B):
-        keypoints = []
-        for c in range(C):  # chaque articulation / canal
-            heatmap = pose_full_image[b, c]
-            max_val = heatmap.max()
-            yx = torch.nonzero(heatmap == max_val, as_tuple=False)
-            if yx.numel() == 0:
-                x = 0.5
-                y = 0.5
-                conf = 0.0
-            else:
-                y_idx, x_idx = yx[0].float()  # premier max
-                x = x_idx / W
-                y = y_idx / H
-                conf = max_val.clamp(0.0, 1.0)
-            keypoints.append([x.item(), y.item(), conf.item()])
-
-            # debug visuel
-            if debug and b == 0:
-                if conf > 0.05:
-                    cv2.circle(pose_img, (int(x*W), int(y*H)), 5, (0,255,0), -1)
-
-        keypoints_list.append(keypoints)
-
-    keypoints_tensor = torch.tensor(keypoints_list, dtype=torch.float32, device=device)  # [B, num_joints, 3]
-
-    # --- Debug save ---
-    if debug and debug_dir is not None and frame_counter is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-        save_path = f"{debug_dir}/keypoints_{frame_counter:05d}_b0.png"
-        cv2.imwrite(save_path, cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
-        print(f"[DEBUG] Keypoints frame {frame_counter}, batch 0 sauvegardés : {save_path}")
-
-    return keypoints_tensor
-
 def extract_keypoints_from_pose(
     pose_full_image,
     device="cuda",
@@ -3249,7 +1856,255 @@ def extract_keypoints_from_pose(
 
     return keypoints_tensor
 
+#---------------------------------------------------------
 
+#def apply_pose_driven_motion( latents, previous_latent, latents_before_openpose, latents_after_openpose, keypoints, prev_keypoints=None, frame_counter=0, device="cuda", breathing=True, ):
+    """
+    Motion basé sur keypoints OpenPose (épaule / torse / tête)
+    Batch-safe et broadcast corrigé.
+    """
+def apply_pose_driven_motion(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    """
+    Motion basé sur keypoints OpenPose (épaule / torse / tête)
+    Batch-safe, debug complet et impact map.
+    """
+    import torch
+    import torch.nn.functional as F
+    import math
+    import os
+    import numpy as np
+    from PIL import Image
+
+    # 🔹 Shapes
+    B, C, H, W = latents.shape
+    device = latents.device
+
+    # 🔹 Respiration
+    if breathing and previous_latent is not None:
+        breath = 0.03 * math.sin(frame_counter * 0.15)
+        latents = latents * (1.0 + breath)
+
+    latents_in = latents.clone()
+
+    # 🔹 Extraction points clés
+    def get_point(kp_tensor, idx):
+        return kp_tensor[:, idx, :2]  # [B,2]
+
+    r_shoulder = get_point(keypoints, 2)
+    l_shoulder = get_point(keypoints, 5)
+    torso_center = (r_shoulder + l_shoulder) * 0.5
+
+    if prev_keypoints is not None:
+        prev_r_shoulder = get_point(prev_keypoints, 2)
+        prev_l_shoulder = get_point(prev_keypoints, 5)
+        prev_torso = (prev_r_shoulder + prev_l_shoulder) * 0.5
+        delta_torso = torso_center - prev_torso  # [B,2]
+    else:
+        delta_torso = torch.zeros(B, 2, device=device)
+
+    # 🔹 Conversion → latent space
+    dx = delta_torso[:, 0].reshape(B,1,1) * W
+    dy = delta_torso[:, 1].reshape(B,1,1) * H
+
+    # 🔹 Grid warp
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)  # [1,H,W,2]
+    delta_grid = torch.cat([dx*2/W, dy*2/H], dim=-1).unsqueeze(2)  # [B,1,1,2]
+    grid = grid + delta_grid  # broadcast → [B,H,W,2]
+
+    latents_warped = F.grid_sample(
+        latents,
+        grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True
+    )
+
+    # 🔹 Masque haut du corps
+    mask = build_upper_body_mask(keypoints, latents.shape, device=device)
+
+    # 🔹 Fusion motion
+    motion_strength = 0.6
+    latents = (1 - mask * motion_strength) * latents + (mask * motion_strength) * latents_warped
+
+    # 🔹 Delta OpenPose
+    if latents_before_openpose is not None and latents_after_openpose is not None:
+        delta = latents_after_openpose - latents_before_openpose
+        delta = torch.clamp(delta, -0.15, 0.15)
+        latents = latents + delta * mask * 0.5
+
+    # 🔹 Stabilisation
+    latents = torch.nan_to_num(latents)
+    latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
+    latents = latents / (latents_max + 1e-6)
+    latents = latents * 0.95
+    latents = torch.clamp(latents, -1.2, 1.2)
+
+    # 🔹 DEBUG
+    if debug:
+        print("===== DEBUG apply_pose_driven_motion =====")
+        print(f"Latents shape: {latents.shape}")
+        print(f"Keypoints:\n{keypoints}")
+        if prev_keypoints is not None:
+            print(f"Prev keypoints:\n{prev_keypoints}")
+        print(f"Delta torso:\n{delta_torso}")
+        print(f"dx shape: {dx.shape}, dy shape: {dy.shape}")
+        print(f"dx min/max: {dx.min().item()}/{dx.max().item()}")
+        print(f"dy min/max: {dy.min().item()}/{dy.max().item()}")
+        print(f"Grid x min/max: {grid[...,0].min().item()}/{grid[...,0].max().item()}")
+        print(f"Grid y min/max: {grid[...,1].min().item()}/{grid[...,1].max().item()}")
+
+    # 🔹 Impact map debug
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)  # [B,1,H,W]
+        impact_np = impact_map[0,0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        impact_img = (impact_np*255).astype(np.uint8)
+        Image.fromarray(impact_img).save(
+            os.path.join(debug_dir, f"impact_map_{frame_counter:05d}.png")
+        )
+
+    return latents
+#------------------------------------------------------------------
+def update_pose_sequence_from_keypoints_batch(
+    pose_seq,
+    keypoints_tensor,
+    frame_idx,
+    prev_keypoints=None,
+    alpha=0.5,
+    add_motion=True,
+    debug=True
+):
+    """
+    Met à jour une séquence de poses batchée à partir des keypoints OpenPose.
+    Optimisé pour des batchs >1, avec logs intermédiaires et nettoyage GPU.
+
+    Args:
+        pose_seq: [B, C, H, W] tensor, séquence d'images de pose
+        keypoints_tensor: [B,18,3] ou [B,3,18]
+        frame_idx: index de la frame courante
+        prev_keypoints: keypoints de la frame précédente
+        alpha: interpolation factor pour smooth transition
+        add_motion: ajoute un micro-mouvement sinusoidal
+        debug: logs détaillés
+    Returns:
+        keypoints mis à jour [B,18,3] tensor
+    """
+    import torch, cv2, numpy as np
+    B, C, H, W = pose_seq.shape
+    device = pose_seq.device
+
+    # ---- 0️⃣ Convert to numpy ----
+    keypoints = keypoints_tensor.detach().cpu().numpy()
+
+    # ---- 0.1️⃣ Handle OpenPose shape [B,3,18] ----
+    if keypoints.shape[1] == 3 and keypoints.shape[2] == 18:
+        keypoints = keypoints.transpose(0,2,1)
+
+    # ---- 0.2️⃣ Fix batch mismatch ----
+    if keypoints.shape[0] != B:
+        keypoints = np.repeat(keypoints, B, axis=0)
+        if debug:
+            print(f"[DEBUG] Frame {frame_idx} - Batch mismatch fixed: repeated keypoints to match B={B}")
+
+    # ---- 1️⃣ Interpolation with previous keypoints ----
+    if prev_keypoints is not None:
+        prev_kp = prev_keypoints.detach().cpu().numpy()
+        if prev_kp.shape[0] != B:
+            prev_kp = np.repeat(prev_kp, B, axis=0)
+        if prev_kp.shape[1] == 3 and prev_kp.shape[2] == 18:
+            prev_kp = prev_kp.transpose(0,2,1)
+
+        conf = keypoints[..., 2:3]
+        prev_conf = prev_kp[..., 2:3]
+        mask = (conf + prev_conf) > 1e-6
+        mask_xy = np.repeat(mask, 2, axis=2)
+        combined = (alpha * keypoints[..., :2] * conf + (1 - alpha) * prev_kp[..., :2] * prev_conf) / (conf + prev_conf + 1e-6)
+        keypoints[..., :2] = np.where(mask_xy, combined, keypoints[..., :2])
+        if debug:
+            print(f"[DEBUG] Frame {frame_idx} - Interpolation applied, mask sum={mask.sum()}")
+
+    # ---- 2️⃣ Micro-movement ----
+    if add_motion:
+        t = frame_idx
+        offset_x = 0.005 * np.sin(t * 0.1)
+        offset_y = 0.005 * np.cos(t * 0.1)
+        weights = np.linspace(0.1, 0.7, keypoints.shape[1])
+        keypoints[..., 0] += offset_x * weights
+        keypoints[..., 1] += offset_y * weights
+        if debug:
+            print(f"[DEBUG] Frame {frame_idx} - Micro-movement offset_x={offset_x:.5f}, offset_y={offset_y:.5f}")
+
+    # ---- 3️⃣ Clamp coordinates ----
+    keypoints[..., :2] = np.clip(keypoints[..., :2], 0.0, 1.0)
+
+    # ---- 4️⃣ Skeleton drawing ----
+    skeleton = [
+        (0,1),(1,2),(2,3),(3,4),
+        (1,5),(5,6),(6,7),
+        (1,8),(1,11),
+        (14,0),(15,0),(16,14),(17,15)
+    ]
+    radius = max(2, H // 200)
+    thickness = max(1, H // 300)
+
+    for b in range(B):
+        pose_img = np.zeros((H, W, 3), dtype=np.uint8)
+        if keypoints[b].shape != (18,3):
+            raise ValueError(f"[ERROR] Frame {frame_idx}, batch {b}: Expected keypoints shape (18,3), got {keypoints[b].shape}")
+
+        # draw points
+        for x, y, conf in keypoints[b]:
+            if conf < 0.1: continue
+            px, py = int(np.clip(x*W,0,W-1)), int(np.clip(y*H,0,H-1))
+            cv2.circle(pose_img, (px, py), radius, (180,180,180), -1, lineType=cv2.LINE_AA)
+
+        # draw bones
+        for i,j in skeleton:
+            xi, yi, ci = keypoints[b][i]
+            xj, yj, cj = keypoints[b][j]
+            if ci < 0.1 or cj < 0.1: continue
+            cv2.line(
+                pose_img,
+                (int(np.clip(xi*W,0,W-1)), int(np.clip(yi*H,0,H-1))),
+                (int(np.clip(xj*W,0,W-1)), int(np.clip(yj*H,0,H-1))),
+                (180,180,180),
+                thickness,
+                lineType=cv2.LINE_AA
+            )
+
+        # ---- 5️⃣ Convert to tensor ----
+        pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()
+        pose_img_tensor = pose_img_tensor / 255.0 * 2.0 - 1.0
+        pose_seq[b] = pose_img_tensor.to(device)
+
+    # ---- 6️⃣ Debug final ----
+    if debug:
+        print(f"[DEBUG] Frame {frame_idx} - Keypoints min/max: {keypoints[..., :2].min():.4f}/{keypoints[..., :2].max():.4f}")
+
+    # ---- 7️⃣ Clean GPU cache ----
+    torch.cuda.empty_cache()
+
+    return torch.from_numpy(keypoints).to(keypoints_tensor.device)
 
 def apply_pose_driven_motion(
     latents,
@@ -3261,82 +2116,78 @@ def apply_pose_driven_motion(
     frame_counter=0,
     device="cuda",
     breathing=True,
+    debug=False,
+    debug_dir=None
 ):
     """
     Motion basé sur keypoints OpenPose (épaule / torse / tête)
-
-    Args:
-        latents: [B,C,H,W]
-        keypoints: [B,18,3] (x,y,conf) normalized
-        prev_keypoints: previous frame keypoints
+    Batch-safe, debug complet et impact map.
     """
-
     import torch
-    import math
     import torch.nn.functional as F
+    import math
+    import os
+    import numpy as np
+    from PIL import Image
 
     B, C, H, W = latents.shape
+    device = latents.device
 
-    # ============================
-    # 1️⃣ RESPIRATION (propre)
-    # ============================
+    # 🔹 Respiration
     if breathing and previous_latent is not None:
         breath = 0.03 * math.sin(frame_counter * 0.15)
-        latents = latents + breath * latents
+        latents = latents * (1.0 + breath)
+        if debug:
+            print(f"[DEBUG] Frame {frame_counter} - breathing applied: {breath:.5f}")
 
-    # ============================
-    # 2️⃣ EXTRACTION POINTS CLÉS
-    # ============================
-    kp = keypoints
+    latents_in = latents.clone()
 
-    def get_point(idx):
-        return kp[:, idx, :2]  # [B,2]
+    # 🔹 Extraction points clés
+    def get_point(kp_tensor, idx):
+        return kp_tensor[:, idx, :2]  # [B,2]
 
-    neck = get_point(1)
-    r_shoulder = get_point(2)
-    l_shoulder = get_point(5)
-
-    # centre torse
+    r_shoulder = get_point(keypoints, 2)
+    l_shoulder = get_point(keypoints, 5)
     torso_center = (r_shoulder + l_shoulder) * 0.5
 
-    # ============================
-    # 3️⃣ MOUVEMENT RELATIF (frame-to-frame)
-    # ============================
     if prev_keypoints is not None:
-        prev_kp = prev_keypoints
-
-        def get_prev(idx):
-            return prev_kp[:, idx, :2]
-
-        prev_torso = (get_prev(2) + get_prev(5)) * 0.5
-
-        # déplacement torse
+        prev_r_shoulder = get_point(prev_keypoints, 2)
+        prev_l_shoulder = get_point(prev_keypoints, 5)
+        prev_torso = (prev_r_shoulder + prev_l_shoulder) * 0.5
         delta_torso = torso_center - prev_torso  # [B,2]
-
     else:
-        delta_torso = torch.zeros_like(torso_center)
+        delta_torso = torch.zeros(B, 2, device=device)
 
-    # ============================
-    # 4️⃣ CONVERSION → LATENT SPACE
-    # ============================
-    dx = delta_torso[:, 0].view(B,1,1,1) * W
-    dy = delta_torso[:, 1].view(B,1,1,1) * H
+    # 🔹 Correctif batch pour dx/dy
+    if delta_torso.shape[0] != B:
+        delta_mean = delta_torso.mean(dim=0, keepdim=True)  # [1,2]
+    else:
+        delta_mean = delta_torso
 
-    # ============================
-    # 5️⃣ WARP LATENT (clé du mouvement)
-    # ============================
+    dx = delta_mean[:, 0].view(B,1,1) * W
+    dy = delta_mean[:, 1].view(B,1,1) * H
+
+    # 🔹 Logs intermédiaires
+    if debug:
+        print("===== DEBUG apply_pose_driven_motion =====")
+        print(f"Frame {frame_counter} - Latents shape: {latents.shape}")
+        print(f"Keypoints shape: {keypoints.shape}")
+        if prev_keypoints is not None:
+            print(f"Prev keypoints shape: {prev_keypoints.shape}")
+        print(f"Delta torso shape: {delta_torso.shape}, Delta mean shape: {delta_mean.shape}")
+        print(f"dx shape: {dx.shape}, dy shape: {dy.shape}")
+        print(f"dx min/max: {dx.min().item():.5f}/{dx.max().item():.5f}")
+        print(f"dy min/max: {dy.min().item():.5f}/{dy.max().item():.5f}")
+
+    # 🔹 Grid warp
     grid_y, grid_x = torch.meshgrid(
-        torch.linspace(-1,1,H,device=device),
-        torch.linspace(-1,1,W,device=device),
-        indexing="ij"
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
     )
-
-    grid = torch.stack((grid_x, grid_y), dim=-1)  # [H,W,2]
-    grid = grid.unsqueeze(0).repeat(B,1,1,1)
-
-    # appliquer translation
-    grid[..., 0] += dx.squeeze() / W
-    grid[..., 1] += dy.squeeze() / H
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)  # [1,H,W,2]
+    delta_grid = torch.cat([dx*2/W, dy*2/H], dim=-1).unsqueeze(2)  # [B,1,1,2]
+    grid = grid + delta_grid  # broadcast → [B,H,W,2]
 
     latents_warped = F.grid_sample(
         latents,
@@ -3346,244 +2197,46 @@ def apply_pose_driven_motion(
         align_corners=True
     )
 
-    # ============================
-    # 6️⃣ MASQUE HAUT DU CORPS
-    # ============================
+    # 🔹 Masque haut du corps (fonction à définir dans utils)
     mask = build_upper_body_mask(keypoints, latents.shape, device=device)
 
-    # ============================
-    # 7️⃣ FUSION MOTION
-    # ============================
+    # 🔹 Fusion motion
     motion_strength = 0.6
     latents = (1 - mask * motion_strength) * latents + (mask * motion_strength) * latents_warped
 
-    # ============================
-    # 8️⃣ DELTA OPENPOSE (garder cohérence)
-    # ============================
+    # 🔹 Delta OpenPose
     if latents_before_openpose is not None and latents_after_openpose is not None:
         delta = latents_after_openpose - latents_before_openpose
-        energy = delta.abs().mean(dim=1, keepdim=True)
+        delta = torch.clamp(delta, -0.15, 0.15)
+        latents = latents + delta * mask * 0.5
 
-        boost = 1.0 + torch.pow(torch.clamp(energy * 2.0, 0.0, 1.0), 0.7)
-
-        latents = latents + delta * mask * boost * 0.8
-
-    # ============================
-    # 9️⃣ STABILISATION (CRITIQUE)
-    # ============================
+    # 🔹 Stabilisation
     latents = torch.nan_to_num(latents)
-
     latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
     latents = latents / (latents_max + 1e-6)
-
+    latents = latents * 0.95
     latents = torch.clamp(latents, -1.2, 1.2)
+
+    # 🔹 Impact map debug
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)  # [B,1,H,W]
+        impact_np = impact_map[0,0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        impact_img = (impact_np*255).astype(np.uint8)
+        from PIL import Image
+        Image.fromarray(impact_img).save(
+            os.path.join(debug_dir, f"impact_map_{frame_counter:05d}.png")
+        )
+        if debug:
+            print(f"[DEBUG] Frame {frame_counter} - impact map saved: {debug_dir}")
 
     return latents
 
-#------------------------------------------------------------------
-def update_pose_sequence_from_keypoints_v1(pose_seq, keypoints_tensor, frame_idx):
-    """
-    Remplace le frame_idx de pose_seq par les keypoints manuels.
 
-    pose_seq : tensor [B,3,H,W]
-    keypoints_tensor : [B,18,3] avec x,y ∈ [0,1]
-    """
-    import cv2
-    import numpy as np
-
-    B, C, H, W = pose_seq.shape
-    keypoints = keypoints_tensor[0].cpu().numpy()  # suppose B=1
-
-    # Création d'une image vide [H,W,3]
-    pose_img = np.zeros((H,W,3), dtype=np.uint8)
-
-    # Convertir keypoints en pixels et dessiner
-    for x, y, conf in keypoints:
-        if conf < 0.1:
-            continue
-        px, py = int(x*W), int(y*H)
-        cv2.circle(pose_img, (px, py), 5, (255,255,255), -1)
-
-    # Facultatif: ajouter les lignes du squelette
-    skeleton = [
-        (0,1),(1,2),(2,3),(3,4),(1,5),(5,6),(6,7),
-        (1,8),(1,11),(14,0),(15,0),(16,14),(17,15)
-    ]
-    for i,j in skeleton:
-        xi, yi, ci = keypoints[i]
-        xj, yj, cj = keypoints[j]
-        if ci < 0.1 or cj < 0.1:
-            continue
-        cv2.line(pose_img, (int(xi*W), int(yi*H)), (int(xj*W), int(yj*H)), (255,255,255), 2)
-
-    # Convert back to tensor [3,H,W] normalized [-1,1]
-    pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()/127.5 - 1.0
-    pose_seq[frame_idx] = pose_img_tensor.to(pose_seq.device)
-
-
-def update_pose_sequence_from_keypoints_v2(pose_seq, keypoints_tensor, frame_idx):
-    """
-    Remplace le frame_idx de pose_seq par les keypoints manuels et retourne keypoints_tensor.
-
-    pose_seq : tensor [B,3,H,W]
-    keypoints_tensor : [B,18,3] avec x,y ∈ [0,1]
-    frame_idx : index de la frame à mettre à jour
-    """
-    import cv2
-    import numpy as np
-
-    B, C, H, W = pose_seq.shape
-    keypoints = keypoints_tensor[0].cpu().numpy()  # suppose B=1
-
-    # Création d'une image vide [H,W,3]
-    pose_img = np.zeros((H,W,3), dtype=np.uint8)
-
-    # Convertir keypoints en pixels et dessiner
-    for x, y, conf in keypoints:
-        if conf < 0.1:
-            continue
-        px, py = int(x*W), int(y*H)
-        cv2.circle(pose_img, (px, py), 5, (255,255,255), -1)
-
-    # Ajouter les lignes du squelette
-    skeleton = [
-        (0,1),(1,2),(2,3),(3,4),(1,5),(5,6),(6,7),
-        (1,8),(1,11),(14,0),(15,0),(16,14),(17,15)
-    ]
-    for i,j in skeleton:
-        xi, yi, ci = keypoints[i]
-        xj, yj, cj = keypoints[j]
-        if ci < 0.1 or cj < 0.1:
-            continue
-        cv2.line(pose_img, (int(xi*W), int(yi*H)), (int(xj*W), int(yj*H)), (255,255,255), 2)
-
-    # Convert back to tensor [3,H,W] normalized [-1,1]
-    pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()/127.5 - 1.0
-    pose_seq[frame_idx] = pose_img_tensor.to(pose_seq.device)
-
-    # 🔹 Retourner les keypoints pour continuer à les utiliser
-    return keypoints_tensor
-
-
-def update_pose_sequence_from_keypoints(pose_seq, keypoints_tensor, frame_idx, prev_keypoints=None, alpha=0.5):
-    """
-    Met à jour le frame_idx de pose_seq avec les keypoints, et permet une interpolation avec prev_keypoints.
-
-    pose_seq : tensor [B,3,H,W]
-    keypoints_tensor : [B,18,3] avec x,y ∈ [0,1]
-    frame_idx : index de la frame à mettre à jour
-    prev_keypoints : torch.Tensor [B,18,3] ou None, pour interpolation
-    alpha : float, poids d'interpolation (0 = prev, 1 = actuel)
-    """
-    import cv2
-    import numpy as np
-    import torch
-
-    B, C, H, W = pose_seq.shape
-    keypoints = keypoints_tensor.clone().cpu().numpy()  # suppose B=1
-
-    # Si prev_keypoints fourni, interpoler pour fluidité
-    if prev_keypoints is not None:
-        prev_kp = prev_keypoints.clone().cpu().numpy()
-        keypoints = alpha * keypoints + (1 - alpha) * prev_kp
-
-    # Création d'une image vide [H,W,3]
-    pose_img = np.zeros((H, W, 3), dtype=np.uint8)
-
-    # Convertir keypoints en pixels et dessiner
-    for x, y, conf in keypoints[0]:
-        if conf < 0.1:
-            continue
-        px, py = int(x*W), int(y*H)
-        cv2.circle(pose_img, (px, py), 5, (255,255,255), -1)
-
-    # Ajouter les lignes du squelette
-    skeleton = [
-        (0,1),(1,2),(2,3),(3,4),(1,5),(5,6),(6,7),
-        (1,8),(1,11),(14,0),(15,0),(16,14),(17,15)
-    ]
-    for i,j in skeleton:
-        xi, yi, ci = keypoints[0][i]
-        xj, yj, cj = keypoints[0][j]
-        if ci < 0.1 or cj < 0.1:
-            continue
-        cv2.line(pose_img, (int(xi*W), int(yi*H)), (int(xj*W), int(yj*H)), (255,255,255), 2)
-
-    # Convert back to tensor [3,H,W] normalized [-1,1]
-    pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()/127.5 - 1.0
-    pose_seq[frame_idx] = pose_img_tensor.to(pose_seq.device)
-
-    # 🔹 Retourner les keypoints éventuellement interpolés
-    return torch.from_numpy(keypoints).to(keypoints_tensor.device)
 #--------------------------------------------------------------------------------------------------------------
-def update_pose_sequence_from_keypoints_test(pose_seq, keypoints_tensor, frame_idx, prev_keypoints=None, alpha=0.5):
-    """
-    Met à jour le frame_idx de pose_seq avec les keypoints et extrait les keypoints
-    depuis l'image existante en utilisant cv2.connectedComponents (pas de sklearn).
-    """
-    import cv2
-    import numpy as np
-    import torch
-
-    B, C, H, W = pose_seq.shape
-    keypoints = keypoints_tensor.clone().cpu().numpy()  # [B,18,3]
-
-    # Interpolation avec prev_keypoints si fourni
-    if prev_keypoints is not None:
-        prev_kp = prev_keypoints.clone().cpu().numpy()
-        keypoints = alpha * keypoints + (1 - alpha) * prev_kp
-
-    # Extraction depuis pose_seq
-    pose_img_tensor = pose_seq[frame_idx]
-    if pose_img_tensor.abs().sum() > 0.1:  # image non vide
-        # [-1,1] -> [0,255]
-        pose_img = ((pose_img_tensor.cpu().numpy().transpose(1,2,0) + 1.0) * 127.5).astype(np.uint8)
-        gray = cv2.cvtColor(pose_img, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
-
-        # Connected Components
-        num_labels, labels_im = cv2.connectedComponents(thresh)
-        extracted_kp = np.zeros_like(keypoints)
-
-        # Parcours des composantes, max 18 keypoints
-        kp_idx = 0
-        for i in range(1, num_labels):  # label 0 = background
-            ys, xs = np.where(labels_im == i)
-            if len(xs) == 0 or kp_idx >= 18:
-                continue
-            cx, cy = xs.mean(), ys.mean()
-            extracted_kp[0, kp_idx, 0] = cx / W
-            extracted_kp[0, kp_idx, 1] = cy / H
-            extracted_kp[0, kp_idx, 2] = 1.0  # confiance max
-            kp_idx += 1
-
-        # Interpolation avec les keypoints existants
-        keypoints = alpha * keypoints + (1 - alpha) * extracted_kp
-
-    # Dessiner les keypoints et le squelette
-    pose_img = np.zeros((H, W, 3), dtype=np.uint8)
-    for x, y, conf in keypoints[0]:
-        if conf < 0.1:
-            continue
-        cv2.circle(pose_img, (int(x*W), int(y*H)), 5, (255,255,255), -1)
-
-    skeleton = [
-        (0,1),(1,2),(2,3),(3,4),(1,5),(5,6),(6,7),
-        (1,8),(1,11),(14,0),(15,0),(16,14),(17,15)
-    ]
-    for i,j in skeleton:
-        xi, yi, ci = keypoints[0][i]
-        xj, yj, cj = keypoints[0][j]
-        if ci < 0.1 or cj < 0.1:
-            continue
-        cv2.line(pose_img, (int(xi*W), int(yi*H)), (int(xj*W), int(yj*H)), (255,255,255), 2)
-
-    # Convert back to tensor [-1,1]
-    pose_img_tensor = torch.from_numpy(pose_img).permute(2,0,1).float()/127.5 - 1.0
-    pose_seq[frame_idx] = pose_img_tensor.to(pose_seq.device)
-
-    return torch.from_numpy(keypoints).to(keypoints_tensor.device)
-#------------------------------------------------------------------
 
 def save_debug_pose_image_with_skeleton(
     pose_tensor,
@@ -3604,10 +2257,6 @@ def save_debug_pose_image_with_skeleton(
         cfg (dict, optional): peut contenir 'visual_debug' pour activer/désactiver
         prefix (str, optional): préfixe du fichier
     """
-    import os
-    import cv2
-    import numpy as np
-    from PIL import Image
 
     if cfg is not None and cfg.get("visual_debug") is False:
         return
@@ -3616,7 +2265,7 @@ def save_debug_pose_image_with_skeleton(
 
     # ---------------------------
     # 🔹 Convertir pose_tensor en image RGB [0,255]
-    # ---------------------------
+    # ----------------------------
     pose_img = pose_tensor[0].detach().cpu()
     if pose_img.ndim == 3 and pose_img.shape[0] == 3:
         pose_img = pose_img.permute(1,2,0)  # H,W,C
