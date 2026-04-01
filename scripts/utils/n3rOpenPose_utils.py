@@ -2084,7 +2084,7 @@ def compute_torso_angle(keypoints):
     torso_center = (right_shoulder + left_shoulder) * 0.5
     return angle, torso_center
 
-def rotate_mask_around_point(mask, center, angle, H, W, device):
+def rotate_mask_around_point_v1(mask, center, angle, H, W, device):
     """
     Rotate mask around center point (B,C,H,W).
     center: [B,2] with normalized coordinates [0,1]
@@ -2119,6 +2119,55 @@ def rotate_mask_around_point(mask, center, angle, H, W, device):
     grid_final = grid_final.reshape(B,H,W,2)
 
     mask_rotated = F.grid_sample(mask, grid_final, align_corners=True)
+    return mask_rotated
+
+def rotate_mask_around_point(mask, center_px, angle, H, W, device):
+    """
+    Rotate mask around a given center point.
+
+    mask: [B, C, H, W] tensor
+    center_px: [B,2] center in pixel coordinates
+    angle: [B,1] in radians
+    """
+    B, C, h, w = mask.shape
+
+    # Convert center to normalized coordinates [-1,1] for grid_sample
+    center_norm = center_px.clone()
+    center_norm[:, 0] = (center_px[:, 0] / (W-1)) * 2 - 1
+    center_norm[:, 1] = (center_px[:, 1] / (H-1)) * 2 - 1
+
+    # Create meshgrid in normalized coords [-1,1]
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1,1,H,device=device),
+        torch.linspace(-1,1,W,device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)  # [B,H,W,2]
+
+    # Flatten grid for batch matmul
+    grid_flat = grid.view(B, -1, 2)
+
+    # Translate grid to center
+    grid_centered = grid_flat - center_norm[:, None, :]
+
+    # Rotation matrix
+    cos = torch.cos(angle).unsqueeze(-1)  # [B,1]
+    sin = torch.sin(angle).unsqueeze(-1)  # [B,1]
+    rot_mat = torch.zeros(B, 2, 2, device=device)
+    rot_mat[:, 0, 0] = cos[:,0]
+    rot_mat[:, 0, 1] = -sin[:,0]
+    rot_mat[:, 1, 0] = sin[:,0]
+    rot_mat[:, 1, 1] = cos[:,0]
+
+    # Rotate
+    grid_rot = torch.bmm(grid_centered, rot_mat.transpose(1,2))
+
+    # Translate back
+    grid_final = grid_rot + center_norm[:, None, :]
+    grid_final = grid_final.view(B, H, W, 2)
+
+    # Use nearest neighbor to preserve mask
+    mask_rotated = F.grid_sample(mask, grid_final, mode='nearest', padding_mode='zeros', align_corners=True)
     return mask_rotated
 
 def create_upper_body_mask(keypoints, H, W, device):
