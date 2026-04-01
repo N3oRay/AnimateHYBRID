@@ -472,8 +472,7 @@ def main(args):
                                 )
                             """
                             # Mettre à jour les keypoints éventuellement modifiés
-                            #current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints, prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
-
+                            current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints, prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
 
                             # 🔹 Appliquer le mouvement du haut du corps / OpenPose
                             latents = apply_pose_driven_motion(
