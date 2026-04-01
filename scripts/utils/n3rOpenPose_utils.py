@@ -1892,21 +1892,25 @@ def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
 
 # 🔹 Calcule le déplacement du torse par rapport à la frame précédente
 #   Utilisé pour translater les latents afin de suivre le mouvement.
-def compute_delta_torso(kp, prev_kp, B):
+
+def compute_delta_torso(kp, scale=0.8):
     """
-    Calcule le déplacement du torse entre keypoints actuels et précédents.
+    Utilise la position ABSOLUE du torse pour générer un mouvement.
+    Plus de dépendance aux frames précédentes.
     """
+
     r_shoulder = get_point(kp, 2)
     l_shoulder = get_point(kp, 5)
-    torso_center = (r_shoulder + l_shoulder) * 0.5
-    if prev_kp is not None:
-        prev_r_shoulder = get_point(prev_kp, 2)
-        prev_l_shoulder = get_point(prev_kp, 5)
-        prev_torso = (prev_r_shoulder + prev_l_shoulder) * 0.5
-        delta_torso = torso_center - prev_torso
-    else:
-        delta_mean = torso_center.mean(dim=0, keepdim=True)
-        delta_torso = delta_mean.repeat(B, 1)
+
+    # Centre du torse
+    torso_center = (r_shoulder + l_shoulder) * 0.5  # [B,2]
+
+    # 🔥 Transformation en mouvement
+    delta_torso = torso_center * scale
+
+    # 🔒 Stabilisation (évite les gros jumps)
+    delta_torso = torch.tanh(delta_torso * 2.0) * 0.5
+
     return delta_torso
 
 # 🔹 Applique une translation sur les latents en utilisant un grid warp
@@ -2006,7 +2010,7 @@ def apply_pose_driven_motion(
     if debug: print("[DEBUG] Keypoints normalized (local only)")
 
     # -------------------- Torso delta (SUR RAW !) --------------------
-    delta_torso = compute_delta_torso(raw_keypoints, raw_prev_keypoints, B)
+    delta_torso = compute_delta_torso(raw_keypoints)
 
     if debug:
         print(f"[DEBUG] Delta torso (RAW): {delta_torso}")
@@ -2205,65 +2209,74 @@ def update_pose_sequence_from_keypoints_batch(
     frame_idx=0,
     alpha=0.5,
     add_motion=True,
-    debug=True
+    debug=False
 ):
     """
-    Met à jour les keypoints batchés OpenPose pour un mouvement fluide.
-    Simplifié : ne dépend plus de pose_seq, juste keypoints et prev_keypoints.
-
-    Args:
-        keypoints_tensor: [B,18,3] ou [B,3,18] tensor
-        prev_keypoints: keypoints de la frame précédente [B,18,3] tensor
-        frame_idx: index de la frame courante
-        alpha: interpolation factor pour smooth transition
-        add_motion: ajoute un micro-mouvement sinusoidal
-        debug: logs détaillés
-    Returns:
-        keypoints mis à jour [B,18,3] tensor
+    Génère une évolution temporelle des keypoints.
+    Fonctionne même avec pose statique (motion procédural).
     """
+
     import torch
-    import numpy as np
+    import math
 
-    keypoints = keypoints_tensor.detach().cpu().numpy()
-    B = keypoints.shape[0]
+    kp = keypoints_tensor.clone()
+    B, N, _ = kp.shape
+    device = kp.device
 
-    # Convert [B,3,18] -> [B,18,3] si nécessaire
-    if keypoints.shape[1] == 3 and keypoints.shape[2] == 18:
-        keypoints = keypoints.transpose(0,2,1)
-
-    # ---- Interpolation avec prev_keypoints ----
+    # =========================
+    # 🔹 1. SMOOTH TEMPOREL
+    # =========================
     if prev_keypoints is not None:
-        prev_kp = prev_keypoints.detach().cpu().numpy()
-        if prev_kp.shape[1] == 3 and prev_kp.shape[2] == 18:
-            prev_kp = prev_kp.transpose(0,2,1)
+        kp = alpha * kp + (1 - alpha) * prev_keypoints
 
-        conf = keypoints[..., 2:3]
-        prev_conf = prev_kp[..., 2:3]
-        mask = (conf + prev_conf) > 1e-6
-        mask_xy = np.repeat(mask, 2, axis=2)
-        combined = (alpha * keypoints[..., :2] * conf + (1 - alpha) * prev_kp[..., :2] * prev_conf) / (conf + prev_conf + 1e-6)
-        keypoints[..., :2] = np.where(mask_xy, combined, keypoints[..., :2])
-        if debug:
-            print(f"[DEBUG] Frame {frame_idx} - Interpolation applied, mask sum={mask.sum()}")
-
-    # ---- Micro-mouvement ----
+    # =========================
+    # 🔹 2. MOTION PROCÉDURAL
+    # =========================
     if add_motion:
+
         t = frame_idx
-        offset_x = 0.005 * np.sin(t * 0.1)
-        offset_y = 0.005 * np.cos(t * 0.1)
-        weights = np.linspace(0.1, 0.7, keypoints.shape[1])
-        keypoints[..., 0] += offset_x * weights
-        keypoints[..., 1] += offset_y * weights
-        if debug:
-            print(f"[DEBUG] Frame {frame_idx} - Micro-movement offset_x={offset_x:.5f}, offset_y={offset_y:.5f}")
 
-    # ---- Clamp coordonnées ----
-    keypoints[..., :2] = np.clip(keypoints[..., :2], 0.0, 1.0)
+        # -------- Breathing (vertical torso + épaules)
+        breath = 0.015 * math.sin(t * 0.15)
 
+        # épaules (indices OpenPose)
+        kp[:, 2, 1] += breath   # right shoulder Y
+        kp[:, 5, 1] += breath   # left shoulder Y
+
+        # -------- Sway (balancement gauche/droite)
+        sway = 0.02 * math.sin(t * 0.08)
+
+        kp[:, :, 0] += sway  # léger mouvement global en X
+
+        # -------- Head motion (indépendant)
+        head_idx = 0
+        kp[:, head_idx, 0] += 0.01 * math.sin(t * 0.2)
+        kp[:, head_idx, 1] += 0.01 * math.cos(t * 0.18)
+
+        # -------- Drift lent (très faible)
+        drift_x = 0.005 * math.sin(t * 0.03)
+        drift_y = 0.005 * math.cos(t * 0.025)
+
+        kp[:, :, 0] += drift_x
+        kp[:, :, 1] += drift_y
+
+        # -------- Micro noise (anti-freeze)
+        noise = torch.randn_like(kp[..., :2]) * 0.003
+        kp[..., :2] += noise
+
+    # =========================
+    # 🔹 3. STABILISATION
+    # =========================
+    kp[..., :2] = torch.clamp(kp[..., :2], -1.2, 1.2)
+
+    # =========================
+    # 🔹 DEBUG
+    # =========================
     if debug:
-        print(f"[DEBUG] Frame {frame_idx} - Keypoints min/max: {keypoints[..., :2].min():.4f}/{keypoints[..., :2].max():.4f}")
+        motion_strength = (kp - keypoints_tensor).abs().mean()
+        print(f"[DEBUG] Keypoint motion strength: {motion_strength.item():.6f}")
 
-    return torch.from_numpy(keypoints).to(keypoints_tensor.device)
+    return kp
 
 
 
