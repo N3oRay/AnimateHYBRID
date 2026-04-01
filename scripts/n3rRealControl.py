@@ -463,26 +463,19 @@ def main(args):
                             #new code fonction --------------------------------------------------------------------------------------
 
                             # Extraire keypoints + debug visuel
+                            # 🔹 Extraction / update des keypoints
+                            current_keypoints = extract_keypoints_from_pose( pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter)
+                            """
                             if current_keypoints is None:
                                 current_keypoints = extract_keypoints_from_pose(
                                     pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter
                                 )
-
-                            # Mettre à jour la pose_sequence et récupérer les keypoints éventuellement modifiés
-                            #current_keypoints = update_pose_sequence_from_keypoints( pose_sequence, current_keypoints, frame_counter)
-                            # interpolation avec la frame précédente pour mouvement fluide
-                            current_keypoints = update_pose_sequence_from_keypoints_batch( pose_sequence, current_keypoints, frame_counter, prev_keypoints=prev_keypoints, alpha=0.5, add_motion=True)
-
-                            # Appliquer le mouvement du haut du corps
                             """
-                            latents = apply_upper_body_motion(
-                                latents=latents, previous_latent=previous_latent_single,
-                                latents_before_openpose=latents_before_openpose if 'latents_before_openpose' in locals() else None,
-                                latents_after_openpose=latents_after if 'latents_after' in locals() else None,
-                                keypoints=current_keypoints, frame_counter=frame_counter, device=device,
-                                breathing=True,   # respiration
-                            )
-                            """
+                            # Mettre à jour les keypoints éventuellement modifiés
+                            #current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints, prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
+
+
+                            # 🔹 Appliquer le mouvement du haut du corps / OpenPose
                             latents = apply_pose_driven_motion(
                                 latents=latents,
                                 previous_latent=previous_latent_single,
@@ -495,9 +488,12 @@ def main(args):
                                 breathing=True,
                                 debug=True,
                                 debug_dir=output_dir
-
                             )
+
+                            # 🔹 Nettoyage / stabilisation
                             latents = sanitize_latents(latents)
+
+                            # 🔹 Stocker les keypoints pour la frame suivante
                             prev_keypoints = current_keypoints.clone()
 
                             #-------------------------------------------------------------------------------------------------------------
