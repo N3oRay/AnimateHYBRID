@@ -1893,20 +1893,28 @@ def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
 # 🔹 Calcule le déplacement du torse par rapport à la frame précédente
 #   Utilisé pour translater les latents afin de suivre le mouvement.
 
-def compute_delta_torso(kp, scale=0.8):
+def compute_delta_torso(kp, latent_h, latent_w, scale=0.8):
     """
-    Utilise la position ABSOLUE du torse pour générer un mouvement.
-    Plus de dépendance aux frames précédentes.
+    Calcule le déplacement du torse en coordonnées latentes.
+    Centre le mouvement sur le personnage.
     """
 
-    r_shoulder = get_point(kp, 2)
+    # Extraire épaules
+    r_shoulder = get_point(kp, 2)  # [B,2]
     l_shoulder = get_point(kp, 5)
 
-    # Centre du torse
+    # Centre du torse (image)
     torso_center = (r_shoulder + l_shoulder) * 0.5  # [B,2]
 
-    # 🔥 Transformation en mouvement
-    delta_torso = torso_center * scale
+    # Normalisation sur [0,1] selon image
+    # On suppose que kp est déjà normalisé [0,1] sur H,W si update_pose_sequence est utilisé
+    torso_center_norm = torso_center.clone()
+
+    # Transformer en coordonnées latentes
+    delta_x = (torso_center_norm[:,0] - 0.5) * latent_w * scale
+    delta_y = (torso_center_norm[:,1] - 0.5) * latent_h * scale
+
+    delta_torso = torch.stack([delta_x, delta_y], dim=1)
 
     # 🔒 Stabilisation (évite les gros jumps)
     delta_torso = torch.tanh(delta_torso * 2.0) * 0.5
@@ -2010,7 +2018,7 @@ def apply_pose_driven_motion(
     if debug: print("[DEBUG] Keypoints normalized (local only)")
 
     # -------------------- Torso delta (SUR RAW !) --------------------
-    delta_torso = compute_delta_torso(raw_keypoints)
+    delta_torso = compute_delta_torso( raw_keypoints, latent_h=H, latent_w=W, scale=0.8 )
 
     if debug:
         print(f"[DEBUG] Delta torso (RAW): {delta_torso}")
