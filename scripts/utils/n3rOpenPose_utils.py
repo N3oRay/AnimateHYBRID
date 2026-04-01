@@ -2123,51 +2123,38 @@ def rotate_mask_around_point_v1(mask, center, angle, H, W, device):
 
 def rotate_mask_around_point(mask, center_px, angle, H, W, device):
     """
-    Rotate mask around a given center point.
-
-    mask: [B, C, H, W] tensor
-    center_px: [B,2] center in pixel coordinates
-    angle: [B,1] in radians
+    Rotate mask around center point (pixels) using F.grid_sample
+    mask: [B,C,H,W]
+    center_px: [B,2] (x,y in pixels)
+    angle: [B] radians
     """
     B, C, h, w = mask.shape
 
-    # Convert center to normalized coordinates [-1,1] for grid_sample
-    center_norm = center_px.clone()
-    center_norm[:, 0] = (center_px[:, 0] / (W-1)) * 2 - 1
-    center_norm[:, 1] = (center_px[:, 1] / (H-1)) * 2 - 1
-
-    # Create meshgrid in normalized coords [-1,1]
+    # Meshgrid [H,W,2]
     yy, xx = torch.meshgrid(
-        torch.linspace(-1,1,H,device=device),
-        torch.linspace(-1,1,W,device=device),
+        torch.arange(H, device=device, dtype=torch.float32),
+        torch.arange(W, device=device, dtype=torch.float32),
         indexing='ij'
     )
-    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)  # [B,H,W,2]
+    grid = torch.stack((xx, yy), dim=-1)  # [H,W,2]
+    grid = grid.unsqueeze(0).repeat(B,1,1,1)  # [B,H,W,2]
 
-    # Flatten grid for batch matmul
-    grid_flat = grid.view(B, -1, 2)
+    # Déplacement relatif au centre
+    grid_centered = grid - center_px[:, None, None, :]  # [B,H,W,2]
 
-    # Translate grid to center
-    grid_centered = grid_flat - center_norm[:, None, :]
+    cos = torch.cos(angle)[:, None, None]  # [B,1,1]
+    sin = torch.sin(angle)[:, None, None]
 
-    # Rotation matrix
-    cos = torch.cos(angle).unsqueeze(-1)  # [B,1]
-    sin = torch.sin(angle).unsqueeze(-1)  # [B,1]
-    rot_mat = torch.zeros(B, 2, 2, device=device)
-    rot_mat[:, 0, 0] = cos[:,0]
-    rot_mat[:, 0, 1] = -sin[:,0]
-    rot_mat[:, 1, 0] = sin[:,0]
-    rot_mat[:, 1, 1] = cos[:,0]
+    rot_x = cos * grid_centered[...,0] - sin * grid_centered[...,1]
+    rot_y = sin * grid_centered[...,0] + cos * grid_centered[...,1]
 
-    # Rotate
-    grid_rot = torch.bmm(grid_centered, rot_mat.transpose(1,2))
+    grid_rot = torch.stack((rot_x, rot_y), dim=-1) + center_px[:, None, None, :]  # [B,H,W,2]
 
-    # Translate back
-    grid_final = grid_rot + center_norm[:, None, :]
-    grid_final = grid_final.view(B, H, W, 2)
+    # Normalisation [-1,1] pour F.grid_sample
+    grid_rot[...,0] = 2 * grid_rot[...,0] / (W-1) - 1
+    grid_rot[...,1] = 2 * grid_rot[...,1] / (H-1) - 1
 
-    # Use nearest neighbor to preserve mask
-    mask_rotated = F.grid_sample(mask, grid_final, mode='nearest', padding_mode='zeros', align_corners=True)
+    mask_rotated = F.grid_sample(mask, grid_rot, align_corners=True)
     return mask_rotated
 
 def create_upper_body_mask(keypoints, H, W, device):
@@ -2229,9 +2216,25 @@ def apply_pose_driven_motion(
         print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
 
     # -------------------- Rotation du masque selon l'angle --------------------
-    torso_center = ((pose.get_point(2) + pose.get_point(5)) * 0.5)  # [B,2] en coordonnées [0,1]
-    torso_center_pixels = torch.stack([torso_center[:,0]*(W-1), torso_center[:,1]*(H-1)], dim=1)
-    mask_rotated = rotate_mask_around_point(mask, torso_center_pixels, angle, H, W, device)
+    #torso_center = ((pose.get_point(2) + pose.get_point(5)) * 0.5)  # [B,2] en coordonnées [0,1]
+    #torso_center_pixels = torch.stack([torso_center[:,0]*(W-1), torso_center[:,1]*(H-1)], dim=1)
+    #mask_rotated = rotate_mask_around_point(mask, torso_center_pixels, angle, H, W, device)
+
+    # -------------------- Rotation du masque selon l'angle --------------------
+    #torso_center = ((pose.get_point(2) + pose.get_point(5)) * 0.5)  # [B,2] coords [0,1]
+
+    # Normaliser en [-1,1] pour grid_sample
+    #torso_center_norm = torch.zeros_like(torso_center)
+    #torso_center_norm[:,0] = torso_center[:,0] * 2 - 1  # x
+    #torso_center_norm[:,1] = torso_center[:,1] * 2 - 1  # y
+
+    #mask_rotated = rotate_mask_around_point(mask, torso_center_norm, angle, H, W, device)
+    angle = angle.view(-1)  # s'assure que c'est [B]
+    # Rotation du masque autour du centre du torse
+    torso_center = ((pose.get_point(2) + pose.get_point(5)) * 0.5)  # [B,2] en [0,1]
+    torso_center_px = torch.stack([torso_center[:,0]*(W-1), torso_center[:,1]*(H-1)], dim=1)
+
+    mask_rotated = rotate_mask_around_point(mask, torso_center_px, angle, H, W, device)
 
     # -------------------- Fusion latents --------------------
     #latents = latents * (1 - mask_rotated) + latents_warped * mask_rotated
