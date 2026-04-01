@@ -97,12 +97,18 @@ class Pose:
         mask = torch.clamp(mask, 0, 1)
 
         # Debug : sauvegarde en PNG
+        # -------------------- Debug --------------------
         if debug and debug_dir is not None:
             import os, cv2, numpy as np
             os.makedirs(debug_dir, exist_ok=True)
 
             # Copie CPU
             mask_np = mask[0,0].detach().cpu().numpy()
+
+            # Normalisation pour le debug (0-255)
+            mask_np -= mask_np.min()
+            if mask_np.max() > 0:
+                mask_np = mask_np / mask_np.max()
             mask_np = (mask_np * 255).astype(np.uint8)
 
             # Agrandissement fixe
@@ -115,6 +121,7 @@ class Pose:
             save_path = os.path.join(debug_dir, f"skeleton_mask_{frame_counter:05d}.png")
             cv2.imwrite(save_path, mask_debug_rgb)
             print(f"[DEBUG] Upper body mask saved (scale {debug_scale}): {save_path}")
+
         return mask
 #----------------------------------------------------------------------------------------------------------------------
 
