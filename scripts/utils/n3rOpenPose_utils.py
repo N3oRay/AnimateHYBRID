@@ -2070,7 +2070,7 @@ def apply_pose_driven_motion(
         print(f"[DEBUG] Impact map saved for frame {frame_counter}")
 
     return latents
-
+#------------------------------------------------------------------------------------------
 
 def apply_pose_driven_motion_v1(
     latents,
