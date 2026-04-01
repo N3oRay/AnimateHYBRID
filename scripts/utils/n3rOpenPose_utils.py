@@ -75,49 +75,49 @@ class Pose:
         self.angles = angle
         return angle
 
-    # ----------------- Upper body mask -----------------
     def create_upper_body_mask(self, H: int, W: int, kernel_size: int = 15, sigma: float = 5.0,
                            debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
         """
-        Crée un masque flouté torse + bras.
-        Si debug=True et debug_dir fourni, enregistre le masque en PNG.
+        Crée un masque polygonal flouté torse + bras.
+        Le torse est basé sur les épaules, et les bras sur coudes et poignets.
         """
-
         mask = torch.zeros(self.B, 1, H, W, device=self.device)
 
-        # Marque les keypoints
-        for i in [2,3,4,5,6,7]:  # épaules + coudes + poignets
-            kp = self.get_point(i)
-            x = (kp[:,0] * (W-1)).long()
-            y = (kp[:,1] * (H-1)).long()
-            mask[torch.arange(self.B), 0, y, x] = 1.0
+        for b in range(self.B):
+            # Récupère les keypoints
+            r_sh = self.get_point(2)[b].cpu().numpy()
+            r_el = self.get_point(3)[b].cpu().numpy()
+            r_wr = self.get_point(4)[b].cpu().numpy()
+            l_sh = self.get_point(5)[b].cpu().numpy()
+            l_el = self.get_point(6)[b].cpu().numpy()
+            l_wr = self.get_point(7)[b].cpu().numpy()
 
-        # Floutage final
+            # Convertir en pixels
+            def to_px(kp):
+                return [int(kp[0]*(W-1)), int(kp[1]*(H-1))]
+            pts = np.array([
+                to_px(r_sh), to_px(r_el), to_px(r_wr),
+                to_px(l_wr), to_px(l_el), to_px(l_sh)
+            ], dtype=np.int32)
+
+            # Remplir le polygone
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(mask_np, [pts], 255)
+
+            # Convertir en tensor et assigner
+            mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+
+        # Floutage pour adoucir les bords
         mask = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
         mask = torch.clamp(mask, 0, 1)
 
-        # Debug : sauvegarde en PNG
         # -------------------- Debug --------------------
         if debug and debug_dir is not None:
-            import os, cv2, numpy as np
             os.makedirs(debug_dir, exist_ok=True)
-
-            # Copie CPU
-            mask_np = mask[0,0].detach().cpu().numpy()
-
-            # Normalisation pour le debug (0-255)
-            mask_np -= mask_np.min()
-            if mask_np.max() > 0:
-                mask_np = mask_np / mask_np.max()
-            mask_np = (mask_np * 255).astype(np.uint8)
-
-            # Agrandissement fixe
             debug_scale = 4
-            mask_debug = cv2.resize(mask_np, (W*debug_scale, H*debug_scale), interpolation=cv2.INTER_NEAREST)
-
-            # Conversion en 3 canaux pour voir en couleur
+            mask_np_debug = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
+            mask_debug = cv2.resize(mask_np_debug, (W*debug_scale, H*debug_scale), interpolation=cv2.INTER_NEAREST)
             mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
-
             save_path = os.path.join(debug_dir, f"skeleton_mask_{frame_counter:05d}.png")
             cv2.imwrite(save_path, mask_debug_rgb)
             print(f"[DEBUG] Upper body mask saved (scale {debug_scale}): {save_path}")
