@@ -35,7 +35,7 @@ from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RM
 from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, apply_breathing_latents, apply_upper_body_motion, extract_keypoints_from_pose, apply_pose_driven_motion, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints, update_pose_sequence_from_keypoints_test
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, apply_breathing_latents, apply_upper_body_motion, extract_keypoints_from_pose, apply_pose_driven_motion, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -471,9 +471,7 @@ def main(args):
                             # Mettre à jour la pose_sequence et récupérer les keypoints éventuellement modifiés
                             #current_keypoints = update_pose_sequence_from_keypoints( pose_sequence, current_keypoints, frame_counter)
                             # interpolation avec la frame précédente pour mouvement fluide
-                            current_keypoints = update_pose_sequence_from_keypoints( pose_sequence, current_keypoints, frame_counter, prev_keypoints=prev_keypoints, alpha=0.5)
-                            #current_keypoints = update_pose_sequence_from_keypoints_test( pose_sequence, current_keypoints, frame_counter, prev_keypoints=prev_keypoints, alpha=0.5)
-
+                            current_keypoints = update_pose_sequence_from_keypoints_batch( pose_sequence, current_keypoints, frame_counter, prev_keypoints=prev_keypoints, alpha=0.5, add_motion=True)
 
                             # Appliquer le mouvement du haut du corps
                             """
@@ -494,6 +492,10 @@ def main(args):
                                 prev_keypoints=prev_keypoints,
                                 frame_counter=frame_counter,
                                 device=device,
+                                breathing=True,
+                                debug=True,
+                                debug_dir=output_dir
+
                             )
                             latents = sanitize_latents(latents)
                             prev_keypoints = current_keypoints.clone()
