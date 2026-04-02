@@ -7,6 +7,7 @@
 # ----------------------------------------------------------------------------------------
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=info,1=warning,2=error
 
 import math, threading, random, json, traceback, hashlib, pickle, argparse
 from pathlib import Path
@@ -33,7 +34,7 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_po
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, get_nose_coords_safe, get_shoulders_coords_safe, get_clavicules_coords_safe, get_neck_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, get_nose_coords_safe, get_shoulders_coords_safe, get_clavicules_coords_safe, get_neck_coords_safe, get_elbows_coords_safe, get_wrists_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth
 
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_controlnet_openpose_step_ultrasafe, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, apply_breathing_latents, apply_upper_body_motion, extract_keypoints_from_pose, apply_pose_driven_motion, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch
@@ -252,13 +253,10 @@ def main(args):
             # -----------------------------------------------------------------------------------------
             nose_coords = get_nose_coords_safe(input_pil) # 0 nose / nez
             neck_coords = get_neck_coords_safe(input_pil) # 1 neck / cou
-            shoulders_coords = get_shoulders_coords_safe(input_pil) # 2 right_shoulder / épaule droite
+            shoulders_coords = get_shoulders_coords_safe(input_pil) # 2 right_shoulder / épaule droite # 5 left_shoulder / épaule gauche
             clavicules_coords = get_clavicules_coords_safe(input_pil)
-            # 3 right_elbow / coude droit
-            # 4 right_wrist / poignet droit
-            # 5 left_shoulder / épaule gauche
-            # 6 left_elbow / coude gauche
-            # 7 left_wrist / poignet gauche
+            elbow_coords = get_elbows_coords_safe(input_pil)  # 3 right_elbow / coude droit # 6 left_elbow / coude gauche
+            wrists_coords = get_wrists_coords_safe(input_pil)  # 4 right_wrist / poignet droit # 7 left_wrist / poignet gauche
             # 8 right_hip / hanche droite
             # 9 right_knee (absent)
             # 10 right_ankle (absent)
