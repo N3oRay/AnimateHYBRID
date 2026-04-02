@@ -2291,7 +2291,7 @@ def apply_pose_driven_motion(
     avg_shoulders = shoulders.mean(dim=1)  # moyenne gauche/droite
 
     # bouche (si détectée, ici keypoint 18)
-    mouth = pts[:, 3, :] if pts.shape[1] > 18 else None
+    mouth = pts[:, 3, :]  # keypoint 18, déjà inclus dans pts
 
     sternum_offset_y = compute_sternum_offset_y(neck, avg_shoulders, mouth_coords=mouth, ratio=0.5)
     content_center = pts.mean(dim=1, keepdim=True) + torch.tensor([0.0, sternum_offset_y], device=device)
@@ -2328,7 +2328,13 @@ def apply_pose_driven_motion(
     shift_y = (mask_center_y[:,0,0,0] - content_center_px[:,1]) * 2 / (H-1)
 
     # On réduit le décalage horizontal pour éviter que le masque ne glisse trop
-    shift_x *= 0.8  # ajustable entre 0.4 et 0.6 selon image
+
+    # largeur moyenne du torse (en pixels)
+    torso_width_px = (shoulders[:,0,0] - shoulders[:,1,0]).abs()  # droite - gauche
+    # coefficient de correction relatif à la largeur du torse
+    correction_factor = torch.clamp(torso_width_px / (W-1), 0.5, 1.0)
+    shift_x *= correction_factor
+    #shift_x *= 1.0  # ajustable entre 0.4 et 0.6 selon image
 
     grid[...,0] -= shift_x[:,None,None]
     grid[...,1] -= shift_y[:,None,None]
