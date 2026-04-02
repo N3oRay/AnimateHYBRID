@@ -29,6 +29,63 @@ def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
 
     return [(int(x * scale_x), int(y * scale_y)) for x, y in mouth_coords]
 #----------------------------------------------------------------------------
+
+def get_hips_coords_safe(image_pil, H=None, W=None):
+    """
+    Détecte les coudes (left/right) de manière sécurisée.
+    Si MediaPipe ne détecte pas les hanches.
+    Retourne les coordonnées normalisées [0,1] pour x et y.
+    """
+    try:
+        coords = get_hips_coords_pixels(image_pil, H, W)
+        if coords is None:
+            print("⚠ Aucune hanche détecté.")
+        return coords
+    except Exception as e:
+        print(f"[Hips detection ERROR] {e}")
+        return None
+
+def get_hips_coords_pixels(image_pil, H=None, W=None):
+    """
+    Retourne les coordonnées des hanches en pixels.
+    Fallback proportionnel si MediaPipe échoue.
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    # --- Taille de l'image ---
+    img_width, img_height = image_pil.size
+    if W is None: W = img_width
+    if H is None: H = img_height
+
+    # --- MediaPipe Pose ---
+    mp_pose = mp.solutions.pose
+    image = np.array(image_pil.convert("RGB"))
+
+    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
+        results = pose.process(image)
+        if results.pose_landmarks:
+            lm = results.pose_landmarks.landmark
+            LEFT_HIP = 23
+            RIGHT_HIP = 24
+            left_hip = (lm[LEFT_HIP].x * W, lm[LEFT_HIP].y * H)
+            right_hip = (lm[RIGHT_HIP].x * W, lm[RIGHT_HIP].y * H)
+            return [left_hip, right_hip]
+
+    # --- Fallback proportionnel depuis les épaules ---
+    shoulders = get_shoulders_coords(image_pil, H, W)
+    if shoulders is None:
+        return None
+
+    left_shoulder, right_shoulder = shoulders
+    vertical_offset = 0.4 * H  # approx. hauteur torse → hanche
+    left_hip = (left_shoulder[0], left_shoulder[1] + vertical_offset)
+    right_hip = (right_shoulder[0], right_shoulder[1] + vertical_offset)
+
+    print("⚠ Aucune hanche détectée, fallback proportionnel utilisé")
+    return [left_hip, right_hip]
+
+#----------------------------------------------------------------------------------
 def get_elbows_coords_safe(image_pil, H=None, W=None):
     """
     Détecte les coudes (left/right) de manière sécurisée.
@@ -313,23 +370,6 @@ def get_mouth_coords(image_pil):
 
 #--------------------------------------------------------------------------------
 
-def get_wrists_coords_safe(image_pil, H=None, W=None):
-    """
-    Détecte les poignets avec MediaPipe Pose de manière sécurisée.
-    Retourne None si aucun poignet n'est détecté.
-    """
-    try:
-        coords = get_wrists_coords(image_pil, H, W)
-        if coords is None:
-            print("⚠ Aucun poignet détecté")
-            return None
-        print(f"✋ Wrists detected: {coords}")
-        return coords
-    except Exception as e:
-        print(f"[Wrists detection ERROR] {e}")
-        return None
-
-
 def get_wrists_coords(image_pil, H=None, W=None):
     """
     Récupère les coordonnées des poignets avec MediaPipe Pose.
@@ -364,6 +404,54 @@ def get_wrists_coords(image_pil, H=None, W=None):
         right_wrist = (int(lm[RIGHT_WRIST].x * W), int(lm[RIGHT_WRIST].y * H))
 
         return [left_wrist, right_wrist]
+
+
+def get_wrists_coords_safe(image_pil, H=None, W=None):
+    """
+    Détecte les poignets avec MediaPipe Pose de manière sécurisée.
+    Retourne None si aucun poignet n'est détecté.
+    """
+    try:
+        coords = get_wrists_coords_pixels(image_pil, H, W)
+        if coords is None:
+            print("⚠ Aucun poignet détecté")
+            return None
+        print(f"✋ Wrists detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Wrists detection ERROR] {e}")
+        return None
+
+
+def get_wrists_coords_pixels(image_pil, H=None, W=None):
+    """
+    Retourne les coordonnées des poignets en pixels.
+    Fallback proportionnel si MediaPipe échoue.
+    """
+    import numpy as np
+
+    # --- Taille de l'image ---
+    img_width, img_height = image_pil.size
+    if W is None: W = img_width
+    if H is None: H = img_height
+
+    # --- Essaye MediaPipe Pose ---
+    coords = get_wrists_coords(image_pil, H, W)
+    if coords is not None:
+        return coords
+
+    print("⚠ Aucun poignet détecté, fallback proportionnel utilisé")
+
+    # --- Fallback proportionnel depuis les coudes ---
+    elbows = get_elbows_coords_pixels(image_pil, H, W)
+    shoulders = get_shoulders_coords(image_pil, H, W)
+    if elbows is None or shoulders is None:
+        return None
+
+    left_wrist = (elbows[0][0], elbows[0][1] + 0.2 * H)
+    right_wrist = (elbows[1][0], elbows[1][1] + 0.2 * H)
+
+    return [left_wrist, right_wrist]
 
 
 def get_wrists_coords_safe_v1(image_pil, H=None, W=None):
