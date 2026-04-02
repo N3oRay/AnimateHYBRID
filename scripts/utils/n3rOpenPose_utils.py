@@ -15,6 +15,104 @@ import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
 import traceback
 
+#------extract_keypoints_from_pose
+
+def extract_keypoints_from_pose(
+    pose_full_image,
+    device="cuda",
+    debug=False,
+    debug_dir=None,
+    frame_counter=None
+):
+    """
+    FR:
+    Extraction MANUELLE des keypoints (format COCO 18 points).
+    Les coordonnées sont normalisées entre [0,1] dans l'espace IMAGE.
+
+    EN:
+    MANUAL keypoints extraction (COCO 18 format).
+    Coordinates are normalized in [0,1] in IMAGE space.
+
+    Output:
+        keypoints_tensor: [B, 18, 3]  (x, y, confidence)
+    """
+
+    B, C, H, W = pose_full_image.shape  # H=height, W=width
+
+    # ---------------------------
+    # 🔥 KEYPOINTS MANUELS / MANUAL KEYPOINTS
+    # ---------------------------
+    # FR:
+    # x = pixel_x / image_width
+    # y = pixel_y / image_height
+    # IMPORTANT: utiliser la taille de l'image originale (pose_full), PAS le latent
+
+    # EN:
+    # x = pixel_x / image_width
+    # y = pixel_y / image_height
+    # IMPORTANT: use original image size (pose_full), NOT latent size
+
+    # 👄 Mouth detected: [(404, 446)]
+
+    keypoints_template = [
+        [418/896, 418/1280, 1.0],  # 0 nose / nez (ok)
+        [383/896, 515/1280, 1.0],  # 1 neck / cou
+
+        [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite
+        [612/896, 838/1280, 1.0],  # 3 right_elbow / coude droit
+        [488/896, 1040/1280, 1.0], # 4 right_wrist / poignet droit
+
+        [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche
+        [197/896, 944/1280, 1.0],  # 6 left_elbow / coude gauche
+        [431/896, 1087/1280, 1.0], # 7 left_wrist / poignet gauche
+
+        [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite
+        [0.0, 0.0, 0.0],           # 9 right_knee (absent)
+        [0.0, 0.0, 0.0],           # 10 right_ankle (absent)
+
+        [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche
+        [0.0, 0.0, 0.0],           # 12 left_knee (absent)
+        [0.0, 0.0, 0.0],           # 13 left_ankle (absent)
+
+        [359/896, 490/1280, 1.0],  # 14 right_eye / œil droit - 👁 Eyes detected: (ok)
+        [379/896, 326/1280, 1.0],  # 15 left_eye / œil gauche - 👁 Eyes detected: [(326, 379), (359, 490)]
+        [608/896, 304/1280, 1.0],  # 16 right_ear / oreille droite
+        [290/896, 244/1280, 1.0],  # 17 left_ear / oreille gauche
+        [404/896, 446/1280, 1.0],  # 18 mouth / Bouche (ok) - 👄 Mouth detected: [(404, 446)]
+        [277/896, 528/1280, 1.0],  # 19 🦾 right_clavicules detected: [(277, 528), (562, 514)]
+        [562/896, 514/1280, 1.0],  # 20 🦾 left_clavicules detected: [(277, 528), (562, 514)]
+    ]
+
+    # ---------------------------
+    # 🔹 Conversion numpy → tensor
+    # ---------------------------
+    keypoints_np = np.array(keypoints_template, dtype=np.float32)
+
+    # FR: sécurité pour éviter valeurs hors [0,1]
+    # EN: safety clamp to keep values in [0,1]
+    keypoints_np = np.clip(keypoints_np, 0.0, 1.0)
+
+    # FR: duplication pour batch
+    # EN: repeat for batch
+    keypoints_np = np.expand_dims(keypoints_np, axis=0)  # [1,18,3]
+    keypoints_np = np.repeat(keypoints_np, B, axis=0)    # [B,18,3]
+
+    keypoints_tensor = torch.from_numpy(keypoints_np).to(device)
+
+    # ---------------------------
+    # 🔹 DEBUG VISUEL / VISUAL DEBUG
+    # ---------------------------
+    if debug and debug_dir is not None and frame_counter is not None:
+        # Affichage des points en debug
+        debug_draw_openpose_skeleton(
+            pose_full_image=pose_full_image,
+            keypoints_tensor=keypoints_tensor,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
+        )
+
+    return keypoints_tensor
+
 
 
 
@@ -1855,102 +1953,7 @@ def apply_upper_body_motion(latents, previous_latent, latents_before_openpose, l
     return latents
 
 
-#------extract_keypoints_from_pose
 
-def extract_keypoints_from_pose(
-    pose_full_image,
-    device="cuda",
-    debug=False,
-    debug_dir=None,
-    frame_counter=None
-):
-    """
-    FR:
-    Extraction MANUELLE des keypoints (format COCO 18 points).
-    Les coordonnées sont normalisées entre [0,1] dans l'espace IMAGE.
-
-    EN:
-    MANUAL keypoints extraction (COCO 18 format).
-    Coordinates are normalized in [0,1] in IMAGE space.
-
-    Output:
-        keypoints_tensor: [B, 18, 3]  (x, y, confidence)
-    """
-
-    B, C, H, W = pose_full_image.shape  # H=height, W=width
-
-    # ---------------------------
-    # 🔥 KEYPOINTS MANUELS / MANUAL KEYPOINTS
-    # ---------------------------
-    # FR:
-    # x = pixel_x / image_width
-    # y = pixel_y / image_height
-    # IMPORTANT: utiliser la taille de l'image originale (pose_full), PAS le latent
-
-    # EN:
-    # x = pixel_x / image_width
-    # y = pixel_y / image_height
-    # IMPORTANT: use original image size (pose_full), NOT latent size
-
-    # 👄 Mouth detected: [(404, 446)]
-
-    keypoints_template = [
-        [418/896, 418/1280, 1.0],  # 0 nose / nez
-        [383/896, 515/1280, 1.0],  # 1 neck / cou
-
-        [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite
-        [612/896, 838/1280, 1.0],  # 3 right_elbow / coude droit
-        [488/896, 1040/1280, 1.0], # 4 right_wrist / poignet droit
-
-        [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche
-        [197/896, 944/1280, 1.0],  # 6 left_elbow / coude gauche
-        [431/896, 1087/1280, 1.0], # 7 left_wrist / poignet gauche
-
-        [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite
-        [0.0, 0.0, 0.0],           # 9 right_knee (absent)
-        [0.0, 0.0, 0.0],           # 10 right_ankle (absent)
-
-        [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche
-        [0.0, 0.0, 0.0],           # 12 left_knee (absent)
-        [0.0, 0.0, 0.0],           # 13 left_ankle (absent)
-
-        [495/896, 353/1280, 1.0],  # 14 right_eye / œil droit - 👁 Eyes detected:
-        [373/896, 322/1280, 1.0],  # 15 left_eye / œil gauche - 👁 Eyes detected:
-
-        [608/896, 304/1280, 1.0],  # 16 right_ear / oreille droite
-        [290/896, 244/1280, 1.0],  # 17 left_ear / oreille gauche
-        [404/896, 446/1280, 1.0],  # 18 mouth / Bouche
-    ]
-
-    # ---------------------------
-    # 🔹 Conversion numpy → tensor
-    # ---------------------------
-    keypoints_np = np.array(keypoints_template, dtype=np.float32)
-
-    # FR: sécurité pour éviter valeurs hors [0,1]
-    # EN: safety clamp to keep values in [0,1]
-    keypoints_np = np.clip(keypoints_np, 0.0, 1.0)
-
-    # FR: duplication pour batch
-    # EN: repeat for batch
-    keypoints_np = np.expand_dims(keypoints_np, axis=0)  # [1,18,3]
-    keypoints_np = np.repeat(keypoints_np, B, axis=0)    # [B,18,3]
-
-    keypoints_tensor = torch.from_numpy(keypoints_np).to(device)
-
-    # ---------------------------
-    # 🔹 DEBUG VISUEL / VISUAL DEBUG
-    # ---------------------------
-    if debug and debug_dir is not None and frame_counter is not None:
-        # Affichage des points en debug
-        debug_draw_openpose_skeleton(
-            pose_full_image=pose_full_image,
-            keypoints_tensor=keypoints_tensor,
-            debug_dir=debug_dir,
-            frame_counter=frame_counter
-        )
-
-    return keypoints_tensor
 
 #---------------------------------------------------------
 
@@ -2288,6 +2291,7 @@ def apply_pose_driven_motion(
 
     neck = pts[:, 0, :]                # cou
     shoulders = pts[:, 1:, :]          # épaules
+    #shoulders = pts[:, 1:3, :]
     avg_shoulders = shoulders.mean(dim=1)  # moyenne gauche/droite
 
     # bouche (si détectée, ici keypoint 18)
@@ -2308,8 +2312,13 @@ def apply_pose_driven_motion(
     grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
     grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
 
+    print(f"[DEBUG] grid_x: {grid_x}")
+    print(f"[DEBUG] gridyx: {grid_y}")
+
+
     # Centre du masque (barycentre)
     mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
+    print(f"[DEBUG] mask_sum: {mask_sum}")
     mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
     mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
 
@@ -2326,14 +2335,17 @@ def apply_pose_driven_motion(
     # Décalage basé sur barycentre du haut du torse (épaules)
     shift_x = (mask_center_x[:,0,0,0] - content_center_px[:,0]) * 2 / (W-1)
     shift_y = (mask_center_y[:,0,0,0] - content_center_px[:,1]) * 2 / (H-1)
-
+    print(f"[DEBUG] shift_x: {shift_x}")
+    print(f"[DEBUG] shift_y: {shift_y}")
     # On réduit le décalage horizontal pour éviter que le masque ne glisse trop
 
     # largeur moyenne du torse (en pixels)
     torso_width_px = (shoulders[:,0,0] - shoulders[:,1,0]).abs()  # droite - gauche
     # coefficient de correction relatif à la largeur du torse
     correction_factor = torch.clamp(torso_width_px / (W-1), 0.5, 1.0)
-    shift_x *= correction_factor
+    print(f"[DEBUG] correction_factor: {correction_factor}")
+    shift_x *= 0.4 # correction_factor
+    print(f"[DEBUG] shift_x correction: {shift_x}")
     #shift_x *= 1.0  # ajustable entre 0.4 et 0.6 selon image
 
     grid[...,0] -= shift_x[:,None,None]
