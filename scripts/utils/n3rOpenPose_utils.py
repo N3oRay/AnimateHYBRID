@@ -2289,6 +2289,136 @@ def apply_pose_driven_motion(
     offset_x = mask_center[:,0,0,0] - content_center_x[:,0,0,0]  # centrer X sur le contenu
     offset_y = mask_center[:,1,0,0] - torso_center_y[:,0,0,0]    # centrer Y sur le torse
 
+    offset_y = torch.clamp(offset_y, -H*0.5, H*0.5)
+
+    offset = torch.stack([offset_x, offset_y], dim=1).view(B,2,1,1)
+    offset = offset * 0.8  # <-- réduction de l'atténuation verticale
+    #offset = offset.clamp(-10, 10)  # <-- clamp plus petit pour limiter le déplacement
+
+    if debug:
+        print("[DEBUG] offset centré:", offset[0,:,0,0])
+        print("[DEBUG] mask_center:", mask_center[0,:,0,0])
+        print("[DEBUG] content_center_x:", content_center_x[0,0,0,0])
+        print("[DEBUG] torso_center_y:", torso_center_y[0,0,0,0])
+
+    # -------------------- Shift avec grid_sample --------------------
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1,1,H,device=device),
+        torch.linspace(-1,1,W,device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx,yy),dim=-1).unsqueeze(0).repeat(B,1,1,1)
+    shift_x = offset[:,0,0,0] * 2 / (W-1)
+    shift_y = offset[:,1,0,0] * 2 / (H-1)
+    grid[...,0] -= shift_x[:,None,None]
+    grid[...,1] -= shift_y[:,None,None]
+    latents_warped = F.grid_sample(latents_warped, grid, align_corners=True)
+
+    # -------------------- Fusion latents --------------------
+    mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
+    latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
+
+    # -------------------- OpenPose delta --------------------
+    latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
+
+    # -------------------- Stabilisation --------------------
+    latents = stabilize_latents_motion(latents)
+
+    # -------------------- Impact map (debug) --------------------
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
+        impact_np = impact_map[0,0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        Image.fromarray((impact_np*255).astype(np.uint8)).save(
+            os.path.join(debug_dir, f"impact_map_driven_{frame_counter:05d}.png")
+        )
+
+    return latents
+
+
+
+def apply_pose_driven_motion_decale(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    import os
+    from PIL import Image
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents_in = latents.clone()
+
+    # -------------------- Respiration --------------------
+    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
+    if debug: print("[DEBUG] Respiration applied")
+
+    # -------------------- Pose --------------------
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W, scale=0.8)
+    angle = pose.compute_torso_angle()
+    mask = pose.create_upper_body_mask(H, W, kernel_size=15, sigma=5.0, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    if debug:
+        print(f"[DEBUG] Torso delta: {pose.delta}")
+        print(f"[DEBUG] Torso angle (rad): {angle}")
+
+    # -------------------- Grid warp --------------------
+    latents_warped, dx, dy, _ = warp_latents(latents, pose.delta, H, W, device)
+    if debug:
+        print(f"[DEBUG] Grid warp applied")
+        print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
+        print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
+
+    # -------------------- Recentrage automatique --------------------
+    points_idx = [2, 5, 8, 11]  # épaules et hanches
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,4,2]
+    torso_center = pts.mean(dim=1)  # [B,2]
+    torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
+    torso_points_px = torso_points_px.view(B,2,1,1)
+    mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle.view(-1), H, W, device)
+
+    # -------------------- Offset calculation --------------------
+    # -------------------- Offset calculation --------------------
+    # Grilles pour le calcul du barycentre
+    grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
+    grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
+
+    # Centre du masque (barycentre du masque lui-même)
+    mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
+    mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
+    mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
+    mask_center = torch.cat([mask_center_x, mask_center_y], dim=1)
+
+    # Centre du contenu horizontal (X) basé sur le masque et les latents
+    content = latents_warped.mean(1, keepdim=True)  # [B,1,H,W]
+    content_sum = (mask_rotated * content).sum(dim=[2,3], keepdim=True) + 1e-6
+    content_center_x = ((mask_rotated * content) * grid_x).sum(dim=[2,3], keepdim=True) / content_sum
+
+    # Barycentre vertical du torse uniquement (Y)
+    torso_mask = mask_rotated.clone()
+    torso_mask[:,:int(H*0.2),:] = 0   # couper le haut (épaules)
+    torso_mask[:,int(H*0.8):,:] = 0  # couper le bas (bassin/jambe)
+    torso_sum = (torso_mask * content).sum(dim=[2,3], keepdim=True) + 1e-6
+    torso_center_y = ((torso_mask * content) * grid_y).sum(dim=[2,3], keepdim=True) / torso_sum
+
+    # Construction de l'offset
+    offset_x = mask_center[:,0,0,0] - content_center_x[:,0,0,0]  # centrer X sur le contenu
+    offset_y = mask_center[:,1,0,0] - torso_center_y[:,0,0,0]    # centrer Y sur le torse
+
     offset = torch.stack([offset_x, offset_y], dim=1).view(B,2,1,1)
     offset = offset * 0.7  # atténuation pour éviter les sauts trop violents
     offset = offset.clamp(-20, 20)
@@ -2336,7 +2466,7 @@ def apply_pose_driven_motion(
 
     return latents
 
-def apply_pose_driven_motion_decale(
+def apply_pose_driven_motion_test(
     latents,
     previous_latent,
     latents_before_openpose,
