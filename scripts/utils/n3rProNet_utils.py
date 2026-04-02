@@ -46,43 +46,42 @@ def get_hips_coords_safe(image_pil, H=None, W=None):
         return None
 
 def get_hips_coords_pixels(image_pil, H=None, W=None):
-    """
-    Retourne les coordonnées des hanches en pixels.
-    Fallback proportionnel si MediaPipe échoue.
-    """
     import numpy as np
     import mediapipe as mp
 
-    # --- Taille de l'image ---
     img_width, img_height = image_pil.size
     if W is None: W = img_width
     if H is None: H = img_height
 
-    # --- MediaPipe Pose ---
-    mp_pose = mp.solutions.pose
     image = np.array(image_pil.convert("RGB"))
 
-    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
+    mp_pose = mp.solutions.pose
+    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.3) as pose:
         results = pose.process(image)
+
         if results.pose_landmarks:
             lm = results.pose_landmarks.landmark
             LEFT_HIP = 23
             RIGHT_HIP = 24
-            left_hip = (lm[LEFT_HIP].x * W, lm[LEFT_HIP].y * H)
-            right_hip = (lm[RIGHT_HIP].x * W, lm[RIGHT_HIP].y * H)
+            left_hip = (lm[LEFT_HIP].x * img_width, lm[LEFT_HIP].y * img_height)
+            right_hip = (lm[RIGHT_HIP].x * img_width, lm[RIGHT_HIP].y * img_height)
+            print(f"[DEBUG] Hips detected: left={left_hip}, right={right_hip}")
             return [left_hip, right_hip]
+        else:
+            print("[DEBUG] MediaPipe n'a pas détecté de pose")
 
-    # --- Fallback proportionnel depuis les épaules ---
+    # Fallback proportionnel depuis les épaules
     shoulders = get_shoulders_coords(image_pil, H, W)
     if shoulders is None:
+        print("[DEBUG] hanche non détectées, fallback impossible")
         return None
 
     left_shoulder, right_shoulder = shoulders
-    vertical_offset = 0.4 * H  # approx. hauteur torse → hanche
+    vertical_offset = 0.4 * H
     left_hip = (left_shoulder[0], left_shoulder[1] + vertical_offset)
     right_hip = (right_shoulder[0], right_shoulder[1] + vertical_offset)
 
-    print("⚠ Aucune hanche détectée, fallback proportionnel utilisé")
+    print(f"⚠ Aucune hanche détectée, fallback proportionnel utilisé: left={left_hip}, right={right_hip}")
     return [left_hip, right_hip]
 
 #----------------------------------------------------------------------------------
@@ -414,7 +413,7 @@ def get_wrists_coords_safe(image_pil, H=None, W=None):
     try:
         coords = get_wrists_coords_pixels(image_pil, H, W)
         if coords is None:
-            print("⚠ Aucun poignet détecté")
+            print("⚠ Aucun poignet / Wrists détecté")
             return None
         print(f"✋ Wrists detected: {coords}")
         return coords
@@ -464,10 +463,10 @@ def get_wrists_coords_safe_v1(image_pil, H=None, W=None):
         if coords is None:
             print("⚠ Aucun poignet détecté, fallback proportionnel utilisé")
             return None
-        print(f"✋ Wrists detected/estimated: {coords}")
+        print(f"✋ Wrists - poignet detected/estimated: {coords}")
         return coords
     except Exception as e:
-        print(f"[Wrists detection ERROR] {e}")
+        print(f"[Wrists - poignet detection ERROR] {e}")
         return None
 
 
