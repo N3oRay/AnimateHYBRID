@@ -28,8 +28,100 @@ def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
     scale_y = lat_H / img_H
 
     return [(int(x * scale_x), int(y * scale_y)) for x, y in mouth_coords]
+#----------------------------------------------------------------------------
+def get_elbows_coords_safe(image_pil, H=None, W=None):
+    """
+    Détecte les coudes (left/right) de manière sécurisée.
+    Si MediaPipe ne détecte pas les coudes, utilise un fallback proportionnel
+    basé sur épaules et cou.
+    Retourne les coordonnées normalisées [0,1] pour x et y.
+    """
+    try:
+        coords = get_elbows_coords_pixels(image_pil, H, W)
+        if coords is None:
+            print("⚠ Aucun coude détecté, fallback proportionnel utilisé")
+        print(f"🦾 Elbows detected/estimated: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Elbow detection ERROR] {e}")
+        return None
+
+def get_elbows_coords_pixels(image_pil, H=None, W=None):
+    """
+    Détecte les coudes en pixels via MediaPipe Pose.
+    Si aucun coude n'est détecté, fallback proportionnel est utilisé.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+        H, W (int, optional): dimensions pour normaliser. Si None, prend image.size
+
+    Returns:
+        list[[x, y], [x, y]] : [left_elbow, right_elbow] en pixels
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    mp_pose = mp.solutions.pose
+
+    img_width, img_height = image_pil.size
+    if W is None: W = img_width
+    if H is None: H = img_height
+
+    image = np.array(image_pil.convert("RGB"))
+
+    try:
+        with mp_pose.Pose(static_image_mode=True, model_complexity=1) as pose:
+            results = pose.process(image)
+
+        fallback = True
+        # fallback proportionnel
+        left_elbow = [int(0.2 * W), int(0.7 * H)]
+        right_elbow = [int(0.7 * W), int(0.7 * H)]
+
+        if results.pose_landmarks:
+            lm = results.pose_landmarks.landmark
+            LEFT_SHOULDER = mp_pose.PoseLandmark.LEFT_SHOULDER.value
+            RIGHT_SHOULDER = mp_pose.PoseLandmark.RIGHT_SHOULDER.value
+            LEFT_ELBOW = mp_pose.PoseLandmark.LEFT_ELBOW.value
+            RIGHT_ELBOW = mp_pose.PoseLandmark.RIGHT_ELBOW.value
+            NOSE = mp_pose.PoseLandmark.NOSE.value
+
+            left_shoulder = np.array([lm[LEFT_SHOULDER].x * W, lm[LEFT_SHOULDER].y * H])
+            right_shoulder = np.array([lm[RIGHT_SHOULDER].x * W, lm[RIGHT_SHOULDER].y * H])
+            nose = np.array([lm[NOSE].x * W, lm[NOSE].y * H])
+
+            def estimate_elbow(shoulder, opposite_shoulder):
+                torso_h = max(abs(shoulder[1] - nose[1]), 1)
+                shoulder_w = max(abs(shoulder[0] - opposite_shoulder[0]), 1)
+                x_offset = 0.15 * shoulder_w * np.sign(opposite_shoulder[0] - shoulder[0])
+                y_offset = 0.35 * torso_h
+                return [shoulder[0] + x_offset, shoulder[1] + y_offset]
+
+            # visibilité
+            left_elbow = ([lm[LEFT_ELBOW].x * W, lm[LEFT_ELBOW].y * H]
+                          if lm[LEFT_ELBOW].visibility > 0.5
+                          else estimate_elbow(left_shoulder, right_shoulder))
+            right_elbow = ([lm[RIGHT_ELBOW].x * W, lm[RIGHT_ELBOW].y * H]
+                           if lm[RIGHT_ELBOW].visibility > 0.5
+                           else estimate_elbow(right_shoulder, left_shoulder))
+
+            # convertir en int pixels
+            left_elbow = [int(c) for c in left_elbow]
+            right_elbow = [int(c) for c in right_elbow]
+            fallback = False
+
+        if fallback:
+            print("⚠ Aucun coude détecté, fallback proportionnel utilisé")
+
+        return [left_elbow, right_elbow]
+
+    except Exception as e:
+        print(f"[Elbow detection ERROR] {e}")
+        return [[int(0.2*W), int(0.7*H)], [int(0.7*W), int(0.7*H)]]
 
 
+
+#-----------------------------------------------------------------------------
 
 def get_neck_coords_safe(image_pil, H=None, W=None):
     """
@@ -219,7 +311,123 @@ def get_mouth_coords(image_pil):
         mouth_center = get_center(MOUTH_OUTER)
         return [mouth_center]
 
+#--------------------------------------------------------------------------------
 
+def get_wrists_coords_safe(image_pil, H=None, W=None):
+    """
+    Détecte les poignets avec MediaPipe Pose de manière sécurisée.
+    Retourne None si aucun poignet n'est détecté.
+    """
+    try:
+        coords = get_wrists_coords(image_pil, H, W)
+        if coords is None:
+            print("⚠ Aucun poignet détecté")
+            return None
+        print(f"✋ Wrists detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Wrists detection ERROR] {e}")
+        return None
+
+
+def get_wrists_coords(image_pil, H=None, W=None):
+    """
+    Récupère les coordonnées des poignets avec MediaPipe Pose.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+        H, W: dimensions pour normaliser (pixels)
+
+    Returns:
+        list[(x, y)] ou None: [left_wrist, right_wrist]
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    mp_pose = mp.solutions.pose
+
+    image = np.array(image_pil.convert("RGB"))
+    img_h, img_w, _ = image.shape
+    if H is None: H = img_h
+    if W is None: W = img_w
+
+    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
+        results = pose.process(image)
+        if not results.pose_landmarks:
+            return None
+
+        lm = results.pose_landmarks.landmark
+        LEFT_WRIST = mp_pose.PoseLandmark.LEFT_WRIST.value
+        RIGHT_WRIST = mp_pose.PoseLandmark.RIGHT_WRIST.value
+
+        left_wrist = (int(lm[LEFT_WRIST].x * W), int(lm[LEFT_WRIST].y * H))
+        right_wrist = (int(lm[RIGHT_WRIST].x * W), int(lm[RIGHT_WRIST].y * H))
+
+        return [left_wrist, right_wrist]
+
+
+def get_wrists_coords_safe_v1(image_pil, H=None, W=None):
+    """
+    Détecte les coordonnées des poignets avec MediaPipe Pose de manière sécurisée.
+    Retourne None si aucun poignet détecté.
+    """
+    try:
+        coords = get_wrists_coords(image_pil, H, W)
+        if coords is None:
+            print("⚠ Aucun poignet détecté, fallback proportionnel utilisé")
+            return None
+        print(f"✋ Wrists detected/estimated: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Wrists detection ERROR] {e}")
+        return None
+
+
+def get_wrists_coords_v1(image_pil, H=None, W=None):
+    """
+    Approxime les coordonnées des poignets à partir des coudes et épaules.
+    Si MediaPipe ne détecte pas, utilise un fallback proportionnel.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+        H, W: dimensions optionnelles pour normaliser
+
+    Returns:
+        list[(x, y)] ou None: gauche et droite des poignets
+    """
+    import numpy as np
+
+    # --- Récupère coudes et épaules ---
+    elbows = get_elbows_coords_pixels(image_pil, H, W)
+    shoulders = get_shoulders_coords(image_pil, H, W)
+
+    if elbows is None or shoulders is None:
+        # fallback proportionnel si détection échoue
+        img_width, img_height = image_pil.size
+        if W is None: W = img_width
+        if H is None: H = img_height
+
+        # exemple de fallback basé sur ratios de la taille d'image
+        left_wrist = (int(0.431 * W), int(0.85 * H))
+        right_wrist = (int(0.488 * W), int(0.81 * H))
+        return [left_wrist, right_wrist]
+
+    left_elbow, right_elbow = elbows
+    left_shoulder, right_shoulder = shoulders
+
+    # déplacement proportionnel du poignet à partir du coude (bras légèrement étendu)
+    def estimate_wrist(elbow, shoulder):
+        dx = elbow[0] - shoulder[0]
+        dy = elbow[1] - shoulder[1]
+        wrist_x = int(elbow[0] + 0.8 * dx)
+        wrist_y = int(elbow[1] + 0.8 * dy)
+        return wrist_x, wrist_y
+
+    left_wrist = estimate_wrist(left_elbow, left_shoulder)
+    right_wrist = estimate_wrist(right_elbow, right_shoulder)
+
+    return [left_wrist, right_wrist]
+#--------------------------------------------------------------------------------
 
 def scale_eye_coords_to_latents(eye_coords, img_H, img_W, lat_H, lat_W):
     """
