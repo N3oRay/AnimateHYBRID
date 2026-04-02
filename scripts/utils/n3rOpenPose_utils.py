@@ -2262,35 +2262,42 @@ def apply_pose_driven_motion(
     mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle.view(-1), H, W, device)
 
     # -------------------- Offset calculation --------------------
+    # -------------------- Offset calculation --------------------
     # Grilles pour le calcul du barycentre
     grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
     grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
 
-    # Centre du masque
+    # Centre du masque (barycentre du masque lui-même)
     mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
     mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
     mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
     mask_center = torch.cat([mask_center_x, mask_center_y], dim=1)
 
-    # Centre géométrique du contenu basé sur le masque
-    content_sum = (mask_rotated * latents_warped.mean(1, keepdim=True)).sum(dim=[2,3], keepdim=True) + 1e-6
-    content_center_x = ((mask_rotated * latents_warped.mean(1, keepdim=True)) * grid_x).sum(dim=[2,3], keepdim=True) / content_sum
-    content_center_y = ((mask_rotated * latents_warped.mean(1, keepdim=True)) * grid_y).sum(dim=[2,3], keepdim=True) / content_sum
-    content_center = torch.cat([content_center_x, content_center_y], dim=1)
+    # Centre du contenu horizontal (X) basé sur le masque et les latents
+    content = latents_warped.mean(1, keepdim=True)  # [B,1,H,W]
+    content_sum = (mask_rotated * content).sum(dim=[2,3], keepdim=True) + 1e-6
+    content_center_x = ((mask_rotated * content) * grid_x).sum(dim=[2,3], keepdim=True) / content_sum
 
-    # Offset : X centré sur contenu du masque, Y centré sur torse
-    offset_x = mask_center[:,0,0,0] - content_center[:,0,0,0]
-    offset_y = mask_center[:,1,0,0] - torso_points_px[:,1,0,0]
+    # Barycentre vertical du torse uniquement (Y)
+    torso_mask = mask_rotated.clone()
+    torso_mask[:,:int(H*0.2),:] = 0   # couper le haut (épaules)
+    torso_mask[:,int(H*0.8):,:] = 0  # couper le bas (bassin/jambe)
+    torso_sum = (torso_mask * content).sum(dim=[2,3], keepdim=True) + 1e-6
+    torso_center_y = ((torso_mask * content) * grid_y).sum(dim=[2,3], keepdim=True) / torso_sum
+
+    # Construction de l'offset
+    offset_x = mask_center[:,0,0,0] - content_center_x[:,0,0,0]  # centrer X sur le contenu
+    offset_y = mask_center[:,1,0,0] - torso_center_y[:,0,0,0]    # centrer Y sur le torse
 
     offset = torch.stack([offset_x, offset_y], dim=1).view(B,2,1,1)
-    offset = offset * 0.7
+    offset = offset * 0.7  # atténuation pour éviter les sauts trop violents
     offset = offset.clamp(-20, 20)
 
     if debug:
         print("[DEBUG] offset centré:", offset[0,:,0,0])
         print("[DEBUG] mask_center:", mask_center[0,:,0,0])
-        print("[DEBUG] content_center:", content_center[0,:,0,0])
-        print("[DEBUG] torso_center_px:", torso_points_px[0,:,0,0])
+        print("[DEBUG] content_center_x:", content_center_x[0,0,0,0])
+        print("[DEBUG] torso_center_y:", torso_center_y[0,0,0,0])
 
     # -------------------- Shift avec grid_sample --------------------
     yy, xx = torch.meshgrid(
