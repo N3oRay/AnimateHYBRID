@@ -30,6 +30,69 @@ def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
     return [(int(x * scale_x), int(y * scale_y)) for x, y in mouth_coords]
 
 
+def get_nose_coords_safe(image_pil, H=None, W=None):
+    """
+    Détecte les coordonnées du nez de manière sécurisée.
+    Renvoie None si aucun visage n'est détecté ou en cas d'erreur.
+    """
+    try:
+        coords = get_nose_coords(image_pil)
+        if coords is None:
+            print("⚠️ Aucun visage détecté ou nez non détecté")
+            return None
+        print(f"👃 Nose detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Nose detection ERROR] {e}")
+        return None
+
+
+
+def get_nose_coords(image_pil):
+    """
+    Détecte les coordonnées du nez avec MediaPipe FaceMesh.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+
+    Returns:
+        list[(x, y)]: centre du nez en coordonnées image
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    mp_face_mesh = mp.solutions.face_mesh
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True
+    ) as face_mesh:
+
+        results = face_mesh.process(image)
+        if not results.multi_face_landmarks:
+            return None
+
+        face_landmarks = results.multi_face_landmarks[0]
+
+        # 🔹 Indices MediaPipe pour le nez (tip + base)
+        NOSE_INDICES = [1, 2, 98, 327, 168]  # peut ajuster selon précision souhaitée
+
+        def get_center(indices):
+            xs, ys = [], []
+            for idx in indices:
+                lm = face_landmarks.landmark[idx]
+                xs.append(lm.x * w)
+                ys.append(lm.y * h)
+            return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+        nose_center = get_center(NOSE_INDICES)
+        return [nose_center]
+
+
 def get_mouth_coords_safe(image_pil, H=None, W=None):
     """
     Détecte les coordonnées de la bouche de manière sécurisée.
