@@ -55,14 +55,14 @@ def extract_keypoints_from_pose(
     # 👄 Mouth detected: [(404, 446)]
 
     keypoints_template = [
-        [418/896, 418/1280, 1.0],  # 0 nose / nez (ok)
+        [418/896, 418/1280, 1.0],  # 0 nose / nez (ok) 👃 Nose detected: [(422, 408)]
         [383/896, 515/1280, 1.0],  # 1 neck / cou
 
-        [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite
+        [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
         [612/896, 838/1280, 1.0],  # 3 right_elbow / coude droit
         [488/896, 1040/1280, 1.0], # 4 right_wrist / poignet droit
 
-        [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche
+        [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
         [197/896, 944/1280, 1.0],  # 6 left_elbow / coude gauche
         [431/896, 1087/1280, 1.0], # 7 left_wrist / poignet gauche
 
@@ -2324,6 +2324,10 @@ def apply_pose_driven_motion(
 
     # -------------------- Déplacement du contenu aligné au haut du torse ----
     content_center_px = content_points_px[:,0]  # [B,2]
+    print(f"[DEBUG] content_center_px init: {content_center_px}")
+    shoulders = pts[:, 1:3, :]  # right + left
+    content_center_shoulders = shoulders.mean(dim=1, keepdim=True)
+    print(f"[DEBUG] content_center_shoulders : {content_center_shoulders}")
 
     yy, xx = torch.meshgrid(
         torch.linspace(-1,1,H,device=device),
@@ -2335,8 +2339,17 @@ def apply_pose_driven_motion(
     # Décalage basé sur barycentre du haut du torse (épaules)
     shift_x = (mask_center_x[:,0,0,0] - content_center_px[:,0]) * 2 / (W-1)
     shift_y = (mask_center_y[:,0,0,0] - content_center_px[:,1]) * 2 / (H-1)
+
     print(f"[DEBUG] shift_x: {shift_x}")
     print(f"[DEBUG] shift_y: {shift_y}")
+    shift_y += 0.05
+    print(f"[DEBUG] shift_y correction: {shift_y}")
+    shift_y = torch.clamp(shift_y, -0.5, 0.5)
+    print(f"[DEBUG] shift_y clamp: {shift_y}")
+    shift_x += 0.4
+    print(f"[DEBUG] shift_x correction: {shift_x}")
+    shift_x = torch.clamp(shift_x, -0.02, 0.10)
+    print(f"[DEBUG] shift_x clamp: {shift_x}")
     # On réduit le décalage horizontal pour éviter que le masque ne glisse trop
 
     # largeur moyenne du torse (en pixels)
@@ -2344,9 +2357,6 @@ def apply_pose_driven_motion(
     # coefficient de correction relatif à la largeur du torse
     correction_factor = torch.clamp(torso_width_px / (W-1), 0.5, 1.0)
     print(f"[DEBUG] correction_factor: {correction_factor}")
-    shift_x *= 0.4 # correction_factor
-    print(f"[DEBUG] shift_x correction: {shift_x}")
-    #shift_x *= 1.0  # ajustable entre 0.4 et 0.6 selon image
 
     grid[...,0] -= shift_x[:,None,None]
     grid[...,1] -= shift_y[:,None,None]

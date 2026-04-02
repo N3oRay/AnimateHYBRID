@@ -30,6 +30,71 @@ def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
     return [(int(x * scale_x), int(y * scale_y)) for x, y in mouth_coords]
 
 
+
+def get_neck_coords_safe(image_pil, H=None, W=None):
+    """
+    Détecte les coordonnées approximatives du cou de manière sécurisée.
+    Renvoie None si aucun visage n'est détecté ou en cas d'erreur.
+    """
+    try:
+        coords = get_neck_coords(image_pil, H, W)
+        if coords is None:
+            print("⚠️ Aucun visage détecté ou cou non détecté")
+            return None
+        print(f"🦵 Neck detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Neck detection ERROR] {e}")
+        return None
+
+
+def get_neck_coords(image_pil, H=None, W=None):
+    """
+    Détecte les coordonnées approximatives du cou à partir du menton et des clavicules.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+        H, W: dimensions pour normaliser
+
+    Returns:
+        list[(x, y)]: centre du cou en coordonnées image
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    mp_face_mesh = mp.solutions.face_mesh
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+    if H is None: H = h
+    if W is None: W = w
+
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True
+    ) as face_mesh:
+
+        results = face_mesh.process(image)
+        if not results.multi_face_landmarks:
+            return None
+
+        lm = results.multi_face_landmarks[0].landmark
+        CHIN_IDX = 152  # menton
+        LEFT_JAW = 234
+        RIGHT_JAW = 454
+
+        # Calcul centre du cou à partir du menton et largeur de la mâchoire
+        chin_x = lm[CHIN_IDX].x * W
+        chin_y = lm[CHIN_IDX].y * H
+
+        left_x = lm[LEFT_JAW].x * W
+        right_x = lm[RIGHT_JAW].x * W
+
+        neck_x = (left_x + right_x) / 2
+        neck_y = chin_y + 0.15 * (chin_y - min(lm[LEFT_JAW].y * H, lm[RIGHT_JAW].y * H))  # proportionnel
+
+        return [(int(neck_x), int(neck_y))]
+
 def get_nose_coords_safe(image_pil, H=None, W=None):
     """
     Détecte les coordonnées du nez de manière sécurisée.
@@ -251,53 +316,55 @@ def get_shoulders_coords_safe(image_pil, H=None, W=None):
 
 def get_shoulders_coords(image_pil, H=None, W=None):
     """
-    Approximation réaliste des vraies extrémités des épaules
-    à partir des clavicules détectées par MediaPipe Pose.
+    Approxime les coordonnées des épaules à partir des clavicules
+    avec un léger décalage proportionnel et correction de l'inclinaison du torse.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+        H, W: dimensions optionnelles pour normaliser
+
+    Returns:
+        list[(x, y)] ou None: gauche et droite des épaules
     """
     import numpy as np
-    import mediapipe as mp
 
-    image = np.array(image_pil.convert("RGB"))
-    h, w, _ = image.shape
-    if H is None: H = h
-    if W is None: W = w
-
-    mp_pose = mp.solutions.pose
-
-    try:
-        with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
-            results = pose.process(image)
-            if not results.pose_landmarks:
-                print("⚠️ Pas de PoseLandmarks détectés")
-                return None
-
-            l = results.pose_landmarks.landmark[11]  # gauche clavicule
-            r = results.pose_landmarks.landmark[12]  # droite clavicule
-            neck = results.pose_landmarks.landmark[1] # cou
-
-            # Coordonnées en pixels
-            l_x, l_y = l.x * W, l.y * H
-            r_x, r_y = r.x * W, r.y * H
-            neck_x, neck_y = neck.x * W, neck.y * H
-
-            # Largeur approximative du torse
-            torso_width = 1.5 * abs(r_x - l_x)  # on écarte plus que la distance clavicules
-            # Centre des clavicules
-            center_x = (l_x + r_x) / 2
-            # Ajustement horizontal : projeter vers les vraies épaules
-            left_x = center_x - torso_width / 2
-            right_x = center_x + torso_width / 2
-
-            # Ajustement vertical pour correspondre au haut du bras
-            avg_y = (l_y + r_y) / 2
-            left_y = avg_y
-            right_y = avg_y
-
-            return [(int(left_x), int(left_y)), (int(right_x), int(right_y))]
-    except Exception as e:
-        print(f"[Pose detection ERROR] {e}")
+    # --- Récupère les clavicules ---
+    clav_coords = get_clavicules_coords(image_pil, H, W)
+    if clav_coords is None:
+        print("⚠️ Impossible de détecter les clavicules pour calculer les épaules")
         return None
 
+    left_clav, right_clav = clav_coords
+
+    # --- Taille de l'image pour proportion ---
+    img_width, img_height = image_pil.size
+    if W is None: W = img_width
+    if H is None: H = img_height
+
+    # --- Distance et angle ---
+    dx = right_clav[0] - left_clav[0]
+    dy = right_clav[1] - left_clav[1]
+    angle = np.arctan2(dy, dx)  # angle du torse (rad)
+
+    # --- Ratios proportionnels ---
+    shoulder_x_ratio_left = -0.7   # déplacement relatif gauche
+    shoulder_x_ratio_right = 0.7   # déplacement relatif droite
+    shoulder_y_ratio = 0.03        # léger décalage vertical proportionnel à la hauteur de l'image
+
+    # --- Décalage vectoriel selon angle du torse ---
+    def offset(x_ratio, y_ratio, dx, dy, H):
+        # décale proportionnellement sur l'axe du torse et verticalement
+        x_offset = x_ratio * dx
+        y_offset = x_ratio * dy + y_ratio * H
+        return x_offset, y_offset
+
+    left_offset = offset(shoulder_x_ratio_left, shoulder_y_ratio, dx, dy, H)
+    right_offset = offset(shoulder_x_ratio_right, shoulder_y_ratio, dx, dy, H)
+
+    left_shoulder = (left_clav[0] + left_offset[0], left_clav[1] + left_offset[1])
+    right_shoulder = (right_clav[0] + right_offset[0], right_clav[1] + right_offset[1])
+
+    return [left_shoulder, right_shoulder]
 
 def get_clavicules_coords_safe(image_pil, H=None, W=None):
     """
