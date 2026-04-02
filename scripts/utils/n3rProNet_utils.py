@@ -232,6 +232,242 @@ def get_eye_coords(image_pil):
 
         return [left_eye, right_eye]
 
+
+def get_shoulders_coords_safe(image_pil, H=None, W=None):
+    """
+    Détecte les coordonnées des épaules avec MediaPipe Pose de manière sécurisée.
+    Retourne None si aucun torse détecté.
+    """
+    try:
+        coords = get_shoulders_coords(image_pil, H, W)
+        if coords is None:
+            print("⚠️ Aucune détection d'épaules")
+            return None
+        print(f"🦾 Shoulders detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Shoulder detection ERROR] {e}")
+        return None
+
+def get_shoulders_coords(image_pil, H=None, W=None):
+    """
+    Approximation réaliste des vraies extrémités des épaules
+    à partir des clavicules détectées par MediaPipe Pose.
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+    if H is None: H = h
+    if W is None: W = w
+
+    mp_pose = mp.solutions.pose
+
+    try:
+        with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
+            results = pose.process(image)
+            if not results.pose_landmarks:
+                print("⚠️ Pas de PoseLandmarks détectés")
+                return None
+
+            l = results.pose_landmarks.landmark[11]  # gauche clavicule
+            r = results.pose_landmarks.landmark[12]  # droite clavicule
+            neck = results.pose_landmarks.landmark[1] # cou
+
+            # Coordonnées en pixels
+            l_x, l_y = l.x * W, l.y * H
+            r_x, r_y = r.x * W, r.y * H
+            neck_x, neck_y = neck.x * W, neck.y * H
+
+            # Largeur approximative du torse
+            torso_width = 1.5 * abs(r_x - l_x)  # on écarte plus que la distance clavicules
+            # Centre des clavicules
+            center_x = (l_x + r_x) / 2
+            # Ajustement horizontal : projeter vers les vraies épaules
+            left_x = center_x - torso_width / 2
+            right_x = center_x + torso_width / 2
+
+            # Ajustement vertical pour correspondre au haut du bras
+            avg_y = (l_y + r_y) / 2
+            left_y = avg_y
+            right_y = avg_y
+
+            return [(int(left_x), int(left_y)), (int(right_x), int(right_y))]
+    except Exception as e:
+        print(f"[Pose detection ERROR] {e}")
+        return None
+
+
+def get_clavicules_coords_safe(image_pil, H=None, W=None):
+    """
+    Détecte les coordonnées des épaules avec MediaPipe Pose de manière sécurisée.
+    Retourne None si aucun torse détecté.
+    """
+    try:
+        coords = get_clavicules_coords(image_pil, H, W)
+        if coords is None:
+            print("⚠️ Aucune détection clavicules")
+            return None
+        print(f"🦾 clavicules detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[clavicules detection ERROR] {e}")
+        return None
+
+
+def get_clavicules_coords(image_pil, H=None, W=None):
+    """
+    Détecte les coordonnées approximatives des épaules avec fallback
+    et ajuste la largeur pour mieux représenter les épaules réelles.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+        H, W: dimensions optionnelles pour normaliser
+
+    Returns:
+        list[(x, y)] ou None: gauche et droite des épaules
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+    if H is None: H = h
+    if W is None: W = w
+
+    mp_pose = mp.solutions.pose
+    mp_face_mesh = mp.solutions.face_mesh
+
+    # --- Essai Pose ---
+    try:
+        with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
+            results = pose.process(image)
+            if results.pose_landmarks:
+                LEFT_SHOULDER = 11
+                RIGHT_SHOULDER = 12
+                l = results.pose_landmarks.landmark[LEFT_SHOULDER]
+                r = results.pose_landmarks.landmark[RIGHT_SHOULDER]
+
+                # Coordonnées brutes
+                left_x, left_y = l.x * W, l.y * H
+                right_x, right_y = r.x * W, r.y * H
+
+                # Écart horizontal supplémentaire (~15% de la distance entre les épaules)
+                shoulder_span = right_x - left_x
+                left_x -= 0.15 * shoulder_span
+                right_x += 0.15 * shoulder_span
+
+                left_coords = (int(left_x), int(left_y))
+                right_coords = (int(right_x), int(right_y))
+                return [left_coords, right_coords]
+    except Exception as e:
+        print(f"[Pose detection ERROR] {e}")
+
+    # --- Fallback FaceMesh ---
+    try:
+        with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) as fm:
+            results = fm.process(image)
+            if not results.multi_face_landmarks:
+                print("⚠️ Aucun visage détecté pour approximation des clavicules")
+                return None
+            lm = results.multi_face_landmarks[0].landmark
+
+            LEFT_JAW = 234
+            RIGHT_JAW = 454
+            CHIN = 152
+
+            def jaw_to_shoulder(idx):
+                x = lm[idx].x * W
+                y = lm[idx].y * H
+                # offset vers le haut du torse (1.2x distance menton - jaw)
+                y += 1.2 * (lm[CHIN].y * H - y)
+                return x, y
+
+            left_x, left_y = jaw_to_shoulder(LEFT_JAW)
+            right_x, right_y = jaw_to_shoulder(RIGHT_JAW)
+
+            # Écart horizontal supplémentaire (~15%)
+            shoulder_span = right_x - left_x
+            left_x -= 0.15 * shoulder_span
+            right_x += 0.15 * shoulder_span
+
+            left_coords = (int(left_x), int(left_y))
+            right_coords = (int(right_x), int(right_y))
+            return [left_coords, right_coords]
+    except Exception as e:
+        print(f"[FaceMesh fallback ERROR] {e}")
+        return None
+
+
+def get_shoulders_coords_safe_1(image_pil, H=None, W=None):
+    """
+    Détecte les coordonnées des épaules de manière sécurisée.
+    Renvoie None si aucun visage n'est détecté ou en cas d'erreur.
+    """
+    try:
+        coords = get_shoulders_coords(image_pil)
+        if coords is None:
+            print("⚠️ Aucun visage détecté ou épaules non détectées")
+            return None
+        print(f"🦾 Shoulders detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Shoulder detection ERROR] {e}")
+        return None
+
+
+def get_shoulders_coords_1(image_pil):
+    """
+    Détecte les coordonnées approximatives des épaules avec MediaPipe FaceMesh.
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+
+    Returns:
+        list[(x, y)]: gauche et droite des épaules en coordonnées image
+    """
+    import numpy as np
+    import mediapipe as mp
+
+    mp_pose = mp.solutions.pose
+    mp_face_mesh = mp.solutions.face_mesh
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    # Utiliser MediaPipe Pose pour les épaules si disponible
+    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
+        results = pose.process(image)
+        if results.pose_landmarks:
+            # Indices MediaPipe Pose pour les épaules
+            LEFT_SHOULDER = 11
+            RIGHT_SHOULDER = 12
+            left = results.pose_landmarks.landmark[LEFT_SHOULDER]
+            right = results.pose_landmarks.landmark[RIGHT_SHOULDER]
+            left_coords = (int(left.x * w), int(left.y * h))
+            right_coords = (int(right.x * w), int(right.y * h))
+            return [left_coords, right_coords]
+
+    # Sinon fallback approximatif sur le visage avec FaceMesh
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) as face_mesh:
+        results = face_mesh.process(image)
+        if not results.multi_face_landmarks:
+            return None
+        face_landmarks = results.multi_face_landmarks[0]
+
+        # Indices approximatifs pour les coins de la mâchoire (proche épaules)
+        LEFT_JAW = 234  # côté gauche du visage
+        RIGHT_JAW = 454  # côté droit du visage
+
+        def get_coords(idx):
+            lm = face_landmarks.landmark[idx]
+            return int(lm.x * w), int(lm.y * h)
+
+        left_coords = get_coords(LEFT_JAW)
+        right_coords = get_coords(RIGHT_JAW)
+        return [left_coords, right_coords]
+
 def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=0.25, blur_kernel=5):
     """
     Applique un glow froid ciblé sur l'iris des yeux dans les latents [B,C,H,W].
