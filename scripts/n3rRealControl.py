@@ -257,10 +257,9 @@ def main(args):
             clavicules_coords = get_clavicules_coords_safe(input_pil)
             elbow_coords = get_elbows_coords_safe(input_pil)  # 3 right_elbow / coude droit # 6 left_elbow / coude gauche
             wrists_coords = get_wrists_coords_safe(input_pil)  # 4 right_wrist / poignet droit # 7 left_wrist / poignet gauche
-            # 8 right_hip / hanche droite
+            hips_coords = get_hips_coords_safe(input_pil)  # 8 right_hip / hanche droite # 11 left_hip / hanche gauche
             # 9 right_knee (absent)
             # 10 right_ankle (absent)
-            # 11 left_hip / hanche gauche
             # 12 left_knee (absent)
             # 13 left_ankle (absent)
             # 14 right_eye / œil droit - 👁 Eyes detected:
