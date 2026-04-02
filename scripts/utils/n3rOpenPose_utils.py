@@ -2289,7 +2289,7 @@ def apply_pose_driven_motion(
     offset_x = mask_center[:,0,0,0] - content_center_x[:,0,0,0]  # centrer X sur le contenu
     offset_y = mask_center[:,1,0,0] - torso_center_y[:,0,0,0]    # centrer Y sur le torse
 
-    offset_y = torch.clamp(offset_y, -H*0.5, H*0.5)
+    offset_y = torch.clamp(offset_y, -H*0.5, H*0.5) # Ajout ici !
 
     offset = torch.stack([offset_x, offset_y], dim=1).view(B,2,1,1)
     offset = offset * 0.8  # <-- réduction de l'atténuation verticale
