@@ -1892,6 +1892,8 @@ def extract_keypoints_from_pose(
     # y = pixel_y / image_height
     # IMPORTANT: use original image size (pose_full), NOT latent size
 
+    # 👄 Mouth detected: [(404, 446)]
+
     keypoints_template = [
         [418/896, 418/1280, 1.0],  # 0 nose / nez
         [383/896, 515/1280, 1.0],  # 1 neck / cou
@@ -1912,8 +1914,8 @@ def extract_keypoints_from_pose(
         [0.0, 0.0, 0.0],           # 12 left_knee (absent)
         [0.0, 0.0, 0.0],           # 13 left_ankle (absent)
 
-        [498/896, 360/1280, 1.0],  # 14 right_eye / œil droit
-        [373/896, 324/1280, 1.0],  # 15 left_eye / œil gauche
+        [495/896, 353/1280, 1.0],  # 14 right_eye / œil droit - 👁 Eyes detected:
+        [373/896, 322/1280, 1.0],  # 15 left_eye / œil gauche - 👁 Eyes detected:
 
         [608/896, 304/1280, 1.0],  # 16 right_ear / oreille droite
         [290/896, 244/1280, 1.0],  # 17 left_ear / oreille gauche
@@ -1951,11 +1953,6 @@ def extract_keypoints_from_pose(
 
 #---------------------------------------------------------
 
-#def apply_pose_driven_motion( latents, previous_latent, latents_before_openpose, latents_after_openpose, keypoints, prev_keypoints=None, frame_counter=0, device="cuda", breathing=True, ):
-    """
-    Motion basé sur keypoints OpenPose (épaule / torse / tête)
-    Batch-safe et broadcast corrigé.
-    """
 # 🔹 Récupère les coordonnées (x,y) d’un keypoint spécifique dans le batch
 # 🔹 Récupère les coordonnées (x,y) d’un keypoint spécifique dans le batch
 def get_point(kp_tensor, idx):
@@ -2161,60 +2158,52 @@ def rotate_mask_around_point_v2(mask, center_px, angle, H, W, device):
 
 
 
-def rotate_mask_around_point(mask, center_px, angle, H, W, device="cuda"):
+def rotate_mask_around_torso(mask, torso_points_px, angle, H, W, device="cuda"):
     """
-    Rotate a mask around a given center (in pixels) with automatic centering.
+    Rotate a mask around the torso center instead of the image center.
 
     mask: [B, 1, H, W] ou [B, C, H, W]
-    center_px: [B, 2] en pixels (x, y)
+    torso_points_px: [B, 2, N] points clés du torse (x, y en pixels)
     angle: [B] en radians
     """
-
     B, C, H_mask, W_mask = mask.shape
-    print(f"[LOG] mask.shape = {mask.shape}, center_px.shape = {center_px.shape}, angle.shape = {angle.shape}")
+    print(f"[LOG] mask.shape = {mask.shape}, torso_points_px.shape = {torso_points_px.shape}, angle.shape = {angle.shape}")
 
-    # Création de la grid de coordonnées
-    yy, xx = torch.meshgrid(torch.arange(H_mask, device=device), torch.arange(W_mask, device=device), indexing='ij')
-    yy = yy.float()
-    xx = xx.float()
+    # Calcul du centre du torse
+    torso_center = torso_points_px.mean(dim=2)  # [B, 2]
+    print(f"[LOG] torso_center (px) = {torso_center}")
 
-    # Broadcasting pour batch
-    xx = xx.unsqueeze(0).expand(B, -1, -1)
-    yy = yy.unsqueeze(0).expand(B, -1, -1)
-
+    # Création de la grid
+    yy, xx = torch.meshgrid(torch.arange(H_mask, device=device),
+                            torch.arange(W_mask, device=device), indexing='ij')
+    xx = xx.float().unsqueeze(0).expand(B, -1, -1)
+    yy = yy.float().unsqueeze(0).expand(B, -1, -1)
     print(f"[LOG] xx min/max: {xx.min().item()}/{xx.max().item()}, yy min/max: {yy.min().item()}/{yy.max().item()}")
 
     # Translation vers le centre du torse
-    x_shift = xx - center_px[:, 0].view(B, 1, 1)
-    y_shift = yy - center_px[:, 1].view(B, 1, 1)
-
+    x_shift = xx - torso_center[:, 0].view(B, 1, 1)
+    y_shift = yy - torso_center[:, 1].view(B, 1, 1)
     print(f"[LOG] x_shift min/max: {x_shift.min().item()}/{x_shift.max().item()}, y_shift min/max: {y_shift.min().item()}/{y_shift.max().item()}")
 
-    # Rotation
     cos_angle = torch.cos(angle).view(B, 1, 1)
     sin_angle = torch.sin(angle).view(B, 1, 1)
 
     x_rot = cos_angle * x_shift - sin_angle * y_shift
     y_rot = sin_angle * x_shift + cos_angle * y_shift
-
     print(f"[LOG] x_rot min/max: {x_rot.min().item()}/{x_rot.max().item()}, y_rot min/max: {y_rot.min().item()}/{y_rot.max().item()}")
 
-    # Recentrage sur la position originale
-    x_final = x_rot + center_px[:, 0].view(B, 1, 1)
-    y_final = y_rot + center_px[:, 1].view(B, 1, 1)
-
+    x_final = x_rot + torso_center[:, 0].view(B, 1, 1)
+    y_final = y_rot + torso_center[:, 1].view(B, 1, 1)
     print(f"[LOG] x_final min/max: {x_final.min().item()}/{x_final.max().item()}, y_final min/max: {y_final.min().item()}/{y_final.max().item()}")
 
-    # Normalisation en [-1, 1] pour grid_sample
+    # Normalisation [-1, 1]
     x_norm = 2.0 * x_final / (W - 1) - 1.0
     y_norm = 2.0 * y_final / (H - 1) - 1.0
-    grid = torch.stack((x_norm, y_norm), dim=-1)  # [B, H, W, 2]
-
+    grid = torch.stack((x_norm, y_norm), dim=-1)
     print(f"[LOG] grid min/max: x {grid[...,0].min().item()}/{grid[...,0].max().item()}, y {grid[...,1].min().item()}/{grid[...,1].max().item()}")
 
-    # grid_sample attend [B, C, H, W] et grid [B, H, W, 2]
+    # Rotation avec grid_sample
     mask_rotated = F.grid_sample(mask, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-
     print(f"[LOG] mask_rotated min/max/mean: {mask_rotated.min().item()}/{mask_rotated.max().item()}/{mask_rotated.mean().item()}")
 
     return mask_rotated
@@ -2222,6 +2211,125 @@ def rotate_mask_around_point(mask, center_px, angle, H, W, device="cuda"):
 # -------------------- Fonction principale --------------------
 
 def apply_pose_driven_motion(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    import os
+    from PIL import Image
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents_in = latents.clone()
+
+    # -------------------- Respiration --------------------
+    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
+    if debug: print("[DEBUG] Respiration applied")
+
+    # -------------------- Pose --------------------
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W, scale=0.8)
+    angle = pose.compute_torso_angle()
+    mask = pose.create_upper_body_mask(H, W, kernel_size=15, sigma=5.0, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    if debug:
+        print(f"[DEBUG] Torso delta: {pose.delta}")
+        print(f"[DEBUG] Torso angle (rad): {angle}")
+
+    # -------------------- Grid warp --------------------
+    latents_warped, dx, dy, _ = warp_latents(latents, pose.delta, H, W, device)
+    if debug:
+        print(f"[DEBUG] Grid warp applied")
+        print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
+        print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
+
+    # -------------------- Recentrage automatique --------------------
+    points_idx = [2, 5, 8, 11]  # épaules et hanches
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,4,2]
+    torso_center = pts.mean(dim=1)  # [B,2]
+    torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
+    torso_points_px = torso_points_px.view(B,2,1,1)
+    mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle.view(-1), H, W, device)
+
+    # -------------------- Offset calculation --------------------
+    # Grilles pour le calcul du barycentre
+    grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
+    grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
+
+    # Centre du masque
+    mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
+    mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
+    mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
+    mask_center = torch.cat([mask_center_x, mask_center_y], dim=1)
+
+    # Centre géométrique du contenu basé sur le masque
+    content_sum = (mask_rotated * latents_warped.mean(1, keepdim=True)).sum(dim=[2,3], keepdim=True) + 1e-6
+    content_center_x = ((mask_rotated * latents_warped.mean(1, keepdim=True)) * grid_x).sum(dim=[2,3], keepdim=True) / content_sum
+    content_center_y = ((mask_rotated * latents_warped.mean(1, keepdim=True)) * grid_y).sum(dim=[2,3], keepdim=True) / content_sum
+    content_center = torch.cat([content_center_x, content_center_y], dim=1)
+
+    # Offset : X centré sur contenu du masque, Y centré sur torse
+    offset_x = mask_center[:,0,0,0] - content_center[:,0,0,0]
+    offset_y = mask_center[:,1,0,0] - torso_points_px[:,1,0,0]
+
+    offset = torch.stack([offset_x, offset_y], dim=1).view(B,2,1,1)
+    offset = offset * 0.7
+    offset = offset.clamp(-20, 20)
+
+    if debug:
+        print("[DEBUG] offset centré:", offset[0,:,0,0])
+        print("[DEBUG] mask_center:", mask_center[0,:,0,0])
+        print("[DEBUG] content_center:", content_center[0,:,0,0])
+        print("[DEBUG] torso_center_px:", torso_points_px[0,:,0,0])
+
+    # -------------------- Shift avec grid_sample --------------------
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1,1,H,device=device),
+        torch.linspace(-1,1,W,device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx,yy),dim=-1).unsqueeze(0).repeat(B,1,1,1)
+    shift_x = offset[:,0,0,0] * 2 / (W-1)
+    shift_y = offset[:,1,0,0] * 2 / (H-1)
+    grid[...,0] -= shift_x[:,None,None]
+    grid[...,1] -= shift_y[:,None,None]
+    latents_warped = F.grid_sample(latents_warped, grid, align_corners=True)
+
+    # -------------------- Fusion latents --------------------
+    mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
+    latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
+
+    # -------------------- OpenPose delta --------------------
+    latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
+
+    # -------------------- Stabilisation --------------------
+    latents = stabilize_latents_motion(latents)
+
+    # -------------------- Impact map (debug) --------------------
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
+        impact_np = impact_map[0,0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+        Image.fromarray((impact_np*255).astype(np.uint8)).save(
+            os.path.join(debug_dir, f"impact_map_driven_{frame_counter:05d}.png")
+        )
+
+    return latents
+
+def apply_pose_driven_motion_decale(
     latents,
     previous_latent,
     latents_before_openpose,
@@ -2264,9 +2372,17 @@ def apply_pose_driven_motion(
         print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
 
     # -------------------- Recentrage automatique --------------------
-    torso_center = ((pose.get_point(2) + pose.get_point(5)) * 0.5)  # [B,2] en [0,1]
-    torso_center_px = torch.stack([torso_center[:,0]*(W-1), torso_center[:,1]*(H-1)], dim=1)
-    mask_rotated = rotate_mask_around_point(mask, torso_center_px, angle.view(-1), H, W, device)
+    # Si pose.get_point(i) est normalisé [0,1], convertir en pixels
+    # Points pour le torse (épaule et hanche)
+    points_idx = [2, 5, 8, 11]
+    # Récupération des keypoints pour tout le batch
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,4,2]
+    # Centre barycentrique du torse
+    torso_center = pts.mean(dim=1)  # [B,2]
+    # Conversion en pixels
+    torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
+    torso_points_px = torso_points_px.view(B,2,1,1)  # [B,2,1,1]
+    mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle.view(-1), H, W, device)
 
     # -------------------- Offset calculation --------------------
     mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
@@ -2275,15 +2391,27 @@ def apply_pose_driven_motion(
     mask_center = torch.cat([mask_center_x, mask_center_y], dim=1)  # [B,2,1,1]
 
     # centre du contenu (AVANT warp)
-    content_center = torch.stack([
-        (W-1)/2 + (dx * mask_rotated).sum() / (mask_rotated.sum() + 1e-6),
-        (H-1)/2 + (dy * mask_rotated).sum() / (mask_rotated.sum() + 1e-6)
-    ], dim=0).view(1,2,1,1)
+    # Grilles de coordonnées
+    grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
+    grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
+
+    # Centre du contenu pondéré par le masque
+    content_center_x = (latents * mask_rotated * grid_x).sum(dim=[1,2,3], keepdim=True) / ((latents * mask_rotated).sum(dim=[1,2,3], keepdim=True) + 1e-6)
+    #content_center_y = (latents * mask_rotated * grid_y).sum(dim=[1,2,3], keepdim=True) / ((latents * mask_rotated).sum(dim=[1,2,3], keepdim=True) + 1e-6)
+
+    content_center_y = (latents * mask_rotated * grid_y).sum(...) / ((latents * mask_rotated).sum(...) + 1e-6)
+
+    content_center = torch.cat([content_center_x, content_center_y], dim=1)  # [B,2,1,1]
 
     offset = (mask_center - content_center)
     # ✅ Limitation pour éviter de sortir de l'image
     offset = offset.clamp(-20, 20)
     if debug: print("offset px:", offset[0,:,0,0])
+
+    if debug:
+        print(f"[DEBUG] mask_center: {mask_center[0,:,0,0]}")
+        print(f"[DEBUG] content_center: {content_center[0,:,0,0]}")
+        print(f"[DEBUG] applied offset: {offset[0,:,0,0]}")
 
     # -------------------- Shift avec grid_sample --------------------
     yy, xx = torch.meshgrid(
@@ -2344,132 +2472,6 @@ def apply_pose_driven_motion(
 
     return latents
 
-def apply_pose_driven_motion_v3(
-    latents,
-    previous_latent,
-    latents_before_openpose,
-    latents_after_openpose,
-    keypoints,
-    prev_keypoints=None,
-    frame_counter=0,
-    device="cuda",
-    breathing=True,
-    debug=False,
-    debug_dir=None
-):
-    import os
-    from PIL import Image
-
-    B, C, H, W = latents.shape
-    device = latents.device
-    latents_in = latents.clone()
-
-    # -------------------- Respiration --------------------
-    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
-    if debug: print("[DEBUG] Respiration applied")
-
-    # -------------------- Création de l'objet Pose --------------------
-    pose = Pose(keypoints.to(device))
-    pose.compute_torso_delta(latent_h=H, latent_w=W, scale=0.8)
-    angle = pose.compute_torso_angle()
-    mask = pose.create_upper_body_mask(H, W, kernel_size=15, sigma=5.0, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    if debug:
-        print(f"[DEBUG] Torso delta: {pose.delta}")
-        print(f"[DEBUG] Torso angle (rad): {angle}")
-
-    # -------------------- Grid warp --------------------
-    latents_warped, dx, dy, grid = warp_latents(latents, pose.delta, H, W, device)
-    if debug:
-        print(f"[DEBUG] Grid warp applied")
-        print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
-        print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
-
-    # -------------------- Recentrage automatique --------------------
-    torso_center = ((pose.get_point(2) + pose.get_point(5)) * 0.5)  # [B,2] en [0,1]
-    torso_center_px = torch.stack([torso_center[:,0]*(W-1), torso_center[:,1]*(H-1)], dim=1)
-    mask_rotated = rotate_mask_around_point(mask, torso_center_px, angle.view(-1), H, W, device)
-
-
-    # centre du masque
-    mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
-    mask_center_x = (mask_rotated * torch.arange(W, device=device)[None,None,None,:]).sum(dim=[2,3], keepdim=True) / mask_sum
-    mask_center_y = (mask_rotated * torch.arange(H, device=device)[None,None,:,None]).sum(dim=[2,3], keepdim=True) / mask_sum
-
-    mask_center = torch.cat([mask_center_x, mask_center_y], dim=1)  # [B,2,1,1]
-
-    # centre du contenu (AVANT warp = centre image)
-    content_center = torch.stack([
-        (W-1)/2 + (dx * mask_rotated).sum() / (mask_rotated.sum() + 1e-6),
-        (H-1)/2 + (dy * mask_rotated).sum() / (mask_rotated.sum() + 1e-6)
-    ], dim=0).view(1,2,1,1)
-
-    # offset correct
-    offset = (mask_center - content_center)
-    print("offset px:", offset[0,:,0,0])
-
-    # shift
-    # shift subpixel avec grid_sample
-    yy, xx = torch.meshgrid(
-        torch.linspace(-1,1,H,device=device),
-        torch.linspace(-1,1,W,device=device),
-        indexing='ij'
-    )
-
-    grid = torch.stack((xx,yy),dim=-1).unsqueeze(0).repeat(B,1,1,1)
-
-    shift_x = offset[:,0,0,0] * 2 / (W-1)
-    shift_y = offset[:,1,0,0] * 2 / (H-1)
-
-    grid[...,0] -= shift_x[:,None,None]
-    grid[...,1] -= shift_y[:,None,None]
-
-    latents_warped = F.grid_sample(latents_warped, grid, align_corners=True)
-
-    # -------------------- Fusion latents --------------------
-    mask_boosted = mask_rotated ** 0.7   # rehausse légèrement les valeurs
-    mask_boosted = mask_boosted * 1.5    # amplifie globalement
-    mask_boosted = torch.clamp(mask_boosted, 0, 1)  # on reste dans [0,1]
-    latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
-    if debug: print("[DEBUG] Upper body mask fusion applied (inclined)")
-    # -------------------- Debug log pour contribution --------------------
-    if debug:
-        mask_mean = mask_rotated.mean().item()
-        mask_max = mask_rotated.max().item()
-        mask_min = mask_rotated.min().item()
-
-        mask_boosted_mean = mask_boosted.mean().item()
-        mask_boosted_max = mask_boosted.max().item()
-        mask_boosted_min = mask_boosted.min().item()
-
-        print(f"[DEBUG] mask_rotated: min={mask_min:.3f}, max={mask_max:.3f}, mean={mask_mean:.3f}")
-        print(f"[DEBUG] mask_boosted: min={mask_boosted_min:.3f}, max={mask_boosted_max:.3f}, mean={mask_boosted_mean:.3f}")
-
-        # Estimation contribution latents_warped
-        warped_contribution = (latents_warped * mask_boosted).mean().item()
-        print(f"[DEBUG] Approx. latents_warped contribution (mean): {warped_contribution:.3f}")
-
-    # -------------------- OpenPose delta --------------------
-    latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
-    if debug: print("[DEBUG] OpenPose delta applied")
-
-    # -------------------- Stabilisation --------------------
-    latents = stabilize_latents_motion(latents)
-    if debug: print("[DEBUG] Latents stabilized")
-
-    # -------------------- Impact map --------------------
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-        impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
-        impact_np = impact_map[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        Image.fromarray((impact_np*255).astype(np.uint8)).save(
-            os.path.join(debug_dir, f"impact_map_driven_{frame_counter:05d}.png")
-        )
-        print(f"[DEBUG] Impact map saved for frame {frame_counter}")
-
-    return latents
 #-----------------------------------------------------------------------------------------
 
 def create_upper_body_mask(keypoints, H, W, device):
@@ -2488,82 +2490,6 @@ def create_upper_body_mask(keypoints, H, W, device):
     mask = torch.clamp(mask,0,1)
     return mask
 
-
-def apply_pose_driven_motion_v2(
-    latents,
-    previous_latent,
-    latents_before_openpose,
-    latents_after_openpose,
-    keypoints,
-    prev_keypoints=None,
-    frame_counter=0,
-    device="cuda",
-    breathing=True,
-    debug=False,
-    debug_dir=None
-):
-    B, C, H, W = latents.shape
-    device = latents.device
-    latents_in = latents.clone()
-
-    # -------------------- Respiration --------------------
-    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
-    if debug: print("[DEBUG] Respiration applied")
-
-    # ==================== Keypoints bruts ====================
-    raw_keypoints = keypoints
-    raw_prev_keypoints = prev_keypoints
-
-    keypoints = normalize_keypoints(keypoints)
-    if prev_keypoints is not None:
-        prev_keypoints = normalize_keypoints(prev_keypoints)
-    if debug: print("[DEBUG] Keypoints normalized (local only)")
-
-    # -------------------- Torso delta --------------------
-    delta_torso = compute_delta_torso(raw_keypoints, latent_h=H, latent_w=W, scale=0.8)
-    if debug:
-        print(f"[DEBUG] Delta torso (RAW): {delta_torso}")
-        print(f"[DEBUG] delta_torso norm: {delta_torso.norm(dim=1)}")
-
-    # -------------------- Grid warp --------------------
-    latents_warped, dx, dy, grid = warp_latents(latents, delta_torso, H, W, device)
-    if debug:
-        print(f"[DEBUG] Grid warp applied")
-        print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
-        print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
-
-    # -------------------- Angle du torse --------------------
-    angle, torso_center = compute_torso_angle(raw_keypoints)
-    if debug: print(f"[DEBUG] Torso angle (rad): {angle}")
-
-    # -------------------- Upper body fusion avec rotation --------------------
-    mask = create_upper_body_mask(keypoints, H, W, device)
-    mask_rotated = rotate_mask_around_point(mask, torso_center, angle, H, W, device)
-    latents = latents * (1 - mask_rotated) + latents_warped * mask_rotated
-    if debug: print("[DEBUG] Upper body mask fusion applied (inclined)")
-
-    # -------------------- OpenPose delta --------------------
-    latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
-    if debug: print("[DEBUG] OpenPose delta applied")
-
-    # -------------------- Stabilisation --------------------
-    latents = stabilize_latents_motion(latents)
-    if debug: print("[DEBUG] Latents stabilized")
-
-    # -------------------- Impact map --------------------
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-        impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
-        impact_np = impact_map[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        Image.fromarray((impact_np*255).astype(np.uint8)).save(
-            os.path.join(debug_dir, f"impact_map_{frame_counter:05d}.png")
-        )
-        print(f"[DEBUG] Impact map saved for frame {frame_counter}")
-
-    return latents
 
 
 #------------------------------------------------------------------------------------------
