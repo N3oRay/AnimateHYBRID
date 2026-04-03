@@ -79,6 +79,8 @@ def main(args):
 
     use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
     use_openpose = cfg.get("use_openpose", True)
+    open_pose_init = cfg.get("open_pose_init", False)
+
     controlnet_scale = cfg.get("controlnet_scale", 1.0) # typiquement 0.5 → 1.0
     control_strength = cfg.get("control_strength", 1.5)
     n3r_pro_strength = cfg.get("n3r_pro_strength", 0.001) # 0.1, 0.2, 0.3
@@ -470,10 +472,11 @@ def main(args):
 
 
                             # ------------------- Tile-wise OpenPose -------------------
-                            tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, )
+                            if open_pose_init:
+                                tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, )
 
-                            # 🔹 Appel correct de apply_openpose_tilewise
-                            latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
+                                # 🔹 Appel correct de apply_openpose_tilewise
+                                latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
 
                             # BOOST
                             latents_after = latents.clone()  # sortie OpenPose
