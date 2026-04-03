@@ -177,26 +177,26 @@ class Pose:
     def create_upper_body_mask(self, H: int, W: int, kernel_size: int = 15, sigma: float = 5.0,
                            debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
         """
-        Crée un masque polygonal flouté torse + bras.
-        Le torse est basé sur les épaules, et les bras sur coudes et poignets.
+        Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
         """
         mask = torch.zeros(self.B, 1, H, W, device=self.device)
 
         for b in range(self.B):
-            # Récupère les keypoints
-            r_sh = self.get_point(2)[b].cpu().numpy()
-            r_el = self.get_point(3)[b].cpu().numpy()
-            r_wr = self.get_point(4)[b].cpu().numpy()
-            l_sh = self.get_point(5)[b].cpu().numpy()
-            l_el = self.get_point(6)[b].cpu().numpy()
-            l_wr = self.get_point(7)[b].cpu().numpy()
+            # Récupère les keypoints : épaules et hanches
+            r_sh = self.get_point(2)[b].cpu().numpy()  # épaule droite
+            l_sh = self.get_point(5)[b].cpu().numpy()  # épaule gauche
+            r_hip = self.get_point(8)[b].cpu().numpy() # hanche droite
+            l_hip = self.get_point(11)[b].cpu().numpy()# hanche gauche
 
             # Convertir en pixels
             def to_px(kp):
                 return [int(kp[0]*(W-1)), int(kp[1]*(H-1))]
+
             pts = np.array([
-                to_px(r_sh), to_px(r_el), to_px(r_wr),
-                to_px(l_wr), to_px(l_el), to_px(l_sh)
+                to_px(r_sh),
+                to_px(l_sh),
+                to_px(l_hip),
+                to_px(r_hip)
             ], dtype=np.int32)
 
             # Remplir le polygone
@@ -215,6 +215,61 @@ class Pose:
             os.makedirs(debug_dir, exist_ok=True)
             debug_scale = 4
             mask_np_debug = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
+            mask_debug = cv2.resize(mask_np_debug, (W*debug_scale, H*debug_scale), interpolation=cv2.INTER_NEAREST)
+            mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
+            save_path = os.path.join(debug_dir, f"skeleton_mask_{frame_counter:05d}.png")
+            cv2.imwrite(save_path, mask_debug_rgb)
+            print(f"[DEBUG] Upper body mask saved (scale {debug_scale}): {save_path}")
+
+        return mask
+
+    def create_upper_body_mask1(self, H: int, W: int, kernel_size: int = 15, sigma: float = 5.0,
+                           debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
+        """
+        Crée un masque polygonal flouté torse + bras, sans le cou.
+        Le torse est basé uniquement sur les épaules, les bras sur coudes et poignets.
+        """
+        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+
+            #     [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
+    #   [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
+    #    [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite  🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
+    #     [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche 🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
+
+        for b in range(self.B):
+            # Récupère les keypoints : épaules, coudes, poignets
+            r_sh = self.get_point(2)[b].cpu().numpy()
+            r_el = self.get_point(3)[b].cpu().numpy()
+            r_wr = self.get_point(4)[b].cpu().numpy()
+            l_sh = self.get_point(5)[b].cpu().numpy()
+            l_el = self.get_point(6)[b].cpu().numpy()
+            l_wr = self.get_point(7)[b].cpu().numpy()
+
+            # Convertir en pixels
+            def to_px(kp):
+                return [int(kp[0] * (W-1)), int(kp[1] * (H-1))]
+
+            pts = np.array([
+                to_px(r_sh), to_px(r_el), to_px(r_wr),
+                to_px(l_wr), to_px(l_el), to_px(l_sh)
+            ], dtype=np.int32)
+
+            # Remplir le polygone
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(mask_np, [pts], 255)
+
+            # Convertir en tensor et assigner
+            mask[b, 0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+
+        # Floutage pour adoucir les bords
+        mask = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
+        mask = torch.clamp(mask, 0, 1)
+
+        # -------------------- Debug --------------------
+        if debug and debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_scale = 4
+            mask_np_debug = (mask[0, 0].detach().cpu().numpy() * 255).astype(np.uint8)
             mask_debug = cv2.resize(mask_np_debug, (W*debug_scale, H*debug_scale), interpolation=cv2.INTER_NEAREST)
             mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
             save_path = os.path.join(debug_dir, f"skeleton_mask_{frame_counter:05d}.png")
@@ -2262,6 +2317,34 @@ def save_impact_map(latents, latents_in, debug_dir, frame_counter):
     Image.fromarray((impact_np*255).astype(np.uint8)).save(save_path)
     print(f"[DEBUG] Impact map saved: {save_path}")
 
+def scale_mask(mask, scale=0.8):
+    """
+    Réduit le masque autour de son centre par un facteur scale.
+    mask: [B,1,H,W]
+    scale: 0.0-1.0
+    """
+    B, C, H, W = mask.shape
+    # Coordonnées normalisées [-1,1]
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1,1,H,device=mask.device),
+        torch.linspace(-1,1,W,device=mask.device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)
+
+    # Centre du masque
+    mask_sum = mask.sum(dim=[2,3], keepdim=True) + 1e-6
+    center_x = (mask * xx).sum(dim=[2,3], keepdim=True) / mask_sum
+    center_y = (mask * yy).sum(dim=[2,3], keepdim=True) / mask_sum
+
+    # Décalage des coordonnées vers le centre et scaling
+    grid[...,0] = (grid[...,0] - center_x) * scale + center_x
+    grid[...,1] = (grid[...,1] - center_y) * scale + center_y
+
+    # Sample
+    mask_scaled = F.grid_sample(mask, grid, mode='bilinear', align_corners=True)
+    return mask_scaled
+
 # -------------------- Fonction principale --------------------------------------------
 def apply_pose_driven_motion(
     latents,
@@ -2276,11 +2359,8 @@ def apply_pose_driven_motion(
     debug=False,
     debug_dir=None
 ):
-    import os
-    from PIL import Image
     import torch
     import torch.nn.functional as F
-    import numpy as np
 
     B, C, H, W = latents.shape
     device = latents.device
@@ -2307,50 +2387,56 @@ def apply_pose_driven_motion(
         print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
         print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
 
-    # -------------------- Recentrage automatique sur haut du torse --------------------
-    points_idx = [1, 2, 5, 18]  # neck, right_shoulder, left_shoulder, mouth
-    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,4,2]
+    # -------------------- Recentrage automatique sur le torse complet --------------------
 
-    neck = pts[:, 0, :]
-    shoulders = pts[:, 1:3, :]
-    avg_shoulders = shoulders.mean(dim=1)
-    mouth = pts[:, 3, :]
+    #     [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
+    #   [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
+    #    [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite  🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
+    #     [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche 🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
 
-    sternum_offset_y = compute_sternum_offset_y(neck, avg_shoulders, mouth_coords=mouth, ratio=0.5)
-    content_center = pts.mean(dim=1, keepdim=True) + torch.tensor([0.0, sternum_offset_y], device=device)
-    content_points_px = content_center * torch.tensor([W-1, H-1], device=device)
+    points_idx = [1, 2, 5, 8, 11]  # neck, right/left shoulder, right/left hip
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,5,2]
 
-    torso_center = pts.mean(dim=1)
+    # Rectangle englobant le torse
+    x_min = pts[:, :, 0].min(dim=1)[0]
+    x_max = pts[:, :, 0].max(dim=1)[0]
+    y_min = pts[:, :, 1].min(dim=1)[0]
+    y_max = pts[:, :, 1].max(dim=1)[0]
+
+    # Centre exact du torse
+    torso_center_x = (x_min + x_max) / 2
+    torso_center_y = (y_min + y_max) / 2
+    torso_center = torch.stack([torso_center_x, torso_center_y], dim=1)
+
+    # Largeur et hauteur du torse
+    torso_width_px  = (x_max - x_min) * (W-1)  # largeur en pixels
+    torso_height_px = (y_max - y_min) * (H-1)  # hauteur en pixels
+
     torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
     torso_points_px = torso_points_px.view(B,2,1,1)
+
     mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle.view(-1), H, W, device)
     mask_rotated = mask_rotated.clamp(0,1)
 
+    if debug:
+        print(f"[DEBUG] mask_rotated shape: {mask_rotated.shape}, min: {mask_rotated.min().item():.4f}, "
+              f"max: {mask_rotated.max().item():.4f}, mean: {mask_rotated.mean().item():.4f}")
+
     # -------------------- Offset calculation basé sur le masque --------------------
+    # Grilles en pixels
     grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
     grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
 
-    print(f"[DEBUG] grid_x: {grid_x}")
-    print(f"[DEBUG] grid_y: {grid_y}")
-
+    # Somme pondérée du masque
     mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
-    print(f"[DEBUG] mask_sum: {mask_sum}")
     mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
     mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
 
-    # -------------------- Décalage basé sur barycentre du torse --------------------
-    content_center_px = content_points_px[:,0]
-    print(f"[DEBUG] content_center_px init: {content_center_px}")
-    shoulders = pts[:, 1:3, :]
-    content_center_shoulders = shoulders.mean(dim=1, keepdim=True)
-    print(f"[DEBUG] content_center_shoulders : {content_center_shoulders}")
 
     # -------------------- Padding dynamique gauche --------------------
-    padding_left = int(0.2 * W)  # 10% de la largeur
-    print(f"[DEBUG] padding_left: {padding_left}")
+    padding_left = int(0.2 * W)  # 20% de la largeur
     latents_padded = F.pad(latents_warped, (padding_left,0,0,0), mode='replicate')
     B, C, H_pad, W_pad = latents_padded.shape
-    print(f"[DEBUG] latents padded shape: {latents_padded.shape}")
 
     # -------------------- Grid warp avec padding --------------------
     yy, xx = torch.meshgrid(
@@ -2360,32 +2446,30 @@ def apply_pose_driven_motion(
     )
     grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)
 
-    shift_x = (mask_center_x[:,0,0,0] - content_center_px[:,0]) * 2 / (W-1)
-    shift_y = (mask_center_y[:,0,0,0] - content_center_px[:,1]) * 2 / (H-1)
-    print(f"[DEBUG] shift_x: {shift_x}")
-    print(f"[DEBUG] shift_y: {shift_y}")
+    # -------------------- Décalage basé sur barycentre du torse avec largeur --------------------
+    #torso_width_px = (shoulders[:,0,0] - shoulders[:,1,0]).abs()
+    if debug:
+        print(f"[DEBUG] torso_width_px: {torso_width_px}, corrected: {torso_width_px}")
 
-    shift_y += 0.4
-    print(f"[DEBUG] shift_y correction: {shift_y}")
-    shift_y = torch.clamp(shift_y, -0.5, 0.6)
-    print(f"[DEBUG] shift_y clamp: {shift_y}")
-    shift_x += 0.5
-    print(f"[DEBUG] shift_x correction: {shift_x}")
-    shift_x = torch.clamp(shift_x, -0.02, 0.8)
-    print(f"[DEBUG] shift_x clamp: {shift_x}")
 
-    # largeur moyenne du torse
-    torso_width_px = (shoulders[:,0,0] - shoulders[:,1,0]).abs()
-    correction_factor = torch.clamp(torso_width_px / (W-1), 0.5, 1.0)
-    print(f"[DEBUG] torso_width_px: {torso_width_px}")
-    print(f"[DEBUG] correction_factor: {correction_factor}")
+    shift_x = (mask_center_x[:,0,0,0] - torso_center_x) * 2 / torso_width_px
+    shift_y = (mask_center_y[:,0,0,0] - torso_center_y) * 2 / torso_height_px
+
+    if debug:
+        print(f"[DEBUG] shift_x: {shift_x}, shift_y: {shift_y}")
+
+    shift_y = torch.clamp(shift_y + 0.4, -0.5, 0.6)  # légère correction verticale
+    #shift_x = torch.clamp(shift_x, -0.02, 0.8)       # plus de +0.5 magique
+    shift_x = torch.clamp(shift_x, -0.02, 0.5)  # +0.3
+
+    if debug:
+        print(f"[DEBUG] clamp shift_x: {shift_x}, shift_y: {shift_y}")
 
     grid[...,0] -= shift_x[:,None,None]
     grid[...,1] -= shift_y[:,None,None]
 
     latents_warped = F.grid_sample(latents_padded, grid, align_corners=True)
     latents_warped = latents_warped[:, :, :, padding_left:]  # recadrage pour largeur originale
-    print(f"[DEBUG] latents_warped shape after recadrage: {latents_warped.shape}")
 
     # -------------------- Fusion latents --------------------
     mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
@@ -2540,16 +2624,8 @@ def apply_pose_driven_motion_stable(
     latents = stabilize_latents_motion(latents)
 
     # -------------------- Impact map (debug) --------------------
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-        impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
-        impact_np = impact_map[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        Image.fromarray((impact_np*255).astype(np.uint8)).save(
-            os.path.join(debug_dir, f"impact_map_driven_{frame_counter:05d}.png")
-        )
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter)
 
     return latents
 
