@@ -2239,7 +2239,30 @@ def compute_sternum_offset_y(neck_coords, shoulder_coords, mouth_coords=None, ra
     sternum_offset_y = ratio * combined_dist
     return sternum_offset_y
 
-# -------------------- Fonction principale --------------------
+def save_impact_map(latents, latents_in, debug_dir, frame_counter):
+    """
+    Sauvegarde une carte d'impact montrant les différences entre latents et latents_in.
+
+    Args:
+        latents (torch.Tensor): Latents modifiés [B, C, H, W]
+        latents_in (torch.Tensor): Latents originaux [B, C, H, W]
+        debug_dir (str): Répertoire où sauvegarder l'image
+        frame_counter (int): Index de la frame pour le nom de fichier
+    """
+    if debug_dir is None:
+        return
+
+    os.makedirs(debug_dir, exist_ok=True)
+    impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
+    impact_np = impact_map[0,0].detach().cpu().numpy()
+    impact_np -= impact_np.min()
+    if impact_np.max() > 0:
+        impact_np /= impact_np.max()
+    save_path = os.path.join(debug_dir, f"impact_map_driven_{frame_counter:05d}.png")
+    Image.fromarray((impact_np*255).astype(np.uint8)).save(save_path)
+    print(f"[DEBUG] Impact map saved: {save_path}")
+
+# -------------------- Fonction principale --------------------------------------------
 def apply_pose_driven_motion(
     latents,
     previous_latent,
@@ -2307,99 +2330,62 @@ def apply_pose_driven_motion(
     grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
     grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
 
-    if debug:
-        print(f"[DEBUG] grid_x: {grid_x}")
-        print(f"[DEBUG] grid_y: {grid_y}")
+    print(f"[DEBUG] grid_x: {grid_x}")
+    print(f"[DEBUG] grid_y: {grid_y}")
 
     mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
-    if debug:
-        print(f"[DEBUG] mask_sum: {mask_sum}")
+    print(f"[DEBUG] mask_sum: {mask_sum}")
     mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
     mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
 
     # -------------------- Décalage basé sur barycentre du torse --------------------
     content_center_px = content_points_px[:,0]
-    if debug:
-        print(f"[DEBUG] content_center_px init: {content_center_px}")
-    shift_x = (mask_center_x[:,0,0,0] - content_center_px[:,0]) * 2 / (W-1)
-    shift_y = (mask_center_y[:,0,0,0] - content_center_px[:,1]) * 2 / (H-1)
+    print(f"[DEBUG] content_center_px init: {content_center_px}")
+    shoulders = pts[:, 1:3, :]
+    content_center_shoulders = shoulders.mean(dim=1, keepdim=True)
+    print(f"[DEBUG] content_center_shoulders : {content_center_shoulders}")
 
-    if debug:
-        print(f"[DEBUG] shift_x: {shift_x}")
-        print(f"[DEBUG] shift_y: {shift_y}")
-
-    # --- Corrections ---
-    shift_y += 0.4
-    if debug: print(f"[DEBUG] shift_y correction: {shift_y}")
-    shift_y = torch.clamp(shift_y, -0.5, 0.6)
-    if debug: print(f"[DEBUG] shift_y clamp: {shift_y}")
-
-    shift_x += 0.6
-    if debug: print(f"[DEBUG] shift_x correction: {shift_x}")
-    shift_x = torch.clamp(shift_x, -0.02, 0.8)
-    if debug: print(f"[DEBUG] shift_x clamp: {shift_x}")
-
-    # -------------------- Padding adaptatif sécurisé --------------------
-    max_shift_x = torch.max(torch.abs(shift_x)).item()
-    max_shift_y = torch.max(torch.abs(shift_y)).item()
-
-    margin_factor = 0.5  # marge supplémentaire pour éviter artefacts
-    pad_x = int((max_shift_x + margin_factor) * W)
-    pad_y = int((max_shift_y + margin_factor) * H)
-
-    # ⚠️ Clamp pour ne pas dépasser la taille du tenseur
-    pad_x = min(pad_x, W - 1)
-    pad_y = min(pad_y, H - 1)
-
-    if debug:
-        print(f"[DEBUG] max_shift_x: {max_shift_x}")
-        print(f"[DEBUG] max_shift_y: {max_shift_y}")
-        print(f"[DEBUG] pad_x: {pad_x}, pad_y: {pad_y}")
-
-    latents_padded = F.pad(
-        latents_warped,
-        (pad_x, pad_x, pad_y, pad_y),
-        mode='reflect'
-    )
-
+    # -------------------- Padding dynamique gauche --------------------
+    padding_left = int(0.2 * W)  # 10% de la largeur
+    print(f"[DEBUG] padding_left: {padding_left}")
+    latents_padded = F.pad(latents_warped, (padding_left,0,0,0), mode='replicate')
     B, C, H_pad, W_pad = latents_padded.shape
-    if debug:
-        print(f"[DEBUG] latents_padded shape: {latents_padded.shape}")
+    print(f"[DEBUG] latents padded shape: {latents_padded.shape}")
 
-    # -------------------- Grid standard --------------------
+    # -------------------- Grid warp avec padding --------------------
     yy, xx = torch.meshgrid(
         torch.linspace(-1,1,H,device=device),
-        torch.linspace(-1,1,W,device=device),
+        torch.linspace(-1,1,W_pad,device=device),
         indexing='ij'
     )
-    grid = torch.stack((xx,yy),dim=-1).unsqueeze(0).repeat(B,1,1,1)
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)
 
-    # -------------------- Correction d’échelle --------------------
-    scale_x = (W - 1) / (W_pad - 1)
-    scale_y = (H - 1) / (H_pad - 1)
-    if debug:
-        print(f"[DEBUG] scale_x: {scale_x}, scale_y: {scale_y}")
-    grid[..., 0] *= scale_x
-    grid[..., 1] *= scale_y
+    shift_x = (mask_center_x[:,0,0,0] - content_center_px[:,0]) * 2 / (W-1)
+    shift_y = (mask_center_y[:,0,0,0] - content_center_px[:,1]) * 2 / (H-1)
+    print(f"[DEBUG] shift_x: {shift_x}")
+    print(f"[DEBUG] shift_y: {shift_y}")
 
-    # -------------------- Ajustement du shift vers espace paddé --------------------
-    shift_x_pad = shift_x * (W / W_pad)
-    shift_y_pad = shift_y * (H / H_pad)
-    if debug:
-        print(f"[DEBUG] shift_x_pad: {shift_x_pad}")
-        print(f"[DEBUG] shift_y_pad: {shift_y_pad}")
-    grid[...,0] -= shift_x_pad[:,None,None]
-    grid[...,1] -= shift_y_pad[:,None,None]
+    shift_y += 0.4
+    print(f"[DEBUG] shift_y correction: {shift_y}")
+    shift_y = torch.clamp(shift_y, -0.5, 0.6)
+    print(f"[DEBUG] shift_y clamp: {shift_y}")
+    shift_x += 0.5
+    print(f"[DEBUG] shift_x correction: {shift_x}")
+    shift_x = torch.clamp(shift_x, -0.02, 0.8)
+    print(f"[DEBUG] shift_x clamp: {shift_x}")
 
-    # -------------------- Sampling sécurisé --------------------
-    latents_warped = F.grid_sample(
-        latents_padded,
-        grid,
-        align_corners=True,
-        padding_mode='reflection'
-    )
-    if debug:
-        print(f"[DEBUG] latents_warped shape after recadrage: {latents_warped.shape}")
+    # largeur moyenne du torse
+    torso_width_px = (shoulders[:,0,0] - shoulders[:,1,0]).abs()
+    correction_factor = torch.clamp(torso_width_px / (W-1), 0.5, 1.0)
+    print(f"[DEBUG] torso_width_px: {torso_width_px}")
+    print(f"[DEBUG] correction_factor: {correction_factor}")
+
+    grid[...,0] -= shift_x[:,None,None]
+    grid[...,1] -= shift_y[:,None,None]
+
+    latents_warped = F.grid_sample(latents_padded, grid, align_corners=True)
+    latents_warped = latents_warped[:, :, :, padding_left:]  # recadrage pour largeur originale
+    print(f"[DEBUG] latents_warped shape after recadrage: {latents_warped.shape}")
 
     # -------------------- Fusion latents --------------------
     mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
@@ -2412,18 +2398,11 @@ def apply_pose_driven_motion(
     latents = stabilize_latents_motion(latents)
 
     # -------------------- Impact map (debug) --------------------
-    if debug and debug_dir is not None:
-        os.makedirs(debug_dir, exist_ok=True)
-        impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
-        impact_np = impact_map[0,0].detach().cpu().numpy()
-        impact_np -= impact_np.min()
-        if impact_np.max() > 0:
-            impact_np /= impact_np.max()
-        Image.fromarray((impact_np*255).astype(np.uint8)).save(
-            os.path.join(debug_dir, f"impact_map_driven_{frame_counter:05d}.png")
-        )
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter)
 
     return latents
+
 
 #-----------------------------------------------------------------------------------------------------------
 def apply_pose_driven_motion_stable(
