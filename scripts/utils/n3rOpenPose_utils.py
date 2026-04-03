@@ -66,11 +66,11 @@ def extract_keypoints_from_pose(
         [197/896, 944/1280, 1.0],  # 6 left_elbow / coude gauche 🦾 Elbows detected/estimated: [[179, 896], [627, 896]]
         [431/896, 1087/1280, 1.0], # 7 left_wrist / poignet gauche ✋ Wrists detected: [(179, 1152.0), (627, 1152.0)]
 
-        [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite
+        [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite  🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
         [0.0, 0.0, 0.0],           # 9 right_knee (absent)
         [0.0, 0.0, 0.0],           # 10 right_ankle (absent)
 
-        [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche
+        [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche 🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
         [0.0, 0.0, 0.0],           # 12 left_knee (absent)
         [0.0, 0.0, 0.0],           # 13 left_ankle (absent)
 
@@ -79,8 +79,8 @@ def extract_keypoints_from_pose(
         [608/896, 304/1280, 1.0],  # 16 right_ear / oreille droite
         [290/896, 244/1280, 1.0],  # 17 left_ear / oreille gauche
         [404/896, 446/1280, 1.0],  # 18 mouth / Bouche (ok) - 👄 Mouth detected: [(404, 446)]
-        [277/896, 528/1280, 1.0],  # 19 🦾 right_clavicules detected: [(277, 528), (562, 514)]
-        [562/896, 514/1280, 1.0],  # 20 🦾 left_clavicules detected: [(277, 528), (562, 514)]
+        [562/896, 514/1280, 1.0],  # 19 🦾 right_clavicules detected: [562/896, 514/1280, 1.0],
+        [277/896, 528/1280, 1.0],  # 20 🦾 left_clavicules detected: [(277, 528), (562, 514)]
     ]
 
     # ---------------------------
@@ -283,7 +283,7 @@ def debug_draw_openpose_skeleton(
             color = COLORS["eyes"]
         elif i == 0:             # nose
             color = COLORS["nose"]
-        elif i in [2,3,4,5,6,7]: # arms
+        elif i in [2,3,19,20,4,5,6,7]: # arms
             color = COLORS["arms"]
         elif i in [1,8,11]:      # torso
             color = COLORS["torso"]
@@ -297,8 +297,8 @@ def debug_draw_openpose_skeleton(
     # ---------------------------
     skeleton = [
         (0,1),        # nose → neck
-        (1,2), (2,3), (3,4),   # right arm
-        (1,5), (5,6), (6,7),   # left arm
+        (1,19), (19,2), (2,3), (3,4),   # right arm (1,2), (2,3), (3,4),   # right arm
+        (1,20), (20,5), (5,6), (6,7),   # left arm (1,5), (5,6), (6,7),   # left arm
         (1,8), (1,11),         # torso
         (14,0), (15,0),        # eyes → nose
         (16,14), (17,15),      # ears → eyes
@@ -2307,62 +2307,99 @@ def apply_pose_driven_motion(
     grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
     grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
 
-    print(f"[DEBUG] grid_x: {grid_x}")
-    print(f"[DEBUG] grid_y: {grid_y}")
+    if debug:
+        print(f"[DEBUG] grid_x: {grid_x}")
+        print(f"[DEBUG] grid_y: {grid_y}")
 
     mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
-    print(f"[DEBUG] mask_sum: {mask_sum}")
+    if debug:
+        print(f"[DEBUG] mask_sum: {mask_sum}")
     mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
     mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
 
     # -------------------- Décalage basé sur barycentre du torse --------------------
     content_center_px = content_points_px[:,0]
-    print(f"[DEBUG] content_center_px init: {content_center_px}")
-    shoulders = pts[:, 1:3, :]
-    content_center_shoulders = shoulders.mean(dim=1, keepdim=True)
-    print(f"[DEBUG] content_center_shoulders : {content_center_shoulders}")
-
-    # -------------------- Padding dynamique gauche --------------------
-    padding_left = int(0.2 * W)  # 10% de la largeur
-    print(f"[DEBUG] padding_left: {padding_left}")
-    latents_padded = F.pad(latents_warped, (padding_left,0,0,0), mode='replicate')
-    B, C, H_pad, W_pad = latents_padded.shape
-    print(f"[DEBUG] latents padded shape: {latents_padded.shape}")
-
-    # -------------------- Grid warp avec padding --------------------
-    yy, xx = torch.meshgrid(
-        torch.linspace(-1,1,H,device=device),
-        torch.linspace(-1,1,W_pad,device=device),
-        indexing='ij'
-    )
-    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)
-
+    if debug:
+        print(f"[DEBUG] content_center_px init: {content_center_px}")
     shift_x = (mask_center_x[:,0,0,0] - content_center_px[:,0]) * 2 / (W-1)
     shift_y = (mask_center_y[:,0,0,0] - content_center_px[:,1]) * 2 / (H-1)
-    print(f"[DEBUG] shift_x: {shift_x}")
-    print(f"[DEBUG] shift_y: {shift_y}")
 
+    if debug:
+        print(f"[DEBUG] shift_x: {shift_x}")
+        print(f"[DEBUG] shift_y: {shift_y}")
+
+    # --- Corrections ---
     shift_y += 0.4
-    print(f"[DEBUG] shift_y correction: {shift_y}")
+    if debug: print(f"[DEBUG] shift_y correction: {shift_y}")
     shift_y = torch.clamp(shift_y, -0.5, 0.6)
-    print(f"[DEBUG] shift_y clamp: {shift_y}")
-    shift_x += 0.5
-    print(f"[DEBUG] shift_x correction: {shift_x}")
+    if debug: print(f"[DEBUG] shift_y clamp: {shift_y}")
+
+    shift_x += 0.6
+    if debug: print(f"[DEBUG] shift_x correction: {shift_x}")
     shift_x = torch.clamp(shift_x, -0.02, 0.8)
-    print(f"[DEBUG] shift_x clamp: {shift_x}")
+    if debug: print(f"[DEBUG] shift_x clamp: {shift_x}")
 
-    # largeur moyenne du torse
-    torso_width_px = (shoulders[:,0,0] - shoulders[:,1,0]).abs()
-    correction_factor = torch.clamp(torso_width_px / (W-1), 0.5, 1.0)
-    print(f"[DEBUG] torso_width_px: {torso_width_px}")
-    print(f"[DEBUG] correction_factor: {correction_factor}")
+    # -------------------- Padding adaptatif sécurisé --------------------
+    max_shift_x = torch.max(torch.abs(shift_x)).item()
+    max_shift_y = torch.max(torch.abs(shift_y)).item()
 
-    grid[...,0] -= shift_x[:,None,None]
-    grid[...,1] -= shift_y[:,None,None]
+    margin_factor = 0.5  # marge supplémentaire pour éviter artefacts
+    pad_x = int((max_shift_x + margin_factor) * W)
+    pad_y = int((max_shift_y + margin_factor) * H)
 
-    latents_warped = F.grid_sample(latents_padded, grid, align_corners=True)
-    latents_warped = latents_warped[:, :, :, padding_left:]  # recadrage pour largeur originale
-    print(f"[DEBUG] latents_warped shape after recadrage: {latents_warped.shape}")
+    # ⚠️ Clamp pour ne pas dépasser la taille du tenseur
+    pad_x = min(pad_x, W - 1)
+    pad_y = min(pad_y, H - 1)
+
+    if debug:
+        print(f"[DEBUG] max_shift_x: {max_shift_x}")
+        print(f"[DEBUG] max_shift_y: {max_shift_y}")
+        print(f"[DEBUG] pad_x: {pad_x}, pad_y: {pad_y}")
+
+    latents_padded = F.pad(
+        latents_warped,
+        (pad_x, pad_x, pad_y, pad_y),
+        mode='reflect'
+    )
+
+    B, C, H_pad, W_pad = latents_padded.shape
+    if debug:
+        print(f"[DEBUG] latents_padded shape: {latents_padded.shape}")
+
+    # -------------------- Grid standard --------------------
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1,1,H,device=device),
+        torch.linspace(-1,1,W,device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx,yy),dim=-1).unsqueeze(0).repeat(B,1,1,1)
+
+    # -------------------- Correction d’échelle --------------------
+    scale_x = (W - 1) / (W_pad - 1)
+    scale_y = (H - 1) / (H_pad - 1)
+    if debug:
+        print(f"[DEBUG] scale_x: {scale_x}, scale_y: {scale_y}")
+    grid[..., 0] *= scale_x
+    grid[..., 1] *= scale_y
+
+    # -------------------- Ajustement du shift vers espace paddé --------------------
+    shift_x_pad = shift_x * (W / W_pad)
+    shift_y_pad = shift_y * (H / H_pad)
+    if debug:
+        print(f"[DEBUG] shift_x_pad: {shift_x_pad}")
+        print(f"[DEBUG] shift_y_pad: {shift_y_pad}")
+    grid[...,0] -= shift_x_pad[:,None,None]
+    grid[...,1] -= shift_y_pad[:,None,None]
+
+    # -------------------- Sampling sécurisé --------------------
+    latents_warped = F.grid_sample(
+        latents_padded,
+        grid,
+        align_corners=True,
+        padding_mode='reflection'
+    )
+    if debug:
+        print(f"[DEBUG] latents_warped shape after recadrage: {latents_warped.shape}")
 
     # -------------------- Fusion latents --------------------
     mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
@@ -2433,84 +2470,85 @@ def apply_pose_driven_motion_stable(
         print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
         print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
 
-    # -------------------- Recentrage automatique sur haut du torse ----
-    # Points neck + épaules + bouche
-    points_idx = [1, 2, 5, 18]  # neck, right_shoulder, left_shoulder
-    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,3,2]
+    # -------------------- Recentrage automatique sur haut du torse --------------------
+    points_idx = [1, 2, 5, 18]  # neck, right_shoulder, left_shoulder, mouth
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,4,2]
 
-    neck = pts[:, 0, :]                # cou
-    shoulders = pts[:, 1:, :]          # épaules
-    #shoulders = pts[:, 1:3, :]
-    avg_shoulders = shoulders.mean(dim=1)  # moyenne gauche/droite
-
-    # bouche (si détectée, ici keypoint 18)
-    mouth = pts[:, 3, :]  # keypoint 18, déjà inclus dans pts
+    neck = pts[:, 0, :]
+    shoulders = pts[:, 1:3, :]
+    avg_shoulders = shoulders.mean(dim=1)
+    mouth = pts[:, 3, :]
 
     sternum_offset_y = compute_sternum_offset_y(neck, avg_shoulders, mouth_coords=mouth, ratio=0.5)
     content_center = pts.mean(dim=1, keepdim=True) + torch.tensor([0.0, sternum_offset_y], device=device)
     content_points_px = content_center * torch.tensor([W-1, H-1], device=device)
 
-    # Rotation du masque autour du barycentre des épaules
     torso_center = pts.mean(dim=1)
     torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
     torso_points_px = torso_points_px.view(B,2,1,1)
     mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle.view(-1), H, W, device)
+    mask_rotated = mask_rotated.clamp(0,1)
 
     # -------------------- Offset calculation basé sur le masque --------------------
-    mask_rotated = mask_rotated.clamp(0,1)
     grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
     grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
 
     print(f"[DEBUG] grid_x: {grid_x}")
-    print(f"[DEBUG] gridyx: {grid_y}")
+    print(f"[DEBUG] grid_y: {grid_y}")
 
-
-    # Centre du masque (barycentre)
     mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
     print(f"[DEBUG] mask_sum: {mask_sum}")
     mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
     mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
 
-    # -------------------- Déplacement du contenu aligné au haut du torse ----
-    content_center_px = content_points_px[:,0]  # [B,2]
+    # -------------------- Décalage basé sur barycentre du torse --------------------
+    content_center_px = content_points_px[:,0]
     print(f"[DEBUG] content_center_px init: {content_center_px}")
-    shoulders = pts[:, 1:3, :]  # right + left
+    shoulders = pts[:, 1:3, :]
     content_center_shoulders = shoulders.mean(dim=1, keepdim=True)
     print(f"[DEBUG] content_center_shoulders : {content_center_shoulders}")
 
+    # -------------------- Padding dynamique gauche --------------------
+    padding_left = int(0.2 * W)  # 10% de la largeur
+    print(f"[DEBUG] padding_left: {padding_left}")
+    latents_padded = F.pad(latents_warped, (padding_left,0,0,0), mode='replicate')
+    B, C, H_pad, W_pad = latents_padded.shape
+    print(f"[DEBUG] latents padded shape: {latents_padded.shape}")
+
+    # -------------------- Grid warp avec padding --------------------
     yy, xx = torch.meshgrid(
         torch.linspace(-1,1,H,device=device),
-        torch.linspace(-1,1,W,device=device),
+        torch.linspace(-1,1,W_pad,device=device),
         indexing='ij'
     )
-    grid = torch.stack((xx,yy),dim=-1).unsqueeze(0).repeat(B,1,1,1)
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)
 
-    # Décalage basé sur barycentre du haut du torse (épaules)
     shift_x = (mask_center_x[:,0,0,0] - content_center_px[:,0]) * 2 / (W-1)
     shift_y = (mask_center_y[:,0,0,0] - content_center_px[:,1]) * 2 / (H-1)
-
     print(f"[DEBUG] shift_x: {shift_x}")
     print(f"[DEBUG] shift_y: {shift_y}")
+
     shift_y += 0.4
     print(f"[DEBUG] shift_y correction: {shift_y}")
     shift_y = torch.clamp(shift_y, -0.5, 0.6)
     print(f"[DEBUG] shift_y clamp: {shift_y}")
-    shift_x += 0.6
+    shift_x += 0.5
     print(f"[DEBUG] shift_x correction: {shift_x}")
     shift_x = torch.clamp(shift_x, -0.02, 0.8)
     print(f"[DEBUG] shift_x clamp: {shift_x}")
-    # On réduit le décalage horizontal pour éviter que le masque ne glisse trop
 
-    # largeur moyenne du torse (en pixels)
-    torso_width_px = (shoulders[:,0,0] - shoulders[:,1,0]).abs()  # droite - gauche
-    # coefficient de correction relatif à la largeur du torse
+    # largeur moyenne du torse
+    torso_width_px = (shoulders[:,0,0] - shoulders[:,1,0]).abs()
     correction_factor = torch.clamp(torso_width_px / (W-1), 0.5, 1.0)
+    print(f"[DEBUG] torso_width_px: {torso_width_px}")
     print(f"[DEBUG] correction_factor: {correction_factor}")
 
     grid[...,0] -= shift_x[:,None,None]
     grid[...,1] -= shift_y[:,None,None]
 
-    latents_warped = F.grid_sample(latents_warped, grid, align_corners=True)
+    latents_warped = F.grid_sample(latents_padded, grid, align_corners=True)
+    latents_warped = latents_warped[:, :, :, padding_left:]  # recadrage pour largeur originale
+    print(f"[DEBUG] latents_warped shape after recadrage: {latents_warped.shape}")
 
     # -------------------- Fusion latents --------------------
     mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
