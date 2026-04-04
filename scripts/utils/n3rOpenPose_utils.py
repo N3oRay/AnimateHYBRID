@@ -2029,14 +2029,31 @@ def normalize_keypoints(kp_tensor):
     return kp
 
 # 🔹 Applique un léger effet de respiration (scaling sinusoïdal) sur les latents
-def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
+def apply_breathing_big(latents, previous_latent, frame_counter, breathing=True):
     """
     Applique une légère respiration sinusoidale sur les latents.
     """
     import math
     if previous_latent is not None and breathing:
-        breath = 0.03 * math.sin(frame_counter * 0.15)
+        # Amplitude réduite de la respiration
+        breath = 0.012 * math.sin(frame_counter * 0.15)
         latents = latents * (1.0 + breath)
+    return latents
+
+def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
+    """
+    Applique une respiration réaliste sur les latents : décalage vertical centré.
+    """
+    import math
+    if previous_latent is not None and breathing:
+        B, C, H, W = latents.shape
+        breath = 0.005 * math.sin(frame_counter * 0.15)  # amplitude réduite
+        # créer un shift vertical uniforme
+        yy, xx = torch.meshgrid(torch.linspace(-1,1,H,device=latents.device),
+                                torch.linspace(-1,1,W,device=latents.device), indexing='ij')
+        grid = torch.stack((xx, yy + breath, ), dim=-1)  # on ajoute seulement sur y
+        grid = grid.unsqueeze(0).repeat(B,1,1,1)  # batch
+        latents = torch.nn.functional.grid_sample(latents, grid, align_corners=True)
     return latents
 
 # 🔹 Calcule le déplacement du torse par rapport à la frame précédente
@@ -2453,25 +2470,12 @@ def apply_pose_driven_motion(
     shift_x = (mask_center_x[:,0,0,0] - torso_center_x) * 2 / torso_width_px
     shift_y = (mask_center_y[:,0,0,0] - torso_center_y) * 2 / torso_height_px
 
-    #[DEBUG] [←→] shift_x: tensor([1.5488], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.7008], device='cuda:0')
-    #[DEBUG] [←→] clamp shift_x: tensor([[[0.4500]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.6000]]], device='cuda:0')
-
-    #[DEBUG] [←→] shift_x: tensor([1.5619], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.6437], device='cuda:0')
-    #[DEBUG] [←→] clamp shift_x: tensor([[[0.2619]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.5437]]], device='cuda:0')
-
-    #[DEBUG] [←→] shift_x: tensor([1.5921], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.7244], device='cuda:0')
-    #[DEBUG] [←→] clamp shift_x: tensor([[[0.4700]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.4500]]], device='cuda:0')
-
-    #[DEBUG] [←→] shift_x: tensor([1.7167], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.7984], device='cuda:0')
-    #[DEBUG] [←→] clamp shift_x: tensor([[[0.4700]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.6500]]], device='cuda:0')
-
-
     if debug:
         print(f"[DEBUG] [←→] shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
 
     # Fix broadcasting en view
-    shift_x = torch.clamp(shift_x - 1.0, 0.49, 0.5).view(B,1,1)  # valeur plus grande = plus a droite
-    shift_y = torch.clamp(shift_y - 2.0, 0.58, 0.59).view(B,1,1)  # Valeur plus grande = plus bas
+    shift_x = torch.clamp(shift_x - 1.1, 0.475, 0.478).view(B,1,1)  # valeur plus grande = plus a droite
+    shift_y = torch.clamp(shift_y - 2.0, 0.588, 0.595).view(B,1,1)  # Valeur plus grande = plus bas
 
     if debug:
         print(f"[DEBUG] [←→] clamp shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
@@ -2572,7 +2576,11 @@ def apply_pose_driven_motion_test(
     torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
     torso_points_px = torso_points_px.view(B,2,1,1)
 
-    mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle.view(-1), H, W, device)
+    # Limite rotation à ±3 degrés (~0.05 rad)
+    max_angle_rad = 0.05
+    angle_limited = angle.clamp(-max_angle_rad, max_angle_rad)
+    mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle_limited.view(-1), H, W, device)
+    #mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle.view(-1), H, W, device)
     mask_rotated = mask_rotated.clamp(0,1)
 
     if debug:
