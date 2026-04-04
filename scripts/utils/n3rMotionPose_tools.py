@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 import traceback
 
 
-#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton
+#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_torso
 
 
 def debug_draw_openpose_skeleton(
@@ -262,3 +262,181 @@ def feather_inside_strict(mask, radius=5, blur_kernel=5, sigma=1.0):
     result = eroded + band_blur
 
     return torch.clamp(result, 0, 1)
+
+
+def rotate_mask_around_torso_simple(mask, torso_points_px, angle, device="cuda"):
+    """
+    Rotate a mask around the torso center on X-axis only (horizontal rotation),
+    corrected version with proper broadcasting.
+
+    mask: [B, C, H, W]
+    torso_points_px: [B, 2, N]
+    angle: [B] tensor, rotation in radians
+    device: device
+
+    Returns:
+        mask_rotated: [B, C, H, W]
+    """
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = mask.shape
+
+    # Centre du torse
+    torso_center = torso_points_px.mean(dim=2)  # [B, 2]
+    cx = torso_center[:, 0].view(B, 1, 1)
+    cy = torso_center[:, 1].view(B, 1, 1)
+
+    # Coordonnées pixels
+    xx = torch.arange(W, device=device).view(1, 1, W).float()  # [1,1,W]
+    yy = torch.arange(H, device=device).view(1, H, 1).float()  # [1,H,1]
+
+    # Décalage horizontal seulement
+    x_shift = xx - cx
+    y_shift = yy  # vertical inchangé
+
+    # Rotation horizontale
+    cos_a = torch.cos(angle).view(B, 1, 1)
+    x_rot = cos_a * x_shift + cx  # rotation autour du centre X
+    y_rot = y_shift
+
+    # Broadcast pour stack
+    x_norm = 2.0 * x_rot / (W - 1) - 1.0
+    y_norm = 2.0 * y_rot / (H - 1) - 1.0
+    # broadcast sur [B,H,W]
+    x_norm = x_norm.expand(B, H, W)
+    y_norm = y_norm.expand(B, H, W)
+
+    grid = torch.stack((x_norm, y_norm), dim=-1)  # [B,H,W,2]
+
+    # Rotation bilinéaire
+    mask_rotated = F.grid_sample(
+        mask, grid, mode='bilinear', padding_mode='zeros', align_corners=False
+    )
+
+    return mask_rotated
+
+def rotate_mask_around_torso(mask, torso_points_px, angle, H, W, device="cuda"):
+
+    B, C, H_mask, W_mask = mask.shape
+
+    # 🔥 utiliser H_mask / W_mask partout
+    H, W = H_mask, W_mask
+
+    # -------------------- centre du torse --------------------
+    torso_center = torso_points_px.mean(dim=2)  # [B, 2]
+
+    # -------------------- grid pixel --------------------
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    xx = xx.float().unsqueeze(0).expand(B, -1, -1)
+    yy = yy.float().unsqueeze(0).expand(B, -1, -1)
+
+    # -------------------- rotation autour centre --------------------
+    cx = torso_center[:, 0].view(B, 1, 1)
+    cy = torso_center[:, 1].view(B, 1, 1)
+
+    x_shift = xx - cx
+    y_shift = yy - cy
+
+    cos_angle = torch.cos(angle).view(B, 1, 1)
+    sin_angle = torch.sin(angle).view(B, 1, 1)
+
+    x_rot = cos_angle * x_shift - sin_angle * y_shift
+    y_rot = sin_angle * x_shift + cos_angle * y_shift
+
+    x_final = x_rot + cx
+    y_final = y_rot + cy
+
+    # -------------------- NORMALISATION CORRECTE --------------------
+    x_norm = 2.0 * x_final / (W - 1) - 1.0
+    y_norm = 2.0 * y_final / (H - 1) - 1.0
+
+    grid = torch.stack((x_norm, y_norm), dim=-1)
+
+    # 🔥 FIX CRITIQUE : align_corners=False
+    mask_rotated = F.grid_sample(
+        mask,
+        grid,
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=False
+    )
+
+    # 🔥 GARANTIE ABSOLUE
+    assert mask_rotated.shape[2:] == (H, W), \
+        f"Shape mismatch: {mask_rotated.shape} vs {(B,C,H,W)}"
+
+    return mask_rotated
+
+
+def apply_breathing_xy(latents, previous_latent, frame_counter, breathing=True):
+    """
+    Applique une respiration réaliste sur les latents : décalage vertical centré.
+    """
+    if previous_latent is not None and breathing:
+        B, C, H, W = latents.shape
+        breath = 0.004 * math.sin(frame_counter * 0.15)  # amplitude réduite
+        # créer un shift vertical uniforme
+        yy, xx = torch.meshgrid(torch.linspace(-1,1,H,device=latents.device),
+                                torch.linspace(-1,1,W,device=latents.device), indexing='ij')
+        grid = torch.stack((xx, yy + breath, ), dim=-1)  # on ajoute seulement sur y
+        grid = grid.unsqueeze(0).repeat(B,1,1,1)  # batch
+        latents = torch.nn.functional.grid_sample(latents, grid, align_corners=True)
+    return latents
+
+def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
+    """
+    Applique une respiration réaliste sur les latents : décalage vertical uniquement.
+    """
+    if previous_latent is not None and breathing:
+        B, C, H, W = latents.shape
+        device = latents.device
+
+        # amplitude respiration
+        breath = 0.004 * math.sin(frame_counter * 0.15)  # amplitude réduite
+
+        # grille pixels avec meshgrid
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device),
+            torch.linspace(-1, 1, W, device=device),
+            indexing='ij'
+        )  # yy, xx → [H, W]
+
+        # ajouter dimension batch et stack
+        grid = torch.stack((xx, yy + breath), dim=-1)  # [H, W, 2]
+        grid = grid.unsqueeze(0).expand(B, H, W, 2)   # [B, H, W, 2]
+
+        # appliquer le décalage vertical uniquement
+        latents = F.grid_sample(latents, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+
+    return latents
+
+
+
+def save_impact_map(latents, latents_in, debug_dir, frame_counter):
+    """
+    Sauvegarde une carte d'impact montrant les différences entre latents et latents_in.
+
+    Args:
+        latents (torch.Tensor): Latents modifiés [B, C, H, W]
+        latents_in (torch.Tensor): Latents originaux [B, C, H, W]
+        debug_dir (str): Répertoire où sauvegarder l'image
+        frame_counter (int): Index de la frame pour le nom de fichier
+    """
+    if debug_dir is None:
+        return
+
+    os.makedirs(debug_dir, exist_ok=True)
+    impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
+    impact_np = impact_map[0,0].detach().cpu().numpy()
+    impact_np -= impact_np.min()
+    if impact_np.max() > 0:
+        impact_np /= impact_np.max()
+    save_path = os.path.join(debug_dir, f"impact_map_driven_{frame_counter:05d}.png")
+    Image.fromarray((impact_np*255).astype(np.uint8)).save(save_path)
+    print(f"[DEBUG] Impact map saved: {save_path}")
