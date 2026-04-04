@@ -2290,57 +2290,6 @@ def rotate_mask_around_torso(mask, torso_points_px, angle, H, W, device="cuda"):
     return mask_rotated
 
 
-
-def rotate_mask_around_torso_v1(mask, torso_points_px, angle, H, W, device="cuda"):
-    """
-    Rotate a mask around the torso center instead of the image center.
-
-    mask: [B, 1, H, W] ou [B, C, H, W]
-    torso_points_px: [B, 2, N] points clés du torse (x, y en pixels)
-    angle: [B] en radians
-    """
-    B, C, H_mask, W_mask = mask.shape
-    print(f"[LOG] mask.shape = {mask.shape}, torso_points_px.shape = {torso_points_px.shape}, angle.shape = {angle.shape}")
-
-    # Calcul du centre du torse
-    torso_center = torso_points_px.mean(dim=2)  # [B, 2]
-    print(f"[LOG] torso_center (px) = {torso_center}")
-
-    # Création de la grid
-    yy, xx = torch.meshgrid(torch.arange(H_mask, device=device),
-                            torch.arange(W_mask, device=device), indexing='ij')
-    xx = xx.float().unsqueeze(0).expand(B, -1, -1)
-    yy = yy.float().unsqueeze(0).expand(B, -1, -1)
-    print(f"[LOG] xx min/max: {xx.min().item()}/{xx.max().item()}, yy min/max: {yy.min().item()}/{yy.max().item()}")
-
-    # Translation vers le centre du torse
-    x_shift = xx - torso_center[:, 0].view(B, 1, 1)
-    y_shift = yy - torso_center[:, 1].view(B, 1, 1)
-    print(f"[LOG] x_shift min/max: {x_shift.min().item()}/{x_shift.max().item()}, y_shift min/max: {y_shift.min().item()}/{y_shift.max().item()}")
-
-    cos_angle = torch.cos(angle).view(B, 1, 1)
-    sin_angle = torch.sin(angle).view(B, 1, 1)
-
-    x_rot = cos_angle * x_shift - sin_angle * y_shift
-    y_rot = sin_angle * x_shift + cos_angle * y_shift
-    print(f"[LOG] x_rot min/max: {x_rot.min().item()}/{x_rot.max().item()}, y_rot min/max: {y_rot.min().item()}/{y_rot.max().item()}")
-
-    x_final = x_rot + torso_center[:, 0].view(B, 1, 1)
-    y_final = y_rot + torso_center[:, 1].view(B, 1, 1)
-    print(f"[LOG] x_final min/max: {x_final.min().item()}/{x_final.max().item()}, y_final min/max: {y_final.min().item()}/{y_final.max().item()}")
-
-    # Normalisation [-1, 1]
-    x_norm = 2.0 * x_final / (W - 1) - 1.0
-    y_norm = 2.0 * y_final / (H - 1) - 1.0
-    grid = torch.stack((x_norm, y_norm), dim=-1)
-    print(f"[LOG] grid min/max: x {grid[...,0].min().item()}/{grid[...,0].max().item()}, y {grid[...,1].min().item()}/{grid[...,1].max().item()}")
-
-    # Rotation avec grid_sample
-    mask_rotated = F.grid_sample(mask, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-    print(f"[LOG] mask_rotated min/max/mean: {mask_rotated.min().item()}/{mask_rotated.max().item()}/{mask_rotated.mean().item()}")
-
-    return mask_rotated
-
 def compute_sternum_offset_y(neck_coords, shoulder_coords, mouth_coords=None, ratio=0.5):
     """
     Calcule un offset vertical pour centrer le haut du torse vers le sternum.
