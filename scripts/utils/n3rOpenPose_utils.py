@@ -183,8 +183,8 @@ class Pose:
 
         for b in range(self.B):
             # Récupère les keypoints : épaules et hanches
-            r_sh = self.get_point(2)[b].cpu().numpy()  # épaule droite
-            l_sh = self.get_point(5)[b].cpu().numpy()  # épaule gauche
+            r_sh = self.get_point(19)[b].cpu().numpy()  # épaule droite 2 clavicules 19
+            l_sh = self.get_point(20)[b].cpu().numpy()  # épaule gauche 2 clavicules 20
             r_hip = self.get_point(8)[b].cpu().numpy() # hanche droite
             l_hip = self.get_point(11)[b].cpu().numpy()# hanche gauche
 
@@ -2346,7 +2346,158 @@ def scale_mask(mask, scale=0.8):
     return mask_scaled
 
 # -------------------- Fonction principale --------------------------------------------
+
 def apply_pose_driven_motion(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents_in = latents.clone()
+
+    # -------------------- Respiration --------------------
+    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
+    if debug: print("[DEBUG] Respiration applied")
+
+    # -------------------- Pose --------------------
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W, scale=0.8)
+    angle = pose.compute_torso_angle()
+    mask = pose.create_upper_body_mask(H, W, kernel_size=15, sigma=5.0,
+                                       debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    if debug:
+        print(f"[DEBUG] Torso delta: {pose.delta}")
+        print(f"[DEBUG] Torso angle (rad): {angle}")
+
+    # -------------------- Grid warp --------------------
+    latents_warped, dx, dy, _ = warp_latents(latents, pose.delta, H, W, device)
+    if debug:
+        print(f"[DEBUG] Grid warp applied")
+        print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
+        print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
+
+    # -------------------- Recentrage automatique sur le torse complet --------------------
+    points_idx = [2, 5, 8, 11]  # right_shoulder, left_shoulder, right_hip, left_hip
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,4,2]
+
+    # Rectangle englobant le torse
+    x_min = pts[:, :, 0].min(dim=1)[0]
+    x_max = pts[:, :, 0].max(dim=1)[0]
+    y_min = pts[:, :, 1].min(dim=1)[0]
+    y_max = pts[:, :, 1].max(dim=1)[0]
+
+    # Centre exact du torse
+    torso_center_x = (x_min + x_max) / 2
+    torso_center_y = (y_min + y_max) / 2
+    torso_center = torch.stack([torso_center_x, torso_center_y], dim=1)
+    if debug:
+        print(f"[LOG] torso_center_x: {torso_center_x}")
+        print(f"[LOG] torso_center_y: {torso_center_y}")
+
+    # Largeur et hauteur du torse en pixels
+    torso_width_px  = (x_max - x_min) * (W-1)
+    torso_height_px = (y_max - y_min) * (H-1)
+
+    torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
+    torso_points_px = torso_points_px.view(B,2,1,1)
+
+    # Rotation du masque autour du torse
+    max_angle_rad = 0.05  # ~3 degrés
+    angle_limited = angle.clamp(-max_angle_rad, max_angle_rad)
+
+    mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle_limited.view(-1), H, W, device)
+    mask_rotated = mask_rotated.clamp(0,1)
+
+    if debug:
+        print(f"[DEBUG] mask_rotated shape: {mask_rotated.shape}, min: {mask_rotated.min().item():.4f}, "
+              f"max: {mask_rotated.max().item():.4f}, mean: {mask_rotated.mean().item():.4f}")
+
+    # -------------------- Offset calculation basé sur le masque --------------------
+    grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
+    grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
+
+    mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
+    mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
+    mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
+
+    if debug:
+        print(f"[DEBUG] torso_width_px: {torso_width_px}, torso_height_px: {torso_height_px}")
+        print(f"[DEBUG] mask_center_x: {mask_center_x.item()}, mask_center_y: {mask_center_y.item()}")
+
+    # -------------------- Padding dynamique gauche --------------------
+    padding_left = int(0.2 * W)  # 20% de la largeur
+    latents_padded = F.pad(latents_warped, (padding_left,0,0,0), mode='replicate')
+    B, C, H_pad, W_pad = latents_padded.shape
+
+    # -------------------- Grid warp avec padding --------------------
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1,1,H,device=device),
+        torch.linspace(-1,1,W_pad,device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)
+
+    # -------------------- Décalage basé sur barycentre du torse --------------------
+    shift_x = (mask_center_x[:,0,0,0] - torso_center_x) * 2 / torso_width_px
+    shift_y = (mask_center_y[:,0,0,0] - torso_center_y) * 2 / torso_height_px
+
+    #[DEBUG] [←→] shift_x: tensor([1.5488], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.7008], device='cuda:0')
+    #[DEBUG] [←→] clamp shift_x: tensor([[[0.4500]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.6000]]], device='cuda:0')
+
+    #[DEBUG] [←→] shift_x: tensor([1.5619], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.6437], device='cuda:0')
+    #[DEBUG] [←→] clamp shift_x: tensor([[[0.2619]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.5437]]], device='cuda:0')
+
+    #[DEBUG] [←→] shift_x: tensor([1.5921], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.7244], device='cuda:0')
+    #[DEBUG] [←→] clamp shift_x: tensor([[[0.4700]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.4500]]], device='cuda:0')
+
+
+
+    if debug:
+        print(f"[DEBUG] [←→] shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
+
+    # Fix broadcasting en view
+    shift_x = torch.clamp(shift_x - 1.0, 0.45, 0.47).view(B,1,1)
+    shift_y = torch.clamp(shift_y - 2.1, 0.63, 0.65).view(B,1,1)
+
+    if debug:
+        print(f"[DEBUG] [←→] clamp shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
+
+    grid[...,0] -= shift_x
+    grid[...,1] -= shift_y
+
+    latents_warped = F.grid_sample(latents_padded, grid, align_corners=True)
+    latents_warped = latents_warped[:, :, :, padding_left:]  # recadrage pour largeur originale
+
+    # -------------------- Fusion latents --------------------
+    mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
+    latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
+
+    # -------------------- OpenPose delta --------------------
+    latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
+
+    # -------------------- Stabilisation --------------------
+    latents = stabilize_latents_motion(latents)
+
+    # -------------------- Impact map (debug) --------------------
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter)
+
+    return latents
+
+
+def apply_pose_driven_motion_test(
     latents,
     previous_latent,
     latents_before_openpose,
@@ -2394,7 +2545,7 @@ def apply_pose_driven_motion(
     #    [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite  🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
     #     [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche 🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
 
-    points_idx = [1, 2, 5, 8, 11]  # neck, right/left shoulder, right/left hip
+    points_idx = [2, 5, 8, 11]  # neck, right/left shoulder, right/left hip
     pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,5,2]
 
     # Rectangle englobant le torse
@@ -2407,6 +2558,10 @@ def apply_pose_driven_motion(
     torso_center_x = (x_min + x_max) / 2
     torso_center_y = (y_min + y_max) / 2
     torso_center = torch.stack([torso_center_x, torso_center_y], dim=1)
+    if debug:
+        print(f"[DEBUG] Rotation")
+        print(f"[DEBUG] torso_center_x: {torso_center_x}")
+        print(f"[DEBUG] torso_center_y: {torso_center_y}")
 
     # Largeur et hauteur du torse
     torso_width_px  = (x_max - x_min) * (W-1)  # largeur en pixels
