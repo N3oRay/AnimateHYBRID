@@ -1,0 +1,2019 @@
+#********************************************
+# n3rOpenPose_utils.py
+#********************************************
+import torch
+from diffusers import ControlNetModel
+import math
+import torch.nn.functional as F
+from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
+from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import os
+import torchvision.transforms.functional as TF
+from PIL import Image, ImageDraw
+import traceback
+
+#------extract_keypoints_from_pose
+
+def extract_keypoints_from_pose(
+    pose_full_image,
+    device="cuda",
+    debug=False,
+    debug_dir=None,
+    frame_counter=None
+):
+    """
+    FR:
+    Extraction MANUELLE des keypoints (format COCO 18 points).
+    Les coordonnées sont normalisées entre [0,1] dans l'espace IMAGE.
+
+    EN:
+    MANUAL keypoints extraction (COCO 18 format).
+    Coordinates are normalized in [0,1] in IMAGE space.
+
+    Output:
+        keypoints_tensor: [B, 18, 3]  (x, y, confidence)
+    """
+
+    B, C, H, W = pose_full_image.shape  # H=height, W=width
+
+    # ---------------------------
+    # 🔥 KEYPOINTS MANUELS / MANUAL KEYPOINTS
+    # ---------------------------
+    # FR:
+    # x = pixel_x / image_width
+    # y = pixel_y / image_height
+    # IMPORTANT: utiliser la taille de l'image originale (pose_full), PAS le latent
+
+    # EN:
+    # x = pixel_x / image_width
+    # y = pixel_y / image_height
+    # IMPORTANT: use original image size (pose_full), NOT latent size
+
+    # 👄 Mouth detected: [(404, 446)]
+
+    keypoints_template = [
+        [418/896, 418/1280, 1.0],  # 0 nose / nez (ok) 👃 Nose detected: [(422, 408)]
+        [383/896, 515/1280, 1.0],  # 1 neck / cou 🦵 Neck detected: [(420, 518)]
+
+        [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
+        [612/896, 838/1280, 1.0],  # 3 right_elbow / coude droit 🦾 Elbows detected/estimated: [[179, 896], [627, 896]]
+        [488/896, 1040/1280, 1.0], # 4 right_wrist / poignet droit ✋ Wrists detected: [(179, 1152.0), (627, 1152.0)]
+
+        [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
+        [197/896, 944/1280, 1.0],  # 6 left_elbow / coude gauche 🦾 Elbows detected/estimated: [[179, 896], [627, 896]]
+        [431/896, 1087/1280, 1.0], # 7 left_wrist / poignet gauche ✋ Wrists detected: [(179, 1152.0), (627, 1152.0)]
+
+        [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite  🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
+        [0.0, 0.0, 0.0],           # 9 right_knee (absent)
+        [0.0, 0.0, 0.0],           # 10 right_ankle (absent)
+
+        [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche 🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
+        [0.0, 0.0, 0.0],           # 12 left_knee (absent)
+        [0.0, 0.0, 0.0],           # 13 left_ankle (absent)
+
+        [359/896, 490/1280, 1.0],  # 14 right_eye / œil droit - 👁 Eyes detected: (ok)
+        [379/896, 326/1280, 1.0],  # 15 left_eye / œil gauche - 👁 Eyes detected: [(326, 379), (359, 490)]
+        [608/896, 304/1280, 1.0],  # 16 right_ear / oreille droite
+        [290/896, 244/1280, 1.0],  # 17 left_ear / oreille gauche
+        [404/896, 446/1280, 1.0],  # 18 mouth / Bouche (ok) - 👄 Mouth detected: [(404, 446)]
+        [562/896, 514/1280, 1.0],  # 19 🦾 right_clavicules detected: [562/896, 514/1280, 1.0],
+        [277/896, 528/1280, 1.0],  # 20 🦾 left_clavicules detected: [(277, 528), (562, 514)]
+    ]
+
+    # ---------------------------
+    # 🔹 Conversion numpy → tensor
+    # ---------------------------
+    keypoints_np = np.array(keypoints_template, dtype=np.float32)
+
+    # FR: sécurité pour éviter valeurs hors [0,1]
+    # EN: safety clamp to keep values in [0,1]
+    keypoints_np = np.clip(keypoints_np, 0.0, 1.0)
+
+    # FR: duplication pour batch
+    # EN: repeat for batch
+    keypoints_np = np.expand_dims(keypoints_np, axis=0)  # [1,18,3]
+    keypoints_np = np.repeat(keypoints_np, B, axis=0)    # [B,18,3]
+
+    keypoints_tensor = torch.from_numpy(keypoints_np).to(device)
+
+    # ---------------------------
+    # 🔹 DEBUG VISUEL / VISUAL DEBUG
+    # ---------------------------
+    if debug and debug_dir is not None and frame_counter is not None:
+        # Affichage des points en debug
+        debug_draw_openpose_skeleton(
+            pose_full_image=pose_full_image,
+            keypoints_tensor=keypoints_tensor,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
+        )
+
+    return keypoints_tensor
+
+
+
+# sigma correspond a la valeur du flou
+def gaussian_blur_tensor(x, kernel_size=3, sigma=0.5):
+    # x: [B,C,H,W]
+    B, C, H, W = x.shape
+
+    # Générer un kernel 1D
+    def gauss1d(k, sigma):
+        a = torch.arange(k).float() - (k - 1) / 2
+        g = torch.exp(-(a**2)/(2*sigma**2))
+        return g / g.sum()
+
+    k = kernel_size
+    g = gauss1d(k, sigma)
+    kernel2d = g[:,None] * g[None,:]      # [k,k]
+    kernel2d = kernel2d.to(x.device, dtype=x.dtype)
+    kernel2d = kernel2d.expand(C, 1, k, k)  # [C,1,k,k] pour grouped conv
+    pad = k // 2
+    x = F.conv2d(x, kernel2d, padding=pad, groups=C)
+    return x
+#---------------------------------- CLASS POSE ------------------------------------------------------
+class Pose:
+    def __init__(self, keypoints: torch.Tensor):
+        """
+        keypoints : [B, 17, 3]  -> normalized [0,1] + confidence
+        """
+        self.keypoints = keypoints.clone()
+        self.B = keypoints.shape[0]
+        self.delta = None
+        self.angles = None
+        self.device = keypoints.device
+
+    # ----------------- Keypoint utils -----------------
+    def get_point(self, idx):
+        """Récupère un keypoint spécifique [B,2]"""
+        return self.keypoints[:, idx, :2]
+
+    # ----------------- Torso delta -----------------
+    def compute_torso_delta(self, latent_h: int, latent_w: int, scale: float = 0.8):
+        """Calcule le déplacement du torse pour grid warp"""
+        r_shoulder = self.get_point(2)
+        l_shoulder = self.get_point(5)
+        torso_center = (r_shoulder + l_shoulder) * 0.5  # [B,2]
+
+        # Transformation en delta
+        delta = torso_center * scale
+        delta = torch.tanh(delta * 2.0) * 0.5  # stabilisation
+        self.delta = delta
+        return delta
+
+    # ----------------- Torso angle -----------------
+    def compute_torso_angle(self):
+        """Calcule l'angle du torse selon les épaules"""
+        r_shoulder = self.get_point(2)
+        l_shoulder = self.get_point(5)
+        vec = r_shoulder - l_shoulder
+        angle = torch.atan2(vec[:,1], vec[:,0]).unsqueeze(1)  # [B,1]
+        self.angles = angle
+        return angle
+
+    def create_upper_body_mask(self, H: int, W: int, kernel_size: int = 15, sigma: float = 1.0,
+                           debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
+        """
+        Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
+        """
+        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+
+        for b in range(self.B):
+            # Récupère les keypoints : épaules et hanches
+            r_sh = self.get_point(19)[b].cpu().numpy()  # épaule droite 2 clavicules 19
+            l_sh = self.get_point(20)[b].cpu().numpy()  # épaule gauche 2 clavicules 20
+            r_hip = self.get_point(8)[b].cpu().numpy() # hanche droite
+            l_hip = self.get_point(11)[b].cpu().numpy()# hanche gauche
+
+            # Convertir en pixels
+            def to_px(kp):
+                return [int(kp[0]*(W-1)), int(kp[1]*(H-1))]
+
+            pts = np.array([
+                to_px(r_sh),
+                to_px(l_sh),
+                to_px(l_hip),
+                to_px(r_hip)
+            ], dtype=np.int32)
+
+            # Remplir le polygone
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(mask_np, [pts], 255)
+
+            # Convertir en tensor et assigner
+            mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+
+        # Floutage pour adoucir les bords
+        mask = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
+        mask = torch.clamp(mask, 0, 1)
+
+        # -------------------- Debug --------------------
+        if debug and debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_scale = 4
+            mask_np_debug = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
+            mask_debug = cv2.resize(mask_np_debug, (W*debug_scale, H*debug_scale), interpolation=cv2.INTER_NEAREST)
+            mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
+            save_path = os.path.join(debug_dir, f"skeleton_mask_{frame_counter:05d}.png")
+            cv2.imwrite(save_path, mask_debug_rgb)
+            print(f"[DEBUG] Upper body mask saved (scale {debug_scale}): {save_path}")
+
+        return mask
+
+    def create_upper_body_mask1(self, H: int, W: int, kernel_size: int = 15, sigma: float = 5.0,
+                           debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
+        """
+        Crée un masque polygonal flouté torse + bras, sans le cou.
+        Le torse est basé uniquement sur les épaules, les bras sur coudes et poignets.
+        """
+        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+
+            #     [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
+    #   [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
+    #    [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite  🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
+    #     [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche 🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
+
+        for b in range(self.B):
+            # Récupère les keypoints : épaules, coudes, poignets
+            r_sh = self.get_point(2)[b].cpu().numpy()
+            r_el = self.get_point(3)[b].cpu().numpy()
+            r_wr = self.get_point(4)[b].cpu().numpy()
+            l_sh = self.get_point(5)[b].cpu().numpy()
+            l_el = self.get_point(6)[b].cpu().numpy()
+            l_wr = self.get_point(7)[b].cpu().numpy()
+
+            # Convertir en pixels
+            def to_px(kp):
+                return [int(kp[0] * (W-1)), int(kp[1] * (H-1))]
+
+            pts = np.array([
+                to_px(r_sh), to_px(r_el), to_px(r_wr),
+                to_px(l_wr), to_px(l_el), to_px(l_sh)
+            ], dtype=np.int32)
+
+            # Remplir le polygone
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(mask_np, [pts], 255)
+
+            # Convertir en tensor et assigner
+            mask[b, 0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+
+        # Floutage pour adoucir les bords
+        mask = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
+        mask = torch.clamp(mask, 0, 1)
+
+        # -------------------- Debug --------------------
+        if debug and debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_scale = 4
+            mask_np_debug = (mask[0, 0].detach().cpu().numpy() * 255).astype(np.uint8)
+            mask_debug = cv2.resize(mask_np_debug, (W*debug_scale, H*debug_scale), interpolation=cv2.INTER_NEAREST)
+            mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
+            save_path = os.path.join(debug_dir, f"skeleton_mask_{frame_counter:05d}.png")
+            cv2.imwrite(save_path, mask_debug_rgb)
+            print(f"[DEBUG] Upper body mask saved (scale {debug_scale}): {save_path}")
+
+        return mask
+#----------------------------------------------------------------------------------------------------------------------
+
+def debug_draw_openpose_skeleton(
+    pose_full_image,
+    keypoints_tensor,
+    debug_dir,
+    frame_counter,
+):
+    """
+    Dessine les keypoints + squelette OpenPose sur l'image de pose.
+
+    Args:
+        pose_full_image (torch.Tensor): [B,3,H,W] normalisé [-1,1]
+        keypoints_tensor (torch.Tensor): [B,18,3] (x,y,conf) normalisé [0,1]
+        debug_dir (str): dossier de sauvegarde
+        frame_counter (int): index frame
+    """
+
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # ---------------------------
+    # 🔹 Convert tensor → image
+    # ---------------------------
+    pose_img = pose_full_image[0].permute(1, 2, 0).detach().cpu().numpy()
+    pose_img = (pose_img + 1.0) / 2.0
+    pose_img = (pose_img * 255).astype(np.uint8).copy()
+
+    H, W, _ = pose_img.shape
+
+    keypoints = keypoints_tensor[0].detach().cpu().numpy()
+
+    def to_pixel(x, y):
+        return int(x * W), int(y * H)
+
+    # ---------------------------
+    # 🎨 Couleurs
+    # ---------------------------
+    COLORS = {
+        "head": (255, 0, 255),   # rose
+        "eyes": (0, 0, 255),     # rouge
+        "nose": (128, 0, 128),   # violet
+        "arms": (0, 255, 0),     # vert
+        "torso": (255, 0, 0),    # bleu
+        "default": (200, 200, 200)
+    }
+
+    # ---------------------------
+    # 🔹 Draw points
+    # ---------------------------
+    for i, (x, y, conf) in enumerate(keypoints):
+        if conf < 0.1:
+            continue
+
+        px, py = to_pixel(x, y)
+
+        if i in [16, 17]:        # ears
+            color = COLORS["head"]
+        elif i in [14, 15]:      # eyes
+            color = COLORS["eyes"]
+        elif i == 0:             # nose
+            color = COLORS["nose"]
+        elif i in [2,3,19,20,4,5,6,7]: # arms
+            color = COLORS["arms"]
+        elif i in [1,8,11]:      # torso
+            color = COLORS["torso"]
+        else:
+            color = COLORS["default"]
+
+        cv2.circle(pose_img, (px, py), 6, color, -1)
+
+    # ---------------------------
+    # 🔹 Skeleton connections
+    # ---------------------------
+    skeleton = [
+        (0,1),        # nose → neck
+        (1,19), (19,2), (2,3), (3,4),   # right arm (1,2), (2,3), (3,4),   # right arm
+        (1,20), (20,5), (5,6), (6,7),   # left arm (1,5), (5,6), (6,7),   # left arm
+        (1,8), (1,11),         # torso
+        (14,0), (15,0),        # eyes → nose
+        (16,14), (17,15),      # ears → eyes
+    ]
+
+    for i, j in skeleton:
+        xi, yi, ci = keypoints[i]
+        xj, yj, cj = keypoints[j]
+
+        if ci < 0.1 or cj < 0.1:
+            continue
+
+        p1 = to_pixel(xi, yi)
+        p2 = to_pixel(xj, yj)
+
+        # couleurs par type de lien
+        if (i, j) == (0,1):
+            color = (128, 0, 128)  # nez → cou (violet)
+        elif i in [2,3,4,5,6,7]:
+            color = (0,255,0)      # bras
+        elif i in [1,8,11]:
+            color = (255,0,0)      # torse
+        else:
+            color = (255,255,255)
+
+        cv2.line(pose_img, p1, p2, color, 2)
+
+    # ---------------------------
+    # 💾 Save
+    # ---------------------------
+    save_path = f"{debug_dir}/skeleton_{frame_counter:05d}.png"
+    cv2.imwrite(save_path, cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+
+    print(f"[DEBUG] Skeleton sauvegardé : {save_path}")
+
+
+#----------------------------------------------------------------------------------------------------------------
+
+def resize_pose(pose_tile, H_latent, W_latent):
+    target_h = H_latent * 8
+    target_w = W_latent * 8
+
+    if pose_tile.shape[-2:] != (target_h, target_w):
+        return F.interpolate(
+            pose_tile,
+            size=(target_h, target_w),
+            mode='bilinear',
+            align_corners=False
+        )
+    return pose_tile
+
+
+def prepare_inputs(latent_tile, pose_tile, cf_embeds, device):
+    pos_embeds, neg_embeds = cf_embeds
+
+    latent_fp32 = latent_tile.to(device=device, dtype=torch.float32)
+    pose_fp32 = pose_tile.to(device=device, dtype=torch.float32)
+
+    pos_fp32 = pos_embeds.to(device=device, dtype=torch.float32)
+    neg_fp32 = neg_embeds.to(device=device, dtype=torch.float32) if neg_embeds is not None else None
+
+    return latent_fp32, pose_fp32, pos_fp32, neg_fp32
+
+
+def add_noise(latent, scheduler, t, noise_strength=0.5):
+    noise = torch.randn_like(latent) * noise_strength
+    latent_noisy = scheduler.add_noise(latent, noise, t)
+    return torch.clamp(latent_noisy, -20, 20)
+
+
+def apply_cfg(latent_input, pos_embeds, neg_embeds, guidance_scale):
+    if neg_embeds is not None:
+        latent_input = torch.cat([latent_input] * 2)
+        embeds = torch.cat([neg_embeds, pos_embeds])
+        return latent_input, embeds, True
+    return latent_input, pos_embeds, False
+
+
+def compute_noise_pred(unet, controlnet, latent_input, t, embeds, pose):
+    down_samples, mid_sample = controlnet(
+        latent_input,
+        t,
+        encoder_hidden_states=embeds,
+        controlnet_cond=pose,
+        return_dict=False
+    )
+
+    noise_pred = unet(
+        latent_input,
+        t,
+        encoder_hidden_states=embeds,
+        down_block_additional_residuals=down_samples,
+        mid_block_additional_residual=mid_sample,
+        return_dict=False
+    )[0]
+
+    return torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+
+
+def merge_cfg(noise_pred, guidance_scale, use_cfg):
+    if use_cfg:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        return noise_uncond + guidance_scale * (noise_text - noise_uncond)
+    return noise_pred
+
+
+def compute_adaptive_importance(latent):
+    with torch.no_grad():
+        blurred = F.avg_pool2d(latent, kernel_size=3, stride=1, padding=1)
+        high_freq = torch.abs(latent - blurred)
+        importance = high_freq.mean(dim=1, keepdim=True)
+        # normalisation douce
+        importance = importance / (importance.mean() + 1e-6)
+        # compression pour éviter extrêmes
+        importance = torch.sqrt(importance)
+        return torch.clamp(importance, 0.7, 1.3)
+
+
+def compute_delta(latents_out, latent_ref, controlnet_scale, importance):
+    delta = latents_out - latent_ref
+    delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
+    # 🔥 adaptive blending ici
+    delta = torch.tanh(delta) * 0.15 * importance
+    return delta * controlnet_scale
+
+
+def controlnet_tile_fn(
+    latent_tile,
+    pose_tile,
+    frame_counter,
+    unet,
+    controlnet,
+    scheduler,
+    cf_embeds,
+    current_guidance_scale,
+    controlnet_scale,
+    device,
+    target_dtype,
+    **kwargs
+):
+
+    B, C, H_latent, W_latent = latent_tile.shape
+
+    # =========================================================
+    # 1️⃣ Resize pose
+    # =========================================================
+    pose_resized = resize_pose(pose_tile, H_latent, W_latent)
+    # =========================================================
+    # 2️⃣ Inputs
+    # =========================================================
+    latent_fp32, pose_fp32, pos_embeds, neg_embeds = prepare_inputs(
+        latent_tile, pose_resized, cf_embeds, device
+    )
+    # =========================================================
+    # 3️⃣ Timestep
+    # =========================================================
+    t = scheduler.timesteps[min(frame_counter, len(scheduler.timesteps) - 1)]
+
+    # =========================================================
+    # 4️⃣ Noise
+    # =========================================================
+    latent_noisy = add_noise(latent_fp32, scheduler, t)
+
+    latent_input = scheduler.scale_model_input(latent_noisy, t)
+
+    # =========================================================
+    # 5️⃣ CFG
+    # =========================================================
+    latent_input, embeds, use_cfg = apply_cfg(
+        latent_input, pos_embeds, neg_embeds, current_guidance_scale
+    )
+
+    latent_input = latent_input.to(target_dtype)
+    embeds = embeds.to(target_dtype)
+    pose_fp32 = pose_fp32.to(target_dtype)
+
+    # =========================================================
+    # 6️⃣ UNet + ControlNet
+    # =========================================================
+    noise_pred = compute_noise_pred(
+        unet, controlnet, latent_input, t, embeds, pose_fp32
+    )
+
+    noise_pred = merge_cfg(noise_pred, current_guidance_scale, use_cfg)
+
+    # =========================================================
+    # 7️⃣ Scheduler step
+    # =========================================================
+    latents_out = scheduler.step(noise_pred, t, latent_noisy).prev_sample
+
+    # =========================================================
+    # 🔥 8️⃣ Adaptive blending (clé)
+    # =========================================================
+    importance = compute_adaptive_importance(latent_fp32)
+
+    delta = compute_delta(
+        latents_out,
+        latent_fp32,
+        controlnet_scale,
+        importance
+    )
+
+    latents_final = latent_fp32 + delta
+
+    return latents_final.to(target_dtype)
+
+#---------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+def log_frame_error(img_path, error: Exception, verbose: bool = True):
+    print(f"\n[FRAME ERROR] {img_path}")
+    print(f"Type d'erreur : {type(error).__name__}")
+    print(f"Message d'erreur : {error}")
+
+    if verbose:
+        print("Traceback complet :")
+        traceback.print_exc()
+
+
+def prepare_controlnet(
+    controlnet,
+    freeze: bool = True,
+    enable_slicing: bool = True,
+    device=None,
+    dtype=None,
+    verbose: bool = True
+):
+    """
+    Prépare un ControlNet :
+    - eval mode
+    - freeze des poids
+    - attention slicing (si dispo)
+    - move device / dtype
+    - init pose_sequence
+
+    Returns:
+        controlnet, pose_sequence (None par défaut)
+    """
+
+    # ---- eval mode
+    controlnet.eval()
+    if verbose:
+        print("✅ ControlNet en mode eval")
+
+    # ---- freeze
+    if freeze:
+        for p in controlnet.parameters():
+            p.requires_grad = False
+        if verbose:
+            print("✅ Paramètres gelés")
+
+    # ---- attention slicing
+    if enable_slicing:
+        fn = getattr(controlnet, "enable_attention_slicing", None)
+        if callable(fn):
+            fn()
+            if verbose:
+                print("✅ Attention slicing activé")
+        else:
+            if verbose:
+                print("⚠ enable_attention_slicing non disponible")
+
+    # ---- device / dtype
+    if device is not None or dtype is not None:
+        controlnet = controlnet.to(device=device, dtype=dtype)
+        if verbose:
+            print(f"✅ Déplacé sur {device} / {dtype}")
+
+    # ---- init pose
+    pose_sequence = None
+
+    return controlnet, pose_sequence
+
+def fix_pose_sequence(
+    pose_sequence: torch.Tensor,
+    total_frames: int,
+    device=None,
+    dtype=None,
+    verbose: bool = True
+) -> torch.Tensor:
+    """
+    Ajuste une séquence de poses au bon nombre de frames avec interpolation.
+
+    Args:
+        pose_sequence: Tensor (F, C, H, W)
+        total_frames: nombre de frames cible
+        device: device cible (optionnel)
+        dtype: dtype cible (optionnel)
+        verbose: afficher logs
+
+    Returns:
+        Tensor (F, C, H, W)
+    """
+    print(f"🎞 fix_pose_sequence - Frames JSON: {pose_sequence.shape[0]}")
+    print(f"🎞 fix_pose_sequence - Frames attendues: {total_frames}")
+
+    if pose_sequence.shape[0] != total_frames:
+        if verbose:
+            print("⚠ Ajustement du nombre de frames OpenPose")
+
+        # (F, C, H, W) → (1, C, F, H, W)
+        pose_sequence = pose_sequence.permute(1, 0, 2, 3).unsqueeze(0)
+
+        pose_sequence = F.interpolate(
+            pose_sequence,
+            size=(total_frames, pose_sequence.shape[-2], pose_sequence.shape[-1]),
+            mode='trilinear',
+            align_corners=False
+        )
+
+        # retour → (F, C, H, W)
+        pose_sequence = pose_sequence.squeeze(0).permute(1, 0, 2, 3)
+
+    # Fix device + dtype
+    if device is not None or dtype is not None:
+        pose_sequence = pose_sequence.to(device=device, dtype=dtype)
+
+    if verbose:
+        print(
+            "✅ PoseSequence final:",
+            pose_sequence.shape,
+            pose_sequence.device,
+            pose_sequence.dtype
+        )
+
+    return pose_sequence
+
+
+
+def tensor_to_pil(tensor):
+    """
+    Convertit un tensor torch [C,H,W] ou [H,W] en PIL.Image RGB.
+    """
+    if tensor.dim() == 3:
+        C, H, W = tensor.shape
+        if C == 1:
+            array = tensor[0].cpu().numpy()  # [H,W]
+            pil_img = Image.fromarray(array).convert("RGB")
+        elif C == 3:
+            array = tensor.permute(1, 2, 0).cpu().numpy()  # [H,W,C]
+            pil_img = Image.fromarray(array)
+        else:
+            raise ValueError(f"Tensor avec {C} canaux non supporté")
+    elif tensor.dim() == 2:
+        pil_img = Image.fromarray(tensor.cpu().numpy()).convert("RGB")
+    else:
+        raise ValueError(f"Tensor shape non supportée: {tensor.shape}")
+    return pil_img
+
+import os
+from PIL import Image
+import torch
+
+def save_debug_pose_image(pose_tensor, frame_counter, output_dir, cfg=None, prefix="openpose"):
+    """
+    Sauvegarde une image de pose pour contrôle visuel.
+
+    pose_tensor : torch.Tensor [C,H,W] ou [H,W]
+    frame_counter : int, numéro de frame
+    output_dir : str, dossier où sauvegarder
+    cfg : dict ou None, peut contenir paramètre 'visual_debug' pour activer/désactiver
+    prefix : str, préfixe du fichier
+    """
+
+    # Vérifie si le debug visuel est activé
+    if cfg is not None and cfg.get("visual_debug") is False:
+        return
+
+    # Convertir tensor en uint8 [0,255]
+    pose_img = (pose_tensor * 255).clamp(0, 255).byte()
+
+    # Fonction interne pour gérer tous les formats [C,H,W], [H,W]
+    def tensor_to_pil(tensor):
+        if tensor.dim() == 3:
+            C, H, W = tensor.shape
+            if C == 1:
+                array = tensor[0].cpu().numpy()  # [H,W]
+                pil_img = Image.fromarray(array).convert("RGB")
+            elif C == 3:
+                array = tensor.permute(1, 2, 0).cpu().numpy()  # [H,W,C]
+                pil_img = Image.fromarray(array)
+            else:
+                raise ValueError(f"Tensor avec {C} canaux non supporté")
+        elif tensor.dim() == 2:
+            pil_img = Image.fromarray(tensor.cpu().numpy()).convert("RGB")
+        else:
+            # Si la tensor a une forme inattendue, on essaie de la "squeezer"
+            tensor = tensor.squeeze()
+            if tensor.dim() in [2, 3]:
+                return tensor_to_pil(tensor)
+            raise ValueError(f"Tensor shape non supportée: {tensor.shape}")
+        return pil_img
+
+    pil_pose = tensor_to_pil(pose_img)
+
+    # Création du dossier si nécessaire
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Nom du fichier : openpose_00001.png
+    filename = f"{prefix}_{frame_counter:05d}.png"
+    path = os.path.join(output_dir, filename)
+
+    pil_pose.save(path)
+    print(f"[DEBUG] Pose sauvegardée : {path}")
+
+def save_debug_pose_image_mini(pose_tensor, frame_counter, output_dir, cfg=None, prefix="openpose"):
+    """
+    Sauvegarde la pose détectée pour vérification visuelle.
+
+    Args:
+        pose_tensor (torch.Tensor): Tensor BCHW ou CHW (1,3,H,W ou 3,H,W)
+        frame_counter (int): numéro de la frame
+        output_dir (Path): dossier de sortie pour sauvegarde
+        cfg (dict, optional): configuration, active si cfg.get("debug_pose_visual", False) est True
+        prefix (str): préfixe du fichier image (default: 'openpose')
+    """
+    if cfg is None or not cfg.get("debug_pose_visual", False):
+        return
+
+    # S'assurer que le tensor est BCHW
+    if pose_tensor.ndim == 3:  # CHW -> BCHW
+        pose_tensor = pose_tensor.unsqueeze(0)
+
+    pose_tensor = pose_tensor[0]  # retirer batch
+
+    # Limiter à 3 canaux
+    if pose_tensor.shape[0] > 3:
+        pose_tensor = pose_tensor[:3, :, :]
+
+    # CHW -> HWC
+    pose_np = pose_tensor.permute(1, 2, 0).cpu().numpy()
+    # Normalisation 0-255
+    pose_np = (pose_np - pose_np.min()) / (pose_np.max() - pose_np.min() + 1e-8) * 255.0
+    pose_np = pose_np.astype("uint8")
+    img = Image.fromarray(pose_np)
+
+    # Nom de fichier : openpose_0001.png
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = output_dir / f"{prefix}_{frame_counter:04d}.png"
+    img.save(filename)
+
+def debug_pose_visual(pose_tensor, frame_counter, cfg=None, title="Pose Debug"):
+    """
+    Affiche la pose détectée pour vérification visuelle.
+
+    Args:
+        pose_tensor (torch.Tensor): Tensor BCHW ou CHW (1,3,H,W ou 3,H,W)
+        frame_counter (int): numéro de la frame
+        cfg (dict, optional): configuration, active si cfg.get("debug_pose_visual", False) est True
+        title (str): titre pour l'affichage
+    """
+    if cfg is None or not cfg.get("debug_pose_visual", False):
+        return
+
+    # S'assurer que le tensor est BCHW
+    if pose_tensor.ndim == 3:  # CHW -> BCHW
+        pose_tensor = pose_tensor.unsqueeze(0)
+
+    pose_tensor = pose_tensor[0]  # retirer batch
+
+    # Limiter à 3 canaux
+    if pose_tensor.shape[0] > 3:
+        pose_tensor = pose_tensor[:3, :, :]
+
+    # CHW -> HWC pour PIL
+    pose_np = pose_tensor.permute(1, 2, 0).cpu().numpy()
+    pose_np = (pose_np - pose_np.min()) / (pose_np.max() - pose_np.min() + 1e-8) * 255.0
+    pose_np = pose_np.astype("uint8")
+    img = Image.fromarray(pose_np)
+
+    # Affichage rapide avec matplotlib
+    plt.figure(figsize=(4, 4))
+    plt.imshow(img)
+    plt.axis("off")
+    plt.title(f"{title} - Frame {frame_counter}")
+    plt.show(block=False)
+    plt.pause(0.1)  # court délai pour rafraîchir
+    plt.close()
+
+
+#------------- JSON TO POSE SEQUENCE --------------------
+
+def convert_json_to_pose_sequence(anim_data, H=512, W=512,
+                                  device="cuda", dtype=torch.float16,
+                                  debug=False, output_dir=None):
+    """
+    Convertit un JSON d'animation OpenPose en tensor ControlNet, avec centrage et scaling automatique.
+    Output : [num_frames, 3, H, W], dtype et device configurables.
+    """
+    frames = anim_data.get("animation", [])
+    pose_images = []
+
+    # --- Détecter le bounding box global des keypoints ---
+    all_x = []
+    all_y = []
+    for frame in frames:
+        for kp in frame.get("keypoints", []):
+            all_x.append(kp["x"])
+            all_y.append(kp["y"])
+
+    if len(all_x) == 0 or len(all_y) == 0:
+        raise ValueError("Aucun keypoint trouvé dans le JSON.")
+
+    min_x, max_x = min(all_x), max(all_x)
+    min_y, max_y = min(all_y), max(all_y)
+
+    # Scale et translation pour centrer et remplir le canvas
+    scale_x = (W - 20) / (max_x - min_x + 1e-6)  # marge 10px
+    scale_y = (H - 20) / (max_y - min_y + 1e-6)
+    scale = min(scale_x, scale_y)
+
+    offset_x = (W - (max_x - min_x) * scale) / 2 - min_x * scale
+    offset_y = (H - (max_y - min_y) * scale) / 2 - min_y * scale
+
+    for idx, frame in enumerate(frames):
+        keypoints = frame.get("keypoints", [])
+        canvas = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # --- Dessin des points ---
+        for kp in keypoints:
+            x = int(kp["x"] * scale + offset_x)
+            y = int(kp["y"] * scale + offset_y)
+            conf = kp.get("confidence", 1.0)
+            if conf > 0.3:
+                cv2.circle(canvas, (x, y), 4, (255, 255, 255), -1)
+
+        # --- Dessin des connexions ---
+        skeleton = [
+            (0, 1),  # tête → torse
+            (1, 2),  # torse → bras gauche
+            (1, 3),  # torse → bras droit
+            (1, 4),  # torse → jambe gauche
+            (1, 5),  # torse → jambe droite
+        ]
+        for a, b in skeleton:
+            if a < len(keypoints) and b < len(keypoints):
+                x1 = int(keypoints[a]["x"] * scale + offset_x)
+                y1 = int(keypoints[a]["y"] * scale + offset_y)
+                x2 = int(keypoints[b]["x"] * scale + offset_x)
+                y2 = int(keypoints[b]["y"] * scale + offset_y)
+                cv2.line(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        img = torch.from_numpy(canvas).float() / 255.0
+        img = img.permute(2, 0, 1)  # C,H,W
+        pose_images.append(img)
+
+        # Debug
+        if debug and output_dir is not None:
+            cv2.imwrite(f"{output_dir}/debug_pose_{idx:03d}.png", canvas)
+
+    pose_sequence = torch.stack(pose_images).to(device=device, dtype=dtype)
+    pose_sequence = pose_sequence * 2.0 - 1.0  # [-1,1]
+
+    if debug:
+        print(f"[JSON->POSE] shape: {pose_sequence.shape}")
+        print(f"[JSON->POSE] min/max: {pose_sequence.min().item()} / {pose_sequence.max().item()}")
+
+    return pose_sequence
+
+def convert_json_to_pose_sequence_debug(anim_data, H=512, W=512, original_w=512, original_h=512,
+                                  device="cuda", dtype=torch.float16, debug=False, output_dir=None):
+    """
+    Convertit un JSON d'animation OpenPose simplifié en tensor utilisable par ControlNet.
+
+    Args:
+        anim_data: dict JSON avec "animation" -> frames -> keypoints
+        H, W: résolution finale du canvas
+        original_w, original_h: résolution originale des keypoints
+        device: "cuda" ou "cpu"
+        dtype: torch dtype (ex: torch.float16)
+        debug: bool, sauvegarde les images pour visualisation
+        output_dir: chemin pour debug images (optionnel)
+
+    Returns:
+        pose_sequence: tensor [num_frames, 3, H, W] (RGB type)
+    """
+    frames = anim_data.get("animation", [])
+    pose_images = []
+
+    for idx, frame in enumerate(frames):
+        keypoints = frame.get("keypoints", [])
+
+        # Image noire
+        canvas = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # --- Dessin des points ---
+        for kp in keypoints:
+            # remapping keypoints vers la résolution finale
+            x = int(kp["x"] * W / original_w)
+            y = int(kp["y"] * H / original_h)
+            conf = kp.get("confidence", 1.0)
+
+            if conf > 0.3:
+                cv2.circle(canvas, (x, y), 4, (255, 255, 255), -1)
+
+        # --- Dessin des connexions (squelette simple) ---
+        skeleton = [
+            (0, 1),  # tête → torse
+            (1, 2),  # torse → bras gauche
+            (1, 3),  # torse → bras droit
+            (1, 4),  # torse → jambe gauche
+            (1, 5),  # torse → jambe droite
+        ]
+
+        for a, b in skeleton:
+            if a < len(keypoints) and b < len(keypoints):
+                x1 = int(keypoints[a]["x"] * W / original_w)
+                y1 = int(keypoints[a]["y"] * H / original_h)
+                x2 = int(keypoints[b]["x"] * W / original_w)
+                y2 = int(keypoints[b]["y"] * H / original_h)
+                cv2.line(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        # --- Conversion en tensor ---
+        img = torch.from_numpy(canvas).float() / 255.0  # [H, W, C]
+        img = img.permute(2, 0, 1)  # → [C, H, W]
+
+        pose_images.append(img)
+
+        # --- Debug save ---
+        if debug and output_dir is not None:
+            debug_path = f"{output_dir}/debug_pose_{idx:03d}.png"
+            cv2.imwrite(debug_path, (canvas).astype(np.uint8))
+
+    # --- Stack frames + normalisation [-1,1] ---
+    pose_sequence = torch.stack(pose_images).to(device=device, dtype=dtype)
+    pose_sequence = pose_sequence * 2.0 - 1.0  # [0,1] → [-1,1]
+
+    if debug:
+        print(f"[JSON->POSE] shape: {pose_sequence.shape}")
+        print(f"[JSON->POSE] min/max: {pose_sequence.min().item()} / {pose_sequence.max().item()}")
+
+    return pose_sequence
+
+
+
+def build_control_latent_debug(input_pil, vae, device="cuda", latent_scale=0.18215):
+    import torch
+
+    print("\n================ CONTROL LATENT DEBUG ================")
+
+    # 1. Canny
+    control = create_canny_control(input_pil)
+
+    print("[STEP 1] RAW CONTROL")
+    print(" shape:", control.shape)
+    print(" dtype:", control.dtype)
+    print(" min/max:", control.min().item(), control.max().item())
+
+    # 2. 1 → 3 channels
+    if control.shape[1] == 1:
+        control = control.repeat(1, 3, 1, 1)
+
+    # 3. Normalize PROPERLY (CRUCIAL)
+    control = control.clamp(0, 1)          # sécurité
+    control = control * 2.0 - 1.0          # [-1,1]
+
+    print("[STEP 2] NORMALIZED")
+    print(" min/max:", control.min().item(), control.max().item())
+
+    # 4. Move to device FP32
+    control = control.to(device=device, dtype=torch.float32)
+
+    print("[STEP 3] DEVICE")
+    print(" device:", control.device)
+    print(" dtype:", control.dtype)
+
+    # 5. Sync VAE
+    print("[STEP 4] VAE STATE")
+    print(" vae dtype:", next(vae.parameters()).dtype)
+    print(" vae device:", next(vae.parameters()).device)
+
+    # 🔥 FORCER cohérence VAE
+    vae = vae.to(device=device, dtype=torch.float32)
+
+    # 6. Encode SAFE (no autocast)
+    with torch.no_grad():
+        try:
+            latent_dist = vae.encode(control).latent_dist
+            latent = latent_dist.sample()
+        except Exception as e:
+            print("❌ VAE ENCODE CRASH:", e)
+            raise
+
+    print("[STEP 5] LATENT RAW")
+    print(" min/max:", latent.min().item(), latent.max().item())
+    print(" NaN:", torch.isnan(latent).sum().item())
+
+    # 🚨 CHECK NaN
+    if torch.isnan(latent).any():
+        print("⚠️ NaN DETECTED → applying fallback")
+
+        # fallback 1: zero latent
+        latent = torch.zeros_like(latent)
+
+        # fallback 2 (optionnel):
+        # latent = torch.randn_like(latent) * 0.1
+
+    # 7. Scale (SD standard)
+    latent = latent * latent_scale
+
+    print("[STEP 6] SCALED LATENT")
+    print(" min/max:", latent.min().item(), latent.max().item())
+
+    # 8. Back to FP16
+    latent = latent.to(dtype=torch.float16)
+
+    print("[FINAL]")
+    print(" dtype:", latent.dtype)
+    print(" device:", latent.device)
+    print("=====================================================\n")
+
+    return latent
+
+# ---------------- Control -> Latent sécurisé ----------------
+def control_to_latent_safe(control_tensor, vae, device="cuda", LATENT_SCALE=1.0):
+    # 🔥 FORCE VAE EN FP32
+    vae = vae.to(device=device, dtype=torch.float32)
+
+    control_tensor = control_tensor.to(device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        latent = vae.encode(control_tensor).latent_dist.sample()
+
+    return latent * LATENT_SCALE
+
+def process_latents_streamed(control_latent, mini_latents=None, mini_weight=0.5, device="cuda"):
+    """
+    Fusionne ControlNet / mini-latents frame par frame, patch par patch
+    pour réduire l'empreinte VRAM.
+    """
+    # On garde tout en float16 tant que possible
+    control_latent = control_latent.to(device=device, dtype=torch.float16)
+
+    if mini_latents is not None:
+        mini_latents = mini_latents.to(device=device, dtype=torch.float16)
+
+    # Initialisation finale du tensor latents en float16
+    latents = control_latent.clone()
+
+    # Si mini_latents existe, on fait un mix patch par patch
+    if mini_latents is not None:
+        B, C, H, W = latents.shape
+        patch_size = 16  # petit patch pour limiter la VRAM
+        for y in range(0, H, patch_size):
+            y1 = min(y + patch_size, H)
+            for x in range(0, W, patch_size):
+                x1 = min(x + patch_size, W)
+
+                # Sélection patch
+                patch_main = latents[:, :, y:y1, x:x1]
+                patch_mini = mini_latents[:, :, y:y1, x:x1]
+
+                # Mix float16 → float16 pour VRAM
+                patch_main = (1 - mini_weight) * patch_main + mini_weight * patch_mini
+
+                # Écriture patch back
+                latents[:, :, y:y1, x:x1] = patch_main
+
+                # Nettoyage immédiat pour libérer VRAM
+                del patch_main, patch_mini
+                torch.cuda.empty_cache()
+
+    return latents
+
+
+def match_latent_size(latents_main, *tensors):
+    """
+    Interpole tous les tensors pour correspondre à la taille HxW de latents_main.
+    """
+    matched = []
+    for t in tensors:
+        if t.shape[2:] != latents_main.shape[2:]:
+            t = F.interpolate(t, size=latents_main.shape[2:], mode='bilinear', align_corners=False)
+        matched.append(t)
+    return matched if len(matched) > 1 else matched[0]
+
+
+def apply_controlnet_openpose_step(
+    latents,
+    t,
+    unet,
+    controlnet,
+    scheduler,
+    pose_image,
+    pos_embeds,
+    neg_embeds=None,
+    guidance_scale=5.0,
+    controlnet_scale=0.7,
+    device="cuda",
+    dtype=torch.float16,
+    debug=False
+):
+    import torch
+
+    latents = latents.to(device=device, dtype=dtype)
+    pose_image = pose_image.to(device=device, dtype=dtype)
+
+    # 🔁 classifier-free guidance
+    if neg_embeds is not None:
+        latent_model_input = torch.cat([latents] * 2)
+        encoder_states = torch.cat([neg_embeds, pos_embeds])
+        pose_input = torch.cat([pose_image] * 2)
+    else:
+        latent_model_input = latents
+        encoder_states = pos_embeds
+        pose_input = pose_image
+
+    latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+
+    # 🔥 ControlNet
+    down_samples, mid_sample = controlnet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=encoder_states,
+        controlnet_cond=pose_input,
+        return_dict=False
+    )
+
+    # 🔥 UNet avec ControlNet
+    noise_pred = unet(
+        latent_model_input,
+        t,
+        encoder_hidden_states=encoder_states,
+        down_block_additional_residuals=[d * controlnet_scale for d in down_samples],
+        mid_block_additional_residual=mid_sample * controlnet_scale
+    ).sample
+
+    # 🔁 CFG
+    if neg_embeds is not None:
+        noise_uncond, noise_text = noise_pred.chunk(2)
+        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+    # 🔥 Scheduler step
+    latents = scheduler.step(noise_pred, t, latents).prev_sample
+
+    if debug:
+        print(f"[ControlNet] t={t}, latents min/max: {latents.min().item():.3f}/{latents.max().item():.3f}")
+
+    return latents
+
+
+
+
+
+
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+def pad_to_multiple(x, mult=8):
+    B, C, H, W = x.shape
+    pad_H = (mult - H % mult) % mult
+    pad_W = (mult - W % mult) % mult
+    if pad_H == 0 and pad_W == 0:
+        return x
+    return F.pad(x, (0, pad_W, 0, pad_H))  # pad right & bottom
+
+def gaussian_blend_mask(H, W, overlap):
+    """Crée un masque gaussien pour fusionner les tiles avec overlap."""
+
+    y = np.linspace(-1,1,H)
+    x = np.linspace(-1,1,W)
+    xv, yv = np.meshgrid(x,y)
+    mask = np.exp(-(xv**2 + yv**2) / 0.5)  # ajuste le sigma si nécessaire
+    mask = torch.tensor(mask, dtype=torch.float32)
+    return mask
+
+
+from torchvision.utils import save_image
+import os
+from PIL import Image
+
+#---------------------------------------------------------
+
+# 🔹 Récupère les coordonnées (x,y) d’un keypoint spécifique dans le batch
+# 🔹 Récupère les coordonnées (x,y) d’un keypoint spécifique dans le batch
+def get_point(kp_tensor, idx):
+    return kp_tensor[:, idx, :2]  # [B,2]
+
+# 🔹 Recentre tous les keypoints par rapport au torse (entre épaules)
+#   Cela évite que le personnage se déplace vers le coin haut-gauche.
+def normalize_keypoints(kp_tensor):
+    kp = kp_tensor.clone()
+    r_shoulder = get_point(kp, 2)
+    l_shoulder = get_point(kp, 5)
+    torso_center = (r_shoulder + l_shoulder) * 0.5
+    kp[...,0] = kp[...,0] - torso_center[:,0].unsqueeze(1)  # recentre X
+    kp[...,1] = kp[...,1] - torso_center[:,1].unsqueeze(1)  # recentre Y
+    return kp
+
+# 🔹 Applique un léger effet de respiration (scaling sinusoïdal) sur les latents
+def apply_breathing_big(latents, previous_latent, frame_counter, breathing=True):
+    """
+    Applique une légère respiration sinusoidale sur les latents.
+    """
+    import math
+    if previous_latent is not None and breathing:
+        # Amplitude réduite de la respiration
+        breath = 0.012 * math.sin(frame_counter * 0.15)
+        latents = latents * (1.0 + breath)
+    return latents
+
+def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
+    """
+    Applique une respiration réaliste sur les latents : décalage vertical centré.
+    """
+    import math
+    if previous_latent is not None and breathing:
+        B, C, H, W = latents.shape
+        breath = 0.004 * math.sin(frame_counter * 0.15)  # amplitude réduite
+        # créer un shift vertical uniforme
+        yy, xx = torch.meshgrid(torch.linspace(-1,1,H,device=latents.device),
+                                torch.linspace(-1,1,W,device=latents.device), indexing='ij')
+        grid = torch.stack((xx, yy + breath, ), dim=-1)  # on ajoute seulement sur y
+        grid = grid.unsqueeze(0).repeat(B,1,1,1)  # batch
+        latents = torch.nn.functional.grid_sample(latents, grid, align_corners=True)
+    return latents
+
+# 🔹 Calcule le déplacement du torse par rapport à la frame précédente
+#   Utilisé pour translater les latents afin de suivre le mouvement.
+
+def compute_delta_torso(kp, latent_h, latent_w, scale=0.8):
+    """
+    Calcule le déplacement du torse en coordonnées latentes.
+    Le centre du warp est aligné sur le torse du personnage.
+    """
+
+    # Extraire les épaules
+    r_shoulder = get_point(kp, 2)  # [B,2]
+    l_shoulder = get_point(kp, 5)
+
+    # Centre du torse
+    torso_center = (r_shoulder + l_shoulder) * 0.5  # [B,2]
+
+    # Normaliser par rapport à l'image (0-1)
+    # On suppose que kp est déjà normalisé sur H,W [0,1]
+    torso_center_norm = torso_center.clone()
+
+    # Calculer offset depuis le centre du latent
+    center_offset_x = (torso_center_norm[:,0] - 0.5) * latent_w
+    center_offset_y = (torso_center_norm[:,1] - 0.5) * latent_h
+
+    delta_torso = torch.stack([center_offset_x, center_offset_y], dim=1) * scale
+
+    # 🔒 Stabilisation pour éviter les jumps
+    delta_torso = torch.tanh(delta_torso * 2.0) * 0.5
+
+    return delta_torso
+
+# 🔹 Applique une translation sur les latents en utilisant un grid warp
+#   Déplace visuellement le personnage selon le delta du torse.
+def warp_latents(latents, delta_torso, H, W, device):
+    import torch
+    import torch.nn.functional as F
+
+    B = latents.shape[0]
+
+    dx = delta_torso[:, 0].reshape(B,1,1) * W
+    dy = delta_torso[:, 1].reshape(B,1,1) * H
+
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )
+
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).repeat(B,1,1,1)
+
+    delta_grid = torch.cat([dx*2/W, dy*2/H], dim=-1).unsqueeze(2)
+    grid = grid + delta_grid
+
+    latents_warped = F.grid_sample(
+        latents,
+        grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True
+    )
+
+    return latents_warped, dx, dy, grid
+
+
+
+# 🔹 Applique la différence entre latents avant/après OpenPose
+#   Permet de conserver l’impact du pose controlnet.
+def apply_openpose_delta(latents, latents_before, latents_after, mask):
+    if latents_before is not None and latents_after is not None:
+        delta = latents_after - latents_before
+        delta = torch.clamp(delta, -0.15, 0.15)
+        latents = latents + delta * mask * 0.5
+    return latents
+
+# 🔹 Stabilise les latents pour éviter NaN ou valeurs extrêmes
+#   Normalisation et clamp pour rester dans [-1.2,1.2].
+def stabilize_latents_motion(latents):
+    latents = torch.nan_to_num(latents)
+    latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
+    latents = latents / (latents_max + 1e-6)
+    latents = latents * 0.95
+    return torch.clamp(latents, -1.2, 1.2)
+
+
+# -------------------- Fonction utilitaire --------------------
+def compute_torso_angle(keypoints):
+    """
+    Calcule l'angle du torse selon les épaules (radians).
+    """
+    right_shoulder = get_point(keypoints, 2)
+    left_shoulder = get_point(keypoints, 5)
+    vec = right_shoulder - left_shoulder
+    angle = torch.atan2(vec[:,1], vec[:,0])  # [B]
+    torso_center = (right_shoulder + left_shoulder) * 0.5
+    return angle, torso_center
+
+def rotate_mask_around_point_v1(mask, center, angle, H, W, device):
+    """
+    Rotate mask around center point (B,C,H,W).
+    center: [B,2] with normalized coordinates [0,1]
+    angle: [B] radians
+    """
+    B, C, h, w = mask.shape
+    # grid [-1,1]
+    yy, xx = torch.meshgrid(torch.linspace(-1,1,h,device=device), torch.linspace(-1,1,w,device=device), indexing='ij')
+    grid = torch.stack((xx,yy),dim=-1).unsqueeze(0).repeat(B,1,1,1)  # [B,H,W,2]
+
+    # Rotation matrix
+    cos = torch.cos(angle)
+    sin = torch.sin(angle)
+    rot_mat = torch.zeros(B,2,2,device=device)
+    rot_mat[:,0,0] = cos
+    rot_mat[:,0,1] = -sin
+    rot_mat[:,1,0] = sin
+    rot_mat[:,1,1] = cos
+
+    # center in [-1,1]
+    center_norm = center.clone()
+    center_norm[:,0] = center[:,0] * 2 - 1
+    center_norm[:,1] = center[:,1] * 2 - 1
+
+    # translate grid relative to center
+    grid_flat = grid.reshape(B, -1, 2)
+    grid_centered = grid_flat - center_norm[:,None,:]
+
+    # apply rotation
+    grid_rot = torch.bmm(grid_centered, rot_mat.transpose(1,2))
+    grid_final = grid_rot + center_norm[:,None,:]
+    grid_final = grid_final.reshape(B,H,W,2)
+
+    mask_rotated = F.grid_sample(mask, grid_final, align_corners=True)
+    return mask_rotated
+
+def rotate_mask_around_point_v2(mask, center_px, angle, H, W, device):
+    """
+    Rotate mask around center point (pixels) using F.grid_sample
+    mask: [B,C,H,W]
+    center_px: [B,2] (x,y in pixels)
+    angle: [B] radians
+    """
+    B, C, h, w = mask.shape
+
+    # Meshgrid [H,W,2]
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device, dtype=torch.float32),
+        torch.arange(W, device=device, dtype=torch.float32),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1)  # [H,W,2]
+    grid = grid.unsqueeze(0).repeat(B,1,1,1)  # [B,H,W,2]
+
+    # Déplacement relatif au centre
+    grid_centered = grid - center_px[:, None, None, :]  # [B,H,W,2]
+
+    cos = torch.cos(angle)[:, None, None]  # [B,1,1]
+    sin = torch.sin(angle)[:, None, None]
+
+    rot_x = cos * grid_centered[...,0] - sin * grid_centered[...,1]
+    rot_y = sin * grid_centered[...,0] + cos * grid_centered[...,1]
+
+    grid_rot = torch.stack((rot_x, rot_y), dim=-1) + center_px[:, None, None, :]  # [B,H,W,2]
+
+    # Normalisation [-1,1] pour F.grid_sample
+    grid_rot[...,0] = 2 * grid_rot[...,0] / (W-1) - 1
+    grid_rot[...,1] = 2 * grid_rot[...,1] / (H-1) - 1
+
+    mask_rotated = F.grid_sample(mask, grid_rot, align_corners=True)
+    return mask_rotated
+
+
+def rotate_mask_around_torso(mask, torso_points_px, angle, H, W, device="cuda"):
+
+    B, C, H_mask, W_mask = mask.shape
+
+    # 🔥 utiliser H_mask / W_mask partout
+    H, W = H_mask, W_mask
+
+    # -------------------- centre du torse --------------------
+    torso_center = torso_points_px.mean(dim=2)  # [B, 2]
+
+    # -------------------- grid pixel --------------------
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    xx = xx.float().unsqueeze(0).expand(B, -1, -1)
+    yy = yy.float().unsqueeze(0).expand(B, -1, -1)
+
+    # -------------------- rotation autour centre --------------------
+    cx = torso_center[:, 0].view(B, 1, 1)
+    cy = torso_center[:, 1].view(B, 1, 1)
+
+    x_shift = xx - cx
+    y_shift = yy - cy
+
+    cos_angle = torch.cos(angle).view(B, 1, 1)
+    sin_angle = torch.sin(angle).view(B, 1, 1)
+
+    x_rot = cos_angle * x_shift - sin_angle * y_shift
+    y_rot = sin_angle * x_shift + cos_angle * y_shift
+
+    x_final = x_rot + cx
+    y_final = y_rot + cy
+
+    # -------------------- NORMALISATION CORRECTE --------------------
+    x_norm = 2.0 * x_final / (W - 1) - 1.0
+    y_norm = 2.0 * y_final / (H - 1) - 1.0
+
+    grid = torch.stack((x_norm, y_norm), dim=-1)
+
+    # 🔥 FIX CRITIQUE : align_corners=False
+    mask_rotated = F.grid_sample(
+        mask,
+        grid,
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=False
+    )
+
+    # 🔥 GARANTIE ABSOLUE
+    assert mask_rotated.shape[2:] == (H, W), \
+        f"Shape mismatch: {mask_rotated.shape} vs {(B,C,H,W)}"
+
+    return mask_rotated
+
+
+def compute_sternum_offset_y(neck_coords, shoulder_coords, mouth_coords=None, ratio=0.5):
+    """
+    Calcule un offset vertical pour centrer le haut du torse vers le sternum.
+
+    Args:
+        neck_coords (Tensor): [B,2] coordonnées (x,y) du cou
+        shoulder_coords (Tensor): [B,2] coordonnées moyennes des épaules (x,y)
+        mouth_coords (Tensor, optional): [B,2] coordonnées de la bouche
+        ratio (float): proportion de la distance cou-épaules à utiliser pour l'offset
+
+    Returns:
+        Tensor: [B] offset vertical en coordonnées normalisées (0 à 1)
+    """
+    # Distance verticale cou → épaules
+    vertical_dist_neck_shoulders = shoulder_coords[:,1] - neck_coords[:,1]
+
+    if mouth_coords is not None:
+        # Distance cou → bouche
+        vertical_dist_neck_mouth = mouth_coords[:,1] - neck_coords[:,1]
+        # On combine les deux distances pour un offset plus réaliste
+        combined_dist = 0.7 * vertical_dist_neck_shoulders + 0.3 * vertical_dist_neck_mouth
+    else:
+        combined_dist = vertical_dist_neck_shoulders
+
+    sternum_offset_y = ratio * combined_dist
+    return sternum_offset_y
+
+def save_impact_map(latents, latents_in, debug_dir, frame_counter):
+    """
+    Sauvegarde une carte d'impact montrant les différences entre latents et latents_in.
+
+    Args:
+        latents (torch.Tensor): Latents modifiés [B, C, H, W]
+        latents_in (torch.Tensor): Latents originaux [B, C, H, W]
+        debug_dir (str): Répertoire où sauvegarder l'image
+        frame_counter (int): Index de la frame pour le nom de fichier
+    """
+    if debug_dir is None:
+        return
+
+    os.makedirs(debug_dir, exist_ok=True)
+    impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
+    impact_np = impact_map[0,0].detach().cpu().numpy()
+    impact_np -= impact_np.min()
+    if impact_np.max() > 0:
+        impact_np /= impact_np.max()
+    save_path = os.path.join(debug_dir, f"impact_map_driven_{frame_counter:05d}.png")
+    Image.fromarray((impact_np*255).astype(np.uint8)).save(save_path)
+    print(f"[DEBUG] Impact map saved: {save_path}")
+
+
+
+# -------------------- Fonction principale --------------------------------------------
+
+def apply_pose_driven_motion(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents_in = latents.clone()
+
+    # -------------------- Respiration --------------------
+    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
+    if debug: print("[DEBUG] Respiration applied")
+
+    # -------------------- Pose --------------------
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W, scale=0.8)
+    angle = pose.compute_torso_angle()
+    # sigma correspond à la valeur du flou
+    mask = pose.create_upper_body_mask(H, W, kernel_size=10, sigma=2.0,
+                                       debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    if debug:
+        print(f"[DEBUG] Torso delta: {pose.delta}")
+        print(f"[DEBUG] Torso angle (rad): {angle}")
+
+    # -------------------- Grid warp --------------------
+    latents_warped, dx, dy, _ = warp_latents(latents, pose.delta, H, W, device)
+    if debug:
+        print(f"[DEBUG] Grid warp applied")
+        print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
+        print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
+
+    # -------------------- Recentrage automatique sur le torse complet --------------------
+    points_idx = [2, 5, 8, 11]  # right_shoulder, left_shoulder, right_hip, left_hip
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,4,2]
+
+    # Rectangle englobant le torse
+    x_min = pts[:, :, 0].min(dim=1)[0]
+    x_max = pts[:, :, 0].max(dim=1)[0]
+    y_min = pts[:, :, 1].min(dim=1)[0]
+    y_max = pts[:, :, 1].max(dim=1)[0]
+
+    # Centre exact du torse
+    torso_center_x = (x_min + x_max) / 2
+    torso_center_y = (y_min + y_max) / 2
+    torso_center = torch.stack([torso_center_x, torso_center_y], dim=1)
+    if debug:
+        print(f"[LOG] torso_center_x: {torso_center_x}")
+        print(f"[LOG] torso_center_y: {torso_center_y}")
+
+    # Largeur et hauteur du torse en pixels
+    torso_width_px  = (x_max - x_min) * (W-1)
+    torso_height_px = (y_max - y_min) * (H-1)
+
+    torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
+    torso_points_px = torso_points_px.view(B,2,1,1)
+
+    # Rotation du masque autour du torse
+    max_angle_rad = 0.05  # ~3 degrés
+    angle_limited = angle.clamp(-max_angle_rad, max_angle_rad)
+
+    mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle_limited.view(-1), H, W, device)
+    mask_rotated = mask_rotated.clamp(0,1)
+
+    if debug:
+        print(f"[DEBUG] mask_rotated shape: {mask_rotated.shape}, min: {mask_rotated.min().item():.4f}, "
+              f"max: {mask_rotated.max().item():.4f}, mean: {mask_rotated.mean().item():.4f}")
+
+    # -------------------- Offset calculation basé sur le masque --------------------
+    #grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
+    #grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
+
+    #mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
+    #mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
+    #mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
+
+    B, _, Hm, Wm = mask_rotated.shape
+
+    grid_x = torch.arange(Wm, device=device).view(1,1,1,Wm).expand(B,1,Hm,Wm)
+    grid_y = torch.arange(Hm, device=device).view(1,1,Hm,1).expand(B,1,Hm,Wm)
+
+    mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
+    mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
+    mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
+
+    if debug:
+        print(f"[DEBUG] torso_width_px: {torso_width_px}, torso_height_px: {torso_height_px}")
+        print(f"[DEBUG] mask_center_x: {mask_center_x.item()}, mask_center_y: {mask_center_y.item()}")
+
+    # -------------------- Padding dynamique gauche --------------------
+    padding_left = int(0.2 * W)  # 20% de la largeur
+    latents_padded = F.pad(latents_warped, (padding_left,0,0,0), mode='replicate')
+    B, C, H_pad, W_pad = latents_padded.shape
+
+    # -------------------- Grid warp avec padding --------------------
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1,1,H,device=device),
+        torch.linspace(-1,1,W_pad,device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)
+
+    # -------------------- Décalage basé sur barycentre du torse --------------------
+    shift_x = (mask_center_x[:,0,0,0] - torso_center_x) * 2 / torso_width_px
+    shift_y = (mask_center_y[:,0,0,0] - torso_center_y) * 2 / torso_height_px
+
+    if debug:
+        print(f"[DEBUG] [←→] shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
+
+    # Fix broadcasting en view
+    shift_x = torch.clamp(shift_x - 1.23, 0.475, 0.476).view(B,1,1)  # valeur plus grande = plus a droite 1.7058 0.4750
+    shift_y = torch.clamp(shift_y - 2.19, 0.59, 0.595).view(B,1,1)  # Valeur plus grande = plus bas 2.7858 0.5950
+
+    if debug:
+        print(f"[DEBUG] [←→] clamp shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
+
+    grid[...,0] -= shift_x
+    grid[...,1] -= shift_y
+
+
+    latents_warped = F.grid_sample(
+        latents_padded,
+        grid,
+        align_corners=False  # 🔥 FIX
+    )
+
+    latents_warped = latents_warped[:, :, :, padding_left:padding_left+W]
+
+    # -------------------- Fusion latents --------------------
+
+    mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
+
+    # 🔥 alignement obligatoire
+    if mask_boosted.shape[2:] != latents.shape[2:]:
+        mask_boosted = F.interpolate(
+            mask_boosted,
+            size=latents.shape[2:],  # (H, W)
+            mode='bilinear',
+            align_corners=False
+        )
+
+    latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
+
+    # -------------------- OpenPose delta --------------------
+    # 🔥 Assurer alignement taille avant OpenPose delta
+    if mask_rotated.shape[2:] != latents.shape[2:]:
+        mask_rotated = F.interpolate(
+            mask_rotated,
+            size=latents.shape[2:],  # (H, W)
+            mode='bilinear',
+            align_corners=False
+        )
+    latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
+
+    # -------------------- Stabilisation --------------------
+    latents = stabilize_latents_motion(latents)
+
+    # -------------------- Impact map (debug) --------------------
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter)
+
+    return latents
+
+#-----------------------------------------------------------------------------------------------------------
+def apply_pose_driven_motion_stable(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    import os
+    from PIL import Image
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents_in = latents.clone()
+
+    # -------------------- Respiration --------------------
+    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
+    if debug: print("[DEBUG] Respiration applied")
+
+    # -------------------- Pose --------------------
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W, scale=0.8)
+    angle = pose.compute_torso_angle()
+    mask = pose.create_upper_body_mask(H, W, kernel_size=15, sigma=5.0,
+                                       debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    if debug:
+        print(f"[DEBUG] Torso delta: {pose.delta}")
+        print(f"[DEBUG] Torso angle (rad): {angle}")
+
+    # -------------------- Grid warp --------------------
+    latents_warped, dx, dy, _ = warp_latents(latents, pose.delta, H, W, device)
+    if debug:
+        print(f"[DEBUG] Grid warp applied")
+        print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
+        print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
+
+    # -------------------- Recentrage automatique sur haut du torse --------------------
+    points_idx = [1, 2, 5, 18]  # neck, right_shoulder, left_shoulder, mouth
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,4,2]
+
+    neck = pts[:, 0, :]
+    shoulders = pts[:, 1:3, :]
+    avg_shoulders = shoulders.mean(dim=1)
+    mouth = pts[:, 3, :]
+
+    sternum_offset_y = compute_sternum_offset_y(neck, avg_shoulders, mouth_coords=mouth, ratio=0.5)
+    content_center = pts.mean(dim=1, keepdim=True) + torch.tensor([0.0, sternum_offset_y], device=device)
+    content_points_px = content_center * torch.tensor([W-1, H-1], device=device)
+
+    torso_center = pts.mean(dim=1)
+    torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
+    torso_points_px = torso_points_px.view(B,2,1,1)
+    mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle.view(-1), H, W, device)
+    mask_rotated = mask_rotated.clamp(0,1)
+
+    # -------------------- Offset calculation basé sur le masque --------------------
+    grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
+    grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
+
+    print(f"[DEBUG] grid_x: {grid_x}")
+    print(f"[DEBUG] grid_y: {grid_y}")
+
+    mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
+    print(f"[DEBUG] mask_sum: {mask_sum}")
+    mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
+    mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
+
+    # -------------------- Décalage basé sur barycentre du torse --------------------
+    content_center_px = content_points_px[:,0]
+    print(f"[DEBUG] content_center_px init: {content_center_px}")
+    shoulders = pts[:, 1:3, :]
+    content_center_shoulders = shoulders.mean(dim=1, keepdim=True)
+    print(f"[DEBUG] content_center_shoulders : {content_center_shoulders}")
+
+    # -------------------- Padding dynamique gauche --------------------
+    padding_left = int(0.2 * W)  # 10% de la largeur
+    print(f"[DEBUG] padding_left: {padding_left}")
+    latents_padded = F.pad(latents_warped, (padding_left,0,0,0), mode='replicate')
+    B, C, H_pad, W_pad = latents_padded.shape
+    print(f"[DEBUG] latents padded shape: {latents_padded.shape}")
+
+    # -------------------- Grid warp avec padding --------------------
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1,1,H,device=device),
+        torch.linspace(-1,1,W_pad,device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)
+
+    shift_x = (mask_center_x[:,0,0,0] - content_center_px[:,0]) * 2 / (W-1)
+    shift_y = (mask_center_y[:,0,0,0] - content_center_px[:,1]) * 2 / (H-1)
+    print(f"[DEBUG] shift_x: {shift_x}")
+    print(f"[DEBUG] shift_y: {shift_y}")
+
+    shift_y += 0.4
+    print(f"[DEBUG] shift_y correction: {shift_y}")
+    shift_y = torch.clamp(shift_y, -0.5, 0.6)
+    print(f"[DEBUG] shift_y clamp: {shift_y}")
+    shift_x += 0.5
+    print(f"[DEBUG] shift_x correction: {shift_x}")
+    shift_x = torch.clamp(shift_x, -0.02, 0.8)
+    print(f"[DEBUG] shift_x clamp: {shift_x}")
+
+    # largeur moyenne du torse
+    torso_width_px = (shoulders[:,0,0] - shoulders[:,1,0]).abs()
+    correction_factor = torch.clamp(torso_width_px / (W-1), 0.5, 1.0)
+    print(f"[DEBUG] torso_width_px: {torso_width_px}")
+    print(f"[DEBUG] correction_factor: {correction_factor}")
+
+    grid[...,0] -= shift_x[:,None,None]
+    grid[...,1] -= shift_y[:,None,None]
+
+    latents_warped = F.grid_sample(latents_padded, grid, align_corners=True)
+    latents_warped = latents_warped[:, :, :, padding_left:]  # recadrage pour largeur originale
+    print(f"[DEBUG] latents_warped shape after recadrage: {latents_warped.shape}")
+
+    # -------------------- Fusion latents --------------------
+    mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
+    latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
+
+    # -------------------- OpenPose delta --------------------
+    latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
+
+    # -------------------- Stabilisation --------------------
+    latents = stabilize_latents_motion(latents)
+
+    # -------------------- Impact map (debug) --------------------
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter)
+
+    return latents
+
+#-----------------------------------------------------------------------------------------
+
+def create_upper_body_mask(keypoints, H, W, device):
+    """
+    Crée un masque simple du torse + bras.
+    """
+    B = keypoints.shape[0]
+    mask = torch.zeros(B,1,H,W,device=device)
+    # Pour simplifier, on met 1 là où sont les keypoints du torse et bras
+    for i in [2,3,4,5,6,7]:  # épaules + coudes + poignets
+        kp = get_point(keypoints, i)
+        x = (kp[:,0] * (W-1)).long()
+        y = (kp[:,1] * (H-1)).long()
+        mask[torch.arange(B),0,y,x] = 1.0
+    mask = gaussian_blur_tensor(mask, kernel_size=15, sigma=5.0)
+    mask = torch.clamp(mask,0,1)
+    return mask
+
+
+
+#------------------------------------------------------------------------------------------
+def update_pose_sequence_from_keypoints_batch(
+    keypoints_tensor,
+    prev_keypoints=None,
+    frame_idx=0,
+    alpha=0.5,
+    add_motion=True,
+    debug=False
+):
+    """
+    Génère une évolution temporelle des keypoints.
+    Fonctionne même avec pose statique (motion procédural).
+    """
+
+    import torch
+    import math
+
+    kp = keypoints_tensor.clone()
+    B, N, _ = kp.shape
+    device = kp.device
+
+    # =========================
+    # 🔹 1. SMOOTH TEMPOREL
+    # =========================
+    if prev_keypoints is not None:
+        kp = alpha * kp + (1 - alpha) * prev_keypoints
+
+    # =========================
+    # 🔹 2. MOTION PROCÉDURAL
+    # =========================
+    if add_motion:
+
+        t = frame_idx
+
+        # -------- Breathing (vertical torso + épaules)
+        breath = 0.015 * math.sin(t * 0.15)
+
+        # épaules (indices OpenPose)
+        kp[:, 2, 1] += breath   # right shoulder Y
+        kp[:, 5, 1] += breath   # left shoulder Y
+
+        # -------- Sway (balancement gauche/droite)
+        sway = 0.02 * math.sin(t * 0.08)
+
+        kp[:, :, 0] += sway  # léger mouvement global en X
+
+        # -------- Head motion (indépendant)
+        head_idx = 0
+        kp[:, head_idx, 0] += 0.01 * math.sin(t * 0.2)
+        kp[:, head_idx, 1] += 0.01 * math.cos(t * 0.18)
+
+        # -------- Drift lent (très faible)
+        drift_x = 0.005 * math.sin(t * 0.03)
+        drift_y = 0.005 * math.cos(t * 0.025)
+
+        kp[:, :, 0] += drift_x
+        kp[:, :, 1] += drift_y
+
+        # -------- Micro noise (anti-freeze)
+        noise = torch.randn_like(kp[..., :2]) * 0.003
+        kp[..., :2] += noise
+
+    # =========================
+    # 🔹 3. STABILISATION
+    # =========================
+    kp[..., :2] = torch.clamp(kp[..., :2], -1.2, 1.2)
+
+    # =========================
+    # 🔹 DEBUG
+    # =========================
+    if debug:
+        motion_strength = (kp - keypoints_tensor).abs().mean()
+        print(f"[DEBUG] Keypoint motion strength: {motion_strength.item():.6f}")
+
+    return kp
+
+#--------------------------------------------------------------------------------------------------------------
+
+def save_debug_pose_image_with_skeleton(
+    pose_tensor,
+    keypoints_tensor,
+    frame_counter,
+    output_dir,
+    cfg=None,
+    prefix="openpose"
+):
+    """
+    Sauvegarde une image de pose ET un squelette OpenPose pour contrôle visuel.
+
+    Args:
+        pose_tensor (torch.Tensor): [B,3,H,W] normalisé [-1,1] ou [C,H,W]
+        keypoints_tensor (torch.Tensor): [B,18,3] (x,y,conf) normalisé [0,1]
+        frame_counter (int): numéro de frame
+        output_dir (str): dossier où sauvegarder
+        cfg (dict, optional): peut contenir 'visual_debug' pour activer/désactiver
+        prefix (str, optional): préfixe du fichier
+    """
+
+    if cfg is not None and cfg.get("visual_debug") is False:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ---------------------------
+    # 🔹 Convertir pose_tensor en image RGB [0,255]
+    # ----------------------------
+    pose_img = pose_tensor[0].detach().cpu()
+    if pose_img.ndim == 3 and pose_img.shape[0] == 3:
+        pose_img = pose_img.permute(1,2,0)  # H,W,C
+    pose_img = ((pose_img + 1.0)/2.0 * 255).clamp(0,255).byte().numpy()
+
+    # Sauvegarde simple de l'image de pose
+    filename_pose = f"{prefix}_{frame_counter:05d}.png"
+    path_pose = os.path.join(output_dir, filename_pose)
+    cv2.imwrite(path_pose, cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+    print(f"[DEBUG] Pose sauvegardée : {path_pose}")
+
+    # ---------------------------
+    # 🔹 Dessin du squelette via debug_draw_openpose_skeleton
+    # ---------------------------
+    if keypoints_tensor is not None:
+        debug_draw_openpose_skeleton(
+            pose_full_image=pose_tensor.unsqueeze(0) if pose_tensor.ndim==3 else pose_tensor,
+            keypoints_tensor=keypoints_tensor,
+            debug_dir=output_dir,
+            frame_counter=frame_counter
+        )
