@@ -2462,14 +2462,16 @@ def apply_pose_driven_motion(
     #[DEBUG] [←→] shift_x: tensor([1.5921], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.7244], device='cuda:0')
     #[DEBUG] [←→] clamp shift_x: tensor([[[0.4700]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.4500]]], device='cuda:0')
 
+    #[DEBUG] [←→] shift_x: tensor([1.7167], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.7984], device='cuda:0')
+    #[DEBUG] [←→] clamp shift_x: tensor([[[0.4700]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.6500]]], device='cuda:0')
 
 
     if debug:
         print(f"[DEBUG] [←→] shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
 
     # Fix broadcasting en view
-    shift_x = torch.clamp(shift_x - 1.0, 0.45, 0.47).view(B,1,1)
-    shift_y = torch.clamp(shift_y - 2.1, 0.63, 0.65).view(B,1,1)
+    shift_x = torch.clamp(shift_x - 1.0, 0.49, 0.5).view(B,1,1)  # valeur plus grande = plus a droite
+    shift_y = torch.clamp(shift_y - 2.0, 0.58, 0.59).view(B,1,1)  # Valeur plus grande = plus bas
 
     if debug:
         print(f"[DEBUG] [←→] clamp shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
