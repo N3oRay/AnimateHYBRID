@@ -134,6 +134,96 @@ def gaussian_blur_tensor(x, kernel_size=3, sigma=0.5):
     pad = k // 2
     x = F.conv2d(x, kernel2d, padding=pad, groups=C)
     return x
+
+# blur sur le coté du masque type photoshop
+def feather_mask(mask, radius=3):
+    """
+    mask: [B,1,H,W] (0 ou 1)
+    radius: épaisseur du bord en pixels
+    """
+
+    # approx distance via blur répété (rapide GPU)
+    dist = mask.clone()
+
+    for _ in range(radius):
+        dist = F.max_pool2d(dist, kernel_size=3, stride=1, padding=1)
+
+    # bande extérieure uniquement
+    band = (dist - mask).clamp(0, 1)
+
+    # normaliser pour faire un dégradé progressif
+    band = band / (band.max().clamp(min=1e-6))
+
+    # lisser légèrement (optionnel mais joli)
+    band = gaussian_blur_tensor(band, kernel_size=5, sigma=1.0)
+
+    # reconstruire
+    mask = mask + band * (1 - mask)
+
+    return torch.clamp(mask, 0, 1)
+
+# blur sur le coté du masque type photoshop
+def feather_mask_fast(mask, radius=3):
+    k = 2 * radius + 1
+
+    dist = F.max_pool2d(mask, kernel_size=k, stride=1, padding=radius)
+
+    band = (dist - mask).clamp(0, 1)
+    band = gaussian_blur_tensor(band, kernel_size=5, sigma=1.0)
+
+    return torch.clamp(mask + band * (1 - mask), 0, 1)
+
+
+def feather_outside_only(mask, radius=3, blur_kernel=5, sigma=1.0):
+    """
+    mask: [B,1,H,W] (0 ou 1)
+    radius: largeur du dégradé extérieur (pixels)
+    """
+
+    # 1. dilatation contrôlée (couronne extérieure)
+    k = 2 * radius + 1
+    dilated = F.max_pool2d(mask, kernel_size=k, stride=1, padding=radius)
+
+    # 2. isoler UNIQUEMENT l'extérieur
+    band = (dilated - mask).clamp(0, 1)
+
+    # 3. lisser cette bande (sans toucher l'intérieur)
+    band = gaussian_blur_tensor(band, kernel_size=blur_kernel, sigma=sigma)
+
+    # 4. normaliser pour un vrai dégradé
+    band = band / (band.max().clamp(min=1e-6))
+
+    # 5. reconstruction :
+    # intérieur intact + dégradé extérieur uniquement
+    result = mask + band * (1 - mask)
+
+    return torch.clamp(result, 0, 1)
+
+
+def feather_inside(mask, radius=5, blur_kernel=5, sigma=1.0):
+    """
+    mask: [B,1,H,W] (0 ou 1)
+    radius: largeur de la bande à l'intérieur du mask
+    """
+
+    # 1. érosion (réduire le mask) pour créer la bande interne
+    k = 2 * radius + 1
+    eroded = -F.max_pool2d(-mask, kernel_size=k, stride=1, padding=radius)  # erosion via max pooling sur négatif
+
+    # 2. isoler la bande intérieure
+    band = (mask - eroded).clamp(0, 1)
+
+    # 3. lisser légèrement pour le feather
+    band = gaussian_blur_tensor(band, kernel_size=blur_kernel, sigma=sigma)
+
+    # 4. correction alpha pour éviter l’étirement
+    band = band * band * (3 - 2 * band)  # smoothstep
+
+    # 5. reconstruire le mask : intérieur net + dégradé à l’intérieur
+    result = eroded + band
+
+    return torch.clamp(result, 0, 1)
+
 #---------------------------------- CLASS POSE ------------------------------------------------------
 class Pose:
     def __init__(self, keypoints: torch.Tensor):
@@ -174,7 +264,7 @@ class Pose:
         self.angles = angle
         return angle
 
-    def create_upper_body_mask(self, H: int, W: int, kernel_size: int = 11, sigma: float = 1.0,
+    def create_upper_body_mask(self, H: int, W: int,
                            debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
         """
         Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
@@ -205,17 +295,9 @@ class Pose:
 
             # Convertir en tensor et assigner
             mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+            # flouter uniquement sur bande fine avec une dilatation légère
+            mask = feather_inside(mask, radius=5, blur_kernel=5, sigma=1.0)
 
-            # Floutage pour adoucir les bords
-            #mask = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
-            mask_outside = 1.0 - mask
-            # flou global
-            blurred = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
-            # extraire seulement la bordure extérieure
-            edge = (blurred - mask).clamp(0, 1)
-            # reconstruire
-            mask = mask + edge * mask_outside
-            mask = torch.clamp(mask, 0, 1)
 
 
         # -------------------- Debug --------------------
@@ -1527,8 +1609,7 @@ def apply_pose_driven_motion(
     pose.compute_torso_delta(latent_h=H, latent_w=W, scale=0.8)
     angle = pose.compute_torso_angle()
     # sigma correspond à la valeur du flou
-    mask = pose.create_upper_body_mask(H, W, kernel_size=11, sigma=2.0,
-                                       debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
     if debug:
         print(f"[DEBUG] Torso delta: {pose.delta}")
         print(f"[DEBUG] Torso angle (rad): {angle}")
@@ -1617,9 +1698,15 @@ def apply_pose_driven_motion(
     if debug:
         print(f"[DEBUG] [←→] shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
 
+
+
+#[DEBUG] [←→] shift_x: tensor([1.6717], device='cuda:0'), ⬆ ⬇ shift_y: tensor([2.6802], device='cuda:0')
+#[DEBUG] [←→] clamp shift_x: tensor([[[0.4780]]], device='cuda:0'), ⬆ ⬇ shift_y: tensor([[[0.5930]]], device='cuda:0')
+
+
     # Fix broadcasting en view
-    shift_x = torch.clamp(shift_x - 1.23, 0.475, 0.476).view(B,1,1)  # valeur plus grande = plus a droite 1.7058 0.4750
-    shift_y = torch.clamp(shift_y - 2.19, 0.59, 0.595).view(B,1,1)  # Valeur plus grande = plus bas 2.7858 0.5950
+    shift_x = torch.clamp(shift_x - 1.193, 0.479, 0.485).view(B,1,1)  # valeur plus grande = plus a droite 1.7058 0.4750
+    shift_y = torch.clamp(shift_y - 2.086, 0.594, 0.599).view(B,1,1)  # Valeur plus grande = plus bas 2.7858 0.5950
 
     if debug:
         print(f"[DEBUG] [←→] clamp shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
