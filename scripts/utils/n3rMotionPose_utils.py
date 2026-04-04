@@ -174,7 +174,7 @@ class Pose:
         self.angles = angle
         return angle
 
-    def create_upper_body_mask(self, H: int, W: int, kernel_size: int = 15, sigma: float = 1.0,
+    def create_upper_body_mask(self, H: int, W: int, kernel_size: int = 11, sigma: float = 1.0,
                            debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
         """
         Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
@@ -206,9 +206,17 @@ class Pose:
             # Convertir en tensor et assigner
             mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
 
-        # Floutage pour adoucir les bords
-        mask = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
-        mask = torch.clamp(mask, 0, 1)
+            # Floutage pour adoucir les bords
+            #mask = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
+            mask_outside = 1.0 - mask
+            # flou global
+            blurred = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
+            # extraire seulement la bordure extérieure
+            edge = (blurred - mask).clamp(0, 1)
+            # reconstruire
+            mask = mask + edge * mask_outside
+            mask = torch.clamp(mask, 0, 1)
+
 
         # -------------------- Debug --------------------
         if debug and debug_dir is not None:
@@ -1132,72 +1140,6 @@ def match_latent_size(latents_main, *tensors):
     return matched if len(matched) > 1 else matched[0]
 
 
-def apply_controlnet_openpose_step(
-    latents,
-    t,
-    unet,
-    controlnet,
-    scheduler,
-    pose_image,
-    pos_embeds,
-    neg_embeds=None,
-    guidance_scale=5.0,
-    controlnet_scale=0.7,
-    device="cuda",
-    dtype=torch.float16,
-    debug=False
-):
-    import torch
-
-    latents = latents.to(device=device, dtype=dtype)
-    pose_image = pose_image.to(device=device, dtype=dtype)
-
-    # 🔁 classifier-free guidance
-    if neg_embeds is not None:
-        latent_model_input = torch.cat([latents] * 2)
-        encoder_states = torch.cat([neg_embeds, pos_embeds])
-        pose_input = torch.cat([pose_image] * 2)
-    else:
-        latent_model_input = latents
-        encoder_states = pos_embeds
-        pose_input = pose_image
-
-    latent_model_input = scheduler.scale_model_input(latent_model_input, t)
-
-    # 🔥 ControlNet
-    down_samples, mid_sample = controlnet(
-        latent_model_input,
-        t,
-        encoder_hidden_states=encoder_states,
-        controlnet_cond=pose_input,
-        return_dict=False
-    )
-
-    # 🔥 UNet avec ControlNet
-    noise_pred = unet(
-        latent_model_input,
-        t,
-        encoder_hidden_states=encoder_states,
-        down_block_additional_residuals=[d * controlnet_scale for d in down_samples],
-        mid_block_additional_residual=mid_sample * controlnet_scale
-    ).sample
-
-    # 🔁 CFG
-    if neg_embeds is not None:
-        noise_uncond, noise_text = noise_pred.chunk(2)
-        noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
-
-    # 🔥 Scheduler step
-    latents = scheduler.step(noise_pred, t, latents).prev_sample
-
-    if debug:
-        print(f"[ControlNet] t={t}, latents min/max: {latents.min().item():.3f}/{latents.max().item():.3f}")
-
-    return latents
-
-
-
-
 
 
 
@@ -1585,7 +1527,7 @@ def apply_pose_driven_motion(
     pose.compute_torso_delta(latent_h=H, latent_w=W, scale=0.8)
     angle = pose.compute_torso_angle()
     # sigma correspond à la valeur du flou
-    mask = pose.create_upper_body_mask(H, W, kernel_size=10, sigma=2.0,
+    mask = pose.create_upper_body_mask(H, W, kernel_size=11, sigma=2.0,
                                        debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
     if debug:
         print(f"[DEBUG] Torso delta: {pose.delta}")
