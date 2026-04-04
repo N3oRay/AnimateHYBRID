@@ -158,7 +158,7 @@ class Pose:
 
     def create_upper_body_mask(self, H: int, W: int,
                             debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
-                            expand_w=0.8, shrink_h=0.7):
+                            expand_w=0.9, shrink_h=0.65):
         """
         Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
         expand_w: facteur pour élargir le masque horizontalement (>1 = plus large)
@@ -1067,20 +1067,6 @@ def normalize_keypoints(kp_tensor):
     kp[...,1] = kp[...,1] - torso_center[:,1].unsqueeze(1)  # recentre Y
     return kp
 
-# 🔹 Applique un léger effet de respiration (scaling sinusoïdal) sur les latents
-def apply_breathing_big(latents, previous_latent, frame_counter, breathing=True):
-    """
-    Applique une légère respiration sinusoidale sur les latents.
-    """
-    import math
-    if previous_latent is not None and breathing:
-        # Amplitude réduite de la respiration
-        breath = 0.012 * math.sin(frame_counter * 0.15)
-        latents = latents * (1.0 + breath)
-    return latents
-
-
-
 # 🔹 Calcule le déplacement du torse par rapport à la frame précédente
 #   Utilisé pour translater les latents afin de suivre le mouvement.
 
@@ -1309,11 +1295,7 @@ def apply_pose_driven_motion(
     grid[...,1] -= shift_y
 
 
-    latents_warped = F.grid_sample(
-        latents_padded,
-        grid,
-        align_corners=False  # 🔥 FIX
-    )
+    latents_warped = F.grid_sample( latents_padded, grid, align_corners=False )  # 🔥 FIX
 
     latents_warped = latents_warped[:, :, :, padding_left:padding_left+W]
 
@@ -1323,24 +1305,15 @@ def apply_pose_driven_motion(
 
     # 🔥 alignement obligatoire
     if mask_boosted.shape[2:] != latents.shape[2:]:
-        mask_boosted = F.interpolate(
-            mask_boosted,
-            size=latents.shape[2:],  # (H, W)
-            mode='bilinear',
-            align_corners=False
-        )
+        mask_boosted = F.interpolate( mask_boosted, size=latents.shape[2:], mode='bilinear', align_corners=False )
 
     latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
 
     # -------------------- OpenPose delta --------------------
     # 🔥 Assurer alignement taille avant OpenPose delta
     if mask_rotated.shape[2:] != latents.shape[2:]:
-        mask_rotated = F.interpolate(
-            mask_rotated,
-            size=latents.shape[2:],  # (H, W)
-            mode='bilinear',
-            align_corners=False
-        )
+        mask_rotated = F.interpolate( mask_rotated, size=latents.shape[2:], mode='bilinear', align_corners=False )
+
     latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
 
     # -------------------- Stabilisation --------------------

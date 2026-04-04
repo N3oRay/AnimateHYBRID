@@ -389,7 +389,7 @@ def apply_breathing_xy(latents, previous_latent, frame_counter, breathing=True):
         latents = torch.nn.functional.grid_sample(latents, grid, align_corners=True)
     return latents
 
-def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
+def apply_breathing_mask(latents, previous_latent, frame_counter, breathing=True):
     """
     Applique une respiration réaliste sur les latents : décalage vertical uniquement.
     """
@@ -398,7 +398,7 @@ def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
         device = latents.device
 
         # amplitude respiration
-        breath = 0.004 * math.sin(frame_counter * 0.15)  # amplitude réduite
+        breath = 0.003 * math.sin(frame_counter * 0.1)  # amplitude réduite
 
         # grille pixels avec meshgrid
         yy, xx = torch.meshgrid(
@@ -414,6 +414,57 @@ def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
         # appliquer le décalage vertical uniquement
         latents = F.grid_sample(latents, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
+    return latents
+
+def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
+    """
+    Applique une respiration réaliste sur les latents : décalage vertical uniquement.
+    Optimisée pour fluidité et performance.
+    """
+    import torch
+    import torch.nn.functional as F
+    import math
+
+    if previous_latent is not None and breathing:
+        B, C, H, W = latents.shape
+        device = latents.device
+
+        # Amplitude respiration + smooth sinus
+        breath = 0.003 * math.sin(frame_counter * 0.1) * math.cos(frame_counter * 0.02)
+
+        # Pré-calcul de la grille si pas déjà fait
+        if not hasattr(apply_breathing, "_grid_base") or apply_breathing._grid_base[0].shape != (H, W):
+            yy, xx = torch.meshgrid(
+                torch.linspace(-1, 1, H, device=device),
+                torch.linspace(-1, 1, W, device=device),
+                indexing='ij'
+            )
+            apply_breathing._grid_base = (xx, yy)
+
+        xx, yy = apply_breathing._grid_base
+
+        # Construction de la grille batch
+        grid = torch.stack((xx, yy + breath), dim=-1)      # [H, W, 2]
+        grid = grid.unsqueeze(0).expand(B, H, W, 2)       # [B, H, W, 2]
+
+        # Décalage vertical uniquement avec bicubic et align_corners=False
+        latents = F.grid_sample(
+            latents, grid, mode='bicubic', padding_mode='zeros', align_corners=True
+        )
+
+    return latents
+
+
+# 🔹 Applique un léger effet de respiration (scaling sinusoïdal) sur les latents
+def apply_breathing_big(latents, previous_latent, frame_counter, breathing=True):
+    """
+    Applique une légère respiration sinusoidale sur les latents.
+    """
+    import math
+    if previous_latent is not None and breathing:
+        # Amplitude réduite de la respiration
+        breath = 0.012 * math.sin(frame_counter * 0.15)
+        latents = latents * (1.0 + breath)
     return latents
 
 
