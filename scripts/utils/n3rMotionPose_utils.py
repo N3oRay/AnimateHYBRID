@@ -224,6 +224,33 @@ def feather_inside(mask, radius=5, blur_kernel=5, sigma=1.0):
 
     return torch.clamp(result, 0, 1)
 
+
+def feather_inside_strict(mask, radius=5, blur_kernel=5, sigma=1.0):
+    """
+    mask: [B,1,H,W] (0 ou 1)
+    radius: largeur du feather à l'intérieur du mask
+    """
+
+    # 1️⃣ érosion : zone intérieure parfaitement nette
+    k = 2 * radius + 1
+    eroded = -F.max_pool2d(-mask, kernel_size=k, stride=1, padding=radius)
+
+    # 2️⃣ bande interne à flouter (feather)
+    band = (mask - eroded).clamp(0, 1)
+
+    # 3️⃣ flou uniquement sur la bande
+    if band.max() > 0:  # éviter division par zéro
+        band_blur = gaussian_blur_tensor(band, kernel_size=blur_kernel, sigma=sigma)
+        # 4️⃣ correction alpha smoothstep pour éviter étirement
+        band_blur = band_blur * band_blur * (3 - 2 * band_blur)
+    else:
+        band_blur = band
+
+    # 5️⃣ reconstruction : intérieur net + bande floutée
+    result = eroded + band_blur
+
+    return torch.clamp(result, 0, 1)
+
 #---------------------------------- CLASS POSE ------------------------------------------------------
 class Pose:
     def __init__(self, keypoints: torch.Tensor):
@@ -265,6 +292,59 @@ class Pose:
         return angle
 
     def create_upper_body_mask(self, H: int, W: int,
+                            debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
+                            expand_w=0.8, shrink_h=0.8):
+        """
+        Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
+        expand_w: facteur pour élargir le masque horizontalement (>1 = plus large)
+        shrink_h: facteur pour réduire le masque verticalement (<1 = plus petit)
+        """
+
+        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+
+        for b in range(self.B):
+            # Récupère les keypoints : épaules et hanches
+            r_sh = self.get_point(19)[b].cpu().numpy()
+            l_sh = self.get_point(20)[b].cpu().numpy()
+            r_hip = self.get_point(8)[b].cpu().numpy()
+            l_hip = self.get_point(11)[b].cpu().numpy()
+
+            # Convertir en pixels
+            def to_px(kp):
+                return np.array([kp[0]*(W-1), kp[1]*(H-1)])
+
+            pts = np.array([
+                to_px(r_sh),
+                to_px(l_sh),
+                to_px(l_hip),
+                to_px(r_hip)
+            ], dtype=np.float32)
+
+            # 🔹 Ajuster largeur et hauteur
+            # Centre horizontal et vertical du polygone
+            cx = np.mean(pts[:,0])
+            cy = np.mean(pts[:,1])
+
+            # Appliquer le facteur
+            pts[:,0] = cx + (pts[:,0] - cx) * expand_w    # élargir horizontalement
+            pts[:,1] = cy + (pts[:,1] - cy) * shrink_h    # réduire verticalement
+
+            # Convertir en int pour cv2
+            pts = pts.astype(np.int32)
+
+            # Remplir le polygone
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(mask_np, [pts], 255)
+
+            # Convertir en tensor
+            mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+
+        # Appliquer feather intérieur strict
+        mask = feather_inside_strict(mask, radius=5, blur_kernel=3, sigma=1.0)
+
+        return mask
+
+    def create_upper_body_mask_v1(self, H: int, W: int,
                            debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
         """
         Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
@@ -296,7 +376,7 @@ class Pose:
             # Convertir en tensor et assigner
             mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
             # flouter uniquement sur bande fine avec une dilatation légère
-            mask = feather_inside(mask, radius=5, blur_kernel=5, sigma=1.0)
+            mask = feather_inside_strict(mask, radius=5, blur_kernel=3, sigma=1.0)
 
 
 
@@ -313,7 +393,7 @@ class Pose:
 
         return mask
 
-    def create_upper_body_mask1(self, H: int, W: int, kernel_size: int = 15, sigma: float = 5.0,
+    def create_upper_body_mask_test(self, H: int, W: int, kernel_size: int = 15, sigma: float = 5.0,
                            debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
         """
         Crée un masque polygonal flouté torse + bras, sans le cou.
