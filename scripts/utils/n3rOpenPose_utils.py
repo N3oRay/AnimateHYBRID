@@ -115,8 +115,8 @@ def extract_keypoints_from_pose(
 
 
 
-
-def gaussian_blur_tensor(x, kernel_size=3, sigma=1.0):
+# sigma correspond a la valeur du flou
+def gaussian_blur_tensor(x, kernel_size=3, sigma=0.5):
     # x: [B,C,H,W]
     B, C, H, W = x.shape
 
@@ -174,7 +174,7 @@ class Pose:
         self.angles = angle
         return angle
 
-    def create_upper_body_mask(self, H: int, W: int, kernel_size: int = 15, sigma: float = 5.0,
+    def create_upper_body_mask(self, H: int, W: int, kernel_size: int = 15, sigma: float = 1.0,
                            debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
         """
         Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
@@ -2047,7 +2047,7 @@ def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
     import math
     if previous_latent is not None and breathing:
         B, C, H, W = latents.shape
-        breath = 0.005 * math.sin(frame_counter * 0.15)  # amplitude réduite
+        breath = 0.004 * math.sin(frame_counter * 0.15)  # amplitude réduite
         # créer un shift vertical uniforme
         yy, xx = torch.meshgrid(torch.linspace(-1,1,H,device=latents.device),
                                 torch.linspace(-1,1,W,device=latents.device), indexing='ij')
@@ -2232,9 +2232,66 @@ def rotate_mask_around_point_v2(mask, center_px, angle, H, W, device):
     return mask_rotated
 
 
-
-
 def rotate_mask_around_torso(mask, torso_points_px, angle, H, W, device="cuda"):
+
+    B, C, H_mask, W_mask = mask.shape
+
+    # 🔥 utiliser H_mask / W_mask partout
+    H, W = H_mask, W_mask
+
+    # -------------------- centre du torse --------------------
+    torso_center = torso_points_px.mean(dim=2)  # [B, 2]
+
+    # -------------------- grid pixel --------------------
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    xx = xx.float().unsqueeze(0).expand(B, -1, -1)
+    yy = yy.float().unsqueeze(0).expand(B, -1, -1)
+
+    # -------------------- rotation autour centre --------------------
+    cx = torso_center[:, 0].view(B, 1, 1)
+    cy = torso_center[:, 1].view(B, 1, 1)
+
+    x_shift = xx - cx
+    y_shift = yy - cy
+
+    cos_angle = torch.cos(angle).view(B, 1, 1)
+    sin_angle = torch.sin(angle).view(B, 1, 1)
+
+    x_rot = cos_angle * x_shift - sin_angle * y_shift
+    y_rot = sin_angle * x_shift + cos_angle * y_shift
+
+    x_final = x_rot + cx
+    y_final = y_rot + cy
+
+    # -------------------- NORMALISATION CORRECTE --------------------
+    x_norm = 2.0 * x_final / (W - 1) - 1.0
+    y_norm = 2.0 * y_final / (H - 1) - 1.0
+
+    grid = torch.stack((x_norm, y_norm), dim=-1)
+
+    # 🔥 FIX CRITIQUE : align_corners=False
+    mask_rotated = F.grid_sample(
+        mask,
+        grid,
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=False
+    )
+
+    # 🔥 GARANTIE ABSOLUE
+    assert mask_rotated.shape[2:] == (H, W), \
+        f"Shape mismatch: {mask_rotated.shape} vs {(B,C,H,W)}"
+
+    return mask_rotated
+
+
+
+def rotate_mask_around_torso_v1(mask, torso_points_px, angle, H, W, device="cuda"):
     """
     Rotate a mask around the torso center instead of the image center.
 
@@ -2392,7 +2449,8 @@ def apply_pose_driven_motion(
     pose = Pose(keypoints.to(device))
     pose.compute_torso_delta(latent_h=H, latent_w=W, scale=0.8)
     angle = pose.compute_torso_angle()
-    mask = pose.create_upper_body_mask(H, W, kernel_size=15, sigma=5.0,
+    # sigma correspond à la valeur du flou
+    mask = pose.create_upper_body_mask(H, W, kernel_size=10, sigma=2.0,
                                        debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
     if debug:
         print(f"[DEBUG] Torso delta: {pose.delta}")
@@ -2442,8 +2500,17 @@ def apply_pose_driven_motion(
               f"max: {mask_rotated.max().item():.4f}, mean: {mask_rotated.mean().item():.4f}")
 
     # -------------------- Offset calculation basé sur le masque --------------------
-    grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
-    grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
+    #grid_x = torch.arange(W, device=device).view(1,1,1,W).expand(B,1,H,W)
+    #grid_y = torch.arange(H, device=device).view(1,1,H,1).expand(B,1,H,W)
+
+    #mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
+    #mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
+    #mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
+
+    B, _, Hm, Wm = mask_rotated.shape
+
+    grid_x = torch.arange(Wm, device=device).view(1,1,1,Wm).expand(B,1,Hm,Wm)
+    grid_y = torch.arange(Hm, device=device).view(1,1,Hm,1).expand(B,1,Hm,Wm)
 
     mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
     mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
@@ -2474,8 +2541,8 @@ def apply_pose_driven_motion(
         print(f"[DEBUG] [←→] shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
 
     # Fix broadcasting en view
-    shift_x = torch.clamp(shift_x - 1.1, 0.475, 0.478).view(B,1,1)  # valeur plus grande = plus a droite
-    shift_y = torch.clamp(shift_y - 2.0, 0.588, 0.595).view(B,1,1)  # Valeur plus grande = plus bas
+    shift_x = torch.clamp(shift_x - 1.23, 0.475, 0.476).view(B,1,1)  # valeur plus grande = plus a droite 1.7058 0.4750
+    shift_y = torch.clamp(shift_y - 2.19, 0.59, 0.595).view(B,1,1)  # Valeur plus grande = plus bas 2.7858 0.5950
 
     if debug:
         print(f"[DEBUG] [←→] clamp shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
@@ -2483,14 +2550,41 @@ def apply_pose_driven_motion(
     grid[...,0] -= shift_x
     grid[...,1] -= shift_y
 
-    latents_warped = F.grid_sample(latents_padded, grid, align_corners=True)
-    latents_warped = latents_warped[:, :, :, padding_left:]  # recadrage pour largeur originale
+
+    latents_warped = F.grid_sample(
+        latents_padded,
+        grid,
+        align_corners=False  # 🔥 FIX
+    )
+    #latents_warped = latents_warped[:, :, :, padding_left:]  # recadrage pour largeur originale
+    latents_warped = latents_warped[:, :, :, padding_left:padding_left+W]
 
     # -------------------- Fusion latents --------------------
+    #mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
+    #latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
+
     mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
+
+    # 🔥 alignement obligatoire
+    if mask_boosted.shape[2:] != latents.shape[2:]:
+        mask_boosted = F.interpolate(
+            mask_boosted,
+            size=latents.shape[2:],  # (H, W)
+            mode='bilinear',
+            align_corners=False
+        )
+
     latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
 
     # -------------------- OpenPose delta --------------------
+    # 🔥 Assurer alignement taille avant OpenPose delta
+    if mask_rotated.shape[2:] != latents.shape[2:]:
+        mask_rotated = F.interpolate(
+            mask_rotated,
+            size=latents.shape[2:],  # (H, W)
+            mode='bilinear',
+            align_corners=False
+        )
     latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
 
     # -------------------- Stabilisation --------------------
