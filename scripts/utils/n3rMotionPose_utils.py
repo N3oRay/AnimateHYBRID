@@ -1646,7 +1646,7 @@ def apply_global_pose(
     H=None,
     W=None,
     device="cuda",
-    strength=0.3,   # 🔥 beaucoup plus faible !
+    strength=0.1,   # 🔥 beaucoup plus faible !
     debug=False
 ):
     B = latents.shape[0]
@@ -1674,7 +1674,7 @@ def apply_global_pose(
     delta_px = delta_px.view(B,1,1,2)
 
     # -------------------- Clamp pour stabilité --------------------
-    delta_px = torch.clamp(delta_px, min=-20.0, max=20.0)
+    delta_px = torch.clamp(delta_px, min=-10.0, max=10.0)
 
     # -------------------- Grille --------------------
     yy, xx = torch.meshgrid(
@@ -2133,6 +2133,71 @@ def apply_pose_driven_motion_very_stable(
     return latents
 #------------------------------------------------------------------------------------------
 def update_pose_sequence_from_keypoints_batch(
+    keypoints_tensor,
+    prev_keypoints=None,
+    frame_idx=0,
+    alpha=0.7,        # lissage temporel plus fort
+    add_motion=True,
+    debug=False
+):
+    import torch
+    import math
+
+    kp = keypoints_tensor.clone()
+    B, N, _ = kp.shape
+    device = kp.device
+
+    # =========================
+    # 🔹 1. SMOOTH TEMPOREL
+    # =========================
+    if prev_keypoints is not None:
+        kp = alpha * kp + (1 - alpha) * prev_keypoints
+
+    # =========================
+    # 🔹 2. MOTION PROCÉDURAL
+    # =========================
+    if add_motion:
+        t = frame_idx
+
+        # Respiration (vertical torso + épaules)
+        breath = 0.009 * math.sin(t * 0.15)
+        kp[:, 2, 1] += breath
+        kp[:, 5, 1] += breath
+
+        # Balancement gauche/droite
+        sway = 0.010 * math.sin(t * 0.08)
+        kp[:, :, 0] += sway
+
+        # Head motion
+        head_idx = 0
+        kp[:, head_idx, 0] += 0.006 * math.sin(t * 0.2)
+        kp[:, head_idx, 1] += 0.006 * math.cos(t * 0.18)
+
+        # Drift lent
+        drift_x = 0.002 * math.sin(t * 0.03)
+        drift_y = 0.002 * math.cos(t * 0.025)
+        kp[:, :, 0] += drift_x
+        kp[:, :, 1] += drift_y
+
+        # Micro noise (anti-freeze)
+        noise = torch.randn_like(kp[..., :2]) * 0.0015
+        kp[..., :2] += noise
+
+    # =========================
+    # 🔹 3. STABILISATION
+    # =========================
+    kp[..., :2] = torch.clamp(kp[..., :2], -1.2, 1.2)
+
+    # =========================
+    # 🔹 4. DEBUG
+    # =========================
+    if debug:
+        motion_strength = (kp - keypoints_tensor).abs().mean()
+        print(f"[DEBUG] Keypoint motion strength: {motion_strength.item():.6f}")
+
+    return kp
+
+def update_pose_sequence_from_keypoints_batch_v1(
     keypoints_tensor,
     prev_keypoints=None,
     frame_idx=0,
