@@ -1712,20 +1712,23 @@ def apply_face_warp(
     debug_dir=None
 ):
     """
-    Warp visage “vivant” avec micro-mouvements, sourire et ventilation légère.
-    Retourne latents transformés et face_delta.
+    Warp du visage avec micro expressions et respiration.
+    - latents : tenseur [B,C,H,W]
+    - pose : objet Pose
+    - mask_face : masque visage [B,1,H,W]
+    - grid : grille de base [B,H,W,2]
+    - frame_counter : compteur de frame pour animations
     """
 
-    B = latents.shape[0]
+    B, C, H, W = latents.shape
+    latents_in = latents.clone()
 
-    # -------------------- Points et masque visage --------------------
+    # -------------------- Delta visage --------------------
     face_center = pose.get_point(0)  # nez
-    face_center_px = face_center * torch.tensor([W-1,H-1], device=device)
+    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
     face_center_px = face_center_px.view(B,1,1,2)
 
-    face_delta = torch.tanh(face_center*2.0)*0.4  # base mouvement visage
-
-    # -------------------- Respiration / micro mouvement --------------------
+    # Base delta pour respiration/micro-mouvements
     t_dict = {
         "resp_y": torch.tensor(frame_counter / 8.0, device=device),
         "resp_x": torch.tensor(frame_counter / 10.0, device=device),
@@ -1734,82 +1737,42 @@ def apply_face_warp(
         "wind2": torch.tensor(frame_counter / 60.0, device=device),
     }
 
+    face_delta = torch.zeros((B,1,1,2), device=device)
     face_delta[...,1] += 0.01 * torch.sin(t_dict["resp_y"])
     face_delta[...,0] += 0.005 * torch.sin(t_dict["resp_x"])
     face_delta[...,0] += 0.002 * torch.sin(t_dict["micro"])
     face_delta[...,1] += 0.003 * torch.sin(t_dict["micro"] * 1.5)
 
     # -------------------- Micro sourire --------------------
-    try:
-        mouth_mask = pose.get_mouth_region(H, W, device=device,
-                                           debug=debug, debug_dir=debug_dir,
-                                           frame_counter=frame_counter)
-        # amplitude sourire (oscillation subtile)
-        smile_amp = 0.005 * torch.sin(torch.tensor(frame_counter/10.0, device=device))
-        face_delta[...,0] += smile_amp * mouth_mask.squeeze(1)
-    except Exception as e:
-        if debug:
-            print(f"[DEBUG] Mouth region not applied: {e}")
+    mouth_mask = pose.get_mouth_region(H, W, device=device, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mouth_mask_exp = mouth_mask.permute(0,2,3,1)  # [B,H,W,1] pour broadcasting
 
-    # -------------------- Animation cheveux / micro delta --------------------
-    t = torch.tensor(frame_counter / 5.0, device=device)
-    oscillation = 0.02 * torch.sin(t)
-    micro_delta = torch.zeros_like(face_delta)
-    micro_delta[...,0] = oscillation
-    micro_delta[...,1] = oscillation * 0.5
-    face_delta = face_delta + micro_delta
+    smile_strength = 0.02
+    smile_delta = smile_strength * torch.sin(torch.tensor(frame_counter / 10.0, device=device))
 
-    # -------------------- Bruit cohérent cheveux / visage --------------------
-    """"
-    noise_x = (
-        smooth_noise(grid, frame_counter, scale=0.05) +
-        0.5 * smooth_noise(grid, frame_counter, scale=0.15) +
-        0.25 * smooth_noise(grid, frame_counter, scale=0.3)
-    )
-    noise_y = (
-        smooth_noise(grid, frame_counter + 123, scale=0.08) +
-        0.5 * smooth_noise(grid, frame_counter + 123, scale=0.2) +
-        0.25 * smooth_noise(grid, frame_counter + 123, scale=0.4)
-    )
-    """
-    hair_delta_field = torch.zeros_like(grid)
-    #hair_delta_field[...,0:1] = 0.05 * noise_x.unsqueeze(-1)
-    #hair_delta_field[...,1:2] = 0.08 * noise_y.unsqueeze(-1)
+    # face_delta étendu à [B,H,W,2] pour grid_sample
+    face_delta_expanded = face_delta.expand(B,H,W,2).clone()
+    face_delta_expanded[...,0] += mouth_mask_exp[...,0] * smile_delta
 
-    # -------------------- Grille visage --------------------
-    face_delta = face_delta.view(B,1,1,2)
-    mask_face_expand = mask_face.permute(0,2,3,1) ** 2.0
-    mask_hair_expand = pose.create_hair_mask(H, W).permute(0,2,3,1)
-
-    wind_dir = torch.tensor([1.0,0.3], device=device).view(1,1,1,2)
-    wind_strength = 0.01
-    t1 = torch.tensor(frame_counter / 15.0, device=device)
-    t2 = torch.tensor(frame_counter / 60.0, device=device)
-    wind_delta = wind_dir * (wind_strength + 0.01*torch.sin(t1) + 0.005*torch.sin(t2))
-
+    # -------------------- Construction grille --------------------
     grid_face = grid.clone()
     grid_face = grid_face - face_center_px
-    grid_face = grid_face + face_delta * mask_face_expand
-    grid_face = grid_face + hair_delta_field * mask_hair_expand
-    grid_face = grid_face + wind_delta * mask_hair_expand
+    mask_face_exp = mask_face.permute(0,2,3,1)  # [B,H,W,1]
+    grid_face = grid_face + face_delta_expanded * mask_face_exp
     grid_face = grid_face + face_center_px
 
-    # -------------------- Normalisation --------------------
-    grid_face[...,0] = 2.0*grid_face[...,0]/(W-1)-1.0
-    grid_face[...,1] = 2.0*grid_face[...,1]/(H-1)-1.0
+    # Normalisation [-1,1] pour grid_sample
+    grid_face[...,0] = 2.0*grid_face[...,0]/(W-1) - 1.0
+    grid_face[...,1] = 2.0*grid_face[...,1]/(H-1) - 1.0
 
-    latents = F.grid_sample(latents, grid_face, align_corners=True)
+    # -------------------- Warp --------------------
+    latents_out = F.grid_sample(latents, grid_face, align_corners=True)
 
     if debug:
-        save_path = None
-        if debug_dir is not None:
-            os.makedirs(debug_dir, exist_ok=True)
-            mask_vis = (mask_face[0,0].detach().cpu().numpy()*255).astype(np.uint8)
-            save_path = os.path.join(debug_dir, f"face_warp_{frame_counter:05d}.png")
-            cv2.imwrite(save_path, mask_vis)
-        print(f"[DEBUG] Face warp applied, saved mask: {save_path}")
+        save_impact_map(latents_out, latents_in, debug_dir, frame_counter)
+        print("[DEBUG] Face warp applied")
 
-    return latents, face_delta
+    return latents_out, face_delta_expanded
 
 def apply_pose_driven_motion(
     latents,
