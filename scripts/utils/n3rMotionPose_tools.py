@@ -14,7 +14,51 @@ from PIL import Image, ImageDraw
 import traceback
 
 
-#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_torso
+#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha
+
+
+def feather_outside_only_alpha(mask, radius=5, sigma=2.0):
+    """
+    Ajoute une bande floue uniquement à l'extérieur du masque.
+
+    mask: [B,1,H,W] (0 ou 1)
+    radius: taille de la bande extérieure
+    sigma: intensité du flou
+
+    Retourne un masque avec transition douce extérieure uniquement.
+    """
+
+    B, C, H, W = mask.shape
+
+    # -------------------- Dilatation contrôlée --------------------
+    k = 2 * radius + 1
+
+    # padding correct pour garder la taille
+    pad = radius
+
+    dilated = F.max_pool2d(
+        mask,
+        kernel_size=k,
+        stride=1,
+        padding=pad
+    )
+
+    # -------------------- Bande extérieure --------------------
+    band = (dilated - mask).clamp(0, 1)
+
+    # -------------------- Flou de la bande uniquement --------------------
+    if sigma > 0:
+        band = gaussian_blur_tensor(
+            band,
+            kernel_size=2 * int(2 * sigma) + 1,
+            sigma=sigma
+        )
+
+    # -------------------- Reconstruction --------------------
+    # IMPORTANT : on ne touche PAS l'intérieur
+    out = mask + band * (1 - mask)
+
+    return torch.clamp(out, 0, 1)
 
 
 def debug_draw_openpose_skeleton(
@@ -316,7 +360,7 @@ def rotate_mask_around_torso_simple(mask, torso_points_px, angle, device="cuda")
 
     return mask_rotated
 
-def rotate_mask_around_torso(mask, torso_points_px, angle, H, W, device="cuda"):
+def rotate_mask_around_visage(mask, torso_points_px, angle, H, W, device="cuda"):
 
     B, C, H_mask, W_mask = mask.shape
 

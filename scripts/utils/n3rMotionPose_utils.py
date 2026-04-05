@@ -7,7 +7,7 @@ import math
 import torch.nn.functional as F
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_torso, save_impact_map, apply_breathing_xy, apply_breathing
+from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, apply_breathing, feather_outside_only_alpha
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
@@ -134,15 +134,27 @@ class Pose:
         return self.keypoints[:, idx, :2]
 
     # ----------------- Torso delta -----------------
-    def compute_torso_delta(self, latent_h: int, latent_w: int, scale: float = 0.8):
-        """Calcule le déplacement du torse pour grid warp"""
-        r_shoulder = self.get_point(2)
-        l_shoulder = self.get_point(5)
-        torso_center = (r_shoulder + l_shoulder) * 0.5  # [B,2]
+    def compute_torso_delta(self, latent_h: int, latent_w: int, expand_w=0.9, shrink_h=0.65):
+        pts = torch.stack([
+            self.get_point(19),  # r_shoulder
+            self.get_point(20),  # l_shoulder
+            self.get_point(8),   # r_hip
+            self.get_point(11)   # l_hip
+        ], dim=1)  # [B,4,2]
 
-        # Transformation en delta
-        delta = torso_center * scale
-        delta = torch.tanh(delta * 2.0) * 0.5  # stabilisation
+        # Centre exact du polygone
+        cx = pts[:,:,0].mean(dim=1, keepdim=True)
+        cy = pts[:,:,1].mean(dim=1, keepdim=True)
+
+        # Ajuster largeur/hauteur pour matcher le masque
+        pts[:,:,0] = cx + (pts[:,:,0] - cx) * expand_w
+        pts[:,:,1] = cy + (pts[:,:,1] - cy) * shrink_h
+
+        # Delta : simple translation du centre du polygone (sans scale excessif)
+        torso_center = torch.stack([cx.squeeze(1), cy.squeeze(1)], dim=1)  # [B,2]
+        delta = torso_center - 0.5  # recentrer autour du milieu
+        delta = torch.tanh(delta * 1.0) * 0.1  # petite amplitude, stabilisation légère
+
         self.delta = delta
         return delta
 
@@ -221,47 +233,47 @@ class Pose:
         return mask
 
 
-    def create_upper_body_mask_test(self, H: int, W: int, kernel_size: int = 15, sigma: float = 5.0,
-                           debug: bool = False, debug_dir: str = None, frame_counter: int = 0):
+    def create_face_mask(self, H: int, W: int,
+                     debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
+                     expand_w=1.1, expand_h=1.2):
         """
-        Crée un masque polygonal flouté torse + bras, sans le cou.
-        Le torse est basé uniquement sur les épaules, les bras sur coudes et poignets.
+        Crée un masque polygonal pour le visage (yeux, nez, bouche, oreilles).
+        expand_w / expand_h: élargir ou augmenter la hauteur du polygone pour inclure cheveux/front.
         """
         mask = torch.zeros(self.B, 1, H, W, device=self.device)
 
-            #     [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
-    #   [121/896, 553/1280, 1.0],  # 5 left_shoulder / épaule gauche 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
-    #    [619/896, 1048/1280, 1.0], # 8 right_hip / hanche droite  🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
-    #     [260/896, 1139/1280, 1.0], # 11 left_hip / hanche gauche 🦿📍 Hips hanches detected: left=(564, 1102), right=(308, 1129)
-
         for b in range(self.B):
-            # Récupère les keypoints : épaules, coudes, poignets
-            r_sh = self.get_point(2)[b].cpu().numpy()
-            r_el = self.get_point(3)[b].cpu().numpy()
-            r_wr = self.get_point(4)[b].cpu().numpy()
-            l_sh = self.get_point(5)[b].cpu().numpy()
-            l_el = self.get_point(6)[b].cpu().numpy()
-            l_wr = self.get_point(7)[b].cpu().numpy()
+            # Points clés du visage
+            points = [
+                self.get_point(14)[b].cpu().numpy(),  # right_eye
+                self.get_point(15)[b].cpu().numpy(),  # left_eye
+                self.get_point(0)[b].cpu().numpy(),   # nose
+                self.get_point(18)[b].cpu().numpy(),  # mouth
+                self.get_point(16)[b].cpu().numpy(),  # right_ear
+                self.get_point(17)[b].cpu().numpy()   # left_ear
+            ]
 
-            # Convertir en pixels
-            def to_px(kp):
-                return [int(kp[0] * (W-1)), int(kp[1] * (H-1))]
+            pts = np.array([ [p[0]*(W-1), p[1]*(H-1)] for p in points ], dtype=np.float32)
 
-            pts = np.array([
-                to_px(r_sh), to_px(r_el), to_px(r_wr),
-                to_px(l_wr), to_px(l_el), to_px(l_sh)
-            ], dtype=np.int32)
+            # Centre du polygone
+            cx, cy = np.mean(pts[:,0]), np.mean(pts[:,1])
+
+            # Ajustement largeur / hauteur
+            pts[:,0] = cx + (pts[:,0] - cx) * expand_w
+            pts[:,1] = cy + (pts[:,1] - cy) * expand_h
+
+            # Convertir en int pour cv2
+            pts = pts.astype(np.int32)
 
             # Remplir le polygone
             mask_np = np.zeros((H, W), dtype=np.uint8)
             cv2.fillPoly(mask_np, [pts], 255)
 
-            # Convertir en tensor et assigner
-            mask[b, 0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+            # Convertir en tensor
+            mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
 
-        # Floutage pour adoucir les bords
-        mask = gaussian_blur_tensor(mask, kernel_size=kernel_size, sigma=sigma)
-        mask = torch.clamp(mask, 0, 1)
+        # Feather interne strict
+        mask = feather_inside_strict(mask, radius=3, blur_kernel=3, sigma=1.0)
 
         # -------------------- Debug --------------------
         if debug and debug_dir is not None:
@@ -270,13 +282,94 @@ class Pose:
             mask_np_debug = (mask[0, 0].detach().cpu().numpy() * 255).astype(np.uint8)
             mask_debug = cv2.resize(mask_np_debug, (W*debug_scale, H*debug_scale), interpolation=cv2.INTER_NEAREST)
             mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
-            save_path = os.path.join(debug_dir, f"skeleton_mask_{frame_counter:05d}.png")
+            save_path = os.path.join(debug_dir, f"face_mask_{frame_counter:05d}.png")
             cv2.imwrite(save_path, mask_debug_rgb)
-            print(f"[DEBUG] Upper body mask saved (scale {debug_scale}): {save_path}")
+            print(f"[DEBUG] Face mask saved (scale {debug_scale}): {save_path}")
 
         return mask
 #----------------------------------------------------------------------------------------------------------------------
+class PoseAnimator:
+    def __init__(self, pose: Pose, latent_h: int, latent_w: int):
+        self.pose = pose
+        self.H = latent_h
+        self.W = latent_w
 
+    # ----------------- Préparer les masques -----------------
+    def prepare_masks(self):
+        # Masque torse
+        self.torso_mask = self.pose.create_upper_body_mask(
+            H=self.H, W=self.W,
+            expand_w=0.9, shrink_h=0.65
+        )
+
+        # Masque visage
+        self.face_mask = self.pose.create_face_mask(
+            H=self.H, W=self.W,
+            expand_w=1.1, expand_h=1.2
+        )
+
+    # ----------------- Calcul des deltas -----------------
+    def compute_deltas(self, torso_scale=1.0, face_scale=0.3, x_factor=0.3):
+        # Torse
+        self.pose.compute_torso_delta(latent_h=self.H, latent_w=self.W)
+        self.torso_delta = self.pose.delta.clone()
+        self.torso_delta[:,0] *= x_factor  # limiter le déplacement X
+
+        # Face : micro-mouvements
+        face_center = (self.pose.get_point(14) + self.pose.get_point(15) + self.pose.get_point(0)) / 3.0
+        face_delta = face_center * face_scale
+        face_delta = torch.tanh(face_delta * 2.0) * 0.3
+        self.face_delta = face_delta.clone()
+        self.face_delta[:,0] *= x_factor  # réduire X
+
+    # ----------------- Appliquer les deltas sur le latent -----------------
+    def apply_to_latent(self, latent: torch.Tensor):
+        """
+        latent: [B, C, H, W]
+        Retourne latent avec torse + visage animés
+        """
+
+        # Copier pour éviter d'écraser
+        out = latent.clone()
+
+        # Appliquer delta torse
+        torso_mask = self.torso_mask
+        out = self.grid_warp(out, torso_mask, self.torso_delta)
+
+        # Appliquer delta visage
+        face_mask = self.face_mask
+        out = self.grid_warp(out, face_mask, self.face_delta)
+
+        return out
+
+    # ----------------- Grid warp localisé -----------------
+    @staticmethod
+    def grid_warp(latent, mask, delta):
+        """
+        Applique un déplacement (delta) uniquement sur la zone du mask
+        """
+        B, C, H, W = latent.shape
+
+        # Créer grid [B,H,W,2]
+        yy, xx = torch.meshgrid(torch.arange(H, device=latent.device),
+                                torch.arange(W, device=latent.device),
+                                indexing='ij')
+        grid = torch.stack([xx.float(), yy.float()], dim=-1)  # [H,W,2]
+        grid = grid.unsqueeze(0).repeat(B,1,1,1)  # [B,H,W,2]
+
+        # Ajouter delta multiplié par mask
+        mask_expand = mask.permute(0,2,3,1)  # [B,H,W,1]
+        delta_expand = delta.unsqueeze(1).unsqueeze(1)  # [B,1,1,2]
+        grid = grid + delta_expand * mask_expand
+
+        # Normaliser grid entre -1 et 1
+        grid_norm = grid.clone()
+        grid_norm[...,0] = 2.0 * grid[...,0] / (W-1) - 1.0
+        grid_norm[...,1] = 2.0 * grid[...,1] / (H-1) - 1.0
+
+        # Sample latent
+        out = torch.nn.functional.grid_sample(latent, grid_norm, align_corners=True)
+        return out
 #----------------------------------------------------------------------------------------------------------------
 
 def resize_pose(pose_tile, H_latent, W_latent):
@@ -1131,6 +1224,59 @@ def warp_latents(latents, delta_torso, H, W, device):
     return latents_warped, dx, dy, grid
 
 
+def warp_latents_local(latents, delta, mask, center, H, W, device):
+    import torch
+    import torch.nn.functional as F
+
+    B, C, _, _ = latents.shape
+
+    # -------------------- Préparation --------------------
+
+    # centre en pixels
+    center_px = center * torch.tensor([W-1, H-1], device=device)
+    center_px = center_px.view(B,1,1,2)
+
+    # delta en pixels
+    delta_px = delta * torch.tensor([W, H], device=device)
+    delta_px = delta_px.view(B,1,1,2)
+
+    # grille pixel
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).float()
+    grid = grid.unsqueeze(0).repeat(B,1,1,1)
+
+    # masque
+    mask_expand = mask.permute(0,2,3,1) ** 1.5
+
+    # -------------------- 💥 warp pivot --------------------
+
+    grid = grid - center_px
+    grid = grid + delta_px * mask_expand
+    grid = grid + center_px
+
+    # -------------------- normalisation --------------------
+
+    grid_norm = grid.clone()
+    grid_norm[...,0] = 2.0 * grid[...,0] / (W-1) - 1.0
+    grid_norm[...,1] = 2.0 * grid[...,1] / (H-1) - 1.0
+
+    # -------------------- sampling --------------------
+
+    latents_warped = F.grid_sample(
+        latents,
+        grid_norm,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=False
+    )
+
+    return latents_warped
+
+
 
 # 🔹 Applique la différence entre latents avant/après OpenPose
 #   Permet de conserver l’impact du pose controlnet.
@@ -1166,8 +1312,191 @@ def compute_torso_angle(keypoints):
 
 # -------------------- Fonction principale --------------------------------------------
 
-#--------------------------------------------------------------------------------------
 def apply_pose_driven_motion(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents_in = latents.clone()
+
+    # -------------------- Respiration --------------------
+    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
+
+    # -------------------- OpenPose delta global --------------------
+    latents = apply_openpose_delta(
+        latents,
+        latents_before_openpose,
+        latents_after_openpose,
+        torch.ones_like(latents[:, :1])  # masque global
+    )
+
+    # -------------------- Pose --------------------
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W)
+
+    # Masques
+    mask_torso = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask_torso = feather_outside_only_alpha(mask_torso, radius=3, sigma=1.5)
+    mask_face = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask_face = feather_outside_only_alpha(mask_face, radius=3, sigma=1.5)
+
+    # -------------------- Warp torse --------------------
+    points_idx = [2,5,8,11]
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)
+    torso_center_px = pts.mean(dim=1) * torch.tensor([W-1,H-1], device=device)
+    torso_center_px = torso_center_px.view(B,1,1,2)
+
+    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
+
+    # Delta torse appliqué localement
+    delta_px = pose.delta.clone()
+    delta_px[...,0] *= W
+    delta_px[...,1] *= H
+    delta_px = delta_px.view(B,1,1,2)
+    mask_expand = mask_torso.permute(0,2,3,1)
+    grid_torso = grid + delta_px * mask_expand
+
+    # Normalisation
+    grid_torso[...,0] = 2.0*grid_torso[...,0]/(W-1)-1.0
+    grid_torso[...,1] = 2.0*grid_torso[...,1]/(H-1)-1.0
+    latents = F.grid_sample(latents, grid_torso, align_corners=True)
+
+    # -------------------- Warp visage --------------------
+    face_center = pose.get_point(0)
+    face_center_px = face_center * torch.tensor([W-1,H-1], device=device)
+    face_center_px = face_center_px.view(B,1,1,2)
+
+    face_delta = torch.tanh(face_center*2.0)*0.4
+    face_delta[...,0] *= 0.3
+    face_delta[...,1] *= 0.5
+
+    grid_face = grid.clone()
+    mask_face_expand = mask_face.permute(0,2,3,1) ** 1.5
+    grid_face = grid_face - face_center_px
+    grid_face = grid_face + face_delta.view(B,1,1,2) * mask_face_expand
+    grid_face = grid_face + face_center_px
+
+    grid_face[...,0] = 2.0*grid_face[...,0]/(W-1)-1.0
+    grid_face[...,1] = 2.0*grid_face[...,1]/(H-1)-1.0
+
+    latents = F.grid_sample(latents, grid_face, align_corners=True)
+
+    # -------------------- Stabilisation --------------------
+    latents = stabilize_latents_motion(latents)
+
+    # -------------------- Debug --------------------
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter)
+        print("[DEBUG] Motion applied (torse + visage + OpenPose)")
+
+    return latents
+
+def apply_pose_driven_motion_test(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    import torch
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents_in = latents.clone()
+
+    # -------------------- Respiration --------------------
+    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
+    if debug: print("[DEBUG] Respiration applied")
+
+    # -------------------- Pose --------------------
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W, scale=1.0)
+    angle = pose.compute_torso_angle()
+
+    # -------------------- Masques --------------------
+    mask_torso = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask_face  = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+
+    # -------------------- Deltas --------------------
+    # Torse
+    torso_points_idx = [2,5,8,11]  # nose, eyes, mouth
+    torso_center = torch.stack([pose.get_point(i) for i in torso_points_idx], dim=1).mean(dim=1)
+    torso_delta = torch.tanh(face_center * 2.0) * 0.2
+    torso_delta[:,0] *= 0.3  # limiter déplacement horizontal
+
+    # Micro-deltas visage (nez + yeux + bouche)
+    face_points_idx = [0, 14, 15, 18]  # nose, eyes, mouth
+    face_center = torch.stack([pose.get_point(i) for i in face_points_idx], dim=1).mean(dim=1)
+    face_delta = torch.tanh(face_center * 2.0) * 0.2
+    face_delta[:,0] *= 0.2  # limiter X
+
+    # -------------------- Warp torse --------------------
+    latents = PoseAnimator.grid_warp(latents, mask_torso, torso_delta)
+
+    # -------------------- Warp visage --------------------
+    latents = PoseAnimator.grid_warp(latents, mask_face, face_delta)
+
+    # -------------------- Rotation torse --------------------
+    points_idx = [2,5,8,11]
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)
+    cx = pts[:,:,0].mean(dim=1)
+    cy = pts[:,:,1].mean(dim=1)
+    torso_center = torch.stack([cx,cy], dim=1)
+    max_angle_rad = 0.01
+    angle_limited = angle.clamp(-max_angle_rad, max_angle_rad)
+    torso_center_px = torso_center * torch.tensor([W-1,H-1], device=device)
+
+    mask_rotated = rotate_mask_around_torso_simple(
+        mask_torso, torso_center_px.view(B,2,1,1),
+        angle_limited.view(-1), device=device
+    )
+    mask_rotated = mask_rotated.clamp(0,1)
+
+    # -------------------- Fusion latents --------------------
+    mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
+    if mask_boosted.shape[2:] != latents.shape[2:]:
+        mask_boosted = F.interpolate(mask_boosted, size=latents.shape[2:], mode='bilinear', align_corners=False)
+    latents = latents * (1 - mask_boosted) + latents * mask_boosted
+
+    # -------------------- OpenPose delta --------------------
+    if mask_rotated.shape[2:] != latents.shape[2:]:
+        mask_rotated = F.interpolate(mask_rotated, size=latents.shape[2:], mode='bilinear', align_corners=False)
+    latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
+
+    # -------------------- Stabilisation --------------------
+    latents = stabilize_latents_motion(latents)
+
+    # -------------------- Impact map debug --------------------
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter)
+
+    return latents
+
+
+
+#--------------------------------------------------------------------------------------
+def apply_pose_driven_motion_v1(
     latents,
     previous_latent,
     latents_before_openpose,
@@ -1197,6 +1526,7 @@ def apply_pose_driven_motion(
     angle = pose.compute_torso_angle()
     # sigma correspond à la valeur du flou
     mask = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    maskvisage = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
     if debug:
         print(f"[DEBUG] Torso delta: {pose.delta}")
         print(f"[DEBUG] Torso angle (rad): {angle}")
