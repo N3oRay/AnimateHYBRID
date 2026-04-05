@@ -7,7 +7,7 @@ import math
 import torch.nn.functional as F
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, apply_breathing, feather_outside_only_alpha, smooth_noise
+from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, apply_breathing, feather_outside_only_alpha, smooth_noise, feather_dynamic_vectorized
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
@@ -133,8 +133,19 @@ class Pose:
         """Récupère un keypoint spécifique [B,2]"""
         return self.keypoints[:, idx, :2]
 
+    # ----------------- Torso angle -----------------
+    def compute_torso_angle(self):
+        """Calcule l'angle du torse selon les épaules"""
+        r_shoulder = self.get_point(2)
+        l_shoulder = self.get_point(5)
+        vec = r_shoulder - l_shoulder
+        angle = torch.atan2(vec[:,1], vec[:,0]).unsqueeze(1)  # [B,1]
+        self.angles = angle
+        return angle
+
     # ----------------- Torso delta -----------------
-    def compute_torso_delta(self, latent_h: int, latent_w: int, expand_w=0.9, shrink_h=0.65):
+    # Attention le expand_w et le shrink_h doit être similaire pour compute_torso_delta et create_upper_body_mask
+    def compute_torso_delta(self, latent_h: int, latent_w: int, expand_w=0.95, shrink_h=0.65):
         pts = torch.stack([
             self.get_point(19),  # r_shoulder
             self.get_point(20),  # l_shoulder
@@ -158,19 +169,9 @@ class Pose:
         self.delta = delta
         return delta
 
-    # ----------------- Torso angle -----------------
-    def compute_torso_angle(self):
-        """Calcule l'angle du torse selon les épaules"""
-        r_shoulder = self.get_point(2)
-        l_shoulder = self.get_point(5)
-        vec = r_shoulder - l_shoulder
-        angle = torch.atan2(vec[:,1], vec[:,0]).unsqueeze(1)  # [B,1]
-        self.angles = angle
-        return angle
-
     def create_upper_body_mask(self, H: int, W: int,
                             debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
-                            expand_w=0.9, shrink_h=0.65):
+                            expand_w=0.95, shrink_h=0.65):
         """
         Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
         expand_w: facteur pour élargir le masque horizontalement (>1 = plus large)
@@ -1179,13 +1180,6 @@ def match_latent_size(latents_main, *tensors):
     return matched if len(matched) > 1 else matched[0]
 
 
-
-
-
-import torch
-import torch.nn.functional as F
-import numpy as np
-
 def pad_to_multiple(x, mult=8):
     B, C, H, W = x.shape
     pad_H = (mult - H % mult) % mult
@@ -1261,8 +1255,6 @@ def compute_delta_torso(kp, latent_h, latent_w, scale=0.8):
 # 🔹 Applique une translation sur les latents en utilisant un grid warp
 #   Déplace visuellement le personnage selon le delta du torse.
 def warp_latents(latents, delta_torso, H, W, device):
-    import torch
-    import torch.nn.functional as F
 
     B = latents.shape[0]
 
@@ -1292,8 +1284,6 @@ def warp_latents(latents, delta_torso, H, W, device):
 
 
 def warp_latents_local(latents, delta, mask, center, H, W, device):
-    import torch
-    import torch.nn.functional as F
 
     B, C, _, _ = latents.shape
 
@@ -1414,9 +1404,8 @@ def apply_pose_driven_motion(
 
     # Masques
     mask_torso = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    mask_torso = feather_outside_only_alpha(mask_torso, radius=3, sigma=1.5)
     mask_face = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    mask_face = feather_outside_only_alpha(mask_face, radius=3, sigma=1.5)
+    #mask_face = feather_outside_only_alpha(mask_face, radius=3, sigma=1.5)
     mask_hair = pose.create_hair_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
     mask_hair = feather_outside_only_alpha(mask_hair, radius=3, sigma=1.5)
 
@@ -1437,6 +1426,10 @@ def apply_pose_driven_motion(
     delta_px[...,0] *= W
     delta_px[...,1] *= H
     delta_px = delta_px.view(B,1,1,2)
+
+    # glow dynamique
+    mask_torso = feather_dynamic_vectorized(mask_torso, delta_px, base_radius=3, sigma=1.5, scale=2.0)
+
     mask_expand = mask_torso.permute(0,2,3,1)
     grid_torso = grid + delta_px * mask_expand
 
@@ -1451,8 +1444,19 @@ def apply_pose_driven_motion(
     face_center_px = face_center_px.view(B,1,1,2)
 
     face_delta = torch.tanh(face_center*2.0)*0.4
-    face_delta[...,0] *= 0.3
-    face_delta[...,1] *= 0.5
+    t_dict = {
+        "resp_y": torch.tensor(frame_counter / 8.0, device=device),
+        "resp_x": torch.tensor(frame_counter / 10.0, device=device),
+        "micro": torch.tensor(frame_counter / 5.0, device=device),
+        "wind1": torch.tensor(frame_counter / 15.0, device=device),
+        "wind2": torch.tensor(frame_counter / 60.0, device=device),
+    }
+
+    face_delta[...,1] += 0.01 * torch.sin(t_dict["resp_y"])
+    face_delta[...,0] += 0.005 * torch.sin(t_dict["resp_x"])
+    face_delta[...,0] += 0.002 * torch.sin(t_dict["micro"])
+    face_delta[...,1] += 0.003 * torch.sin(t_dict["micro"] * 1.5)
+
 
     # -------------------- Animation cheveux --------------------
     t = torch.tensor(frame_counter / 5.0, device=device)
@@ -1483,9 +1487,7 @@ def apply_pose_driven_motion(
     # Mise en forme correcte pour broadcasting [B,1,1,2]
     face_delta = face_delta.view(B,1,1,2)
 
-    #mask_face_expand = mask_face.permute(0,2,3,1) ** 1.5  # [B,H,W,1]
-    mask_face_expand = mask_face.permute(0,2,3,1)
-    #mask_face_expand = mask_face_expand * 0.8 + 0.2
+    mask_face_expand = mask_face.permute(0,2,3,1) # [B,H,W,1]
     mask_face_expand = mask_face_expand ** 2.0
 
 
@@ -1493,9 +1495,12 @@ def apply_pose_driven_motion(
     wind_dir = torch.tensor([1.0, 0.3], device=device).view(1,1,1,2)  # légèrement diagonal
     wind_strength = 0.03  # amplitude du vent
 
-    t = torch.tensor(frame_counter / 10.0, device=device)
-    wind_variation = 0.01 * torch.sin(t)  # légère oscillation
-    wind_delta = wind_dir * (wind_strength + wind_variation)
+    #t = torch.tensor(frame_counter / 10.0, device=device)
+    #wind_variation = 0.01 * torch.sin(t)  # légère oscillation
+    #wind_delta = wind_dir * (wind_strength + wind_variation)
+    t1 = torch.tensor(frame_counter / 15.0, device=device)
+    t2 = torch.tensor(frame_counter / 60.0, device=device)
+    wind_delta = wind_dir * (wind_strength + 0.01*torch.sin(t1) + 0.005*torch.sin(t2))
 
     # Grille visage
     grid_face = grid.clone()
