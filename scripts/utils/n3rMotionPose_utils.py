@@ -234,31 +234,58 @@ class Pose:
 
 
     def create_hair_mask(self, H: int, W: int,
-                        debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
-                        expand_w=1.2, expand_h=1.5, roll_shift=-1):
+                             debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
+                             top_extend=0.5, side_extend=0.2, height_factor=1.0):
         """
-        Crée un masque pour les cheveux basé sur le masque du visage.
-        expand_w / expand_h : élargir ou augmenter la hauteur pour inclure cheveux/front.
-        roll_shift : décalage vertical pour simuler la partie haute de la tête.
+        Crée un masque cheveux en forme d'ellipse au-dessus du visage.
+        - top_extend : fraction de la hauteur du visage à ajouter au-dessus pour les cheveux
+        - side_extend : fraction de la largeur du visage à ajouter sur les côtés
+        - height_factor : facteur d'étirement vertical de l'ellipse
         """
-        import numpy as np
-        import cv2
-        import torch
+        mask_face = self.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
 
-        mask_face = self.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter,
-                                        expand_w=expand_w, expand_h=expand_h)
+        mask_hair = torch.zeros_like(mask_face)
 
-        # Décalage vertical pour simuler la zone des cheveux
-        mask_hair = torch.roll(mask_face, shifts=roll_shift, dims=2)
+        for b in range(self.B):
+            coords = torch.nonzero(mask_face[b, 0], as_tuple=False)
+            if coords.shape[0] == 0:
+                continue
+            y_min, x_min = coords.min(dim=0)[0]
+            y_max, x_max = coords.max(dim=0)[0]
 
-        # On enlève le visage pour ne garder que les cheveux
+            h_face = y_max - y_min + 1
+            w_face = x_max - x_min + 1
+
+            # Centre de l'ellipse
+            cx = (x_min + x_max) / 2
+            cy = y_min - h_face * top_extend / 2  # centre légèrement au-dessus du visage
+
+            # Rayons de l'ellipse
+            rx = w_face / 2 * (1 + side_extend)
+            ry = h_face / 2 * (1 + top_extend) * height_factor
+
+            # Créer masque numpy pour l'ellipse
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            cv2.ellipse(mask_np,
+                        (int(cx), int(cy)),
+                        (int(rx), int(ry)),
+                        angle=0,
+                        startAngle=0,
+                        endAngle=360,
+                        color=255,
+                        thickness=-1)
+
+            # Convertir en tensor
+            mask_hair[b, 0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+
+        # Retirer le visage
         mask_hair = mask_hair * (1 - mask_face)
 
-        # Clamp et renforcement
+        # Intensification
         mask_hair = torch.clamp(mask_hair, 0, 1)
-        mask_hair = mask_hair ** 2.5  # intensifie le masque
+        mask_hair = mask_hair ** 2.5
 
-        # Feather léger pour adoucir les bords
+        # Feather léger
         mask_hair = feather_outside_only_alpha(mask_hair, radius=3, sigma=1.5)
 
         if debug and debug_dir is not None:
@@ -267,9 +294,9 @@ class Pose:
             mask_np_debug = (mask_hair[0, 0].detach().cpu().numpy() * 255).astype(np.uint8)
             mask_debug = cv2.resize(mask_np_debug, (W*debug_scale, H*debug_scale), interpolation=cv2.INTER_NEAREST)
             mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
-            save_path = os.path.join(debug_dir, f"face_mask_{frame_counter:05d}.png")
+            save_path = os.path.join(debug_dir, f"hair_mask_ellipse_{frame_counter:05d}.png")
             cv2.imwrite(save_path, mask_debug_rgb)
-            print(f"[DEBUG] Face mask_hair saved (scale {debug_scale}): {save_path}")
+            print(f"[DEBUG] Hair ellipse mask saved (scale {debug_scale}): {save_path}")
 
         return mask_hair
 
