@@ -1392,8 +1392,6 @@ def apply_pose_driven_motion(
     debug=False,
     debug_dir=None
 ):
-    import torch
-    import torch.nn.functional as F
 
     B, C, H, W = latents.shape
     device = latents.device
@@ -1419,15 +1417,8 @@ def apply_pose_driven_motion(
     mask_torso = feather_outside_only_alpha(mask_torso, radius=3, sigma=1.5)
     mask_face = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
     mask_face = feather_outside_only_alpha(mask_face, radius=3, sigma=1.5)
-
-    # Nouveau masque cheveux
     mask_hair = pose.create_hair_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
     mask_hair = feather_outside_only_alpha(mask_hair, radius=3, sigma=1.5)
-
-    #mask_hair = torch.roll(mask_face, shifts=-H//12, dims=2)
-    #mask_hair = mask_hair * (1 - mask_face)  # enlève le visage
-    #mask_hair = torch.clamp(mask_hair, 0, 1)
-    #mask_hair = mask_hair ** 2.5
 
     # -------------------- Warp torse --------------------
     points_idx = [2,5,8,11]
@@ -1437,7 +1428,6 @@ def apply_pose_driven_motion(
 
     if debug:
         print(f"[LOG] torso_center_px: {torso_center_px}")
-
 
     yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
     grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
@@ -1473,7 +1463,6 @@ def apply_pose_driven_motion(
     face_delta = face_delta + micro_delta
 
     # -------------------- Animation cheveux (bruit cohérent) --------------------
-
     noise_x = (
         smooth_noise(grid, frame_counter, scale=0.05) +
         0.5 * smooth_noise(grid, frame_counter, scale=0.15) +
@@ -1511,14 +1500,12 @@ def apply_pose_driven_motion(
     # Grille visage
     grid_face = grid.clone()
     grid_face = grid_face - face_center_px
-
     grid_face = grid_face + face_delta * mask_face_expand
 
     mask_hair_expand = mask_hair.permute(0,2,3,1)
 
     grid_face = grid_face + hair_delta_field * mask_hair_expand
     grid_face = grid_face + wind_delta * mask_hair_expand
-
     grid_face = grid_face + face_center_px
 
     # Normalisation
@@ -1529,7 +1516,6 @@ def apply_pose_driven_motion(
 
     # -------------------- Stabilisation --------------------
     latents = stabilize_latents_motion(latents)
-
     # -------------------- Debug --------------------
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter)
