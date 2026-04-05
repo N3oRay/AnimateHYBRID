@@ -1369,7 +1369,386 @@ def compute_torso_angle(keypoints):
 
 # -------------------- Fonction principale --------------------------------------------
 
+def apply_hair_motion(
+    latents,
+    mask_hair,
+    grid,
+    H,
+    W,
+    frame_counter,
+    device,
+    delta_px=None,              # mouvement du torse (optionnel mais recommandé)
+    prev_hair_field=None,
+    debug=False
+):
+    B = latents.shape[0]
+
+    # -------------------- Temps --------------------
+    t_dict = {
+        "noise": frame_counter,
+        "wind1": torch.tensor(frame_counter / 15.0, device=device),
+        "wind2": torch.tensor(frame_counter / 60.0, device=device),
+    }
+
+    # -------------------- Bruit multi-échelle --------------------
+    noise_x = (
+        smooth_noise(grid, t_dict["noise"], scale=0.05) +
+        0.5 * smooth_noise(grid, t_dict["noise"], scale=0.15) +
+        0.25 * smooth_noise(grid, t_dict["noise"], scale=0.3)
+    )
+
+    noise_y = (
+        smooth_noise(grid, t_dict["noise"] + 123, scale=0.08) +
+        0.5 * smooth_noise(grid, t_dict["noise"] + 123, scale=0.2) +
+        0.25 * smooth_noise(grid, t_dict["noise"] + 123, scale=0.4)
+    )
+
+    hair_delta_field = torch.zeros_like(grid)
+    hair_delta_field[..., 0:1] = 0.05 * noise_x.unsqueeze(-1)
+    hair_delta_field[..., 1:2] = 0.08 * noise_y.unsqueeze(-1)
+
+    # -------------------- Vent dynamique --------------------
+    wind_dir = torch.tensor([1.0, 0.3], device=device).view(1,1,1,2)
+    wind_strength = 0.03
+
+    wind_delta = wind_dir * (
+        wind_strength +
+        0.01 * torch.sin(t_dict["wind1"]) +
+        0.005 * torch.sin(t_dict["wind2"])
+    )
+
+    # -------------------- Influence du mouvement du torse --------------------
+    if delta_px is not None:
+        speed = torch.norm(delta_px, dim=-1, keepdim=True)
+        hair_delta_field *= (1.0 + 3.0 * speed)
+
+    # -------------------- Inertie (TRÈS IMPORTANT) --------------------
+    if prev_hair_field is not None:
+        inertia = 0.85
+        hair_delta_field = inertia * prev_hair_field + (1 - inertia) * hair_delta_field
+
+    # -------------------- Masque --------------------
+    mask_hair_expand = mask_hair.permute(0,2,3,1)
+
+    # -------------------- Effet racine → pointe --------------------
+    # plus loin du crâne = plus de mouvement
+    yy = torch.linspace(0, 1, H, device=device).view(1, H, 1, 1)
+    falloff_root = yy  # approx simple (haut = racine, bas = pointes)
+    mask_hair_expand = mask_hair_expand * (0.5 + 0.5 * falloff_root)
+
+    # -------------------- Application --------------------
+    grid_hair = grid.clone()
+    grid_hair = grid_hair + hair_delta_field * mask_hair_expand
+    grid_hair = grid_hair + wind_delta * mask_hair_expand
+
+    # -------------------- Normalisation --------------------
+    grid_hair[...,0] = 2.0 * grid_hair[...,0] / (W-1) - 1.0
+    grid_hair[...,1] = 2.0 * grid_hair[...,1] / (H-1) - 1.0
+
+    # -------------------- Sampling --------------------
+    latents_out = F.grid_sample(latents, grid_hair, align_corners=True)
+
+    if debug:
+        print("[DEBUG] Hair motion applied")
+
+    return latents_out, hair_delta_field
+
+def apply_torso_warp(
+    latents,
+    pose,
+    mask_torso,
+    grid,
+    H,
+    W,
+    device,
+    prev_delta_px=None,
+    debug=False
+):
+    B = latents.shape[0]
+
+    # -------------------- Centre du torse --------------------
+    points_idx = [2, 5, 8, 11]
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)
+
+    torso_center = pts.mean(dim=1)
+    torso_center_px = torso_center * torch.tensor([W-1, H-1], device=device)
+    torso_center_px = torso_center_px.view(B,1,1,2)
+
+    # -------------------- Delta torse --------------------
+    delta_px = pose.delta.clone()
+    delta_px[...,0] *= W
+    delta_px[...,1] *= H
+    delta_px = delta_px.view(B,1,1,2)
+
+    # -------------------- Lissage temporel --------------------
+    if prev_delta_px is not None:
+        alpha = 0.7
+        delta_px = alpha * delta_px + (1 - alpha) * prev_delta_px
+
+    # -------------------- Feather dynamique --------------------
+    mask_torso = feather_dynamic_vectorized(
+        mask_torso,
+        delta_px,
+        base_radius=3,
+        sigma=1.5,
+        scale=2.0
+    )
+
+    mask_expand = mask_torso.permute(0,2,3,1)
+
+    # -------------------- Déformation non-linéaire (IMPORTANT) --------------------
+    offset = grid - torso_center_px
+    distance = torch.norm(offset, dim=-1, keepdim=True)
+
+    # falloff spatial → centre bouge plus que les bords
+    falloff = torch.exp(-distance / (0.35 * W))
+
+    # -------------------- Warp torse --------------------
+    grid_torso = grid + delta_px * mask_expand * falloff
+
+    # -------------------- Normalisation --------------------
+    grid_torso[...,0] = 2.0 * grid_torso[...,0] / (W-1) - 1.0
+    grid_torso[...,1] = 2.0 * grid_torso[...,1] / (H-1) - 1.0
+
+    # -------------------- Sampling --------------------
+    latents_out = F.grid_sample(latents, grid_torso, align_corners=True)
+
+    if debug:
+        print("[DEBUG] Torso warp applied")
+
+    return latents_out, delta_px
+
+def apply_global_pose(
+    latents,
+    pose,
+    prev_pose=None,
+    H=None,
+    W=None,
+    device="cuda",
+    strength=0.3,   # 🔥 beaucoup plus faible !
+    debug=False
+):
+    B = latents.shape[0]
+
+    # -------------------- Si pas de frame précédente → rien faire --------------------
+    if prev_pose is None:
+        return latents, torch.zeros((B,1,1,2), device=device)
+
+    # -------------------- Centre actuel --------------------
+    points_idx = [2, 5, 8, 11]
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)
+    center = pts.mean(dim=1)
+
+    # -------------------- Centre précédent --------------------
+    prev_pts = torch.stack([prev_pose.get_point(i) for i in points_idx], dim=1)
+    prev_center = prev_pts.mean(dim=1)
+
+    # -------------------- Delta réel --------------------
+    delta = center - prev_center  # 🔥 vrai mouvement
+
+    # passage en pixels
+    delta_px = delta.clone()
+    delta_px[...,0] *= W
+    delta_px[...,1] *= H
+    delta_px = delta_px.view(B,1,1,2)
+
+    # -------------------- Clamp pour stabilité --------------------
+    delta_px = torch.clamp(delta_px, min=-20.0, max=20.0)
+
+    # -------------------- Grille --------------------
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
+
+    grid_global = grid + delta_px * strength
+
+    # -------------------- Normalisation --------------------
+    grid_global[...,0] = 2.0 * grid_global[...,0] / (W-1) - 1.0
+    grid_global[...,1] = 2.0 * grid_global[...,1] / (H-1) - 1.0
+
+    # -------------------- Warp --------------------
+    latents_out = F.grid_sample(latents, grid_global, align_corners=True)
+
+    if debug:
+        print(f"[DEBUG] Global delta px: {delta_px.mean().item():.4f}")
+
+    return latents_out, delta_px
+
+def apply_face_warp(
+    latents,
+    pose,
+    mask_face,
+    grid,
+    H,
+    W,
+    frame_counter,
+    device,
+    prev_face_delta=None,
+    debug=False
+):
+    B = latents.shape[0]
+
+    # -------------------- Centre visage --------------------
+    face_center = pose.get_point(0)
+    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
+    face_center_px = face_center_px.view(B, 1, 1, 2)
+
+    # -------------------- Base motion --------------------
+    face_delta = torch.tanh(face_center * 2.0) * 0.4
+
+    # -------------------- Temps (centralisé) --------------------
+    t_dict = {
+        "resp_y": torch.tensor(frame_counter / 8.0, device=device),
+        "resp_x": torch.tensor(frame_counter / 10.0, device=device),
+        "micro": torch.tensor(frame_counter / 5.0, device=device),
+    }
+
+    # -------------------- Micro mouvements --------------------
+    face_delta[...,1] += 0.01 * torch.sin(t_dict["resp_y"])        # respiration
+    face_delta[...,0] += 0.005 * torch.sin(t_dict["resp_x"])       # drift horizontal
+    face_delta[...,0] += 0.002 * torch.sin(t_dict["micro"])        # micro jitter
+    face_delta[...,1] += 0.003 * torch.sin(t_dict["micro"] * 1.5)
+
+    # -------------------- Lissage temporel --------------------
+    if prev_face_delta is not None:
+        alpha = 0.6
+        face_delta = alpha * face_delta + (1 - alpha) * prev_face_delta
+
+    # -------------------- Déformation radiale (très important) --------------------
+    grid_face = grid.clone()
+    offset = grid_face - face_center_px
+    radius = torch.norm(offset, dim=-1, keepdim=True)
+
+    # respiration "organique" du visage
+    face_breath = 0.01 * torch.sin(t_dict["resp_y"])
+    grid_face = grid_face + offset * face_breath * torch.exp(-radius / 20.0)
+
+    # -------------------- Application masque --------------------
+    mask_face_expand = mask_face.permute(0,2,3,1) ** 2.0
+
+    grid_face = grid_face - face_center_px
+    grid_face = grid_face + face_delta.view(B,1,1,2) * mask_face_expand
+    grid_face = grid_face + face_center_px
+
+    # -------------------- Normalisation --------------------
+    grid_face[...,0] = 2.0 * grid_face[...,0] / (W-1) - 1.0
+    grid_face[...,1] = 2.0 * grid_face[...,1] / (H-1) - 1.0
+
+    # -------------------- Sampling --------------------
+    latents_out = F.grid_sample(latents, grid_face, align_corners=True)
+
+    if debug:
+        print("[DEBUG] Face warp applied")
+
+    return latents_out, face_delta
+
 def apply_pose_driven_motion(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents_in = latents.clone()
+
+    # -------------------- Respiration --------------------
+    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
+
+    # -------------------- Pose --------------------
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W)
+
+    # -------------------- Grille (UNE SEULE FOIS) --------------------
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
+
+    # -------------------- Masques --------------------
+    mask_torso = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask_face = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask_hair = pose.create_hair_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+
+    mask_hair = feather_outside_only_alpha(mask_hair, radius=3, sigma=1.5)
+
+    # ============================================================
+    # 🔥 PIPELINE MODULAIRE
+    # ============================================================
+
+    # -------------------- Global Pose --------------------
+
+    prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
+
+    latents, global_delta = apply_global_pose(
+        latents=latents,
+        pose=pose,
+        prev_pose=prev_pose,
+        H=H,
+        W=W,
+        device=device
+    )
+
+    # -------------------- Torso Warp --------------------
+    latents, delta_px = apply_torso_warp(
+        latents=latents,
+        pose=pose,
+        mask_torso=mask_torso,
+        grid=grid,
+        H=H,
+        W=W,
+        device=device
+    )
+
+    # -------------------- Face Warp --------------------
+    latents, face_delta = apply_face_warp(
+        latents=latents,
+        pose=pose,
+        mask_face=mask_face,
+        grid=grid,
+        H=H,
+        W=W,
+        frame_counter=frame_counter,
+        device=device
+    )
+
+    # -------------------- Hair Motion --------------------
+    latents, hair_delta = apply_hair_motion(
+        latents=latents,
+        mask_hair=mask_hair,
+        grid=grid,
+        H=H,
+        W=W,
+        frame_counter=frame_counter,
+        device=device,
+        delta_px=delta_px  # 🔥 important (couplage corps → cheveux)
+    )
+
+    # -------------------- Stabilisation --------------------
+    latents = stabilize_latents_motion(latents)
+
+    # -------------------- Debug --------------------
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter)
+        print("[DEBUG] Full modular motion applied")
+
+    return latents
+
+def apply_pose_driven_motion_v2(
     latents,
     previous_latent,
     latents_before_openpose,
@@ -1525,269 +1904,6 @@ def apply_pose_driven_motion(
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter)
         print("[DEBUG] Motion applied (torse + visage + OpenPose + cheveux)")
-
-    return latents
-
-def apply_pose_driven_motion_micro(
-    latents,
-    previous_latent,
-    latents_before_openpose,
-    latents_after_openpose,
-    keypoints,
-    prev_keypoints=None,
-    frame_counter=0,
-    device="cuda",
-    breathing=True,
-    debug=False,
-    debug_dir=None
-):
-    import torch
-    import torch.nn.functional as F
-
-    B, C, H, W = latents.shape
-    device = latents.device
-    latents_in = latents.clone()
-
-    # -------------------- Respiration --------------------
-    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
-    if debug: print("[DEBUG] Respiration applied")
-
-    # -------------------- OpenPose delta global --------------------
-    latents = apply_openpose_delta(
-        latents,
-        latents_before_openpose,
-        latents_after_openpose,
-        torch.ones_like(latents[:, :1])  # masque global
-    )
-
-    # -------------------- Pose --------------------
-    pose = Pose(keypoints.to(device))
-    pose.compute_torso_delta(latent_h=H, latent_w=W)
-
-    # Masques
-    mask_torso = pose.create_upper_body_mask(
-        H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
-    )
-    mask_torso = feather_outside_only_alpha(mask_torso, radius=3, sigma=1.5)
-
-    mask_face = pose.create_face_mask(
-        H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
-    )
-    mask_face = feather_outside_only_alpha(mask_face, radius=3, sigma=1.5)
-
-    # -------------------- Warp torse --------------------
-    points_idx = [2,5,8,11]
-    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)
-    torso_center_px = pts.mean(dim=1) * torch.tensor([W-1,H-1], device=device)
-    torso_center_px = torso_center_px.view(B,1,1,2)
-
-    if debug:
-        print(f"[LOG] torso_center_x: {torso_center_x}")
-        print(f"[LOG] torso_center_y: {torso_center_y}")
-
-    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
-
-    # Delta torse appliqué localement
-    delta_px = pose.delta.clone()
-    delta_px[...,0] *= W
-    delta_px[...,1] *= H
-    delta_px = delta_px.view(B,1,1,2)
-    mask_expand = mask_torso.permute(0,2,3,1)
-    grid_torso = grid + delta_px * mask_expand
-
-    # Normalisation
-    grid_torso[...,0] = 2.0*grid_torso[...,0]/(W-1)-1.0
-    grid_torso[...,1] = 2.0*grid_torso[...,1]/(H-1)-1.0
-    latents = F.grid_sample(latents, grid_torso, align_corners=True)
-
-    # -------------------- Warp visage (amélioré) --------------------
-    face_center = pose.get_point(0)
-    face_center_px = face_center * torch.tensor([W-1,H-1], device=device)
-    face_center_px = face_center_px.view(B,1,1,2)
-
-    # Delta principal
-    face_delta = torch.tanh(face_center*2.0)*0.4
-    face_delta[...,0] *= 0.3
-    face_delta[...,1] *= 0.5
-
-    # 🔹 Micro-mouvement subtil (respiration / vie)
-    oscillation = 0.02 * torch.sin(torch.tensor(frame_counter / 5.0, device=device) * 2 * 3.1416)
-    micro_delta = torch.zeros_like(face_delta)
-    micro_delta[...,0] = oscillation
-    micro_delta[...,1] = oscillation * 0.5
-    face_delta = face_delta + micro_delta
-
-    # Grille pixel
-    grid_face = grid.clone()
-    mask_face_expand = mask_face.permute(0,2,3,1) ** 1.5
-    grid_face = grid_face - face_center_px
-    grid_face = grid_face + face_delta.view(B,1,1,2) * mask_face_expand
-    grid_face = grid_face + face_center_px
-
-    # Normalisation [-1,1]
-    grid_face[...,0] = 2.0*grid_face[...,0]/(W-1)-1.0
-    grid_face[...,1] = 2.0*grid_face[...,1]/(H-1)-1.0
-
-    latents = F.grid_sample(latents, grid_face, align_corners=True)
-
-    # -------------------- Stabilisation --------------------
-    latents = stabilize_latents_motion(latents)
-
-    # -------------------- Debug --------------------
-    if debug:
-        save_impact_map(latents, latents_in, debug_dir, frame_counter)
-        print("[DEBUG] Motion applied (torse + visage + micro-mouvement + OpenPose)")
-
-    return latents
-
-
-#--------------------------------------------------------------------------------------
-def apply_pose_driven_motion_v1(
-    latents,
-    previous_latent,
-    latents_before_openpose,
-    latents_after_openpose,
-    keypoints,
-    prev_keypoints=None,
-    frame_counter=0,
-    device="cuda",
-    breathing=True,
-    debug=False,
-    debug_dir=None
-):
-    import torch
-    import torch.nn.functional as F
-
-    B, C, H, W = latents.shape
-    device = latents.device
-    latents_in = latents.clone()
-
-    # -------------------- Respiration --------------------
-    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
-    if debug: print("[DEBUG] Respiration applied")
-
-    # -------------------- Pose --------------------
-    pose = Pose(keypoints.to(device))
-    pose.compute_torso_delta(latent_h=H, latent_w=W)
-    angle = pose.compute_torso_angle()
-    # sigma correspond à la valeur du flou
-    mask = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    maskvisage = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    if debug:
-        print(f"[DEBUG] Torso delta: {pose.delta}")
-        print(f"[DEBUG] Torso angle (rad): {angle}")
-
-    # -------------------- Grid warp --------------------
-    latents_warped, dx, dy, _ = warp_latents(latents, pose.delta, H, W, device)
-    if debug:
-        print(f"[DEBUG] Grid warp applied")
-        print(f"[DEBUG] dx min/max: {dx.min().item()}/{dx.max().item()}")
-        print(f"[DEBUG] dy min/max: {dy.min().item()}/{dy.max().item()}")
-
-    # -------------------- Recentrage automatique sur le torse complet --------------------
-    points_idx = [2, 5, 8, 11]  # right_shoulder, left_shoulder, right_hip, left_hip
-    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B,4,2]
-
-    # Rectangle englobant le torse
-    x_min = pts[:, :, 0].min(dim=1)[0]
-    x_max = pts[:, :, 0].max(dim=1)[0]
-    y_min = pts[:, :, 1].min(dim=1)[0]
-    y_max = pts[:, :, 1].max(dim=1)[0]
-
-    # Centre exact du torse
-    torso_center_x = (x_min + x_max) / 2
-    torso_center_y = (y_min + y_max) / 2
-    torso_center = torch.stack([torso_center_x, torso_center_y], dim=1)
-    if debug:
-        print(f"[LOG] torso_center_x: {torso_center_x}")
-        print(f"[LOG] torso_center_y: {torso_center_y}")
-
-    # Largeur et hauteur du torse en pixels
-    torso_width_px  = (x_max - x_min) * (W-1)
-    torso_height_px = (y_max - y_min) * (H-1)
-
-    torso_points_px = torso_center * torch.tensor([W-1, H-1], device=device)
-    torso_points_px = torso_points_px.view(B,2,1,1)
-
-    # Rotation du masque autour du torse
-    max_angle_rad = 0.01  # ~3 degrés
-    angle_limited = angle.clamp(-max_angle_rad, max_angle_rad)
-
-    #mask_rotated = rotate_mask_around_torso(mask, torso_points_px, angle_limited.view(-1), H, W, device)
-    mask_rotated = rotate_mask_around_torso_simple(mask, torso_points_px, angle_limited.view(-1), device=device)
-    mask_rotated = mask_rotated.clamp(0,1)
-
-    if debug:
-        print(f"[DEBUG] mask_rotated shape: {mask_rotated.shape}, min: {mask_rotated.min().item():.4f}, "
-              f"max: {mask_rotated.max().item():.4f}, mean: {mask_rotated.mean().item():.4f}")
-
-    # -------------------- Offset calculation basé sur le masque --------------------
-    B, _, Hm, Wm = mask_rotated.shape
-
-    grid_x = torch.arange(Wm, device=device).view(1,1,1,Wm).expand(B,1,Hm,Wm)
-    grid_y = torch.arange(Hm, device=device).view(1,1,Hm,1).expand(B,1,Hm,Wm)
-
-    mask_sum = mask_rotated.sum(dim=[2,3], keepdim=True) + 1e-6
-    mask_center_x = (mask_rotated * grid_x).sum(dim=[2,3], keepdim=True) / mask_sum
-    mask_center_y = (mask_rotated * grid_y).sum(dim=[2,3], keepdim=True) / mask_sum
-
-    if debug:
-        print(f"[DEBUG] torso_width_px: {torso_width_px}, torso_height_px: {torso_height_px}")
-        print(f"[DEBUG] mask_center_x: {mask_center_x.item()}, mask_center_y: {mask_center_y.item()}")
-
-    # -------------------- Padding dynamique gauche --------------------
-    padding_left = int(0.2 * W)  # 20% de la largeur
-    latents_padded = F.pad(latents_warped, (padding_left,0,0,0), mode='replicate')
-    B, C, H_pad, W_pad = latents_padded.shape
-
-    # -------------------- Grid warp avec padding --------------------
-    yy, xx = torch.meshgrid(
-        torch.linspace(-1,1,H,device=device),
-        torch.linspace(-1,1,W_pad,device=device),
-        indexing='ij'
-    )
-    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).repeat(B,1,1,1)
-
-    # -------------------- Décalage basé sur barycentre du torse --------------------
-    #shift_x = (mask_center_x[:,0,0,0] - torso_center_x) * 2 / torso_width_px
-    shift_x = torch.zeros_like(torso_center_x).view(B,1,1)
-    shift_y = (mask_center_y[:,0,0,0] - torso_center_y) * 2 / torso_height_px
-
-    if debug:
-        print(f"[DEBUG] [←→] shift_x: {shift_x}, ⬆️ ⬇️ shift_y: {shift_y}")
-
-    grid[...,0] -= shift_x
-    grid[...,1] -= shift_y
-
-
-    latents_warped = F.grid_sample( latents_padded, grid, align_corners=False )  # 🔥 FIX
-
-    latents_warped = latents_warped[:, :, :, padding_left:padding_left+W]
-
-    # -------------------- Fusion latents --------------------
-
-    mask_boosted = torch.clamp(mask_rotated ** 0.7 * 1.5, 0, 1)
-
-    # 🔥 alignement obligatoire
-    if mask_boosted.shape[2:] != latents.shape[2:]:
-        mask_boosted = F.interpolate( mask_boosted, size=latents.shape[2:], mode='bilinear', align_corners=False )
-
-    latents = latents * (1 - mask_boosted) + latents_warped * mask_boosted
-
-    # -------------------- OpenPose delta --------------------
-    # 🔥 Assurer alignement taille avant OpenPose delta
-    if mask_rotated.shape[2:] != latents.shape[2:]:
-        mask_rotated = F.interpolate( mask_rotated, size=latents.shape[2:], mode='bilinear', align_corners=False )
-
-    latents = apply_openpose_delta(latents, latents_before_openpose, latents_after_openpose, mask_rotated)
-
-    # -------------------- Stabilisation --------------------
-    latents = stabilize_latents_motion(latents)
-
-    # -------------------- Impact map (debug) --------------------
-    if debug:
-        save_impact_map(latents, latents_in, debug_dir, frame_counter)
 
     return latents
 
