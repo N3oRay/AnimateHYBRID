@@ -14,7 +14,24 @@ from PIL import Image, ImageDraw
 import traceback
 
 
-#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha
+#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha, smooth_noise
+
+
+def smooth_noise(grid, frame, scale=0.05, time_scale=0.1):
+    # grid: [B,H,W,2]
+    x = grid[..., 0]
+    y = grid[..., 1]
+
+    noise = (
+        torch.sin(x * scale + frame * time_scale) *
+        torch.cos(y * scale * 1.3 + frame * time_scale * 0.8)
+    )
+
+    noise += (
+        torch.sin((x + y) * scale * 0.7 + frame * time_scale * 1.5)
+    ) * 0.5
+
+    return noise
 
 
 def feather_outside_only_alpha(mask, radius=5, sigma=2.0):
