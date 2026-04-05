@@ -84,6 +84,10 @@ def extract_keypoints_from_pose(
         [277/896, 528/1280, 1.0],  # 20 🦾 left_clavicules detected: [(277, 528), (562, 514)]
     ]
 
+    #48–54 : lèvres supérieures (coin gauche → coin droit)
+    #54–60 : lèvres inférieures (coin droit → coin gauche)
+    #60–67 : contour interne de la bouche (pour l’ouverture, micro-mouvements)
+
     # ---------------------------
     # 🔹 Conversion numpy → tensor
     # ---------------------------
@@ -128,6 +132,71 @@ class Pose:
         self.angles = None
         self.device = keypoints.device
 
+    # ----------------- Calcul des points de la bouche -----------------
+    def estimate_missing_facial_points(self):
+        """
+        Estime les points manquants du visage (bouche, coins de lèvres, coins des yeux)
+        à partir des points existants (nez, yeux, oreilles).
+
+        Retourne un dictionnaire {nom_point: tensor [B,2]}.
+        """
+        estimated_points = {}
+        B = self.B
+        device = self.device
+
+        # ----------------- BOUCHE -----------------
+        # On suppose que le point 0 = nez
+        nose = self.keypoints[:, 0, :2]  # [B,2]
+
+        # Points yeux si existants
+        right_eye = self.keypoints[:, 14, :2] if self.keypoints.shape[1] > 14 else None
+        left_eye = self.keypoints[:, 15, :2] if self.keypoints.shape[1] > 15 else None
+
+        # Base pour la bouche : légèrement sous le nez
+        mouth_center = nose.clone()
+        mouth_center[:,1] += 0.12  # proportion approximative verticale
+
+        # Largeur de la bouche estimée à partir distance yeux
+        if right_eye is not None and left_eye is not None:
+            eye_dist = (left_eye[:,0] - right_eye[:,0]).abs()
+        else:
+            eye_dist = torch.tensor(0.12, device=device).expand(B)  # fallback
+
+        # Coins gauche/droite
+        mouth_left = mouth_center.clone()
+        mouth_left[:,0] -= eye_dist * 0.3
+        mouth_right = mouth_center.clone()
+        mouth_right[:,0] += eye_dist * 0.3
+
+        # Haut/bas
+        mouth_top = mouth_center.clone()
+        mouth_top[:,1] -= eye_dist * 0.15
+        mouth_bottom = mouth_center.clone()
+        mouth_bottom[:,1] += eye_dist * 0.15
+
+        estimated_points['mouth_center'] = mouth_center
+        estimated_points['mouth_left'] = mouth_left
+        estimated_points['mouth_right'] = mouth_right
+        estimated_points['mouth_top'] = mouth_top
+        estimated_points['mouth_bottom'] = mouth_bottom
+
+        # ----------------- COINS DES YEUX (optionnel) -----------------
+        if right_eye is not None and left_eye is not None:
+            eye_width = (left_eye[:,0] - right_eye[:,0])
+            eye_height = 0.1 * eye_width
+
+            estimated_points['right_eye_inner'] = right_eye.clone()
+            estimated_points['right_eye_outer'] = right_eye.clone()
+            estimated_points['right_eye_outer'][:,0] += 0.5*eye_width
+            estimated_points['right_eye_inner'][:,0] -= 0.2*eye_width
+
+            estimated_points['left_eye_inner'] = left_eye.clone()
+            estimated_points['left_eye_outer'] = left_eye.clone()
+            estimated_points['left_eye_outer'][:,0] -= 0.5*eye_width
+            estimated_points['left_eye_inner'][:,0] += 0.2*eye_width
+
+        return estimated_points
+
     # ----------------- Keypoint utils -----------------
     def get_point(self, idx):
         """Récupère un keypoint spécifique [B,2]"""
@@ -142,6 +211,58 @@ class Pose:
         angle = torch.atan2(vec[:,1], vec[:,0]).unsqueeze(1)  # [B,1]
         self.angles = angle
         return angle
+    # ----------------- Masque Bouche -----------------
+    def get_mouth_region(self, H: int, W: int, device=None,
+                     debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
+                     expand=0.1):
+        """
+        Retourne un masque bouche [B,1,H,W] basé sur les points estimés.
+        - expand : fraction de largeur/hauteur pour agrandir le masque légèrement
+        """
+        if device is None:
+            device = self.device
+
+        B = self.B
+        mask = torch.zeros((B, 1, H, W), device=device)
+
+        # Estimation des points de la bouche
+        points_dict = self.estimate_missing_facial_points()
+        mouth_left = points_dict['mouth_left']
+        mouth_right = points_dict['mouth_right']
+        mouth_top = points_dict['mouth_top']
+        mouth_bottom = points_dict['mouth_bottom']
+
+        for b in range(B):
+            # Calcul coordonnées en pixels
+            x_min = int((mouth_left[b,0] - expand) * (W-1))
+            x_max = int((mouth_right[b,0] + expand) * (W-1))
+            y_min = int((mouth_top[b,1] - expand) * (H-1))
+            y_max = int((mouth_bottom[b,1] + expand) * (H-1))
+
+            # Clamp pour rester dans l'image
+            x_min = max(0, x_min)
+            x_max = min(W-1, x_max)
+            y_min = max(0, y_min)
+            y_max = min(H-1, y_max)
+
+            # Remplir le masque
+            mask[b,0,y_min:y_max+1,x_min:x_max+1] = 1.0
+
+        # Feather léger pour adoucir les bords
+        mask = feather_outside_only_alpha(mask, radius=3, sigma=1.5)
+
+        # Debug
+        if debug and debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            mask_np = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
+            mask_debug = cv2.resize(mask_np, (W*4,H*4), interpolation=cv2.INTER_NEAREST)
+            mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
+            save_path = os.path.join(debug_dir, f"mouth_mask_{frame_counter:05d}.png")
+            cv2.imwrite(save_path, mask_debug_rgb)
+            print(f"[DEBUG] Mouth mask saved (scale 4): {save_path}")
+
+        return mask
+
 
     # ----------------- Torso delta -----------------
     # Attention le expand_w et le shrink_h doit être similaire pour compute_torso_delta et create_upper_body_mask
@@ -1367,7 +1488,7 @@ def compute_torso_angle(keypoints):
     return angle, torso_center
 
 
-# -------------------- Fonction principale --------------------------------------------
+# -------------------- Fonction principale -----------------------------------------------------------------
 
 def apply_hair_motion(
     latents,
@@ -1587,64 +1708,108 @@ def apply_face_warp(
     W,
     frame_counter,
     device,
-    prev_face_delta=None,
-    debug=False
+    debug=False,
+    debug_dir=None
 ):
+    """
+    Warp visage “vivant” avec micro-mouvements, sourire et ventilation légère.
+    Retourne latents transformés et face_delta.
+    """
+
     B = latents.shape[0]
 
-    # -------------------- Centre visage --------------------
-    face_center = pose.get_point(0)
-    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
-    face_center_px = face_center_px.view(B, 1, 1, 2)
+    # -------------------- Points et masque visage --------------------
+    face_center = pose.get_point(0)  # nez
+    face_center_px = face_center * torch.tensor([W-1,H-1], device=device)
+    face_center_px = face_center_px.view(B,1,1,2)
 
-    # -------------------- Base motion --------------------
-    face_delta = torch.tanh(face_center * 2.0) * 0.4
+    face_delta = torch.tanh(face_center*2.0)*0.4  # base mouvement visage
 
-    # -------------------- Temps (centralisé) --------------------
+    # -------------------- Respiration / micro mouvement --------------------
     t_dict = {
         "resp_y": torch.tensor(frame_counter / 8.0, device=device),
         "resp_x": torch.tensor(frame_counter / 10.0, device=device),
         "micro": torch.tensor(frame_counter / 5.0, device=device),
+        "wind1": torch.tensor(frame_counter / 15.0, device=device),
+        "wind2": torch.tensor(frame_counter / 60.0, device=device),
     }
 
-    # -------------------- Micro mouvements --------------------
-    face_delta[...,1] += 0.01 * torch.sin(t_dict["resp_y"])        # respiration
-    face_delta[...,0] += 0.005 * torch.sin(t_dict["resp_x"])       # drift horizontal
-    face_delta[...,0] += 0.002 * torch.sin(t_dict["micro"])        # micro jitter
+    face_delta[...,1] += 0.01 * torch.sin(t_dict["resp_y"])
+    face_delta[...,0] += 0.005 * torch.sin(t_dict["resp_x"])
+    face_delta[...,0] += 0.002 * torch.sin(t_dict["micro"])
     face_delta[...,1] += 0.003 * torch.sin(t_dict["micro"] * 1.5)
 
-    # -------------------- Lissage temporel --------------------
-    if prev_face_delta is not None:
-        alpha = 0.6
-        face_delta = alpha * face_delta + (1 - alpha) * prev_face_delta
+    # -------------------- Micro sourire --------------------
+    try:
+        mouth_mask = pose.get_mouth_region(H, W, device=device,
+                                           debug=debug, debug_dir=debug_dir,
+                                           frame_counter=frame_counter)
+        # amplitude sourire (oscillation subtile)
+        smile_amp = 0.005 * torch.sin(torch.tensor(frame_counter/10.0, device=device))
+        face_delta[...,0] += smile_amp * mouth_mask.squeeze(1)
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] Mouth region not applied: {e}")
 
-    # -------------------- Déformation radiale (très important) --------------------
-    grid_face = grid.clone()
-    offset = grid_face - face_center_px
-    radius = torch.norm(offset, dim=-1, keepdim=True)
+    # -------------------- Animation cheveux / micro delta --------------------
+    t = torch.tensor(frame_counter / 5.0, device=device)
+    oscillation = 0.02 * torch.sin(t)
+    micro_delta = torch.zeros_like(face_delta)
+    micro_delta[...,0] = oscillation
+    micro_delta[...,1] = oscillation * 0.5
+    face_delta = face_delta + micro_delta
 
-    # respiration "organique" du visage
-    face_breath = 0.01 * torch.sin(t_dict["resp_y"])
-    grid_face = grid_face + offset * face_breath * torch.exp(-radius / 20.0)
+    # -------------------- Bruit cohérent cheveux / visage --------------------
+    """"
+    noise_x = (
+        smooth_noise(grid, frame_counter, scale=0.05) +
+        0.5 * smooth_noise(grid, frame_counter, scale=0.15) +
+        0.25 * smooth_noise(grid, frame_counter, scale=0.3)
+    )
+    noise_y = (
+        smooth_noise(grid, frame_counter + 123, scale=0.08) +
+        0.5 * smooth_noise(grid, frame_counter + 123, scale=0.2) +
+        0.25 * smooth_noise(grid, frame_counter + 123, scale=0.4)
+    )
+    """
+    hair_delta_field = torch.zeros_like(grid)
+    #hair_delta_field[...,0:1] = 0.05 * noise_x.unsqueeze(-1)
+    #hair_delta_field[...,1:2] = 0.08 * noise_y.unsqueeze(-1)
 
-    # -------------------- Application masque --------------------
+    # -------------------- Grille visage --------------------
+    face_delta = face_delta.view(B,1,1,2)
     mask_face_expand = mask_face.permute(0,2,3,1) ** 2.0
+    mask_hair_expand = pose.create_hair_mask(H, W).permute(0,2,3,1)
 
+    wind_dir = torch.tensor([1.0,0.3], device=device).view(1,1,1,2)
+    wind_strength = 0.01
+    t1 = torch.tensor(frame_counter / 15.0, device=device)
+    t2 = torch.tensor(frame_counter / 60.0, device=device)
+    wind_delta = wind_dir * (wind_strength + 0.01*torch.sin(t1) + 0.005*torch.sin(t2))
+
+    grid_face = grid.clone()
     grid_face = grid_face - face_center_px
-    grid_face = grid_face + face_delta.view(B,1,1,2) * mask_face_expand
+    grid_face = grid_face + face_delta * mask_face_expand
+    grid_face = grid_face + hair_delta_field * mask_hair_expand
+    grid_face = grid_face + wind_delta * mask_hair_expand
     grid_face = grid_face + face_center_px
 
     # -------------------- Normalisation --------------------
-    grid_face[...,0] = 2.0 * grid_face[...,0] / (W-1) - 1.0
-    grid_face[...,1] = 2.0 * grid_face[...,1] / (H-1) - 1.0
+    grid_face[...,0] = 2.0*grid_face[...,0]/(W-1)-1.0
+    grid_face[...,1] = 2.0*grid_face[...,1]/(H-1)-1.0
 
-    # -------------------- Sampling --------------------
-    latents_out = F.grid_sample(latents, grid_face, align_corners=True)
+    latents = F.grid_sample(latents, grid_face, align_corners=True)
 
     if debug:
-        print("[DEBUG] Face warp applied")
+        save_path = None
+        if debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            mask_vis = (mask_face[0,0].detach().cpu().numpy()*255).astype(np.uint8)
+            save_path = os.path.join(debug_dir, f"face_warp_{frame_counter:05d}.png")
+            cv2.imwrite(save_path, mask_vis)
+        print(f"[DEBUG] Face warp applied, saved mask: {save_path}")
 
-    return latents_out, face_delta
+    return latents, face_delta
 
 def apply_pose_driven_motion(
     latents,
@@ -1684,7 +1849,7 @@ def apply_pose_driven_motion(
     mask_face = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
     mask_hair = pose.create_hair_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
 
-    mask_hair = feather_outside_only_alpha(mask_hair, radius=3, sigma=1.5)
+    #mask_hair = feather_outside_only_alpha(mask_hair, radius=3, sigma=1.5)
 
     # ============================================================
     # 🔥 PIPELINE MODULAIRE
@@ -1715,6 +1880,7 @@ def apply_pose_driven_motion(
     )
 
     # -------------------- Face Warp --------------------
+
     latents, face_delta = apply_face_warp(
         latents=latents,
         pose=pose,
@@ -1723,10 +1889,13 @@ def apply_pose_driven_motion(
         H=H,
         W=W,
         frame_counter=frame_counter,
-        device=device
+        device=device,
+        debug=debug,
+        debug_dir=debug_dir
     )
 
     # -------------------- Hair Motion --------------------
+
     latents, hair_delta = apply_hair_motion(
         latents=latents,
         mask_hair=mask_hair,
@@ -1735,9 +1904,8 @@ def apply_pose_driven_motion(
         W=W,
         frame_counter=frame_counter,
         device=device,
-        delta_px=delta_px  # 🔥 important (couplage corps → cheveux)
+        delta_px=delta_px
     )
-
     # -------------------- Stabilisation --------------------
     latents = stabilize_latents_motion(latents)
 
