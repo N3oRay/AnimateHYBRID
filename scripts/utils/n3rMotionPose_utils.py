@@ -15,6 +15,9 @@ import os
 import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
 import traceback
+from torchvision.utils import save_image
+
+
 
 #------extract_keypoints_from_pose
 
@@ -131,58 +134,80 @@ class Pose:
         self.delta = None
         self.angles = None
         self.device = keypoints.device
+        self._prev_facial_points = None
 
-    def estimate_facial_points_full(self, prev_points=None, smooth=0.8):
+    # =========================
+    # GETTER
+    # =========================
+    def get_prev_facial_points(self):
+        return self._prev_facial_points
+
+    # =========================
+    # SETTER
+    # =========================
+    def set_prev_facial_points(self, points):
+        self._prev_facial_points = points
+
+    def estimate_facial_points_full(self, smooth=0.8):
         """
-        Version améliorée qui combine bouche et coins des yeux avec lissage temporel.
+        Version complète + temporelle + stable
         """
         points = {}
-        B = self.B
-        device = self.device
 
-        nose = self.keypoints[:,0,:2]
-        right_eye = self.keypoints[:,14,:2] if self.keypoints.shape[1] > 14 else None
-        left_eye = self.keypoints[:,15,:2] if self.keypoints.shape[1] > 15 else None
+        nose = self.keypoints[:, 0, :2]
+        right_eye = self.keypoints[:, 14, :2] if self.keypoints.shape[1] > 14 else None
+        left_eye  = self.keypoints[:, 15, :2] if self.keypoints.shape[1] > 15 else None
 
-        # Distance relative yeux-nez pour échelle
-        eye_dist = ((left_eye[:,0]-right_eye[:,0]).abs() if right_eye is not None else 0.12).unsqueeze(1)
+        if right_eye is not None and left_eye is not None:
+            eye_dist = (left_eye[:, 0] - right_eye[:, 0]).abs().unsqueeze(1)
+        else:
+            eye_dist = torch.full((self.B,1), 0.12, device=self.device)
 
-        # --- BOUCHE ---
-        mouth_center = nose + torch.tensor([0.0, eye_dist.mean()*1.0], device=device)
-        mouth_left   = mouth_center + torch.tensor([-0.3,0.0], device=device) * eye_dist
-        mouth_right  = mouth_center + torch.tensor([0.3,0.0], device=device) * eye_dist
-        mouth_top    = mouth_center + torch.tensor([0.0,-0.15], device=device) * eye_dist
-        mouth_bottom = mouth_center + torch.tensor([0.0,0.15], device=device) * eye_dist
+        # -------------------- Base structure --------------------
+        mouth_center = nose + torch.cat([torch.zeros_like(eye_dist), eye_dist * 1.0], dim=1)
+
+        mouth_left   = mouth_center + torch.cat([-0.3 * eye_dist, torch.zeros_like(eye_dist)], dim=1)
+        mouth_right  = mouth_center + torch.cat([ 0.3 * eye_dist, torch.zeros_like(eye_dist)], dim=1)
+        mouth_top    = mouth_center + torch.cat([torch.zeros_like(eye_dist), -0.15 * eye_dist], dim=1)
+        mouth_bottom = mouth_center + torch.cat([torch.zeros_like(eye_dist),  0.15 * eye_dist], dim=1)
 
         points.update({
-            'mouth_center': mouth_center,
-            'mouth_left': mouth_left,
-            'mouth_right': mouth_right,
-            'mouth_top': mouth_top,
-            'mouth_bottom': mouth_bottom
+            "mouth_center": mouth_center,
+            "mouth_left": mouth_left,
+            "mouth_right": mouth_right,
+            "mouth_top": mouth_top,
+            "mouth_bottom": mouth_bottom,
         })
 
-        # --- YEUX ---
+        # -------------------- YEUX enrichis --------------------
         if right_eye is not None and left_eye is not None:
-            eye_width = (left_eye[:,0] - right_eye[:,0])
-            eye_height = 0.1 * eye_width
+            eye_vec = left_eye - right_eye
 
-            points['right_eye_inner'] = right_eye.clone()
-            points['right_eye_outer'] = right_eye.clone()
-            points['right_eye_outer'][:,0] += 0.5*eye_width
-            points['right_eye_inner'][:,0] -= 0.2*eye_width
+            points["eye_center"] = (left_eye + right_eye) / 2
 
-            points['left_eye_inner'] = left_eye.clone()
-            points['left_eye_outer'] = left_eye.clone()
-            points['left_eye_outer'][:,0] -= 0.5*eye_width
-            points['left_eye_inner'][:,0] += 0.2*eye_width
+            points["right_eye_inner"] = right_eye + 0.2 * eye_vec
+            points["right_eye_outer"] = right_eye - 0.3 * eye_vec
 
-        # --- Lissage temporel si prev_points fourni ---
-        if prev_points is not None:
+            points["left_eye_inner"] = left_eye - 0.2 * eye_vec
+            points["left_eye_outer"] = left_eye + 0.3 * eye_vec
+
+        # =========================
+        # 🔥 SMOOTH TEMPOREL AUTO
+        # =========================
+        prev = self.get_prev_facial_points()
+
+        if prev is not None:
             for k in points:
-                points[k] = smooth*prev_points[k] + (1-smooth)*points[k]
+                if k in prev:
+                    points[k] = smooth * prev[k] + (1 - smooth) * points[k]
+
+        # =========================
+        # 🔥 UPDATE MÉMOIRE
+        # =========================
+        self.set_prev_facial_points(points)
 
         return points
+
 
     def estimate_facial_points(self, prev_points=None, smooth=0.8):
         points = {}
@@ -952,9 +977,7 @@ def tensor_to_pil(tensor):
         raise ValueError(f"Tensor shape non supportée: {tensor.shape}")
     return pil_img
 
-import os
-from PIL import Image
-import torch
+
 
 def save_debug_pose_image(pose_tensor, frame_counter, output_dir, cfg=None, prefix="openpose"):
     """
@@ -1239,7 +1262,6 @@ def convert_json_to_pose_sequence_debug(anim_data, H=512, W=512, original_w=512,
 
 
 def build_control_latent_debug(input_pil, vae, device="cuda", latent_scale=0.18215):
-    import torch
 
     print("\n================ CONTROL LATENT DEBUG ================")
 
@@ -1398,10 +1420,6 @@ def gaussian_blend_mask(H, W, overlap):
     mask = torch.tensor(mask, dtype=torch.float32)
     return mask
 
-
-from torchvision.utils import save_image
-import os
-from PIL import Image
 
 #---------------------------------------------------------
 
@@ -1588,9 +1606,6 @@ def apply_hair_motion_extreme(
     - pointes accentuées
     """
 
-    import torch
-    import torch.nn.functional as F
-
     B = latents.shape[0]
     t = frame_counter
     t_wind1 = torch.tensor(t / 10.0, device=device)
@@ -1681,9 +1696,6 @@ def apply_hair_motion(
     - vent + gravité + micro-souplesse
     - inertie adaptative pour fluidité
     """
-
-    import torch
-    import torch.nn.functional as F
 
     B = latents.shape[0]
     t = frame_counter
@@ -2057,81 +2069,104 @@ def apply_face_warp_v2(
     H,
     W,
     frame_counter,
-    prev_facial_points=None,
     device=None,
     debug=False,
     debug_dir=None,
     smooth=0.8
 ):
     """
-    Warp du visage avec micro-expressions et respiration, basé sur estimate_facial_points_full.
-    - latents : [B,C,H,W]
-    - pose : objet Pose
-    - mask_face : [B,1,H,W]
-    - grid : [B,H,W,2]
-    - prev_facial_points : points du visage de la frame précédente pour lissage
+    Warp du visage avec micro-expressions et respiration.
+    Version stateful avec gestion interne des points faciaux.
     """
+
     if device is None:
         device = latents.device
 
     B, C, H, W = latents.shape
     latents_in = latents.clone()
 
-    # -------------------- Estimation points faciaux --------------------
-    facial_points = pose.estimate_facial_points_full(prev_points=prev_facial_points, smooth=smooth)
+    # =========================
+    # 🔥 Récupération + update auto des points
+    # =========================
+    prev_facial_points = pose.get_prev_facial_points()
+
+    # Estimation avec lissage temporel (la méthode n'a PAS prev_points)
+    facial_points = pose.estimate_facial_points_full(smooth=smooth)
+
+    # Sauvegarde pour la frame suivante
+    pose.set_prev_facial_points(facial_points)
+
     mouth_center = facial_points['mouth_center']
     mouth_top    = facial_points['mouth_top']
     mouth_bottom = facial_points['mouth_bottom']
 
-    # -------------------- Déplacements de base (respiration/micro-mouvements) --------------------
-    t_dict = {
-        "resp_y": frame_counter / 8.0,
-        "resp_x": frame_counter / 10.0,
-        "micro": frame_counter / 5.0,
-    }
+    # =========================
+    # 🔹 Temps (tensor safe)
+    # =========================
+    t_resp_y = torch.tensor(frame_counter / 8.0, device=device)
+    t_resp_x = torch.tensor(frame_counter / 10.0, device=device)
+    t_micro  = torch.tensor(frame_counter / 5.0, device=device)
 
+    # =========================
+    # 🔹 Base motion visage
+    # =========================
     face_delta = torch.zeros((B,1,1,2), device=device)
-    face_delta[...,1] += 0.01 * torch.sin(torch.tensor(t_dict["resp_y"], device=device))
-    face_delta[...,0] += 0.005 * torch.sin(torch.tensor(t_dict["resp_x"], device=device))
-    face_delta[...,0] += 0.002 * torch.sin(torch.tensor(t_dict["micro"], device=device))
-    face_delta[...,1] += 0.003 * torch.sin(torch.tensor(t_dict["micro"]*1.5, device=device))
+    face_delta[...,1] += 0.01  * torch.sin(t_resp_y)
+    face_delta[...,0] += 0.005 * torch.sin(t_resp_x)
+    face_delta[...,0] += 0.002 * torch.sin(t_micro)
+    face_delta[...,1] += 0.003 * torch.sin(t_micro * 1.5)
 
-    # -------------------- Micro-sourire basé sur la bouche --------------------
+    # =========================
+    # 🔹 Micro sourire
+    # =========================
     mouth_mask = pose.get_mouth_region(H, W, device=device, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
     mouth_mask_exp = mouth_mask.permute(0,2,3,1)  # [B,H,W,1]
 
     smile_strength = 0.02
     smile_delta = smile_strength * torch.sin(torch.tensor(frame_counter / 10.0, device=device))
+
     face_delta_expanded = face_delta.expand(B,H,W,2).clone()
     face_delta_expanded[...,0] += mouth_mask_exp[...,0] * smile_delta
 
-    # -------------------- Micro mouvement vertical bouche (respiration) --------------------
+    # =========================
+    # 🔹 Respiration bouche
+    # =========================
     breath_strength = 0.005
     breath_delta = breath_strength * torch.sin(torch.tensor(frame_counter / 12.0, device=device))
     face_delta_expanded[...,1] += mouth_mask_exp[...,0] * breath_delta
 
-    # -------------------- Construction grille --------------------
-    # Déplacer autour du centre du visage (nez)
+    # =========================
+    # 🔹 Centre visage (nez)
+    # =========================
     face_center = pose.get_point(0)
-    face_center_px = face_center * torch.tensor([W-1,H-1], device=device)
+    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
     face_center_px = face_center_px.view(B,1,1,2)
 
-    grid_face = grid.clone()
-    grid_face = grid_face - face_center_px
+    # =========================
+    # 🔹 Grid warp
+    # =========================
+    grid_face = grid.clone() - face_center_px
     mask_face_exp = mask_face.permute(0,2,3,1)
     grid_face = grid_face + face_delta_expanded * mask_face_exp
     grid_face = grid_face + face_center_px
 
-    # Normalisation [-1,1] pour grid_sample
-    grid_face[...,0] = 2.0*grid_face[...,0]/(W-1) - 1.0
-    grid_face[...,1] = 2.0*grid_face[...,1]/(H-1) - 1.0
+    # =========================
+    # 🔹 Normalisation
+    # =========================
+    grid_face[...,0] = 2.0 * grid_face[...,0] / (W-1) - 1.0
+    grid_face[...,1] = 2.0 * grid_face[...,1] / (H-1) - 1.0
 
-    # -------------------- Warp --------------------
+    # =========================
+    # 🔹 Warp final
+    # =========================
     latents_out = F.grid_sample(latents, grid_face, align_corners=True)
 
+    # =========================
+    # 🔹 Debug
+    # =========================
     if debug:
         save_impact_map(latents_out, latents_in, debug_dir, frame_counter)
-        print("[DEBUG] Face warp v2 applied")
+        print("[DEBUG] Face warp v2 (stateful) applied")
 
     return latents_out, face_delta_expanded, facial_points
 
@@ -2212,127 +2247,6 @@ def apply_face_warp(
 
 #------------------------------------------------------------------------------------------
 
-def apply_pose_driven_motion_v2(
-    latents,
-    previous_latent,
-    latents_before_openpose,
-    latents_after_openpose,
-    keypoints,
-    prev_keypoints=None,
-    prev_facial_points=None,
-    frame_counter=0,
-    device="cuda",
-    breathing=True,
-    debug=False,
-    debug_dir=None,
-    smooth=0.8
-):
-    """
-    Pipeline complet avec isolation du visage :
-    - Global Pose
-    - Torso Warp
-    - Face Warp (avec estimate_facial_points_full + lissage)
-    - Hair Motion
-    - Respiration / micro-mouvements
-    - Stabilisation
-    """
-    import torch
-    import torch.nn.functional as F
-
-    B, C, H, W = latents.shape
-    device = latents.device
-    latents_in = latents.clone()
-
-    # -------------------- Pose --------------------
-    pose = Pose(keypoints.to(device))
-    pose.compute_torso_delta(latent_h=H, latent_w=W)
-    prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
-
-    # -------------------- Grille --------------------
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
-    )
-    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
-
-    # -------------------- Masques --------------------
-    mask_torso = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    mask_face = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    mask_hair = pose.create_hair_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-
-    mask_face_exp = mask_face.float()       # [B,1,H,W]
-    mask_torso_exp = mask_torso.float() * (1.0 - mask_face_exp)
-    mask_hair_exp = mask_hair.float() * (1.0 - mask_face_exp)
-
-    # -------------------- Global Pose --------------------
-    latents_before_face = latents.clone()
-    latents_global, global_delta = apply_global_pose(
-        latents=latents,
-        pose=pose,
-        prev_pose=prev_pose,
-        H=H,
-        W=W,
-        device=device
-    )
-    latents = latents_global * (1.0 - mask_face_exp) + latents_before_face * mask_face_exp
-    if debug: print("[DEBUG] Global pose applied with face protection")
-
-    # -------------------- Torso Warp --------------------
-    latents_before_torso = latents.clone()
-    latents_torso, delta_px = apply_torso_warp(
-        latents=latents,
-        pose=pose,
-        mask_torso=mask_torso,
-        grid=grid,
-        H=H,
-        W=W,
-        device=device
-    )
-    latents = latents_torso * mask_torso_exp + latents_before_torso * (1.0 - mask_torso_exp)
-    if debug: print("[DEBUG] Torso warp applied with face protection")
-
-    # -------------------- Face Warp --------------------
-    latents, face_delta, facial_points = apply_face_warp_v2(
-        latents=latents,
-        pose=pose,
-        mask_face=mask_face,
-        grid=grid,
-        H=H,
-        W=W,
-        frame_counter=frame_counter,
-        prev_facial_points=prev_facial_points,
-        device=device,
-        debug=debug,
-        debug_dir=debug_dir,
-        smooth=smooth
-    )
-    if debug: print("[DEBUG] Face warp applied with estimate_facial_points_full")
-
-    # -------------------- Hair Motion --------------------
-    latents_before_hair = latents.clone()
-    if frame_counter % 2 == 0:
-        latents_hair, hair_delta = apply_hair_motion(latents, mask_hair, grid, H, W, frame_counter, device, delta_px, debug)
-    else:
-        latents_hair, hair_delta = apply_hair_motion_extreme(latents, mask_hair, grid, H, W, frame_counter, device, delta_px, debug)
-    latents = latents_hair * mask_hair_exp + latents_before_hair * (1.0 - mask_hair_exp)
-    if debug: print("[DEBUG] Hair motion applied with face protection")
-
-    # -------------------- Respiration / Micro-mouvements --------------------
-    latents_before_breath = latents.clone()
-    latents_breath = apply_breathing(latents, previous_latent, frame_counter, breathing)
-    latents = latents_breath * mask_torso_exp + latents_before_breath * (1.0 - mask_torso_exp)
-    if debug: print("[DEBUG] Breathing applied with face protection")
-
-    # -------------------- Stabilisation --------------------
-    latents_before_stab = latents.clone()
-    latents_stab = stabilize_latents_motion(latents)
-    latents = latents_stab * (1.0 - mask_face_exp) + latents_before_stab * mask_face_exp
-    if debug: print("[DEBUG] Stabilization applied with face protection")
-
-    # -------------------- Retour --------------------
-    return latents, facial_points
-
 def apply_pose_driven_motion(
     latents,
     previous_latent,
@@ -2347,47 +2261,61 @@ def apply_pose_driven_motion(
     debug_dir=None
 ):
     """
-    Pipeline complet avec isolation du visage :
+    Pipeline motion PRO (stable + vivant + isolé):
     - Global Pose
     - Torso Warp
-    - Face Warp
-    - Hair Motion
-    - Respiration / micro-mouvements
-    - Stabilisation
-    Chaque module n’affecte que sa zone dédiée.
+    - Face Warp (stateful)
+    - Hair Motion (alt normal/extreme)
+    - Breathing (torso only)
+    - Stabilisation (face protected)
     """
-    import torch
-    import torch.nn.functional as F
 
+    # =========================
+    # 🔹 Setup
+    # =========================
     B, C, H, W = latents.shape
     device = latents.device
+
+    latents = latents.float()
     latents_in = latents.clone()
 
-    # -------------------- Pose --------------------
+    # =========================
+    # 🔹 Pose
+    # =========================
     pose = Pose(keypoints.to(device))
     pose.compute_torso_delta(latent_h=H, latent_w=W)
+
     prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
 
-    # -------------------- Grille --------------------
+    # =========================
+    # 🔹 Grid
+    # =========================
     yy, xx = torch.meshgrid(
         torch.arange(H, device=device),
         torch.arange(W, device=device),
         indexing='ij'
     )
-    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
 
-    # -------------------- Masques --------------------
-    mask_torso = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    mask_face = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    mask_hair = pose.create_hair_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    grid = torch.stack((xx, yy), dim=-1).float()
+    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)
 
-    # Convertir tous les masques en float pour broadcasting
-    mask_face_exp = mask_face.float()       # [B,1,H,W]
-    mask_torso_exp = mask_torso.float() * (1.0 - mask_face_exp)
-    mask_hair_exp = mask_hair.float() * (1.0 - mask_face_exp)
+    # =========================
+    # 🔹 Masks (CLAMP SAFE)
+    # =========================
+    mask_face  = torch.clamp(pose.create_face_mask(H, W), 0, 1).float()
+    mask_torso = torch.clamp(pose.create_upper_body_mask(H, W), 0, 1).float()
+    mask_hair  = torch.clamp(pose.create_hair_mask(H, W), 0, 1).float()
 
-    # -------------------- Global Pose --------------------
-    latents_before_face = latents.clone()
+    # PRIORITÉ VISAGE ABSOLUE
+    mask_face_exp  = mask_face
+    mask_torso_exp = mask_torso * (1.0 - mask_face_exp)
+    mask_hair_exp  = mask_hair  * (1.0 - mask_face_exp)
+
+    # =========================
+    # 🔹 GLOBAL POSE
+    # =========================
+    latents_before = latents.clone()
+
     latents_global, global_delta = apply_global_pose(
         latents=latents,
         pose=pose,
@@ -2396,12 +2324,18 @@ def apply_pose_driven_motion(
         W=W,
         device=device
     )
-    # Blending pour protéger le visage
-    latents = latents_global * (1.0 - mask_face_exp) + latents_before_face * mask_face_exp
-    if debug: print("[DEBUG] Global pose applied with face protection")
 
-    # -------------------- Torso Warp --------------------
-    latents_before_torso = latents.clone()
+    # 🔥 protection visage stricte
+    latents = latents_global * (1.0 - mask_face_exp) + latents_before * mask_face_exp
+
+    if debug:
+        print("[DEBUG] Global pose applied")
+
+    # =========================
+    # 🔹 TORSO
+    # =========================
+    latents_before = latents.clone()
+
     latents_torso, delta_px = apply_torso_warp(
         latents=latents,
         pose=pose,
@@ -2411,10 +2345,15 @@ def apply_pose_driven_motion(
         W=W,
         device=device
     )
-    latents = latents_torso * mask_torso_exp + latents_before_torso * (1.0 - mask_torso_exp)
-    if debug: print("[DEBUG] Torso warp applied with face protection")
 
-    # -------------------- Face Warp --------------------
+    latents = latents_torso * mask_torso_exp + latents_before * (1.0 - mask_torso_exp)
+
+    if debug:
+        print("[DEBUG] Torso warp applied")
+
+    # =========================
+    # 🔹 FACE (STATEFUL)
+    # =========================
     latents, face_delta, facial_points = apply_face_warp_v2(
         latents=latents,
         pose=pose,
@@ -2425,46 +2364,88 @@ def apply_pose_driven_motion(
         frame_counter=frame_counter,
         device=device,
         debug=debug,
-        debug_dir=debug_dir
+        debug_dir=debug_dir,
+        smooth=0.85  # 🔥 un peu plus smooth = vivant mais stable
     )
-    if debug: print("[DEBUG] Face warp applied")
 
-    # -------------------- Hair Motion --------------------
-    latents_before_hair = latents.clone()
+    if debug:
+        print("[DEBUG] Face warp applied")
 
-    # -------------------- Hair Motion --------------------
-    # Alterner entre version normale et extrême
-    if frame_counter % 2 == 0:
-        # Version normale
-        latents_hair, hair_delta = apply_hair_motion( latents=latents, mask_hair=mask_hair, grid=grid, H=H, W=W, frame_counter=frame_counter, device=device, delta_px=delta_px, debug=debug )
+    # =========================
+    # 🔹 HAIR (ALTERNANCE CINÉMA)
+    # =========================
+    latents_before = latents.clone()
+
+    if (frame_counter // 6) % 2 == 0:
+        # 🔹 phase douce
+        latents_hair, hair_delta = apply_hair_motion(
+            latents, mask_hair, grid, H, W,
+            frame_counter, device,
+            delta_px=delta_px,
+            debug=debug
+        )
     else:
-        # Version extrême
-        latents_hair, hair_delta = apply_hair_motion_extreme( latents=latents, mask_hair=mask_hair, grid=grid, H=H, W=W, frame_counter=frame_counter, device=device, delta_px=delta_px, debug=debug )
+        # 🔹 phase dynamique
+        latents_hair, hair_delta = apply_hair_motion_extreme(
+            latents, mask_hair, grid, H, W,
+            frame_counter, device,
+            delta_px=delta_px,
+            debug=debug
+        )
 
-    latents = latents_hair * mask_hair_exp + latents_before_hair * (1.0 - mask_hair_exp)
-    if debug: print("[DEBUG] Hair motion applied with face protection")
+    latents = latents_hair * mask_hair_exp + latents_before * (1.0 - mask_hair_exp)
 
-    # -------------------- Respiration / Micro-mouvements --------------------
-    latents_before_breath = latents.clone()
-    latents_breath = apply_breathing(latents, previous_latent, frame_counter, breathing)
-    # Appliquer respiration uniquement sur torse / cou, pas le visage
-    breath_mask_exp = mask_torso_exp
-    latents = latents_breath * breath_mask_exp + latents_before_breath * (1.0 - breath_mask_exp)
-    if debug: print("[DEBUG] Breathing applied with face protection")
+    if debug:
+        print("[DEBUG] Hair motion applied")
 
-    # -------------------- Stabilisation --------------------
-    latents_before_stab = latents.clone()
+    # =========================
+    # 🔹 BREATHING (TORSO ONLY)
+    # =========================
+    latents_before = latents.clone()
+
+    latents_breath = apply_breathing(
+        latents,
+        previous_latent,
+        frame_counter,
+        breathing
+    )
+
+    latents = latents_breath * mask_torso_exp + latents_before * (1.0 - mask_torso_exp)
+
+    if debug:
+        print("[DEBUG] Breathing applied")
+
+    # =========================
+    # 🔹 STABILISATION
+    # =========================
+    latents_before = latents.clone()
+
     latents_stab = stabilize_latents_motion(latents)
-    # Protéger le visage pendant stabilisation
-    latents = latents_stab * (1.0 - mask_face_exp) + latents_before_stab * mask_face_exp
-    if debug: print("[DEBUG] Stabilization applied with face protection")
 
-    # -------------------- Debug --------------------
+    # 🔥 visage jamais touché
+    latents = latents_stab * (1.0 - mask_face_exp) + latents_before * mask_face_exp
+
+    if debug:
+        print("[DEBUG] Stabilization applied")
+
+    # =========================
+    # 🔹 MICRO BOOST GLOBAL (🔥 IMPORTANT)
+    # =========================
+    # 👉 sinon rendu trop statique
+    micro_amp = 0.002
+    t = torch.tensor(frame_counter / 6.0, device=device)
+
+    latents = latents + micro_amp * torch.sin(t)
+
+    # =========================
+    # 🔹 DEBUG FINAL
+    # =========================
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter)
-        print("[DEBUG] Full modular motion applied with face isolation")
+        print("[DEBUG] Full motion pipeline applied")
 
     return latents
+
 
 
 #------------------------------------------------------------------------------------------
@@ -2476,8 +2457,6 @@ def update_pose_sequence_from_keypoints_batch(
     add_motion=True,
     debug=False
 ):
-    import torch
-    import math
 
     kp = keypoints_tensor.clone()
     B, N, _ = kp.shape
