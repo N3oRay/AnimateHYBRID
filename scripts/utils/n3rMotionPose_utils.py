@@ -2613,9 +2613,9 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 Masks (CLAMP SAFE)
     # =========================
-    mask_face  = torch.clamp(pose.create_face_mask(H, W), 0, 1).float()
-    mask_torso = torch.clamp(pose.create_upper_body_mask(H, W), 0, 1).float()
-    mask_hair  = torch.clamp(pose.create_hair_mask(H, W), 0, 1).float()
+    mask_face  = torch.clamp(pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir), 0, 1).float()
+    mask_torso = torch.clamp(pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir), 0, 1).float()
+    mask_hair  = torch.clamp(pose.create_hair_mask(H, W, debug=debug, debug_dir=debug_dir), 0, 1).float()
 
     mask_face_exp  = mask_face
     mask_torso_exp = mask_torso * (1.0 - mask_face_exp)
