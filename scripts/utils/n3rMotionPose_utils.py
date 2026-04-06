@@ -318,10 +318,10 @@ class Pose:
     # ----------------- Masque Bouche -----------------
     def get_mouth_region(self, H: int, W: int, device=None,
                      debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
-                     expand=0.1):
+                     expand_w=0.3, expand_h=0.25):
         """
         Retourne un masque bouche [B,1,H,W] basé sur les points estimés.
-        - expand : fraction de largeur/hauteur pour agrandir le masque légèrement
+        - expand_w / expand_h : fraction de largeur/hauteur pour agrandir le masque largement
         """
         if device is None:
             device = self.device
@@ -337,11 +337,23 @@ class Pose:
         mouth_bottom = points_dict['mouth_bottom']
 
         for b in range(B):
-            # Calcul coordonnées en pixels
-            x_min = int((mouth_left[b,0] - expand) * (W-1))
-            x_max = int((mouth_right[b,0] + expand) * (W-1))
-            y_min = int((mouth_top[b,1] - expand) * (H-1))
-            y_max = int((mouth_bottom[b,1] + expand) * (H-1))
+            # Centre de la bouche
+            cx = 0.5 * (mouth_left[b,0] + mouth_right[b,0])
+            cy = 0.5 * (mouth_top[b,1] + mouth_bottom[b,1])
+
+            # Largeur et hauteur initiales avec marge dynamique
+            w = (mouth_right[b,0] - mouth_left[b,0]) * (1 + expand_w*2)
+            h = (mouth_bottom[b,1] - mouth_top[b,1]) * (1 + expand_h*2)
+
+            # Ajouter un petit padding proportionnel à la hauteur du visage
+            h += 0.05  # 5% du visage
+            w += 0.05  # 5% du visage
+
+            # Coordonnées en pixels
+            x_min = int((cx - w/2) * (W-1))
+            x_max = int((cx + w/2) * (W-1))
+            y_min = int((cy - h/2) * (H-1))
+            y_max = int((cy + h/2) * (H-1))
 
             # Clamp pour rester dans l'image
             x_min = max(0, x_min)
@@ -353,7 +365,7 @@ class Pose:
             mask[b,0,y_min:y_max+1,x_min:x_max+1] = 1.0
 
         # Feather léger pour adoucir les bords
-        mask = feather_outside_only_alpha(mask, radius=3, sigma=1.5)
+        mask = feather_outside_only_alpha(mask, radius=5, sigma=2.0)
 
         # Debug
         if debug and debug_dir is not None:
@@ -525,64 +537,59 @@ class Pose:
 
         return mask_hair
 
-    def create_face_mask(self, H: int, W: int,
-                     debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
-                     expand_w=1.3, expand_h=1.5):
+    def create_face_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0):
         """
-        Crée un masque polygonal pour le visage (yeux, nez, bouche, oreilles, front, tempes).
-        expand_w / expand_h: élargir ou augmenter la hauteur du polygone pour inclure front/cheveux.
+        Crée un masque facial dynamique basé sur la taille réelle du visage,
+        et inclut la bouche pour que le masque couvre correctement les micro-expressions.
         """
         mask = torch.zeros(self.B, 1, H, W, device=self.device)
 
+        # Récupération du masque bouche
+        mouth_mask = self.get_mouth_region(H, W, device=self.device, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter, expand_w=0.3, expand_h=0.25)
+
         for b in range(self.B):
-            # Points clés principaux
+            # Points clés du visage : yeux, nez, oreilles (on exclut la bouche car déjà prise)
             points = [
-                self.get_point(0)[b].cpu().numpy(),    # nose
-                self.get_point(14)[b].cpu().numpy(),   # right_eye
-                self.get_point(15)[b].cpu().numpy(),   # left_eye
-                self.get_point(16)[b].cpu().numpy(),   # right_ear
-                self.get_point(17)[b].cpu().numpy(),   # left_ear
-                self.get_point(18)[b].cpu().numpy(),   # mouth
+                self.get_point(14)[b].cpu().numpy(),  # right_eye
+                self.get_point(15)[b].cpu().numpy(),  # left_eye
+                self.get_point(0)[b].cpu().numpy(),   # nose
+                self.get_point(16)[b].cpu().numpy(),  # right_ear
+                self.get_point(17)[b].cpu().numpy()   # left_ear
             ]
 
-            # Ajouter la mâchoire si disponible (exemple points 19-21)
-            for idx in range(19, 22):
-                try:
-                    points.append(self.get_point(idx)[b].cpu().numpy())
-                except:
-                    pass  # skip si le point n'existe pas
-
-            # Conversion en pixels
             pts = np.array([[p[0]*(W-1), p[1]*(H-1)] for p in points], dtype=np.float32)
+
+            # Calcul de la largeur et hauteur du visage
+            w_face = np.max(pts[:,0]) - np.min(pts[:,0])
+            h_face = np.max(pts[:,1]) - np.min(pts[:,1])
+
+            # Expansion dynamique
+            expand_w = 1.2 if w_face < W*0.3 else 1.1
+            expand_h = 1.4 if h_face < H*0.3 else 1.25
 
             # Centre du polygone
             cx, cy = np.mean(pts[:,0]), np.mean(pts[:,1])
-
-            # Ajustement largeur / hauteur
             pts[:,0] = cx + (pts[:,0] - cx) * expand_w
             pts[:,1] = cy + (pts[:,1] - cy) * expand_h
 
             # Convertir en int pour cv2
             pts = pts.astype(np.int32)
-
-            # Remplir le polygone
             mask_np = np.zeros((H, W), dtype=np.uint8)
             cv2.fillPoly(mask_np, [pts], 255)
 
-            # Convertir en tensor
-            mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+            # Combiner avec le masque bouche
+            mask[b,0] = torch.maximum(torch.from_numpy(mask_np/255.0).to(self.device), mouth_mask[b,0])
 
-        # Feather plus large pour transitions douces
-        mask = feather_inside_strict(mask, radius=6, blur_kernel=5, sigma=2.0)
-        mask = torch.clamp(mask, 0.0, 1.0)  # s'assurer que le mask reste entre 0 et 1
+        # Feather interne strict pour adoucir les bords
+        mask = feather_inside_strict(mask, radius=3, blur_kernel=3, sigma=1.0)
 
-        # Debug save
+        # Debug
         if debug and debug_dir is not None:
             os.makedirs(debug_dir, exist_ok=True)
             save_path = os.path.join(debug_dir, f"face_mask_{frame_counter:05d}.png")
-            mask_img = mask[0,0].detach().cpu().numpy() * 255
-            Image.fromarray(mask_img.astype(np.uint8)).save(save_path)
-            print(f"[DEBUG] Face mask saved: {save_path}")
+            mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
+            Image.fromarray(mask_img).save(save_path)
+            print(f"[DEBUG] Dynamic face mask saved: {save_path}")
 
         return mask
 
@@ -614,22 +621,16 @@ class PoseAnimator:
             debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
         )
 
-        # Masque visage amélioré
+        # Masque visage dynamique
         self.face_mask = self.pose.create_face_mask(
             H=self.H, W=self.W,
-            expand_w=1.3,   # élargit pour inclure tempes/oreilles
-            expand_h=1.5,   # augmente hauteur pour front et cheveux
-            debug=debug,
-            debug_dir=debug_dir,
-            frame_counter=frame_counter
+            debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
         )
 
-        # Masque cheveux (optionnel, déjà excluant visage)
+        # Masque cheveux
         self.hair_mask = self.pose.create_hair_mask(
             H=self.H, W=self.W,
-            debug=debug,
-            debug_dir=debug_dir,
-            frame_counter=frame_counter
+            debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
         )
 
     # ----------------- Calcul des deltas -----------------
