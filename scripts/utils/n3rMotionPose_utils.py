@@ -325,61 +325,147 @@ class Pose:
         self.angles = angle
         return angle
     # ----------------- Masque Bouche -----------------
-    def get_mouth_region(self, H: int, W: int, device=None,
-                     debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
-                     expand_w=0.3, expand_h=0.25):
+    def get_mouth_region(
+        self,
+        H: int,
+        W: int,
+        device=None,
+        debug: bool = False,
+        debug_dir: str = None,
+        frame_counter: int = 0,
+        expand_w=0.3,
+        expand_h=0.25,
+        min_size=4  # 🔥 taille minimale en pixels
+    ):
         """
-        Retourne un masque bouche [B,1,H,W] basé sur les points estimés.
-        - expand_w : fraction largeur pour élargir le masque
-        - expand_h : fraction hauteur pour agrandir le masque
+        Masque bouche robuste [B,1,H,W]
+        - sécurisé contre NaN / points invalides
+        - taille minimale garantie
+        - fallback intelligent si détection foire
         """
+
         if device is None:
             device = self.device
 
         B = self.B
         mask = torch.zeros((B, 1, H, W), device=device)
 
-        # Estimation des points de la bouche
-        points_dict = self.estimate_missing_facial_points()
-        mouth_left = points_dict['mouth_left']
-        mouth_right = points_dict['mouth_right']
-        mouth_top = points_dict['mouth_top']
+        # =========================
+        # 🔹 Récupération points
+        # =========================
+        try:
+            points_dict = self.estimate_missing_facial_points()
+        except Exception as e:
+            print(f"[WARN] mouth_region: estimation failed → fallback empty ({e})")
+            return mask
+
+        required_keys = ['mouth_left', 'mouth_right', 'mouth_top', 'mouth_bottom']
+
+        # Vérification des clés
+        for k in required_keys:
+            if k not in points_dict:
+                print(f"[WARN] mouth_region: missing key {k}")
+                return mask
+
+        mouth_left   = points_dict['mouth_left']
+        mouth_right  = points_dict['mouth_right']
+        mouth_top    = points_dict['mouth_top']
         mouth_bottom = points_dict['mouth_bottom']
 
+        # =========================
+        # 🔹 Construction masque
+        # =========================
         for b in range(B):
-            # Coordonnées en pixels avec expansion adaptée
+
+            # 🔹 check NaN / invalid
+            pts = torch.stack([
+                mouth_left[b],
+                mouth_right[b],
+                mouth_top[b],
+                mouth_bottom[b]
+            ])
+
+            if torch.isnan(pts).any():
+                print(f"[WARN] mouth_region: NaN detected (batch {b})")
+                continue
+
+            # 🔹 centre
             x_center = (mouth_left[b,0] + mouth_right[b,0]) / 2
             y_center = (mouth_top[b,1] + mouth_bottom[b,1]) / 2
 
-            width = (mouth_right[b,0] - mouth_left[b,0]) * (1 + expand_w)
-            height = (mouth_bottom[b,1] - mouth_top[b,1]) * (1 + expand_h)
+            # 🔹 dimensions (safe)
+            width  = torch.abs(mouth_right[b,0] - mouth_left[b,0])
+            height = torch.abs(mouth_bottom[b,1] - mouth_top[b,1])
 
+            # fallback si trop petit
+            if width < 1e-4 or height < 1e-4:
+                width  = torch.tensor(0.05, device=device)
+                height = torch.tensor(0.05, device=device)
+
+            # 🔹 expansion
+            width  = width  * (1 + expand_w)
+            height = height * (1 + expand_h)
+
+            # 🔹 conversion pixels
             x_min = int((x_center - width/2) * (W-1))
             x_max = int((x_center + width/2) * (W-1))
             y_min = int((y_center - height/2) * (H-1))
             y_max = int((y_center + height/2) * (H-1))
 
-            # Clamp pour rester dans l'image
-            x_min = max(0, x_min)
-            x_max = min(W-1, x_max)
-            y_min = max(0, y_min)
-            y_max = min(H-1, y_max)
+            # 🔹 clamp sécurisé
+            x_min = max(0, min(W-1, x_min))
+            x_max = max(0, min(W-1, x_max))
+            y_min = max(0, min(H-1, y_min))
+            y_max = max(0, min(H-1, y_max))
 
-            # Remplir le masque
-            mask[b,0,y_min:y_max+1,x_min:x_max+1] = 1.0
+            # 🔥 taille minimale garantie
+            if (x_max - x_min) < min_size:
+                cx = (x_min + x_max) // 2
+                x_min = max(0, cx - min_size // 2)
+                x_max = min(W-1, cx + min_size // 2)
 
-        # Feather léger pour adoucir les bords
-        mask = feather_outside_only_alpha(mask, radius=3, sigma=1.5)
+            if (y_max - y_min) < min_size:
+                cy = (y_min + y_max) // 2
+                y_min = max(0, cy - min_size // 2)
+                y_max = min(H-1, cy + min_size // 2)
 
-        # Debug
+            # 🔹 fill
+            mask[b,0,y_min:y_max+1, x_min:x_max+1] = 1.0
+
+        # =========================
+        # 🔹 Feather (safe)
+        # =========================
+        try:
+            mask = feather_outside_only_alpha(mask, radius=3, sigma=1.5)
+        except Exception as e:
+            print(f"[WARN] mouth_region: feather failed ({e})")
+
+        # =========================
+        # 🔹 Debug
+        # =========================
         if debug and debug_dir is not None:
-            os.makedirs(debug_dir, exist_ok=True)
-            mask_np = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
-            mask_debug = cv2.resize(mask_np, (W*4,H*4), interpolation=cv2.INTER_NEAREST)
-            mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
-            save_path = os.path.join(debug_dir, f"mouth_mask_{frame_counter:05d}.png")
-            cv2.imwrite(save_path, mask_debug_rgb)
-            print(f"[DEBUG] Mouth mask saved (scale 4): {save_path}")
+            try:
+                os.makedirs(debug_dir, exist_ok=True)
+                mask_np = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
+
+                mask_debug = cv2.resize(
+                    mask_np,
+                    (W*4, H*4),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+                mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
+
+                save_path = os.path.join(
+                    debug_dir,
+                    f"mouth_mask_{frame_counter:05d}.png"
+                )
+
+                cv2.imwrite(save_path, mask_debug_rgb)
+                print(f"[DEBUG] Mouth mask saved: {save_path}")
+
+            except Exception as e:
+                print(f"[WARN] mouth_region: debug failed ({e})")
 
         return mask
 
@@ -1631,7 +1717,8 @@ def apply_hair_motion_extreme(
     device,
     delta_px=None,
     prev_hair_field=None,
-    debug=False
+    debug=False,
+    debug_dir=None
 ):
     """
     Hair motion version cinéma EXTRÊME :
@@ -1723,7 +1810,8 @@ def apply_hair_motion(
     device,
     delta_px=None,
     prev_hair_field=None,
-    debug=False
+    debug=False,
+    debug_dir=None
 ):
     """
     Hair motion version cinéma amplifiée :
@@ -1980,7 +2068,8 @@ def apply_torso_warp(
     W,
     device,
     prev_delta_px=None,
-    debug=False
+    debug=False,
+    debug_dir=None
 ):
     B = latents.shape[0]
 
@@ -2044,7 +2133,8 @@ def apply_global_pose(
     W=None,
     device="cuda",
     strength=0.1,   # 🔥 beaucoup plus faible !
-    debug=False
+    debug=False,
+    debug_dir=None
 ):
     B = latents.shape[0]
 
@@ -2181,7 +2271,8 @@ def apply_face_warp_v2(
     dist_right = torch.clamp(1.0 - torch.sqrt((x_grid - mouth_right_px[:,0,None,None])**2 +
                                               (y_grid - mouth_right_px[:,1,None,None])**2)/20.0, 0,1)
 
-    smile_strength = 0.08
+    # force du sourire
+    smile_strength = 0.12
     # Déplacement horizontal et vertical des coins
     delta_left  = torch.zeros((B,H,W,2), device=device)
     delta_right = torch.zeros((B,H,W,2), device=device)
@@ -2471,6 +2562,198 @@ def apply_face_warp_v1(
 #------------------------------------------------------------------------------------------
 
 def apply_pose_driven_motion(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    """
+    Pipeline motion PRO (stable + vivant + isolé) :
+    - Global Pose
+    - Torso Warp
+    - Face Warp (stateful)
+    - Hair Motion (alt normal/extreme)
+    - Breathing (torso only)
+    - Stabilisation (face protected)
+    - Micro-boost par zone pour éviter le rendu statique
+    """
+
+    # =========================
+    # 🔹 Setup
+    # =========================
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents = latents.float()
+    latents_in = latents.clone()
+
+    # =========================
+    # 🔹 Pose
+    # =========================
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W)
+    prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
+
+    # =========================
+    # 🔹 Grid
+    # =========================
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
+
+    # =========================
+    # 🔹 Masks (CLAMP SAFE)
+    # =========================
+    mask_face  = torch.clamp(pose.create_face_mask(H, W), 0, 1).float()
+    mask_torso = torch.clamp(pose.create_upper_body_mask(H, W), 0, 1).float()
+    mask_hair  = torch.clamp(pose.create_hair_mask(H, W), 0, 1).float()
+
+    mask_face_exp  = mask_face
+    mask_torso_exp = mask_torso * (1.0 - mask_face_exp)
+    mask_hair_exp  = mask_hair  * (1.0 - mask_face_exp)
+
+    # =========================
+    # 🔹 GLOBAL POSE
+    # =========================
+    latents_before = latents.clone()
+    latents_global, global_delta = apply_global_pose(
+        latents=latents,
+        pose=pose,
+        prev_pose=prev_pose,
+        H=H,
+        W=W,
+        device=device,
+        debug=debug,
+        debug_dir=debug_dir
+    )
+    latents = latents_global * (1.0 - mask_face_exp) + latents_before * mask_face_exp
+
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="torso_global")
+        print("[DEBUG] Global pose applied")
+
+    # =========================
+    # 🔹 TORSO
+    # =========================
+    latents_before = latents.clone()
+    latents_torso, delta_px = apply_torso_warp(
+        latents=latents,
+        pose=pose,
+        mask_torso=mask_torso,
+        grid=grid,
+        H=H,
+        W=W,
+        device=device,
+        debug=debug,
+        debug_dir=debug_dir
+    )
+    latents = latents_torso * mask_torso_exp + latents_before * (1.0 - mask_torso_exp)
+
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="torso_warp")
+        print("[DEBUG] Torso warp applied")
+
+    # =========================
+    # 🔹 FACE (STATEFUL)
+    # =========================
+    latents, face_delta, facial_points = apply_face_warp_v2(
+        latents=latents,
+        pose=pose,
+        mask_face=mask_face,
+        grid=grid,
+        H=H,
+        W=W,
+        frame_counter=frame_counter,
+        device=device,
+        debug=debug,
+        debug_dir=debug_dir,
+        smooth=0.85
+    )
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="face_warp")
+        print("[DEBUG] Face warp applied")
+
+    # =========================
+    # 🔹 HAIR (ALTERNANCE CINÉMA)
+    # =========================
+    latents_before = latents.clone()
+    if (frame_counter // 6) % 2 == 0:
+        latents_hair, hair_delta = apply_hair_motion(
+            latents, mask_hair, grid, H, W,
+            frame_counter, device,
+            delta_px=delta_px,
+            debug=debug,
+            debug_dir=debug_dir
+        )
+    else:
+        latents_hair, hair_delta = apply_hair_motion_extreme(
+            latents, mask_hair, grid, H, W,
+            frame_counter, device,
+            delta_px=delta_px,
+            debug=debug,
+            debug_dir=debug_dir
+        )
+    latents = latents_hair * mask_hair_exp + latents_before * (1.0 - mask_hair_exp)
+
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="hair")
+        print("[DEBUG] Hair motion applied")
+
+    # =========================
+    # 🔹 BREATHING (TORSO ONLY)
+    # =========================
+    latents_before = latents.clone()
+    latents_breath = apply_breathing(
+        latents,
+        previous_latent,
+        frame_counter,
+        breathing,
+        debug=debug,
+        debug_dir=debug_dir
+    )
+    latents = latents_breath * mask_torso_exp + latents_before * (1.0 - mask_torso_exp)
+
+    if debug:
+        print("[DEBUG] Breathing applied")
+
+    # =========================
+    # 🔹 STABILISATION
+    # =========================
+    latents_before = latents.clone()
+    latents_stab = stabilize_latents_motion(latents)
+    latents = latents_stab * (1.0 - mask_face_exp) + latents_before * mask_face_exp
+
+    if debug:
+        print("[DEBUG] Stabilization applied")
+
+    # =========================
+    # 🔹 MICRO BOOST GLOBAL PAR ZONE
+    # =========================
+    micro_amp = 0.002
+    t = torch.tensor(frame_counter / 6.0, device=device)
+    latents += micro_amp * mask_torso_exp * torch.sin(t + 0.1)
+    latents += micro_amp * mask_hair_exp  * torch.sin(t + 0.2)
+    latents += micro_amp * mask_face_exp  * torch.sin(t + 0.3)
+
+    # =========================
+    # 🔹 DEBUG FINAL
+    # =========================
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="final")
+        print("[DEBUG] Full motion pipeline applied")
+
+    return latents
+
+def apply_pose_driven_motion_v1(
     latents,
     previous_latent,
     latents_before_openpose,

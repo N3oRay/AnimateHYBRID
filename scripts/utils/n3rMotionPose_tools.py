@@ -477,7 +477,7 @@ def apply_breathing_mask(latents, previous_latent, frame_counter, breathing=True
 
     return latents
 
-def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
+def apply_breathing(latents, previous_latent, frame_counter, breathing=True, debug=False, debug_dir=None):
     """
     Applique une respiration réaliste sur les latents : décalage vertical uniquement.
     Optimisée pour fluidité et performance.
