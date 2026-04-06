@@ -491,7 +491,7 @@ def apply_breathing(latents, previous_latent, frame_counter, breathing=True):
         device = latents.device
 
         # Amplitude respiration + smooth sinus
-        breath = 0.003 * math.sin(frame_counter * 0.1) * math.cos(frame_counter * 0.02)
+        breath = 0.006 * math.sin(frame_counter * 0.1) * math.cos(frame_counter * 0.06)
 
         # Pré-calcul de la grille si pas déjà fait
         if not hasattr(apply_breathing, "_grid_base") or apply_breathing._grid_base[0].shape != (H, W):
@@ -530,7 +530,7 @@ def apply_breathing_big(latents, previous_latent, frame_counter, breathing=True)
 
 
 
-def save_impact_map(latents, latents_in, debug_dir, frame_counter):
+def save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="driven"):
     """
     Sauvegarde une carte d'impact montrant les différences entre latents et latents_in.
 
@@ -539,16 +539,39 @@ def save_impact_map(latents, latents_in, debug_dir, frame_counter):
         latents_in (torch.Tensor): Latents originaux [B, C, H, W]
         debug_dir (str): Répertoire où sauvegarder l'image
         frame_counter (int): Index de la frame pour le nom de fichier
+        prefix (str): Préfixe pour différencier le type d'impact map
     """
     if debug_dir is None:
         return
 
+
     os.makedirs(debug_dir, exist_ok=True)
+
+    # Calcul de l'impact map
     impact_map = torch.abs(latents - latents_in).mean(1, keepdim=True)
     impact_np = impact_map[0,0].detach().cpu().numpy()
     impact_np -= impact_np.min()
     if impact_np.max() > 0:
         impact_np /= impact_np.max()
-    save_path = os.path.join(debug_dir, f"impact_map_driven_{frame_counter:05d}.png")
+
+    # Nom de fichier avec préfixe
+    save_path = os.path.join(debug_dir, f"impact_map_{prefix}_{frame_counter:05d}.png")
     Image.fromarray((impact_np*255).astype(np.uint8)).save(save_path)
     print(f"[DEBUG] Impact map saved: {save_path}")
+
+
+def feather_dynamic_vectorized(mask, delta_px, base_radius=3, sigma=1.5, scale=2.0):
+    speed = torch.norm(delta_px, dim=-1, keepdim=True)  # [B,1,1]
+    radius_dynamic = torch.clamp(base_radius + scale * speed, max=15.0)
+    radius_int = radius_dynamic.round().long()  # converti en entier pour max_pool2d
+
+    feathered_mask = torch.zeros_like(mask)
+    B = mask.shape[0]
+
+    for b in range(B):
+        feathered_mask[b:b+1] = feather_outside_only_alpha(
+            mask[b:b+1],
+            radius=radius_int[b].item(),
+            sigma=sigma
+        )
+    return feathered_mask

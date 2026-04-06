@@ -367,7 +367,6 @@ class Pose:
 
         return mask
 
-
     # ----------------- Torso delta -----------------
     # Attention le expand_w et le shrink_h doit être similaire pour compute_torso_delta et create_upper_body_mask
     def compute_torso_delta(self, latent_h: int, latent_w: int, expand_w=0.95, shrink_h=0.70):
@@ -2061,6 +2060,7 @@ def apply_global_pose(
 
     return latents_out, delta_px
 
+
 def apply_face_warp_v2(
     latents,
     pose,
@@ -2077,6 +2077,7 @@ def apply_face_warp_v2(
     """
     Warp du visage avec micro-expressions et respiration.
     Version stateful avec gestion interne des points faciaux.
+    Amplification des mouvements pour meilleure visibilité.
     """
 
     if device is None:
@@ -2086,14 +2087,10 @@ def apply_face_warp_v2(
     latents_in = latents.clone()
 
     # =========================
-    # 🔥 Récupération + update auto des points
+    # Récupération et mise à jour des points
     # =========================
     prev_facial_points = pose.get_prev_facial_points()
-
-    # Estimation avec lissage temporel (la méthode n'a PAS prev_points)
     facial_points = pose.estimate_facial_points_full(smooth=smooth)
-
-    # Sauvegarde pour la frame suivante
     pose.set_prev_facial_points(facial_points)
 
     mouth_center = facial_points['mouth_center']
@@ -2101,149 +2098,85 @@ def apply_face_warp_v2(
     mouth_bottom = facial_points['mouth_bottom']
 
     # =========================
-    # 🔹 Temps (tensor safe)
+    # Temps (tensor safe)
     # =========================
     t_resp_y = torch.tensor(frame_counter / 8.0, device=device)
     t_resp_x = torch.tensor(frame_counter / 10.0, device=device)
     t_micro  = torch.tensor(frame_counter / 5.0, device=device)
+    t_wind1  = torch.tensor(frame_counter / 15.0, device=device)
+    t_wind2  = torch.tensor(frame_counter / 60.0, device=device)
 
     # =========================
-    # 🔹 Base motion visage
+    # Base motion visage
     # =========================
     face_delta = torch.zeros((B,1,1,2), device=device)
-    face_delta[...,1] += 0.01  * torch.sin(t_resp_y)
-    face_delta[...,0] += 0.005 * torch.sin(t_resp_x)
-    face_delta[...,0] += 0.002 * torch.sin(t_micro)
-    face_delta[...,1] += 0.003 * torch.sin(t_micro * 1.5)
+    face_delta[...,1] += 0.03  * torch.sin(t_resp_y)  # respiration verticale plus visible
+    face_delta[...,0] += 0.015 * torch.sin(t_resp_x)  # respiration horizontale
+    face_delta[...,0] += 0.006 * torch.sin(t_micro)   # micro-mouvements
+    face_delta[...,1] += 0.009 * torch.sin(t_micro * 1.5)
 
     # =========================
-    # 🔹 Micro sourire
+    # Micro sourire
     # =========================
     mouth_mask = pose.get_mouth_region(H, W, device=device, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    mouth_mask_exp = mouth_mask.permute(0,2,3,1)  # [B,H,W,1]
+    mouth_mask_exp = mouth_mask.permute(0,2,3,1)
 
-    smile_strength = 0.02
-    smile_delta = smile_strength * torch.sin(torch.tensor(frame_counter / 10.0, device=device))
+    smile_strength = 0.08  # plus visible
+    smile_delta = smile_strength * torch.sin(torch.tensor(frame_counter / 8.0, device=device))
 
     face_delta_expanded = face_delta.expand(B,H,W,2).clone()
     face_delta_expanded[...,0] += mouth_mask_exp[...,0] * smile_delta
 
     # =========================
-    # 🔹 Respiration bouche
+    # Respiration bouche
     # =========================
-    breath_strength = 0.005
+    breath_strength = 0.018  # plus visible
     breath_delta = breath_strength * torch.sin(torch.tensor(frame_counter / 12.0, device=device))
     face_delta_expanded[...,1] += mouth_mask_exp[...,0] * breath_delta
 
     # =========================
-    # 🔹 Centre visage (nez)
+    # Micro-oscillations supplémentaires (effet "vent")
+    # =========================
+    wind_delta_x = 0.004 * torch.sin(t_wind1)
+    wind_delta_y = 0.003 * torch.sin(t_wind2)
+    mask_face_exp = mask_face.permute(0,2,3,1)
+    face_delta_expanded[...,0] += mask_face_exp[...,0] * wind_delta_x
+    face_delta_expanded[...,1] += mask_face_exp[...,0] * wind_delta_y
+
+    # =========================
+    # Centre visage (nez)
     # =========================
     face_center = pose.get_point(0)
     face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
     face_center_px = face_center_px.view(B,1,1,2)
 
     # =========================
-    # 🔹 Grid warp
+    # Grid warp
     # =========================
     grid_face = grid.clone() - face_center_px
-    mask_face_exp = mask_face.permute(0,2,3,1)
     grid_face = grid_face + face_delta_expanded * mask_face_exp
     grid_face = grid_face + face_center_px
 
     # =========================
-    # 🔹 Normalisation
+    # Normalisation [-1,1]
     # =========================
     grid_face[...,0] = 2.0 * grid_face[...,0] / (W-1) - 1.0
     grid_face[...,1] = 2.0 * grid_face[...,1] / (H-1) - 1.0
 
     # =========================
-    # 🔹 Warp final
+    # Warp final
     # =========================
     latents_out = F.grid_sample(latents, grid_face, align_corners=True)
 
     # =========================
-    # 🔹 Debug
+    # Debug
     # =========================
     if debug:
-        save_impact_map(latents_out, latents_in, debug_dir, frame_counter)
-        print("[DEBUG] Face warp v2 (stateful) applied")
+        save_impact_map(latents_out, latents_in, debug_dir, frame_counter, prefix="face")
+        print("[DEBUG] Face warp v2 (stateful) applied with amplified motion")
 
     return latents_out, face_delta_expanded, facial_points
 
-def apply_face_warp(
-    latents,
-    pose,
-    mask_face,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device,
-    debug=False,
-    debug_dir=None
-):
-    """
-    Warp du visage avec micro expressions et respiration.
-    - latents : tenseur [B,C,H,W]
-    - pose : objet Pose
-    - mask_face : masque visage [B,1,H,W]
-    - grid : grille de base [B,H,W,2]
-    - frame_counter : compteur de frame pour animations
-    """
-
-    B, C, H, W = latents.shape
-    latents_in = latents.clone()
-
-    # -------------------- Delta visage --------------------
-    face_center = pose.get_point(0)  # nez
-    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
-    face_center_px = face_center_px.view(B,1,1,2)
-
-    # Base delta pour respiration/micro-mouvements
-    t_dict = {
-        "resp_y": torch.tensor(frame_counter / 8.0, device=device),
-        "resp_x": torch.tensor(frame_counter / 10.0, device=device),
-        "micro": torch.tensor(frame_counter / 5.0, device=device),
-        "wind1": torch.tensor(frame_counter / 15.0, device=device),
-        "wind2": torch.tensor(frame_counter / 60.0, device=device),
-    }
-
-    face_delta = torch.zeros((B,1,1,2), device=device)
-    face_delta[...,1] += 0.01 * torch.sin(t_dict["resp_y"])
-    face_delta[...,0] += 0.005 * torch.sin(t_dict["resp_x"])
-    face_delta[...,0] += 0.002 * torch.sin(t_dict["micro"])
-    face_delta[...,1] += 0.003 * torch.sin(t_dict["micro"] * 1.5)
-
-    # -------------------- Micro sourire --------------------
-    mouth_mask = pose.get_mouth_region(H, W, device=device, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    mouth_mask_exp = mouth_mask.permute(0,2,3,1)  # [B,H,W,1] pour broadcasting
-
-    smile_strength = 0.02
-    smile_delta = smile_strength * torch.sin(torch.tensor(frame_counter / 10.0, device=device))
-
-    # face_delta étendu à [B,H,W,2] pour grid_sample
-    face_delta_expanded = face_delta.expand(B,H,W,2).clone()
-    face_delta_expanded[...,0] += mouth_mask_exp[...,0] * smile_delta
-
-    # -------------------- Construction grille --------------------
-    grid_face = grid.clone()
-    grid_face = grid_face - face_center_px
-    mask_face_exp = mask_face.permute(0,2,3,1)  # [B,H,W,1]
-    grid_face = grid_face + face_delta_expanded * mask_face_exp
-    grid_face = grid_face + face_center_px
-
-    # Normalisation [-1,1] pour grid_sample
-    grid_face[...,0] = 2.0*grid_face[...,0]/(W-1) - 1.0
-    grid_face[...,1] = 2.0*grid_face[...,1]/(H-1) - 1.0
-
-    # -------------------- Warp --------------------
-    latents_out = F.grid_sample(latents, grid_face, align_corners=True)
-
-    if debug:
-        save_impact_map(latents_out, latents_in, debug_dir, frame_counter)
-        print("[DEBUG] Face warp applied")
-
-    return latents_out, face_delta_expanded
 
 #------------------------------------------------------------------------------------------
 
@@ -2330,6 +2263,8 @@ def apply_pose_driven_motion(
 
     if debug:
         print("[DEBUG] Global pose applied")
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="torce")
+
 
     # =========================
     # 🔹 TORSO
@@ -2350,6 +2285,7 @@ def apply_pose_driven_motion(
 
     if debug:
         print("[DEBUG] Torso warp applied")
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="warp")
 
     # =========================
     # 🔹 FACE (STATEFUL)
@@ -2397,6 +2333,7 @@ def apply_pose_driven_motion(
 
     if debug:
         print("[DEBUG] Hair motion applied")
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="Hair")
 
     # =========================
     # 🔹 BREATHING (TORSO ONLY)
@@ -2441,7 +2378,7 @@ def apply_pose_driven_motion(
     # 🔹 DEBUG FINAL
     # =========================
     if debug:
-        save_impact_map(latents, latents_in, debug_dir, frame_counter)
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="final")
         print("[DEBUG] Full motion pipeline applied")
 
     return latents
