@@ -542,6 +542,7 @@ class Pose:
 
         self.delta = delta
         return delta
+
     def create_upper_body_mask(
         self,
         H: int,
@@ -557,100 +558,51 @@ class Pose:
         Masque torse PRO++ :
         - largeur adaptative épaules / hanches
         - forme elliptique anatomique
-        - pondération gaussienne (🔥 rendu naturel)
+        - pondération gaussienne
         """
-
         # Valeurs par défaut dynamiques
-        if expand_w is None:
-            expand_w = self.get_torce_expand_w()
-        if shrink_h is None:
-            shrink_h = self.get_torce_shrink_h()
+        expand_w = expand_w or self.get_torce_expand_w()
+        shrink_h = shrink_h or self.get_torce_shrink_h()
 
         mask = torch.zeros(self.B, 1, H, W, device=self.device)
 
+        # Grille unique
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=self.device),
+            torch.arange(W, device=self.device),
+            indexing="ij"
+        )
+
+        def to_px(kp):
+            return kp * torch.tensor([W-1, H-1], device=self.device)
+
         for b in range(self.B):
+            r_sh = to_px(self.get_point(19)[b])
+            l_sh = to_px(self.get_point(20)[b])
+            r_hip = to_px(self.get_point(8)[b])
+            l_hip = to_px(self.get_point(11)[b])
 
-            # =========================
-            # 🔹 Points clés
-            # =========================
-            r_sh = self.get_point(19)[b]
-            l_sh = self.get_point(20)[b]
-            r_hip = self.get_point(8)[b]
-            l_hip = self.get_point(11)[b]
+            # Centres anatomiques et largeur/hauteur
+            shoulder_center, hip_center = (r_sh + l_sh)/2, (r_hip + l_hip)/2
+            center = (shoulder_center * 0.5 + hip_center * 0.5)
 
-            def to_px(kp):
-                return torch.tensor([
-                    kp[0] * (W - 1),
-                    kp[1] * (H - 1)
-                ], device=self.device)
-
-            r_sh = to_px(r_sh)
-            l_sh = to_px(l_sh)
-            r_hip = to_px(r_hip)
-            l_hip = to_px(l_hip)
-
-            # =========================
-            # 🔹 Centres anatomiques
-            # =========================
-            shoulder_center = (r_sh + l_sh) / 2
-            hip_center = (r_hip + l_hip) / 2
-
-            chest = shoulder_center * 0.7 + hip_center * 0.3
-            belly = shoulder_center * 0.3 + hip_center * 0.7
-
-            center = (chest + belly) / 2
-
-            # =========================
-            # 🔹 Largeurs adaptatives
-            # =========================
-            shoulder_width = torch.norm(r_sh - l_sh)
-            hip_width = torch.norm(r_hip - l_hip)
-
-            width_top = shoulder_width * expand_w
-            width_bottom = hip_width * expand_w * 0.9  # léger taper naturel
-
+            width_top = torch.norm(r_sh - l_sh) * expand_w
+            width_bottom = torch.norm(r_hip - l_hip) * expand_w * 0.9
             height = torch.norm(hip_center - shoulder_center) * shrink_h
 
-            # =========================
-            # 🔹 Grille locale
-            # =========================
-            yy, xx = torch.meshgrid(
-                torch.arange(H, device=self.device),
-                torch.arange(W, device=self.device),
-                indexing="ij"
-            )
-
-            dx = xx - center[0]
-            dy = yy - center[1]
-
-            # =========================
-            # 🔹 Interpolation largeur verticale
-            # =========================
+            # Ellipse adaptative
+            dx, dy = xx - center[0], yy - center[1]
             t = torch.clamp((dy / height) + 0.5, 0, 1)
-
             width_interp = width_top * (1 - t) + width_bottom * t
-
-            # =========================
-            # 🔹 Forme elliptique dynamique
-            # =========================
             ellipse = (dx / (width_interp / 2))**2 + (dy / (height / 2))**2
 
-            # =========================
-            # 🔹 Masque doux (🔥 clé)
-            # =========================
-            mask_soft = torch.exp(-ellipse * 2.5)  # gaussian falloff
+            mask[b,0] = torch.exp(-ellipse * 2.5)  # Gaussian falloff
 
-            mask[b,0] = mask_soft
-
-        # =========================
-        # 🔹 Clamp + Feather
-        # =========================
+        # Clamp + feather
         mask = torch.clamp(mask, 0, 1)
         mask = feather_inside_strict(mask, radius=5, blur_kernel=3, sigma=1.2)
 
-        # =========================
-        # 🔹 Debug
-        # =========================
+        # Debug
         if debug and debug_dir is not None:
             save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="torso_mask_PRO")
 
@@ -665,86 +617,54 @@ class Pose:
         frame_counter: int = 0,
         expand_w=1.0,
         shrink_h=0.9,
-        roundness=0.6  # 🔥 contrôle du côté arrondi
+        roundness=0.6
     ):
         """
-        Masque torse PRO :
-        - forme capsule (rectangle + ellipse)
-        - beaucoup plus naturel que polygon
+        Masque torse PRO : capsule (rectangle + ellipse), plus naturel que polygon
         """
-
         mask = torch.zeros(self.B, 1, H, W, device=self.device)
 
+        def to_px(kp):
+            return np.array([kp[0]*(W-1), kp[1]*(H-1)])
+
         for b in range(self.B):
+            # Points clés
+            pts = np.array([
+                to_px(self.get_point(19)[b].cpu().numpy()),  # r_sh
+                to_px(self.get_point(20)[b].cpu().numpy()),  # l_sh
+                to_px(self.get_point(8)[b].cpu().numpy()),   # r_hip
+                to_px(self.get_point(11)[b].cpu().numpy())   # l_hip
+            ])
 
-            # =========================
-            # 🔹 Points clés
-            # =========================
-            r_sh = self.get_point(19)[b].cpu().numpy()
-            l_sh = self.get_point(20)[b].cpu().numpy()
-            r_hip = self.get_point(8)[b].cpu().numpy()
-            l_hip = self.get_point(11)[b].cpu().numpy()
+            # Centre et dimensions
+            x_min, y_min = pts[:,0].min(), pts[:,1].min()
+            x_max, y_max = pts[:,0].max(), pts[:,1].max()
+            cx, cy = (x_min + x_max)/2, (y_min + y_max)/2
+            width, height = (x_max - x_min) * expand_w, (y_max - y_min) * shrink_h
 
-            def to_px(kp):
-                return np.array([kp[0]*(W-1), kp[1]*(H-1)])
-
-            r_sh = to_px(r_sh)
-            l_sh = to_px(l_sh)
-            r_hip = to_px(r_hip)
-            l_hip = to_px(l_hip)
-
-            # =========================
-            # 🔹 Dimensions globales
-            # =========================
-            x_min = min(r_sh[0], l_sh[0], r_hip[0], l_hip[0])
-            x_max = max(r_sh[0], l_sh[0], r_hip[0], l_hip[0])
-            y_min = min(r_sh[1], l_sh[1])
-            y_max = max(r_hip[1], l_hip[1])
-
-            cx = (x_min + x_max) / 2
-            cy = (y_min + y_max) / 2
-
-            width  = (x_max - x_min) * expand_w
-            height = (y_max - y_min) * shrink_h
-
-            # =========================
-            # 🔹 Création masque
-            # =========================
-            mask_np = np.zeros((H, W), dtype=np.uint8)
-
-            # 🔸 rectangle central
-            rect_w = int(width)
+            # Rectangle central
             rect_h = int(height * (1 - roundness))
+            rect_w = int(width)
+            x0, y0 = int(cx - rect_w/2), int(cy - rect_h/2)
 
-            x0 = int(cx - rect_w/2)
-            y0 = int(cy - rect_h/2)
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            cv2.rectangle(mask_np, (x0, y0), (x0 + rect_w, y0 + rect_h), 255, -1)
 
-            cv2.rectangle( mask_np, (x0, y0), (x0 + rect_w, y0 + rect_h), 255, -1 )
-
-            # 🔸 ellipse haut (épaules)
+            # Ellipses haut/bas
             ellipse_h = int(height * roundness)
+            for y_center, start_angle, end_angle in [(y0, 0, 180), (y0 + rect_h, 180, 360)]:
+                cv2.ellipse(mask_np, (int(cx), int(y_center)), (rect_w//2, ellipse_h), 0, start_angle, end_angle, 255, -1)
 
-            cv2.ellipse( mask_np, (int(cx), int(y0)), (int(rect_w/2), int(ellipse_h)), 0, 0, 180, 255, -1 )
-
-            # 🔸 ellipse bas (hanches)
-            cv2.ellipse( mask_np, (int(cx), int(y0 + rect_h)), (int(rect_w/2), int(ellipse_h)), 0, 180, 360, 255, -1 )
-
-            # =========================
-            # 🔹 Smooth morphologique (🔥 clé)
-            # =========================
+            # Morphologie pour lisser
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
             mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel)
 
             mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
 
-        # =========================
-        # 🔹 Feather final
-        # =========================
+        # Feather final
         mask = feather_inside_strict(mask, radius=5, blur_kernel=3, sigma=1.2)
 
-        # =========================
-        # 🔹 Debug
-        # =========================
+        # Debug
         if debug and debug_dir is not None:
             save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="torso_mask_")
 
@@ -929,3 +849,97 @@ class Pose:
             save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="face_mask_")
 
         return mask
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# Pose PoseAnimator en DEV
+# ----------------------------------------------------------------------------------------------------------------------------------
+
+class PoseAnimator:
+    def __init__(self, pose: Pose, latent_h: int, latent_w: int):
+        self.pose = pose
+        self.H = latent_h
+        self.W = latent_w
+
+    # ----------------- Préparer les masques -----------------
+    def prepare_masks(self, debug=False, debug_dir=None, frame_counter=0):
+        # Masque torse
+        self.torso_mask = self.pose.create_upper_body_mask(
+            H=self.H, W=self.W,
+            expand_w=0.9, shrink_h=0.65,
+            debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
+        )
+
+        # Masque visage dynamique
+        self.face_mask = self.pose.create_face_mask(
+            H=self.H, W=self.W,
+            debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
+        )
+
+        # Masque cheveux
+        self.hair_mask = self.pose.create_hair_mask(
+            H=self.H, W=self.W,
+            debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
+        )
+
+    # ----------------- Calcul des deltas -----------------
+    def compute_deltas(self, torso_scale=1.0, face_scale=0.3, x_factor=0.3):
+        # Torse
+        self.pose.compute_torso_delta(latent_h=self.H, latent_w=self.W)
+        self.torso_delta = self.pose.delta.clone()
+        self.torso_delta[:,0] *= x_factor  # limiter le déplacement X
+
+        # Face : micro-mouvements
+        face_center = (self.pose.get_point(14) + self.pose.get_point(15) + self.pose.get_point(0)) / 3.0
+        face_delta = face_center * face_scale
+        face_delta = torch.tanh(face_delta * 2.0) * 0.3
+        self.face_delta = face_delta.clone()
+        self.face_delta[:,0] *= x_factor  # réduire X
+
+    # ----------------- Appliquer les deltas sur le latent -----------------
+    def apply_to_latent(self, latent: torch.Tensor):
+        """
+        latent: [B, C, H, W]
+        Retourne latent avec torse + visage animés
+        """
+
+        # Copier pour éviter d'écraser
+        out = latent.clone()
+
+        # Appliquer delta torse
+        torso_mask = self.torso_mask
+        out = self.grid_warp(out, torso_mask, self.torso_delta)
+
+        # Appliquer delta visage
+        face_mask = self.face_mask
+        out = self.grid_warp(out, face_mask, self.face_delta)
+
+        return out
+
+    # ----------------- Grid warp localisé -----------------
+    @staticmethod
+    def grid_warp(latent, mask, delta):
+        """
+        Applique un déplacement (delta) uniquement sur la zone du mask
+        """
+        B, C, H, W = latent.shape
+
+        # Créer grid [B,H,W,2]
+        yy, xx = torch.meshgrid(torch.arange(H, device=latent.device),
+                                torch.arange(W, device=latent.device),
+                                indexing='ij')
+        grid = torch.stack([xx.float(), yy.float()], dim=-1)  # [H,W,2]
+        grid = grid.unsqueeze(0).repeat(B,1,1,1)  # [B,H,W,2]
+
+        # Ajouter delta multiplié par mask
+        mask_expand = mask.permute(0,2,3,1)  # [B,H,W,1]
+        delta_expand = delta.unsqueeze(1).unsqueeze(1)  # [B,1,1,2]
+        grid = grid + delta_expand * mask_expand
+
+        # Normaliser grid entre -1 et 1
+        grid_norm = grid.clone()
+        grid_norm[...,0] = 2.0 * grid[...,0] / (W-1) - 1.0
+        grid_norm[...,1] = 2.0 * grid[...,1] / (H-1) - 1.0
+
+        # Sample latent
+        out = torch.nn.functional.grid_sample(latent, grid_norm, align_corners=True)
+        return out

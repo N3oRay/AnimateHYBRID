@@ -7,7 +7,7 @@ import math
 import torch.nn.functional as F
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, apply_breathing, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, apply_breathing, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_3D, apply_hair_motion_cycle
 from .n3rMotionPoseClass import Pose
 import numpy as np
 import cv2
@@ -122,98 +122,6 @@ def extract_keypoints_from_pose(
     return keypoints_tensor
 
 
-
-
-#----------------------------------------------------------------------------------------------------------------------
-class PoseAnimator:
-    def __init__(self, pose: Pose, latent_h: int, latent_w: int):
-        self.pose = pose
-        self.H = latent_h
-        self.W = latent_w
-
-    # ----------------- Préparer les masques -----------------
-    def prepare_masks(self, debug=False, debug_dir=None, frame_counter=0):
-        # Masque torse
-        self.torso_mask = self.pose.create_upper_body_mask(
-            H=self.H, W=self.W,
-            expand_w=0.9, shrink_h=0.65,
-            debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
-        )
-
-        # Masque visage dynamique
-        self.face_mask = self.pose.create_face_mask(
-            H=self.H, W=self.W,
-            debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
-        )
-
-        # Masque cheveux
-        self.hair_mask = self.pose.create_hair_mask(
-            H=self.H, W=self.W,
-            debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
-        )
-
-    # ----------------- Calcul des deltas -----------------
-    def compute_deltas(self, torso_scale=1.0, face_scale=0.3, x_factor=0.3):
-        # Torse
-        self.pose.compute_torso_delta(latent_h=self.H, latent_w=self.W)
-        self.torso_delta = self.pose.delta.clone()
-        self.torso_delta[:,0] *= x_factor  # limiter le déplacement X
-
-        # Face : micro-mouvements
-        face_center = (self.pose.get_point(14) + self.pose.get_point(15) + self.pose.get_point(0)) / 3.0
-        face_delta = face_center * face_scale
-        face_delta = torch.tanh(face_delta * 2.0) * 0.3
-        self.face_delta = face_delta.clone()
-        self.face_delta[:,0] *= x_factor  # réduire X
-
-    # ----------------- Appliquer les deltas sur le latent -----------------
-    def apply_to_latent(self, latent: torch.Tensor):
-        """
-        latent: [B, C, H, W]
-        Retourne latent avec torse + visage animés
-        """
-
-        # Copier pour éviter d'écraser
-        out = latent.clone()
-
-        # Appliquer delta torse
-        torso_mask = self.torso_mask
-        out = self.grid_warp(out, torso_mask, self.torso_delta)
-
-        # Appliquer delta visage
-        face_mask = self.face_mask
-        out = self.grid_warp(out, face_mask, self.face_delta)
-
-        return out
-
-    # ----------------- Grid warp localisé -----------------
-    @staticmethod
-    def grid_warp(latent, mask, delta):
-        """
-        Applique un déplacement (delta) uniquement sur la zone du mask
-        """
-        B, C, H, W = latent.shape
-
-        # Créer grid [B,H,W,2]
-        yy, xx = torch.meshgrid(torch.arange(H, device=latent.device),
-                                torch.arange(W, device=latent.device),
-                                indexing='ij')
-        grid = torch.stack([xx.float(), yy.float()], dim=-1)  # [H,W,2]
-        grid = grid.unsqueeze(0).repeat(B,1,1,1)  # [B,H,W,2]
-
-        # Ajouter delta multiplié par mask
-        mask_expand = mask.permute(0,2,3,1)  # [B,H,W,1]
-        delta_expand = delta.unsqueeze(1).unsqueeze(1)  # [B,1,1,2]
-        grid = grid + delta_expand * mask_expand
-
-        # Normaliser grid entre -1 et 1
-        grid_norm = grid.clone()
-        grid_norm[...,0] = 2.0 * grid[...,0] / (W-1) - 1.0
-        grid_norm[...,1] = 2.0 * grid[...,1] / (H-1) - 1.0
-
-        # Sample latent
-        out = torch.nn.functional.grid_sample(latent, grid_norm, align_corners=True)
-        return out
 #----------------------------------------------------------------------------------------------------------------
 
 def resize_pose(pose_tile, H_latent, W_latent):
@@ -997,98 +905,7 @@ def compute_torso_angle(keypoints):
 
 
 # -------------------- Fonction principale -----------------------------------------------------------------
-def apply_hair_motion_extreme(
-    latents,
-    mask_hair,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device,
-    delta_px=None,
-    prev_hair_field=None,
-    debug=False,
-    debug_dir=None
-):
-    """
-    Hair motion version cinéma EXTRÊME :
-    - mouvements très amples
-    - vent + gravité + torse amplifiés
-    - inertie légère pour réactivité maximale
-    - pointes accentuées
-    """
 
-    B = latents.shape[0]
-    t = frame_counter
-    t_wind1 = torch.tensor(t / 10.0, device=device)
-    t_wind2 = torch.tensor(t / 40.0, device=device)
-
-    # -------------------- Multi-échelle bruit --------------------
-    def multi_noise(grid, t, scales=[0.05,0.15,0.3], weights=[1.0,0.5,0.25]):
-        val = 0
-        for s, w in zip(scales, weights):
-            val += w * smooth_noise(grid, t, scale=s)
-        return val
-
-    noise_x = multi_noise(grid, t)
-    noise_y = multi_noise(grid, t + 123, scales=[0.08,0.2,0.4], weights=[1.0,0.5,0.25])
-
-    # -------------------- Champ delta de base extrême --------------------
-    hair_delta_field = torch.zeros_like(grid)
-    hair_delta_field[...,0] = 0.12 * noise_x   # x4 vs version cinéma
-    hair_delta_field[...,1] = 0.18 * noise_y   # x4 vs version cinéma
-
-    # -------------------- Vent extrême --------------------
-    wind_dir = torch.tensor([[1.0,0.3],[0.5,0.2]], device=device).mean(dim=0).view(1,1,1,2)
-    wind_strength = 0.08 + 0.04 * torch.sin(t_wind1) + 0.02 * torch.sin(t_wind2)
-    wind_delta = wind_dir * wind_strength
-
-    # -------------------- Gravité plus marquée --------------------
-    gravity_delta = torch.zeros_like(grid)
-    gravity_delta[...,1] = 0.015  # fort tombant
-
-    # -------------------- Influence du torse amplifiée --------------------
-    if delta_px is not None:
-        speed = torch.norm(delta_px, dim=-1, keepdim=True)
-        hair_delta_field *= (1.0 + 5.0 * speed)
-        wind_delta *= (1.0 + 3.0 * speed)
-        gravity_delta *= (1.0 + 1.5 * speed)
-
-    # -------------------- Inertie légère --------------------
-    inertia = 0.5  # moins d'amortissement → mouvements plus réactifs
-    if prev_hair_field is not None:
-        hair_delta_field = inertia * prev_hair_field + (1-inertia) * hair_delta_field
-
-    # -------------------- Masque + falloff racine→pointe --------------------
-    mask_hair_expand = mask_hair.permute(0,2,3,1)
-    yy = torch.linspace(0,1,H,device=device).view(1,H,1,1)
-    extreme_falloff = yy**3 * (3 - 2*yy**1.5)  # pointes très dynamiques
-    mask_hair_expand = mask_hair_expand * extreme_falloff
-
-    # -------------------- Micro-souplesse physique --------------------
-    spring = 0.01 * torch.sin(t*0.8 + grid[...,1:2]*5.0)
-    hair_delta_field[...,1:2] += spring
-
-    # -------------------- Micro noise --------------------
-    micro_noise = 0.003 * (torch.rand_like(hair_delta_field)-0.5)
-    hair_delta_field += micro_noise
-
-    # -------------------- Application --------------------
-    grid_hair = grid + hair_delta_field * mask_hair_expand
-    grid_hair += wind_delta * mask_hair_expand
-    grid_hair += gravity_delta * mask_hair_expand
-
-    # -------------------- Normalisation --------------------
-    grid_hair[...,0] = 2.0 * grid_hair[...,0] / (W-1) - 1.0
-    grid_hair[...,1] = 2.0 * grid_hair[...,1] / (H-1) - 1.0
-
-    # -------------------- Sampling --------------------
-    latents_out = F.grid_sample(latents, grid_hair, align_corners=True)
-
-    if debug:
-        print("[DEBUG] Hair motion EXTREME applied")
-
-    return latents_out, hair_delta_field
 
 def apply_hair_motion(
     latents,
@@ -1975,24 +1792,32 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 HAIR (ALTERNANCE CINÉMA)
     # =========================
+
+    # Définir un dictionnaire global ou un buffer par batch
+    if not hasattr(apply_pose_driven_motion, "prev_hair_fields"):
+        apply_pose_driven_motion.prev_hair_fields = [None] * B
+
+    # =========================
+    # 🔹 HAIR (ALTERNANCE CINÉMA)
+    # =========================
     latents_before = latents.clone()
-    if (frame_counter // 6) % 2 == 0:
-        latents_hair, hair_delta = apply_hair_motion(
-            latents, mask_hair, grid, H, W,
-            frame_counter, device,
-            delta_px=delta_px,
-            debug=debug,
-            debug_dir=debug_dir
-        )
-    else:
-        latents_hair, hair_delta = apply_hair_motion_extreme(
-            latents, mask_hair, grid, H, W,
-            frame_counter, device,
-            delta_px=delta_px,
-            debug=debug,
-            debug_dir=debug_dir
-        )
+    latents_hair, hair_delta = apply_hair_motion_cycle(
+        latents=latents,
+        mask_hair=mask_hair,
+        grid=grid,
+        H=H,
+        W=W,
+        frame_counter=frame_counter,
+        device=device,
+        delta_px=delta_px,
+        prev_hair_field=apply_pose_driven_motion.prev_hair_fields[0] if B==1 else None,
+        debug=debug,
+        debug_dir=debug_dir
+    )
     latents = latents_hair * mask_hair_exp + latents_before * (1.0 - mask_hair_exp)
+
+    # Stocker pour la prochaine frame
+    apply_pose_driven_motion.prev_hair_fields[0] = hair_delta
 
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="hair")
@@ -2245,8 +2070,6 @@ def apply_pose_driven_motion_v1(
         print("[DEBUG] Full motion pipeline applied")
 
     return latents
-
-
 
 #------------------------------------------------------------------------------------------
 def update_pose_sequence_from_keypoints_batch(

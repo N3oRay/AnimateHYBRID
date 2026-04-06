@@ -14,7 +14,8 @@ from PIL import Image, ImageDraw
 import traceback
 
 
-#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha, smooth_noise
+
+#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha, smooth_noise, apply_hair_motion_3D
 
 
 def smooth_noise(grid, frame, scale=0.05, time_scale=0.1):
@@ -794,4 +795,418 @@ def save_debug_pose_image_with_skeleton(
             debug_dir=output_dir,
             frame_counter=frame_counter
         )
+#----------------------------------------------------------------------------------------------------------------------------------
+#------------------------------------------- VENT                       -----------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------------------
 
+def debug_save_mask_and_wind(mask, wind_delta, H, W, debug_dir, frame_counter, mask_prefix="torso_mask_", wind_scale=200):
+    """
+    Sauvegarde le masque et une icône vent pour debug.
+
+    mask : torch tensor [B,1,H,W]
+    wind_delta : torch tensor [1,1,1,2] ou [2]
+    H, W : dimensions originales du masque
+    debug_dir : dossier de sauvegarde
+    frame_counter : numéro de la frame
+    mask_prefix : préfixe du fichier masque
+    wind_scale : échelle visuelle de la flèche vent
+    """
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # --- Sauvegarde masque ---
+    save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix=mask_prefix)
+
+    # --- Image couleur vent ---
+    wind_img = np.zeros((H*4, W*4, 3), dtype=np.uint8)
+
+    # convertir wind_delta en numpy 1D si torch tensor
+    if isinstance(wind_delta, torch.Tensor):
+        wind_delta = wind_delta.detach().cpu().numpy().flatten()
+
+    # position centrale
+    pos = (W*2, H*2)
+    end_point = (int(pos[0] + wind_delta[0]*wind_scale), int(pos[1] + wind_delta[1]*wind_scale))
+    cv2.arrowedLine(wind_img, pos, end_point, color=(0,255,255), thickness=2, tipLength=0.3)
+
+    # --- Sauvegarde vent ---
+    save_path_wind = os.path.join(debug_dir, f"wind_icon_{frame_counter:05d}.png")
+    cv2.imwrite(save_path_wind, wind_img)
+
+    print(f"[DEBUG] Mask saved: {mask_prefix}{frame_counter:05d}, Wind icon saved: {save_path_wind}")
+#----------------------------------------------------------------------------------------------------------------------------------
+
+def draw_wind_icon(img, wind_delta, pos=(50,50), scale=100, color=(0,255,255), thickness=2):
+    """
+    Dessine un icône vent sur l'image de debug.
+
+    img : np.array HxWx3 BGR
+    wind_delta : torch tensor [dx, dy] ou [1,2], valeurs approximatives
+    pos : tuple (x,y) centre du vent
+    scale : multiplicateur pour agrandir la flèche
+    color : couleur BGR
+    thickness : épaisseur de la flèche
+    """
+    if isinstance(wind_delta, torch.Tensor):
+        wind_delta = wind_delta.detach().cpu().numpy().flatten()
+
+    start_point = pos
+    end_point = (int(pos[0] + wind_delta[0]*scale), int(pos[1] + wind_delta[1]*scale))
+
+    # flèche principale
+    cv2.arrowedLine(img, start_point, end_point, color, thickness, tipLength=0.3)
+
+    return img
+
+#--------------------------------------------------------------------------------------------
+
+def apply_hair_motion_cycle(
+    latents,
+    mask_hair,
+    grid,
+    H,
+    W,
+    frame_counter,
+    device,
+    delta_px=None,
+    prev_hair_field=None,
+    debug=False,
+    debug_dir=None
+):
+    """
+    Alternance de 3 styles de mouvement des cheveux :
+    0 → apply_hair_motion_vent
+    1 → apply_hair_motion_3D (cinéma)
+    2 → apply_hair_motion_extreme
+    """
+
+    mode = frame_counter % 3  # cycle 0,1,2
+
+    if mode == 0:
+        latents_hair, hair_delta = apply_hair_motion_vent(
+            latents, mask_hair, grid, H, W,
+            frame_counter, device,
+            delta_px=delta_px,
+            prev_hair_field=prev_hair_field,
+            debug=debug,
+            debug_dir=debug_dir
+        )
+    elif mode == 1:
+        latents_hair, hair_delta = apply_hair_motion_3D(
+            latents, mask_hair, grid, H, W,
+            frame_counter, device,
+            delta_px=delta_px,
+            prev_hair_field=prev_hair_field,
+            debug=debug,
+            debug_dir=debug_dir
+        )
+    else:  # mode == 2
+        latents_hair, hair_delta = apply_hair_motion_extreme(
+            latents, mask_hair, grid, H, W,
+            frame_counter, device,
+            delta_px=delta_px,
+            prev_hair_field=prev_hair_field,
+            debug=debug,
+            debug_dir=debug_dir
+        )
+
+    return latents_hair, hair_delta
+#----------------------------------------------------------------------------------------------
+def apply_hair_motion_3D(
+    latents,
+    mask_hair,
+    grid,
+    H,
+    W,
+    frame_counter,
+    device,
+    delta_px=None,
+    prev_hair_field=None,
+    debug=False,
+    debug_dir=None
+):
+    """
+    Hair motion 3D cinéma amplifiée :
+    - mouvements plus marqués
+    - vent + gravité + micro-souplesse
+    - inertie adaptative pour fluidité
+    - batch-safe et GPU-friendly
+    """
+
+    B = latents.shape[0]
+    t = torch.tensor(frame_counter, device=device, dtype=torch.float32)
+    t_wind1 = t / 15.0
+    t_wind2 = t / 60.0
+
+    # -------------------- Multi-échelle bruit --------------------
+    def multi_noise(grid, t, scales=[0.05,0.15,0.3], weights=[1.0,0.5,0.25]):
+        val = 0
+        for s, w in zip(scales, weights):
+            val += w * smooth_noise(grid, t, scale=s)
+        return val
+
+    noise_x = multi_noise(grid, t)
+    noise_y = multi_noise(grid, t + 123, scales=[0.08,0.2,0.4], weights=[1.0,0.5,0.25])
+
+    # -------------------- Champ delta de base --------------------
+    hair_delta_field = torch.zeros((1, H, W, 2), device=device)
+    hair_delta_field[...,0] = 0.06 * noise_x
+    hair_delta_field[...,1] = 0.10 * noise_y
+
+    # -------------------- Vent dynamique --------------------
+    wind_dir = torch.tensor([[1.0,0.2],[0.3,0.1]], device=device).mean(dim=0).view(1,1,1,2)
+    wind_strength = 0.04 + 0.02 * torch.sin(t_wind1) + 0.01 * torch.sin(t_wind2)
+    wind_delta = wind_dir * wind_strength
+
+    # -------------------- Gravité légère --------------------
+    gravity_delta = torch.zeros_like(hair_delta_field)
+    gravity_delta[...,1] = 0.008
+
+    # -------------------- Adapter au mouvement du torse --------------------
+    if delta_px is not None:
+        speed = torch.norm(delta_px, dim=-1, keepdim=True)
+        hair_delta_field = hair_delta_field * (1.0 + 3.5 * speed)
+        wind_delta = wind_delta * (1.0 + 2.0 * speed)
+        gravity_delta = gravity_delta * (1.0 + 0.8 * speed)
+
+    # -------------------- Inertie adaptative --------------------
+    inertia = 0.7
+    if prev_hair_field is not None:
+        hair_delta_field = inertia * prev_hair_field + (1 - inertia) * hair_delta_field
+
+    # -------------------- Batch-safe expansion --------------------
+    hair_delta_field = hair_delta_field.expand(B, H, W, 2).clone()
+    wind_delta = wind_delta.expand(B, H, W, 2).clone()
+    gravity_delta = gravity_delta.expand(B, H, W, 2).clone()
+
+    # -------------------- Masque + falloff racine→pointe --------------------
+    mask_hair_expand = mask_hair.permute(0,2,3,1)
+    yy = torch.linspace(0,1,H,device=device).view(1,H,1,1)
+    smooth_falloff = yy**2.5 * (3 - 2*yy**1.5)
+    mask_hair_expand = mask_hair_expand * smooth_falloff
+
+    # -------------------- Micro-souplesse physique --------------------
+    spring = 0.006 * torch.sin(t*0.5 + grid[...,1:2]*3.0)
+    hair_delta_field[...,1:2] += spring.expand(B,H,W,1)
+
+    # -------------------- Micro noise --------------------
+    micro_noise = 0.002 * (torch.rand_like(hair_delta_field)-0.5)
+    hair_delta_field += micro_noise
+
+    # -------------------- Application --------------------
+    grid_hair = grid + hair_delta_field * mask_hair_expand
+    grid_hair += wind_delta * mask_hair_expand
+    grid_hair += gravity_delta * mask_hair_expand
+
+    # -------------------- Normalisation pour grid_sample --------------------
+    grid_hair[...,0] = 2.0 * grid_hair[...,0] / (W-1) - 1.0
+    grid_hair[...,1] = 2.0 * grid_hair[...,1] / (H-1) - 1.0
+
+    # -------------------- Sampling --------------------
+    latents_out = F.grid_sample(latents, grid_hair, align_corners=True)
+
+    if debug:
+        print("[DEBUG] Hair motion 3D amplified applied")
+    if debug and debug_dir is not None:
+        debug_save_mask_and_wind( mask=mask_hair, wind_delta=wind_delta, H=H, W=W, debug_dir=debug_dir, frame_counter=frame_counter )
+
+    return latents_out, hair_delta_field
+
+
+
+def apply_hair_motion_extreme(
+    latents,
+    mask_hair,
+    grid,
+    H,
+    W,
+    frame_counter,
+    device,
+    delta_px=None,
+    prev_hair_field=None,
+    prev_wind_delta=None,
+    debug=False,
+    debug_dir=None
+):
+    """
+    Hair motion version cinéma EXTREME améliorée Y :
+    - mouvements très amples
+    - vent + gravité + torse amplifiés
+    - inertie légère pour réactivité maximale
+    - pointes accentuées
+    - vent vertical amplifié et cohérent
+    """
+
+    B = latents.shape[0]
+    t = frame_counter
+
+    # -------------------- Multi-échelle bruit --------------------
+    def multi_noise(grid, t, scales=[0.05,0.15,0.3], weights=[1.0,0.5,0.25]):
+        val = 0
+        for s, w in zip(scales, weights):
+            val += w * smooth_noise(grid, t, scale=s)
+        return val
+
+    noise_x = multi_noise(grid, t)
+    noise_y = multi_noise(grid, t + 123, scales=[0.08,0.2,0.4], weights=[1.0,0.5,0.25])
+
+    # -------------------- Champ delta de base extrême --------------------
+    hair_delta_field = torch.zeros_like(grid)
+    hair_delta_field[...,0] = 0.12 * noise_x
+    hair_delta_field[...,1] = 0.18 * noise_y
+
+    # -------------------- Vent extrême avec Y amplifié --------------------
+    wind_dir = torch.tensor([[1.0,0.5],[0.3,0.6]], device=device).mean(dim=0).view(1,1,1,2)
+    t = torch.tensor(frame_counter, dtype=torch.float32, device=device)
+    wind_strength = ( 0.12 + 0.06 * torch.sin(t / 15.0) + 0.03 * torch.sin(t / 60.0) + 0.02 * torch.sin(t / 7.0) )
+    wind_delta = wind_dir * wind_strength
+
+    # -------------------- Gravité plus marquée --------------------
+    gravity_delta = torch.zeros_like(grid)
+    gravity_delta[...,1] = 0.015
+
+    # -------------------- Influence du torse amplifiée --------------------
+    if delta_px is not None:
+        speed = torch.norm(delta_px, dim=-1, keepdim=True)
+        hair_delta_field *= (1.0 + 5.0*speed)
+        wind_delta[...,0] *= (1.0 + 3.0*speed)
+        wind_delta[...,1] *= (1.0 + 6.0*speed)  # Y amplifié
+        gravity_delta *= (1.0 + 1.5*speed)
+
+    # -------------------- Inertie légère --------------------
+    inertia = 0.5
+    if prev_hair_field is not None:
+        hair_delta_field = inertia*prev_hair_field + (1-inertia)*hair_delta_field
+
+    if prev_wind_delta is not None:
+        alpha = 0.7
+        wind_delta = alpha*prev_wind_delta + (1-alpha)*wind_delta
+
+    # -------------------- Masque + falloff racine→pointe --------------------
+    mask_hair_expand = mask_hair.permute(0,2,3,1)
+    yy = torch.linspace(0,1,H,device=device).view(1,H,1,1)
+    extreme_falloff = yy**3 * (3 - 2*yy**1.5)
+    mask_hair_expand = mask_hair_expand * extreme_falloff
+
+    # -------------------- Micro-souplesse physique --------------------
+    spring = 0.01 * torch.sin(t*0.8 + grid[...,1:2]*5.0)
+    hair_delta_field[...,1:2] += spring
+
+    # -------------------- Micro noise --------------------
+    micro_noise = 0.003 * (torch.rand_like(hair_delta_field)-0.5)
+    hair_delta_field += micro_noise
+
+    # -------------------- Application --------------------
+    grid_hair = grid + hair_delta_field * mask_hair_expand
+    grid_hair += wind_delta * mask_hair_expand
+    grid_hair += gravity_delta * mask_hair_expand
+
+    # -------------------- Normalisation --------------------
+    grid_hair[...,0] = 2.0 * grid_hair[...,0] / (W-1) - 1.0
+    grid_hair[...,1] = 2.0 * grid_hair[...,1] / (H-1) - 1.0
+
+    # -------------------- Sampling --------------------
+    latents_out = F.grid_sample(latents, grid_hair, align_corners=True)
+
+    if debug:
+        print("[DEBUG] Hair motion EXTREME Y amplifié applied")
+    if debug and debug_dir is not None:
+        debug_save_mask_and_wind( mask=mask_hair, wind_delta=wind_delta, H=H, W=W, debug_dir=debug_dir, frame_counter=frame_counter )
+
+    return latents_out, hair_delta_field, wind_delta
+
+
+
+def apply_hair_motion_vent(
+    latents,
+    mask_hair,
+    grid,
+    H,
+    W,
+    frame_counter,
+    device,
+    delta_px=None,
+    prev_hair_field=None,
+    debug=False,
+    debug_dir=None
+):
+    """
+    Hair motion version cinéma EXTRÊME :
+    - mouvements très amples
+    - vent + gravité + torse amplifiés
+    - inertie légère pour réactivité maximale
+    - pointes accentuées
+    """
+
+    B = latents.shape[0]
+    t = frame_counter
+    t_wind1 = torch.tensor(t / 10.0, device=device)
+    t_wind2 = torch.tensor(t / 40.0, device=device)
+
+    # -------------------- Multi-échelle bruit --------------------
+    def multi_noise(grid, t, scales=[0.05,0.15,0.3], weights=[1.0,0.5,0.25]):
+        val = 0
+        for s, w in zip(scales, weights):
+            val += w * smooth_noise(grid, t, scale=s)
+        return val
+
+    noise_x = multi_noise(grid, t)
+    noise_y = multi_noise(grid, t + 123, scales=[0.08,0.2,0.4], weights=[1.0,0.5,0.25])
+
+    # -------------------- Champ delta de base extrême --------------------
+    hair_delta_field = torch.zeros_like(grid)
+    hair_delta_field[...,0] = 0.12 * noise_x   # x4 vs version cinéma
+    hair_delta_field[...,1] = 0.18 * noise_y   # x4 vs version cinéma
+
+    # -------------------- Vent extrême --------------------
+    wind_dir = torch.tensor([[1.0,0.3],[0.5,0.2]], device=device).mean(dim=0).view(1,1,1,2)
+    wind_strength = 0.08 + 0.04 * torch.sin(t_wind1) + 0.02 * torch.sin(t_wind2)
+    wind_delta = wind_dir * wind_strength
+
+    # -------------------- Gravité plus marquée --------------------
+    gravity_delta = torch.zeros_like(grid)
+    gravity_delta[...,1] = 0.015  # fort tombant
+
+    # -------------------- Influence du torse amplifiée --------------------
+    if delta_px is not None:
+        speed = torch.norm(delta_px, dim=-1, keepdim=True)
+        hair_delta_field *= (1.0 + 5.0 * speed)
+        wind_delta *= (1.0 + 3.0 * speed)
+        gravity_delta *= (1.0 + 1.5 * speed)
+
+    # -------------------- Inertie légère --------------------
+    inertia = 0.5  # moins d'amortissement → mouvements plus réactifs
+    if prev_hair_field is not None:
+        hair_delta_field = inertia * prev_hair_field + (1-inertia) * hair_delta_field
+
+    # -------------------- Masque + falloff racine→pointe --------------------
+    mask_hair_expand = mask_hair.permute(0,2,3,1)
+    yy = torch.linspace(0,1,H,device=device).view(1,H,1,1)
+    extreme_falloff = yy**3 * (3 - 2*yy**1.5)  # pointes très dynamiques
+    mask_hair_expand = mask_hair_expand * extreme_falloff
+
+    # -------------------- Micro-souplesse physique --------------------
+    spring = 0.01 * torch.sin(t*0.8 + grid[...,1:2]*5.0)
+    hair_delta_field[...,1:2] += spring
+
+    # -------------------- Micro noise --------------------
+    micro_noise = 0.003 * (torch.rand_like(hair_delta_field)-0.5)
+    hair_delta_field += micro_noise
+
+    # -------------------- Application --------------------
+    grid_hair = grid + hair_delta_field * mask_hair_expand
+    grid_hair += wind_delta * mask_hair_expand
+    grid_hair += gravity_delta * mask_hair_expand
+
+    # -------------------- Normalisation --------------------
+    grid_hair[...,0] = 2.0 * grid_hair[...,0] / (W-1) - 1.0
+    grid_hair[...,1] = 2.0 * grid_hair[...,1] / (H-1) - 1.0
+
+    # -------------------- Sampling --------------------
+    latents_out = F.grid_sample(latents, grid_hair, align_corners=True)
+
+    if debug:
+        print("[DEBUG] Hair motion EXTREME applied")
+
+    if debug and debug_dir is not None:
+        debug_save_mask_and_wind( mask=mask_hair, wind_delta=wind_delta, H=H, W=W, debug_dir=debug_dir, frame_counter=frame_counter )
+    return latents_out, hair_delta_field
