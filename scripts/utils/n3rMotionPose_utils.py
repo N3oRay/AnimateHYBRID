@@ -527,25 +527,33 @@ class Pose:
 
     def create_face_mask(self, H: int, W: int,
                      debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
-                     expand_w=1.1, expand_h=1.2):
+                     expand_w=1.3, expand_h=1.5):
         """
-        Crée un masque polygonal pour le visage (yeux, nez, bouche, oreilles).
-        expand_w / expand_h: élargir ou augmenter la hauteur du polygone pour inclure cheveux/front.
+        Crée un masque polygonal pour le visage (yeux, nez, bouche, oreilles, front, tempes).
+        expand_w / expand_h: élargir ou augmenter la hauteur du polygone pour inclure front/cheveux.
         """
         mask = torch.zeros(self.B, 1, H, W, device=self.device)
 
         for b in range(self.B):
-            # Points clés du visage
+            # Points clés principaux
             points = [
-                self.get_point(14)[b].cpu().numpy(),  # right_eye
-                self.get_point(15)[b].cpu().numpy(),  # left_eye
-                self.get_point(0)[b].cpu().numpy(),   # nose
-                self.get_point(18)[b].cpu().numpy(),  # mouth
-                self.get_point(16)[b].cpu().numpy(),  # right_ear
-                self.get_point(17)[b].cpu().numpy()   # left_ear
+                self.get_point(0)[b].cpu().numpy(),    # nose
+                self.get_point(14)[b].cpu().numpy(),   # right_eye
+                self.get_point(15)[b].cpu().numpy(),   # left_eye
+                self.get_point(16)[b].cpu().numpy(),   # right_ear
+                self.get_point(17)[b].cpu().numpy(),   # left_ear
+                self.get_point(18)[b].cpu().numpy(),   # mouth
             ]
 
-            pts = np.array([ [p[0]*(W-1), p[1]*(H-1)] for p in points ], dtype=np.float32)
+            # Ajouter la mâchoire si disponible (exemple points 19-21)
+            for idx in range(19, 22):
+                try:
+                    points.append(self.get_point(idx)[b].cpu().numpy())
+                except:
+                    pass  # skip si le point n'existe pas
+
+            # Conversion en pixels
+            pts = np.array([[p[0]*(W-1), p[1]*(H-1)] for p in points], dtype=np.float32)
 
             # Centre du polygone
             cx, cy = np.mean(pts[:,0]), np.mean(pts[:,1])
@@ -564,8 +572,19 @@ class Pose:
             # Convertir en tensor
             mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
 
-        # Feather interne strict
-        mask = feather_inside_strict(mask, radius=3, blur_kernel=3, sigma=1.0)
+        # Feather plus large pour transitions douces
+        mask = feather_inside_strict(mask, radius=6, blur_kernel=5, sigma=2.0)
+        mask = torch.clamp(mask, 0.0, 1.0)  # s'assurer que le mask reste entre 0 et 1
+
+        # Debug save
+        if debug and debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            save_path = os.path.join(debug_dir, f"face_mask_{frame_counter:05d}.png")
+            mask_img = mask[0,0].detach().cpu().numpy() * 255
+            Image.fromarray(mask_img.astype(np.uint8)).save(save_path)
+            print(f"[DEBUG] Face mask saved: {save_path}")
+
+        return mask
 
         # -------------------- Debug --------------------
         if debug and debug_dir is not None:
@@ -587,17 +606,30 @@ class PoseAnimator:
         self.W = latent_w
 
     # ----------------- Préparer les masques -----------------
-    def prepare_masks(self):
+    def prepare_masks(self, debug=False, debug_dir=None, frame_counter=0):
         # Masque torse
         self.torso_mask = self.pose.create_upper_body_mask(
             H=self.H, W=self.W,
-            expand_w=0.9, shrink_h=0.65
+            expand_w=0.9, shrink_h=0.65,
+            debug=debug, debug_dir=debug_dir, frame_counter=frame_counter
         )
 
-        # Masque visage
+        # Masque visage amélioré
         self.face_mask = self.pose.create_face_mask(
             H=self.H, W=self.W,
-            expand_w=1.1, expand_h=1.2
+            expand_w=1.3,   # élargit pour inclure tempes/oreilles
+            expand_h=1.5,   # augmente hauteur pour front et cheveux
+            debug=debug,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
+        )
+
+        # Masque cheveux (optionnel, déjà excluant visage)
+        self.hair_mask = self.pose.create_hair_mask(
+            H=self.H, W=self.W,
+            debug=debug,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
         )
 
     # ----------------- Calcul des deltas -----------------
