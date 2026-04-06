@@ -1489,8 +1489,173 @@ def compute_torso_angle(keypoints):
 
 
 # -------------------- Fonction principale -----------------------------------------------------------------
+def apply_hair_motion(  # version cinéma
+    latents,
+    mask_hair,
+    grid,
+    H,
+    W,
+    frame_counter,
+    device,
+    delta_px=None,
+    prev_hair_field=None,
+    debug=False
+):
+    B = latents.shape[0]
 
-def apply_hair_motion(
+    # -------------------- Temps --------------------
+    t = frame_counter
+    t_wind1 = torch.tensor(t / 15.0, device=device)
+    t_wind2 = torch.tensor(t / 60.0, device=device)
+
+    # -------------------- Multi-échelle bruit --------------------
+    def multi_noise(grid, t, scales=[0.05,0.15,0.3], weights=[1.0,0.5,0.25]):
+        val = 0
+        for s,w in zip(scales, weights):
+            val += w * smooth_noise(grid, t, scale=s)
+        return val
+
+    noise_x = multi_noise(grid, t)
+    noise_y = multi_noise(grid, t + 123, scales=[0.08,0.2,0.4], weights=[1.0,0.5,0.25])
+
+    # -------------------- Champ delta de base --------------------
+    hair_delta_field = torch.zeros_like(grid)
+    hair_delta_field[...,0] = 0.03 * noise_x
+    hair_delta_field[...,1] = 0.05 * noise_y
+
+    # -------------------- Vent dynamique --------------------
+    wind_dir = torch.tensor([[1.0,0.2],[0.3,0.1]], device=device).mean(dim=0).view(1,1,1,2)
+    wind_strength = 0.02 + 0.01 * torch.sin(t_wind1) + 0.005 * torch.sin(t_wind2)
+    wind_delta = wind_dir * wind_strength
+
+    # -------------------- Gravité légère --------------------
+    gravity_delta = torch.zeros_like(grid)
+    gravity_delta[...,1] = 0.004  # constant downwards
+
+    # -------------------- Influence du torse --------------------
+    if delta_px is not None:
+        speed = torch.norm(delta_px, dim=-1, keepdim=True)
+        hair_delta_field *= (1.0 + 2.5*speed)
+        wind_delta *= (1.0 + 1.5*speed)
+        gravity_delta *= (1.0 + 0.5*speed)
+
+    # -------------------- Inertie adaptative --------------------
+    inertia = 0.85
+    if prev_hair_field is not None:
+        hair_delta_field = inertia * prev_hair_field + (1-inertia) * hair_delta_field
+
+    # -------------------- Masque + falloff racine→pointe --------------------
+    mask_hair_expand = mask_hair.permute(0,2,3,1)
+    yy = torch.linspace(0,1,H,device=device).view(1,H,1,1)
+    smooth_falloff = yy**2 * (3-2*yy)
+    mask_hair_expand = mask_hair_expand * smooth_falloff
+
+    # -------------------- Micro-souplesse physique --------------------
+    spring = 0.003 * torch.sin(t*0.5 + grid[...,1:2]*3.0)
+    hair_delta_field[...,1:2] += spring
+
+    # -------------------- Micro noise --------------------
+    micro_noise = 0.001 * (torch.rand_like(hair_delta_field)-0.5)
+    hair_delta_field += micro_noise
+
+    # -------------------- Application --------------------
+    grid_hair = grid + hair_delta_field * mask_hair_expand
+    grid_hair += wind_delta * mask_hair_expand
+    grid_hair += gravity_delta * mask_hair_expand
+
+    # -------------------- Normalisation --------------------
+    grid_hair[...,0] = 2.0 * grid_hair[...,0] / (W-1) - 1.0
+    grid_hair[...,1] = 2.0 * grid_hair[...,1] / (H-1) - 1.0
+
+    # -------------------- Sampling --------------------
+    latents_out = F.grid_sample(latents, grid_hair, align_corners=True)
+
+    if debug:
+        print("[DEBUG] Hair motion cinema applied")
+
+    return latents_out, hair_delta_field
+
+def apply_hair_motion_v2(
+    latents,
+    mask_hair,
+    grid,
+    H,
+    W,
+    frame_counter,
+    device,
+    delta_px=None,
+    prev_hair_field=None,
+    debug=False
+):
+    B = latents.shape[0]
+
+    # -------------------- Temps --------------------
+    t_dict = {
+        "noise": frame_counter,
+        "wind1": torch.tensor(frame_counter / 15.0, device=device),
+        "wind2": torch.tensor(frame_counter / 60.0, device=device),
+    }
+
+    # -------------------- Bruit multi-échelle --------------------
+    def multi_scale_noise(grid, t, scales=[0.05, 0.15, 0.3], weights=[1.0, 0.5, 0.25]):
+        result = 0
+        for s, w in zip(scales, weights):
+            result += w * smooth_noise(grid, t, scale=s)
+        return result
+
+    noise_x = multi_scale_noise(grid, t_dict["noise"])
+    noise_y = multi_scale_noise(grid, t_dict["noise"] + 123, scales=[0.08, 0.2, 0.4], weights=[1.0,0.5,0.25])
+
+    # -------------------- Hair delta --------------------
+    hair_delta_field = torch.zeros_like(grid)
+    hair_delta_field[..., 0] = 0.04 * noise_x
+    hair_delta_field[..., 1] = 0.06 * noise_y
+
+    # -------------------- Vent dynamique --------------------
+    wind_dir = torch.tensor([1.0, 0.3], device=device).view(1,1,1,2)
+    wind_strength = 0.03
+    wind_delta = wind_dir * (wind_strength +
+                             0.01 * torch.sin(t_dict["wind1"]) +
+                             0.005 * torch.sin(t_dict["wind2"]))
+
+    # -------------------- Influence du mouvement du torse --------------------
+    if delta_px is not None:
+        speed = torch.norm(delta_px, dim=-1, keepdim=True)
+        hair_delta_field *= (1.0 + 2.5 * speed)  # plus naturel
+
+    # -------------------- Inertie --------------------
+    inertia = 0.85 if prev_hair_field is not None else 0.0
+    if prev_hair_field is not None:
+        hair_delta_field = inertia * prev_hair_field + (1 - inertia) * hair_delta_field
+
+    # -------------------- Masque + Falloff racine→pointe --------------------
+    mask_hair_expand = mask_hair.permute(0,2,3,1)
+
+    yy = torch.linspace(0, 1, H, device=device).view(1,H,1,1)
+    # Smoothstep pour transition plus douce
+    falloff_root = yy**2 * (3 - 2*yy)  # smoothstep approximation
+    mask_hair_expand = mask_hair_expand * falloff_root
+
+    # -------------------- Micro noise supplémentaire --------------------
+    micro_noise = 0.002 * (torch.rand_like(hair_delta_field) - 0.5)
+    hair_delta_field += micro_noise
+
+    # -------------------- Application --------------------
+    grid_hair = grid + hair_delta_field * mask_hair_expand + wind_delta * mask_hair_expand
+
+    # -------------------- Normalisation --------------------
+    grid_hair[...,0] = 2.0 * grid_hair[...,0] / (W-1) - 1.0
+    grid_hair[...,1] = 2.0 * grid_hair[...,1] / (H-1) - 1.0
+
+    # -------------------- Sampling --------------------
+    latents_out = F.grid_sample(latents, grid_hair, align_corners=True)
+
+    if debug:
+        print("[DEBUG] Hair motion applied with improved quality")
+
+    return latents_out, hair_delta_field
+
+def apply_hair_motion_v1(
     latents,
     mask_hair,
     grid,
@@ -1787,13 +1952,133 @@ def apply_pose_driven_motion(
     debug=False,
     debug_dir=None
 ):
+    """
+    Pipeline complet : animation globale, torso, visage, cheveux, respiration
+    """
+    import torch
+    import torch.nn.functional as F
 
     B, C, H, W = latents.shape
     device = latents.device
     latents_in = latents.clone()
 
-    # -------------------- Respiration --------------------
+    # -------------------- Pose --------------------
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W)
+    prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
+
+    # -------------------- Grille --------------------
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
+
+    # -------------------- Masques --------------------
+    mask_torso = pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask_face = pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask_hair = pose.create_hair_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+
+    # -------------------- Global Pose --------------------
+    prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
+
+    # Appliquer le mouvement global
+    latents_global, global_delta = apply_global_pose(
+        latents=latents,
+        pose=pose,
+        prev_pose=prev_pose,
+        H=H,
+        W=W,
+        device=device
+    )
+
+    # -------------------- Blend visage pour protéger le warp global --------------------
+    # Assurer que tous les tenseurs sont float
+    latents_global = latents_global.float()
+    latents_before_face = latents.clone().float()  # copie avant face warp
+    face_mask_exp = mask_face.clone().float()       # [B,1,H,W]
+
+    # Broadcasting sûr
+    latents = latents_global * (1.0 - face_mask_exp) + latents_before_face * face_mask_exp
+
+    if debug:
+        print("[DEBUG] Global pose applied with face mask blending")
+
+    # -------------------- Torso Warp --------------------
+    latents, delta_px = apply_torso_warp(
+        latents=latents,
+        pose=pose,
+        mask_torso=mask_torso,
+        grid=grid,
+        H=H,
+        W=W,
+        device=device
+    )
+    if debug:
+        print("[DEBUG] Torso Warp pose applied.")
+
+    # -------------------- Face Warp --------------------
+    latents, face_delta = apply_face_warp(
+        latents=latents,
+        pose=pose,
+        mask_face=mask_face,
+        grid=grid,
+        H=H,
+        W=W,
+        frame_counter=frame_counter,
+        device=device,
+        debug=debug,
+        debug_dir=debug_dir
+    )
+    if debug:
+        print("[DEBUG] Face Warp pose applied.")
+
+    # -------------------- Hair Motion --------------------
+    latents, hair_delta = apply_hair_motion(
+        latents=latents,
+        mask_hair=mask_hair,
+        grid=grid,
+        H=H,
+        W=W,
+        frame_counter=frame_counter,
+        device=device,
+        delta_px=delta_px
+    )
+    if debug:
+        print("[DEBUG] Hair Warp pose applied.")
+
+    # -------------------- Respiration / Micro-mouvements --------------------
     latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
+
+    # -------------------- Stabilisation --------------------
+    latents = stabilize_latents_motion(latents)
+
+    # -------------------- Debug --------------------
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter)
+        print("[DEBUG] Full modular motion applied")
+
+    return latents
+
+def apply_pose_driven_motion_test(
+    latents,
+    previous_latent,
+    latents_before_openpose,
+    latents_after_openpose,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents_in = latents.clone()
+
 
     # -------------------- Pose --------------------
     pose = Pose(keypoints.to(device))
@@ -1869,6 +2154,9 @@ def apply_pose_driven_motion(
         device=device,
         delta_px=delta_px
     )
+
+    # -------------------- Respiration --------------------
+    latents = apply_breathing(latents, previous_latent, frame_counter, breathing)
     # -------------------- Stabilisation --------------------
     latents = stabilize_latents_motion(latents)
 
@@ -2190,81 +2478,6 @@ def update_pose_sequence_from_keypoints_batch(
 
     # =========================
     # 🔹 4. DEBUG
-    # =========================
-    if debug:
-        motion_strength = (kp - keypoints_tensor).abs().mean()
-        print(f"[DEBUG] Keypoint motion strength: {motion_strength.item():.6f}")
-
-    return kp
-
-def update_pose_sequence_from_keypoints_batch_v1(
-    keypoints_tensor,
-    prev_keypoints=None,
-    frame_idx=0,
-    alpha=0.5,
-    add_motion=True,
-    debug=False
-):
-    """
-    Génère une évolution temporelle des keypoints.
-    Fonctionne même avec pose statique (motion procédural).
-    """
-
-    import torch
-    import math
-
-    kp = keypoints_tensor.clone()
-    B, N, _ = kp.shape
-    device = kp.device
-
-    # =========================
-    # 🔹 1. SMOOTH TEMPOREL
-    # =========================
-    if prev_keypoints is not None:
-        kp = alpha * kp + (1 - alpha) * prev_keypoints
-
-    # =========================
-    # 🔹 2. MOTION PROCÉDURAL
-    # =========================
-    if add_motion:
-
-        t = frame_idx
-
-        # -------- Breathing (vertical torso + épaules)
-        breath = 0.015 * math.sin(t * 0.15)
-
-        # épaules (indices OpenPose)
-        kp[:, 2, 1] += breath   # right shoulder Y
-        kp[:, 5, 1] += breath   # left shoulder Y
-
-        # -------- Sway (balancement gauche/droite)
-        sway = 0.02 * math.sin(t * 0.08)
-
-        kp[:, :, 0] += sway  # léger mouvement global en X
-
-        # -------- Head motion (indépendant)
-        head_idx = 0
-        kp[:, head_idx, 0] += 0.01 * math.sin(t * 0.2)
-        kp[:, head_idx, 1] += 0.01 * math.cos(t * 0.18)
-
-        # -------- Drift lent (très faible)
-        drift_x = 0.005 * math.sin(t * 0.03)
-        drift_y = 0.005 * math.cos(t * 0.025)
-
-        kp[:, :, 0] += drift_x
-        kp[:, :, 1] += drift_y
-
-        # -------- Micro noise (anti-freeze)
-        noise = torch.randn_like(kp[..., :2]) * 0.003
-        kp[..., :2] += noise
-
-    # =========================
-    # 🔹 3. STABILISATION
-    # =========================
-    kp[..., :2] = torch.clamp(kp[..., :2], -1.2, 1.2)
-
-    # =========================
-    # 🔹 DEBUG
     # =========================
     if debug:
         motion_strength = (kp - keypoints_tensor).abs().mean()
