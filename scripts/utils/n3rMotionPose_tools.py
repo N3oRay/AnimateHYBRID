@@ -529,6 +529,29 @@ def apply_breathing_big(latents, previous_latent, frame_counter, breathing=True)
     return latents
 
 
+def save_debug_mask(mask: torch.Tensor, H: int, W: int, debug_dir: str, frame_counter: int, prefix: str = "mask", scale: int = 4):
+    """
+    Sauvegarde un masque pour debug.
+    - mask: tensor [B,1,H,W]
+    - H,W: dimensions originales
+    - debug_dir: dossier de sortie
+    - frame_counter: numéro de frame pour nommage
+    - prefix: nom du fichier
+    - scale: facteur d'agrandissement pour visualisation
+    """
+    if debug_dir is None:
+        return
+
+    os.makedirs(debug_dir, exist_ok=True)
+
+    mask_np_debug = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
+    mask_debug = cv2.resize(mask_np_debug, (W*scale, H*scale), interpolation=cv2.INTER_NEAREST)
+    mask_debug_rgb = cv2.cvtColor(mask_debug, cv2.COLOR_GRAY2BGR)
+
+    save_path = os.path.join(debug_dir, f"{prefix}_{frame_counter:05d}.png")
+    cv2.imwrite(save_path, mask_debug_rgb)
+    print(f"[DEBUG] {prefix} saved: {save_path}")
+
 
 def save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="driven"):
     """
@@ -575,3 +598,200 @@ def feather_dynamic_vectorized(mask, delta_px, base_radius=3, sigma=1.5, scale=2
             sigma=sigma
         )
     return feathered_mask
+
+
+def compute_delta(latents_out, latent_ref, controlnet_scale, importance):
+    delta = latents_out - latent_ref
+    delta = torch.nan_to_num(delta, nan=0.0, posinf=1.0, neginf=-1.0)
+    # 🔥 adaptive blending ici
+    delta = torch.tanh(delta) * 0.15 * importance
+    return delta * controlnet_scale
+
+
+# 🔹 Stabilise les latents pour éviter NaN ou valeurs extrêmes
+#   Normalisation et clamp pour rester dans [-1.2,1.2].
+def stabilize_latents_motion(latents):
+    latents = torch.nan_to_num(latents)
+    latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
+    latents = latents / (latents_max + 1e-6)
+    latents = latents * 0.95
+    return torch.clamp(latents, -1.2, 1.2)
+
+# ---------------------- Ancienne fonction --------------------------------------------------------
+# 🔹 Calcule le déplacement du torse par rapport à la frame précédente
+#   Utilisé pour translater les latents afin de suivre le mouvement.
+
+def compute_delta_torso(kp, latent_h, latent_w, scale=0.8):
+    """
+    Calcule le déplacement du torse en coordonnées latentes.
+    Le centre du warp est aligné sur le torse du personnage.
+    """
+
+    # Extraire les épaules
+    r_shoulder = get_point(kp, 2)  # [B,2]
+    l_shoulder = get_point(kp, 5)
+
+    # Centre du torse
+    torso_center = (r_shoulder + l_shoulder) * 0.5  # [B,2]
+
+    # Normaliser par rapport à l'image (0-1)
+    # On suppose que kp est déjà normalisé sur H,W [0,1]
+    torso_center_norm = torso_center.clone()
+
+    # Calculer offset depuis le centre du latent
+    center_offset_x = (torso_center_norm[:,0] - 0.5) * latent_w
+    center_offset_y = (torso_center_norm[:,1] - 0.5) * latent_h
+
+    delta_torso = torch.stack([center_offset_x, center_offset_y], dim=1) * scale
+
+    # 🔒 Stabilisation pour éviter les jumps
+    delta_torso = torch.tanh(delta_torso * 2.0) * 0.5
+
+    return delta_torso
+
+
+# 🔹 Recentre tous les keypoints par rapport au torse (entre épaules)
+#   Cela évite que le personnage se déplace vers le coin haut-gauche.
+def normalize_keypoints(kp_tensor):
+    kp = kp_tensor.clone()
+    r_shoulder = get_point(kp, 2)
+    l_shoulder = get_point(kp, 5)
+    torso_center = (r_shoulder + l_shoulder) * 0.5
+    kp[...,0] = kp[...,0] - torso_center[:,0].unsqueeze(1)  # recentre X
+    kp[...,1] = kp[...,1] - torso_center[:,1].unsqueeze(1)  # recentre Y
+    return kp
+
+# 🔹 Applique une translation sur les latents en utilisant un grid warp
+#   Déplace visuellement le personnage selon le delta du torse.
+def warp_latents(latents, delta_torso, H, W, device):
+
+    B = latents.shape[0]
+
+    dx = delta_torso[:, 0].reshape(B,1,1) * W
+    dy = delta_torso[:, 1].reshape(B,1,1) * H
+
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )
+
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).repeat(B,1,1,1)
+
+    delta_grid = torch.cat([dx*2/W, dy*2/H], dim=-1).unsqueeze(2)
+    grid = grid + delta_grid
+
+    latents_warped = F.grid_sample(
+        latents,
+        grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True
+    )
+
+    return latents_warped, dx, dy, grid
+
+
+def warp_latents_local(latents, delta, mask, center, H, W, device):
+
+    B, C, _, _ = latents.shape
+
+    # -------------------- Préparation --------------------
+
+    # centre en pixels
+    center_px = center * torch.tensor([W-1, H-1], device=device)
+    center_px = center_px.view(B,1,1,2)
+
+    # delta en pixels
+    delta_px = delta * torch.tensor([W, H], device=device)
+    delta_px = delta_px.view(B,1,1,2)
+
+    # grille pixel
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).float()
+    grid = grid.unsqueeze(0).repeat(B,1,1,1)
+
+    # masque
+    mask_expand = mask.permute(0,2,3,1) ** 1.5
+
+    # -------------------- 💥 warp pivot --------------------
+
+    grid = grid - center_px
+    grid = grid + delta_px * mask_expand
+    grid = grid + center_px
+
+    # -------------------- normalisation --------------------
+
+    grid_norm = grid.clone()
+    grid_norm[...,0] = 2.0 * grid[...,0] / (W-1) - 1.0
+    grid_norm[...,1] = 2.0 * grid[...,1] / (H-1) - 1.0
+
+    # -------------------- sampling --------------------
+
+    latents_warped = F.grid_sample(
+        latents,
+        grid_norm,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=False
+    )
+
+    return latents_warped
+
+
+#--------------------------------------------------------------------------------------------------------------
+
+def save_debug_pose_image_with_skeleton(
+    pose_tensor,
+    keypoints_tensor,
+    frame_counter,
+    output_dir,
+    cfg=None,
+    prefix="openpose"
+):
+    """
+    Sauvegarde une image de pose ET un squelette OpenPose pour contrôle visuel.
+
+    Args:
+        pose_tensor (torch.Tensor): [B,3,H,W] normalisé [-1,1] ou [C,H,W]
+        keypoints_tensor (torch.Tensor): [B,18,3] (x,y,conf) normalisé [0,1]
+        frame_counter (int): numéro de frame
+        output_dir (str): dossier où sauvegarder
+        cfg (dict, optional): peut contenir 'visual_debug' pour activer/désactiver
+        prefix (str, optional): préfixe du fichier
+    """
+
+    if cfg is not None and cfg.get("visual_debug") is False:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ---------------------------
+    # 🔹 Convertir pose_tensor en image RGB [0,255]
+    # ----------------------------
+    pose_img = pose_tensor[0].detach().cpu()
+    if pose_img.ndim == 3 and pose_img.shape[0] == 3:
+        pose_img = pose_img.permute(1,2,0)  # H,W,C
+    pose_img = ((pose_img + 1.0)/2.0 * 255).clamp(0,255).byte().numpy()
+
+    # Sauvegarde simple de l'image de pose
+    filename_pose = f"{prefix}_{frame_counter:05d}.png"
+    path_pose = os.path.join(output_dir, filename_pose)
+    cv2.imwrite(path_pose, cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+    print(f"[DEBUG] Pose sauvegardée : {path_pose}")
+
+    # ---------------------------
+    # 🔹 Dessin du squelette via debug_draw_openpose_skeleton
+    # ---------------------------
+    if keypoints_tensor is not None:
+        debug_draw_openpose_skeleton(
+            pose_full_image=pose_tensor.unsqueeze(0) if pose_tensor.ndim==3 else pose_tensor,
+            keypoints_tensor=keypoints_tensor,
+            debug_dir=output_dir,
+            frame_counter=frame_counter
+        )
+
