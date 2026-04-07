@@ -626,40 +626,29 @@ def save_frames_as_video_from_folder(
     fps=12,
     upscale_factor=1
 ):
-    """
-    Sauvegarde toutes les images PNG d'un dossier en vidéo MP4.
-    - Utilise ffmpeg directement (plus besoin de imageio)
-    - Supporte l'upscale des images
-    """
     if pattern is None:
         pattern = "*.png"
 
     folder_path = Path(folder_path)
     images = sorted(folder_path.glob(pattern))
-
     if not images:
         raise ValueError(f"Aucune image trouvée dans {folder_path}")
 
-    # Créer un dossier temporaire pour les images upscale
     tmp_dir = folder_path / "_tmp_upscaled"
     tmp_dir.mkdir(exist_ok=True)
 
-    # Redimensionner les images si nécessaire
-    for idx, img_path in enumerate(images):
+    # Upscale
+    for idx,img_path in enumerate(images):
         img = Image.open(img_path)
         if upscale_factor != 1:
-            img = img.resize((img.width * upscale_factor, img.height * upscale_factor), Image.BICUBIC)
+            img = img.resize((img.width*upscale_factor,img.height*upscale_factor), Image.BICUBIC)
         tmp_file = tmp_dir / f"frame_{idx:05d}.png"
         img.save(tmp_file)
 
-    # Appel ffmpeg pour créer la vidéo
     cmd = [
-        "ffmpeg",
-        "-y",  # overwrite
-        "-framerate", str(fps),
+        "ffmpeg", "-y", "-framerate", str(fps),
         "-i", str(tmp_dir / "frame_%05d.png"),
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
         str(out_path)
     ]
 
@@ -667,7 +656,7 @@ def save_frames_as_video_from_folder(
     subprocess.run(cmd, check=True)
     print(f"🎬 Vidéo sauvegardée : {out_path}")
 
-    # Optionnel : supprimer le dossier temporaire
+    # Nettoyage
     for f in tmp_dir.glob("*.png"):
         f.unlink()
     tmp_dir.rmdir()
