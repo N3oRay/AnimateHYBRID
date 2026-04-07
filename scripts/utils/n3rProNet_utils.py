@@ -197,13 +197,13 @@ def get_elbows_coords_pixels(image_pil, H=None, W=None):
 
 #-----------------------------------------------------------------------------
 
-def get_neck_coords_safe(image_pil, H=None, W=None):
+def get_neck_coords_safe(image_pil, face_mesh, H=None, W=None):
     """
     Détecte les coordonnées approximatives du cou de manière sécurisée.
     Renvoie None si aucun visage n'est détecté ou en cas d'erreur.
     """
     try:
-        coords = get_neck_coords(image_pil, H, W)
+        coords = get_neck_coords_full(image_pil, face_mesh, H, W)
         if coords is None:
             print("⚠️ Aucun visage détecté ou cou non détecté")
             return None
@@ -214,64 +214,64 @@ def get_neck_coords_safe(image_pil, H=None, W=None):
         return None
 
 
-def get_neck_coords(image_pil, H=None, W=None):
-    """
-    Détecte les coordonnées approximatives du cou à partir du menton et des clavicules.
+def get_neck_coords_full(image_pil, face_mesh, H=None, W=None):
 
-    Args:
-        image_pil (PIL.Image): image d'entrée
-        H, W: dimensions pour normaliser
-
-    Returns:
-        list[(x, y)]: centre du cou en coordonnées image
-    """
-    import numpy as np
-    import mediapipe as mp
-
-    mp_face_mesh = mp.solutions.face_mesh
     image = np.array(image_pil.convert("RGB"))
     h, w, _ = image.shape
+
     if H is None: H = h
     if W is None: W = w
 
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True
-    ) as face_mesh:
+    results = face_mesh.process(image)
 
-        results = face_mesh.process(image)
-        if not results.multi_face_landmarks:
-            return None
+    if not results.multi_face_landmarks:
+        return None
 
-        lm = results.multi_face_landmarks[0].landmark
-        CHIN_IDX = 152  # menton
-        LEFT_JAW = 234
-        RIGHT_JAW = 454
+    lm = results.multi_face_landmarks[0].landmark
 
-        # Calcul centre du cou à partir du menton et largeur de la mâchoire
-        chin_x = lm[CHIN_IDX].x * W
-        chin_y = lm[CHIN_IDX].y * H
+    CHIN       = 152
+    LEFT_JAW   = 234
+    RIGHT_JAW  = 454
+    NOSE_BASE  = 1
 
-        left_x = lm[LEFT_JAW].x * W
-        right_x = lm[RIGHT_JAW].x * W
+    def get_point(idx):
+        return int(lm[idx].x * W), int(lm[idx].y * H)
 
-        neck_x = (left_x + right_x) / 2
-        neck_y = chin_y + 0.15 * (chin_y - min(lm[LEFT_JAW].y * H, lm[RIGHT_JAW].y * H))  # proportionnel
+    chin  = get_point(CHIN)
+    left  = get_point(LEFT_JAW)
+    right = get_point(RIGHT_JAW)
+    nose  = get_point(NOSE_BASE)
 
-        return [(int(neck_x), int(neck_y))]
+    # centre du cou
+    center_x = (left[0] + right[0]) // 2
+    neck_y = int(chin[1] + 0.2 * (chin[1] - nose[1]))
 
-def get_nose_coords_safe(image_pil, H=None, W=None):
+    center = (center_x, neck_y)
+
+    return {
+        "center": center,
+        "chin": chin,
+        "left": left,
+        "right": right,
+        "anchor": nose  # utile pour stabilisation
+    }
+
+
+def get_nose_coords_safe(image_pil, face_mesh):
     """
-    Détecte les coordonnées du nez de manière sécurisée.
+    Détecte les coordonnées du nez de manière sécurisée avec le FaceMesh singleton.
     Renvoie None si aucun visage n'est détecté ou en cas d'erreur.
     """
+    if face_mesh is None:
+        print("[Nose detection ERROR] face_mesh is None")
+        return None
+
     try:
-        coords = get_nose_coords(image_pil)
+        coords = get_nose_coords_full(image_pil, face_mesh)
         if coords is None:
             print("⚠️ Aucun visage détecté ou nez non détecté")
             return None
-        print(f"👃 Nose detected: {coords}")
+        print(f"👃 Nose detected: {coords['center']}")
         return coords
     except Exception as e:
         print(f"[Nose detection ERROR] {e}")
@@ -279,58 +279,55 @@ def get_nose_coords_safe(image_pil, H=None, W=None):
 
 
 
-def get_nose_coords(image_pil):
-    """
-    Détecte les coordonnées du nez avec MediaPipe FaceMesh.
+def get_nose_coords_full(image_pil, face_mesh):
 
-    Args:
-        image_pil (PIL.Image): image d'entrée
-
-    Returns:
-        list[(x, y)]: centre du nez en coordonnées image
-    """
-    import numpy as np
-    import mediapipe as mp
-
-    mp_face_mesh = mp.solutions.face_mesh
 
     image = np.array(image_pil.convert("RGB"))
     h, w, _ = image.shape
 
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True
-    ) as face_mesh:
+    results = face_mesh.process(image)
 
-        results = face_mesh.process(image)
-        if not results.multi_face_landmarks:
-            return None
+    if not results.multi_face_landmarks:
+        return None
 
-        face_landmarks = results.multi_face_landmarks[0]
+    face_landmarks = results.multi_face_landmarks[0]
 
-        # 🔹 Indices MediaPipe pour le nez (tip + base)
-        NOSE_INDICES = [1, 2, 98, 327, 168]  # peut ajuster selon précision souhaitée
+    # Points clés nez
+    NOSE_TIP    = 1
+    NOSE_TOP    = 168
+    NOSE_LEFT   = 98
+    NOSE_RIGHT  = 327
 
-        def get_center(indices):
-            xs, ys = [], []
-            for idx in indices:
-                lm = face_landmarks.landmark[idx]
-                xs.append(lm.x * w)
-                ys.append(lm.y * h)
-            return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+    def get_point(idx):
+        lm = face_landmarks.landmark[idx]
+        return int(lm.x * w), int(lm.y * h)
 
-        nose_center = get_center(NOSE_INDICES)
-        return [nose_center]
+    tip   = get_point(NOSE_TIP)
+    top   = get_point(NOSE_TOP)
+    left  = get_point(NOSE_LEFT)
+    right = get_point(NOSE_RIGHT)
+
+    center = (
+        int((left[0] + right[0]) / 2),
+        int((top[1] + tip[1]) / 2)
+    )
+
+    return {
+        "center": center,
+        "tip": tip,
+        "top": top,
+        "left": left,
+        "right": right
+    }
 
 
-def get_mouth_coords_safe(image_pil, H=None, W=None):
+def get_mouth_coords_safe(image_pil, face_mesh, H=None, W=None):
     """
     Détecte les coordonnées de la bouche de manière sécurisée.
     Renvoie None si aucun visage n'est détecté ou en cas d'erreur.
     """
     try:
-        coords = get_mouth_coords(image_pil)
+        coords = get_mouth_coords(image_pil, face_mesh)
         if coords is None:
             print("⚠️ Aucun visage détecté ou bouche non détectée")
             return None
@@ -341,49 +338,45 @@ def get_mouth_coords_safe(image_pil, H=None, W=None):
         return None
 
 
-def get_mouth_coords(image_pil):
+def get_mouth_coords(image_pil, face_mesh):
     """
-    Détecte les coordonnées de la bouche avec MediaPipe FaceMesh.
+    Détecte les coordonnées de la bouche avec MediaPipe FaceMesh (mode tracking).
 
     Args:
         image_pil (PIL.Image): image d'entrée
+        face_mesh: instance persistante MediaPipe FaceMesh
 
     Returns:
-        list[(x, y)]: coins ou centre de la bouche en coordonnées image
+        list[(x, y)]: centre de la bouche
     """
     import numpy as np
-    import mediapipe as mp
-
-    mp_face_mesh = mp.solutions.face_mesh
 
     image = np.array(image_pil.convert("RGB"))
     h, w, _ = image.shape
 
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True
-    ) as face_mesh:
+    # 🔥 Utilisation de l'instance existante (IMPORTANT)
+    results = face_mesh.process(image)
 
-        results = face_mesh.process(image)
-        if not results.multi_face_landmarks:
-            return None
+    if not results.multi_face_landmarks:
+        print("⚠️ No face detected (mouth)")
+        return None
 
-        face_landmarks = results.multi_face_landmarks[0]
+    face_landmarks = results.multi_face_landmarks[0]
 
-        # 🔹 Indices MediaPipe pour la bouche (Outer lips)
-        MOUTH_OUTER = [61, 291, 0, 17, 37, 267, 78, 308]
+    # 🔹 Indices bouche (outer lips)
+    MOUTH_OUTER = [61, 291, 0, 17, 37, 267, 78, 308]
 
-        def get_center(indices):
-            xs, ys = [], []
-            for idx in indices:
-                lm = face_landmarks.landmark[idx]
-                xs.append(lm.x * w)
-                ys.append(lm.y * h)
-            return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+    def get_center(indices):
+        xs, ys = [], []
+        for idx in indices:
+            lm = face_landmarks.landmark[idx]
+            xs.append(lm.x * w)
+            ys.append(lm.y * h)
+        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
 
-        mouth_center = get_center(MOUTH_OUTER)
-        return [mouth_center]
+    mouth_center = get_center(MOUTH_OUTER)
+
+    return [mouth_center]
 
 #--------------------------------------------------------------------------------
 
@@ -549,9 +542,9 @@ def scale_eye_coords_to_latents(eye_coords, img_H, img_W, lat_H, lat_W):
     return [(int(x * scale_x), int(y * scale_y)) for x, y in eye_coords]
 
 
-def get_eye_coords_safe(image_pil, H=None, W=None):
+def get_eye_coords_safe(image_pil, face_mesh, H=None, W=None):
     try:
-        coords = get_eye_coords(image_pil)
+        coords = get_eye_coords(image_pil, face_mesh)
         if coords is None:
             print("⚠️ Aucun visage détecté")
             return None
@@ -562,53 +555,37 @@ def get_eye_coords_safe(image_pil, H=None, W=None):
         return None
 
 
-def get_eye_coords(image_pil):
+def get_eye_coords(image_pil, face_mesh):
     """
-    Détecte les coordonnées des yeux avec MediaPipe.
-
-    Args:
-        image_pil (PIL.Image): image d'entrée
-
-    Returns:
-        list[(x, y)]: centres des yeux en coordonnées image
+    Détecte les coordonnées des yeux avec MediaPipe (mode tracking).
     """
-    import numpy as np
-    import mediapipe as mp
-
-    mp_face_mesh = mp.solutions.face_mesh
 
     image = np.array(image_pil.convert("RGB"))
     h, w, _ = image.shape
 
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True
-    ) as face_mesh:
+    # 🔥 utiliser l'instance EXISTANTE
+    results = face_mesh.process(image)
 
-        results = face_mesh.process(image)
+    if not results.multi_face_landmarks:
+        return None
 
-        if not results.multi_face_landmarks:
-            return None
+    face_landmarks = results.multi_face_landmarks[0]
 
-        face_landmarks = results.multi_face_landmarks[0]
+    LEFT_IRIS = [474, 475, 476, 477]
+    RIGHT_IRIS = [469, 470, 471, 472]
 
-        # 🔹 Indices iris MediaPipe (refine_landmarks=True requis)
-        LEFT_IRIS = [474, 475, 476, 477]
-        RIGHT_IRIS = [469, 470, 471, 472]
+    def get_center(indices):
+        xs, ys = [], []
+        for idx in indices:
+            lm = face_landmarks.landmark[idx]
+            xs.append(lm.x * w)
+            ys.append(lm.y * h)
+        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
 
-        def get_center(indices):
-            xs, ys = [], []
-            for idx in indices:
-                lm = face_landmarks.landmark[idx]
-                xs.append(lm.x * w)
-                ys.append(lm.y * h)
-            return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+    left_eye = get_center(LEFT_IRIS)
+    right_eye = get_center(RIGHT_IRIS)
 
-        left_eye = get_center(LEFT_IRIS)
-        right_eye = get_center(RIGHT_IRIS)
-
-        return [left_eye, right_eye]
+    return [left_eye, right_eye]
 
 
 def get_shoulders_coords_safe(image_pil, H=None, W=None):
@@ -678,14 +655,127 @@ def get_shoulders_coords(image_pil, H=None, W=None):
     right_shoulder = (right_clav[0] + right_offset[0], right_clav[1] + right_offset[1])
 
     return [left_shoulder, right_shoulder]
+#-------------------------------------- oreilles ----------
 
-def get_clavicules_coords_safe(image_pil, H=None, W=None):
+import mediapipe as mp
+
+def release_mediapipe_models():
+    if hasattr(init_mediapipe_models, "pose_model"):
+        init_mediapipe_models.pose_model.close()
+
+    if hasattr(init_mediapipe_models, "face_mesh"):
+        init_mediapipe_models.face_mesh.close()
+
+    print("🧹 MediaPipe models released")
+
+def get_face_mesh():
+    """
+    Retourne une instance persistante de MediaPipe FaceMesh (mode vidéo).
+    Évite de recréer l'objet à chaque frame (gain énorme CPU/GPU).
+    """
+    if not hasattr(get_face_mesh, "_instance"):
+        mp_face_mesh = mp.solutions.face_mesh
+
+        get_face_mesh._instance = mp_face_mesh.FaceMesh(
+            static_image_mode=False,   # 🔥 tracking vidéo
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        print("✅ FaceMesh initialisé (mode vidéo)")
+
+    return get_face_mesh._instance
+
+def release_face_mesh():
+    """
+    Libère proprement FaceMesh (optionnel mais recommandé en fin de run)
+    """
+    if hasattr(get_face_mesh, "_instance"):
+        get_face_mesh._instance.close()
+        del get_face_mesh._instance
+        print("🧹 FaceMesh libéré")
+
+def get_ear_coords_safe(image_pil, face_mesh, H=None, W=None):
+    try:
+        coords = get_ear_coords(image_pil, face_mesh)
+
+        if coords is None:
+            print("⚠️ Aucun visage détecté (ears)")
+            return None
+
+        print(f"👂 Ears detected: {coords}")
+        return coords
+
+    except Exception as e:
+        print(f"[Ear detection ERROR] {e}")
+        return None
+
+
+def get_ear_coords(image_pil, face_mesh):
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    results = face_mesh.process(image)
+
+    if not results.multi_face_landmarks:
+        return None
+
+    face_landmarks = results.multi_face_landmarks[0]
+
+    LEFT_EAR  = [234]
+    RIGHT_EAR = [454]
+
+    def get_center(indices):
+        xs, ys = [], []
+        for idx in indices:
+            lm = face_landmarks.landmark[idx]
+            xs.append(lm.x * w)
+            ys.append(lm.y * h)
+        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+    left_ear = get_center(LEFT_EAR)
+    right_ear = get_center(RIGHT_EAR)
+
+    return [left_ear, right_ear]
+
+
+def init_mediapipe_models():
+    import mediapipe as mp
+
+    if not hasattr(init_mediapipe_models, "_initialized"):
+
+        mp_pose = mp.solutions.pose
+
+        init_mediapipe_models.pose_model = mp_pose.Pose(
+            static_image_mode=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+            model_complexity=1
+        )
+
+        init_mediapipe_models.face_mesh = get_face_mesh()
+
+        init_mediapipe_models._initialized = True
+        print("✅ MediaPipe fully initialized")
+
+    return init_mediapipe_models.pose_model, init_mediapipe_models.face_mesh
+
+def get_clavicules_coords_safe(image_pil, pose_model, face_mesh, H=None, W=None):
     """
     Détecte les coordonnées des épaules avec MediaPipe Pose de manière sécurisée.
-    Retourne None si aucun torse détecté.
+    Retourne None si aucun torse détecté ou modèles non initialisés.
     """
+    if pose_model is None:
+        print("⚠️ Pose model non initialisé")
+        return None
+    if face_mesh is None:
+        print("⚠️ FaceMesh model non initialisé")
+        return None
+
     try:
-        coords = get_clavicules_coords(image_pil, H, W)
+        coords = get_clavicules_coords(image_pil, pose_model, face_mesh, H, W)
         if coords is None:
             print("⚠️ Aucune détection clavicules")
             return None
@@ -696,88 +786,91 @@ def get_clavicules_coords_safe(image_pil, H=None, W=None):
         return None
 
 
-def get_clavicules_coords(image_pil, H=None, W=None):
+def get_clavicules_coords(image_pil, pose_model, face_mesh, H=None, W=None):
     """
-    Détecte les coordonnées approximatives des épaules avec fallback
-    et ajuste la largeur pour mieux représenter les épaules réelles.
-
-    Args:
-        image_pil (PIL.Image): image d'entrée
-        H, W: dimensions optionnelles pour normaliser
-
-    Returns:
-        list[(x, y)] ou None: gauche et droite des épaules
+    Détecte les clavicules avec Pose (prioritaire) + fallback FaceMesh.
+    Version optimisée tracking (aucune re-init).
     """
     import numpy as np
-    import mediapipe as mp
 
     image = np.array(image_pil.convert("RGB"))
     h, w, _ = image.shape
     if H is None: H = h
     if W is None: W = w
 
-    mp_pose = mp.solutions.pose
-    mp_face_mesh = mp.solutions.face_mesh
+    # =========================
+    # 🔹 1. POSE (prioritaire)
+    # =========================
+    if pose_model is not None:
+        try:
+            results = pose_model.process(image)
 
-    # --- Essai Pose ---
-    try:
-        with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
-            results = pose.process(image)
             if results.pose_landmarks:
                 LEFT_SHOULDER = 11
                 RIGHT_SHOULDER = 12
+
                 l = results.pose_landmarks.landmark[LEFT_SHOULDER]
                 r = results.pose_landmarks.landmark[RIGHT_SHOULDER]
 
-                # Coordonnées brutes
                 left_x, left_y = l.x * W, l.y * H
                 right_x, right_y = r.x * W, r.y * H
 
-                # Écart horizontal supplémentaire (~15% de la distance entre les épaules)
+                # élargissement naturel
                 shoulder_span = right_x - left_x
-                left_x -= 0.15 * shoulder_span
+                left_x  -= 0.15 * shoulder_span
                 right_x += 0.15 * shoulder_span
 
-                left_coords = (int(left_x), int(left_y))
-                right_coords = (int(right_x), int(right_y))
-                return [left_coords, right_coords]
-    except Exception as e:
-        print(f"[Pose detection ERROR] {e}")
+                return [
+                    (int(left_x), int(left_y)),
+                    (int(right_x), int(right_y))
+                ]
+        except Exception as e:
+            print(f"[Pose detection ERROR] {e}")
 
-    # --- Fallback FaceMesh ---
-    try:
-        with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) as fm:
-            results = fm.process(image)
+    # =========================
+    # 🔹 2. FALLBACK FACEMESH
+    # =========================
+    if face_mesh is not None:
+        try:
+            results = face_mesh.process(image)
+
             if not results.multi_face_landmarks:
-                print("⚠️ Aucun visage détecté pour approximation des clavicules")
+                print("⚠️ No face detected (clavicles fallback)")
                 return None
+
             lm = results.multi_face_landmarks[0].landmark
 
-            LEFT_JAW = 234
+            LEFT_JAW  = 234
             RIGHT_JAW = 454
-            CHIN = 152
+            CHIN      = 152
 
             def jaw_to_shoulder(idx):
                 x = lm[idx].x * W
                 y = lm[idx].y * H
-                # offset vers le haut du torse (1.2x distance menton - jaw)
-                y += 1.2 * (lm[CHIN].y * H - y)
+
+                # projection vers torse
+                chin_y = lm[CHIN].y * H
+                y += 1.2 * (chin_y - y)
+
                 return x, y
 
             left_x, left_y = jaw_to_shoulder(LEFT_JAW)
             right_x, right_y = jaw_to_shoulder(RIGHT_JAW)
 
-            # Écart horizontal supplémentaire (~15%)
             shoulder_span = right_x - left_x
-            left_x -= 0.15 * shoulder_span
+            left_x  -= 0.15 * shoulder_span
             right_x += 0.15 * shoulder_span
 
-            left_coords = (int(left_x), int(left_y))
-            right_coords = (int(right_x), int(right_y))
-            return [left_coords, right_coords]
-    except Exception as e:
-        print(f"[FaceMesh fallback ERROR] {e}")
-        return None
+            return [
+                (int(left_x), int(left_y)),
+                (int(right_x), int(right_y))
+            ]
+
+        except Exception as e:
+            print(f"[FaceMesh fallback ERROR] {e}")
+
+    # Aucun modèle dispo
+    return None
 
 
 def get_shoulders_coords_safe_1(image_pil, H=None, W=None):

@@ -59,8 +59,8 @@ def extract_keypoints_from_pose(
     # 👄 Mouth detected: [(404, 446)]
 
     keypoints_template = [
-        [418/896, 418/1280, 1.0],  # 0 nose / nez (ok) 👃 Nose detected: [(422, 408)]
-        [383/896, 515/1280, 1.0],  # 1 neck / cou 🦵 Neck detected: [(420, 518)]
+        [422/896, 408/1280, 1.0],  # 0 nose / nez (ok) 👃 Nose detected: [(422, 408)] OK
+        [420/896, 518/1280, 1.0],  # 1 neck / cou 🦵 Neck detected: [(420, 518)]
 
         [627/896, 533/1280, 1.0],  # 2 right_shoulder / épaule droite 🦾 Shoulders detected: [(77.5, 576.2), (761.5, 542.6)]
         [612/896, 838/1280, 1.0],  # 3 right_elbow / coude droit 🦾 Elbows detected/estimated: [[179, 896], [627, 896]]
@@ -78,13 +78,13 @@ def extract_keypoints_from_pose(
         [0.0, 0.0, 0.0],           # 12 left_knee (absent)
         [0.0, 0.0, 0.0],           # 13 left_ankle (absent)
 
-        [359/896, 490/1280, 1.0],  # 14 right_eye / œil droit - 👁 Eyes detected: (ok)
-        [379/896, 326/1280, 1.0],  # 15 left_eye / œil gauche - 👁 Eyes detected: [(326, 379), (359, 490)]
-        [608/896, 304/1280, 1.0],  # 16 right_ear / oreille droite
-        [290/896, 244/1280, 1.0],  # 17 left_ear / oreille gauche
+        [373/896, 322/1280, 1.0],  # 14 right_eye / œil droit - 👁 Eyes detected: (ok) 👁 Eyes detected: [(492, 353), (373, 322)] OK
+        [492/896, 359/1280, 1.0],  # 15 left_eye / œil gauche - 👁 Eyes detected: [(326, 379), (359, 490)] ok
+        [530/896, 350/1280, 1.0],  # 16 right_ear / oreille droite -👂 Ears detected: [(310, 278), (530, 350)]
+        [310/896, 278/1280, 1.0],  # 17 left_ear / oreille gauche
         [404/896, 446/1280, 1.0],  # 18 mouth / Bouche (ok) - 👄 Mouth detected: [(404, 446)]
-        [562/896, 514/1280, 1.0],  # 19 🦾 right_clavicules detected: [562/896, 514/1280, 1.0],
-        [277/896, 528/1280, 1.0],  # 20 🦾 left_clavicules detected: [(277, 528), (562, 514)]
+        [562/896, 514/1280, 1.0],  # 19 🦾 right_clavicules detected: [562/896, 514/1280, 1.0], OK
+        [277/896, 528/1280, 1.0],  # 20 🦾 left_clavicules detected: [(277, 528), (562, 514)] OK
     ]
 
     #48–54 : lèvres supérieures (coin gauche → coin droit)
