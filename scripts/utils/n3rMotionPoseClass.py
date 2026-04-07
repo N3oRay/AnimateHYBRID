@@ -17,7 +17,7 @@ class Pose:
         self.device = keypoints.device
         self._prev_facial_points = None
 
-        self.torce_expand_w=1.2
+        self.torce_expand_w=1.6
         self.torce_shrink_h=1.2
 
     # =========================

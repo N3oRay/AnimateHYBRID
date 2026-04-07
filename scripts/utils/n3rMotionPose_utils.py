@@ -7,7 +7,7 @@ import math
 import torch.nn.functional as F
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, apply_breathing, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_3D, apply_hair_motion_cycle
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, apply_breathing, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_3D, apply_hair_motion_cycle, apply_breathing_simple
 from .n3rMotionPoseClass import Pose
 import numpy as np
 import cv2
@@ -1827,15 +1827,21 @@ def apply_pose_driven_motion(
     # 🔹 BREATHING (TORSO ONLY)
     # =========================
     latents_before = latents.clone()
-    latents_breath = apply_breathing(
-        latents,
-        previous_latent,
-        frame_counter,
-        breathing,
-        debug=debug,
-        debug_dir=debug_dir
+   #latents_breath = apply_breathing( latents, previous_latent, frame_counter, breathing, debug=debug, debug_dir=debug_dir )
+
+    latents_breath = apply_breathing_simple( latents, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir )
+    #latents = latents_breath * mask_torso_exp + latents_before * (1.0 - mask_torso_exp)
+
+    #breath_strength = 0.25  # 🔥 ajuste entre 0.1 et 0.4
+
+    t = torch.tensor(frame_counter / 10.0, device=latents.device)
+
+    breath_strength = 0.2 + 0.1 * torch.sin(t)
+
+    latents = (
+        latents_before * (1.0 - breath_strength * mask_torso_exp)
+        + latents_breath * (breath_strength * mask_torso_exp)
     )
-    latents = latents_breath * mask_torso_exp + latents_before * (1.0 - mask_torso_exp)
 
     if debug:
         print("[DEBUG] Breathing applied")

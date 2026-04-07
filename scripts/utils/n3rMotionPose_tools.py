@@ -482,11 +482,11 @@ def apply_breathing(latents, previous_latent, frame_counter, breathing=True, deb
     """
     Applique une respiration réaliste sur les latents : décalage vertical uniquement.
     Optimisée pour fluidité et performance.
-    """
+
     import torch
     import torch.nn.functional as F
     import math
-
+    """
     if previous_latent is not None and breathing:
         B, C, H, W = latents.shape
         device = latents.device
@@ -513,6 +513,34 @@ def apply_breathing(latents, previous_latent, frame_counter, breathing=True, deb
         latents = F.grid_sample(
             latents, grid, mode='bicubic', padding_mode='zeros', align_corners=True
         )
+
+    return latents
+
+def apply_breathing_simple(latents, mask_torso, frame_counter, breathing=True, debug=False, debug_dir=None):
+
+    if not breathing:
+        return latents
+
+    B, C, H, W = latents.shape
+    device = latents.device
+
+    breath = 0.003 * math.sin(frame_counter * 0.1)
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )
+
+    # 🔥 IMPORTANT
+    xx = xx.unsqueeze(0).expand(B, H, W)
+    yy = yy.unsqueeze(0).expand(B, H, W)
+
+    mask = mask_torso.permute(0,2,3,1)  # [B,H,W,1]
+
+    grid = torch.stack((xx, yy + breath * mask[...,0]), dim=-1)  # [B,H,W,2]
+
+    latents = F.grid_sample(latents, grid, align_corners=True)
 
     return latents
 
@@ -1107,8 +1135,6 @@ def apply_hair_motion_extreme(
 
     return latents_out, hair_delta_field
 
-
-
 def apply_hair_motion_vent(
     latents,
     mask_hair,
@@ -1123,83 +1149,141 @@ def apply_hair_motion_vent(
     debug_dir=None
 ):
     """
-    Hair motion version cinéma EXTRÊME :
-    - mouvements très amples
-    - vent + gravité + torse amplifiés
-    - inertie légère pour réactivité maximale
-    - pointes accentuées
+    Hair motion VENT amélioré :
+    - sin + cos pour mouvement riche
+    - direction dynamique
+    - variation verticale naturelle
     """
 
     B = latents.shape[0]
-    t = frame_counter
-    t_wind1 = torch.tensor(t / 10.0, device=device)
-    t_wind2 = torch.tensor(t / 40.0, device=device)
 
-    # -------------------- Multi-échelle bruit --------------------
+    # =========================
+    # 🔹 Temps (Tensor SAFE)
+    # =========================
+    t_wind1 = torch.tensor(frame_counter / 10.0, device=device)
+    t_wind2 = torch.tensor(frame_counter / 40.0, device=device)
+
+    # =========================
+    # 🔹 Multi-noise
+    # =========================
     def multi_noise(grid, t, scales=[0.05,0.15,0.3], weights=[1.0,0.5,0.25]):
         val = 0
         for s, w in zip(scales, weights):
             val += w * smooth_noise(grid, t, scale=s)
         return val
 
-    noise_x = multi_noise(grid, t)
-    noise_y = multi_noise(grid, t + 123, scales=[0.08,0.2,0.4], weights=[1.0,0.5,0.25])
+    noise_x = multi_noise(grid, frame_counter)
+    noise_y = multi_noise(grid, frame_counter + 123, scales=[0.08,0.2,0.4])
 
-    # -------------------- Champ delta de base extrême --------------------
+    # =========================
+    # 🔹 Base motion
+    # =========================
     hair_delta_field = torch.zeros_like(grid)
-    hair_delta_field[...,0] = 0.12 * noise_x   # x4 vs version cinéma
-    hair_delta_field[...,1] = 0.18 * noise_y   # x4 vs version cinéma
+    hair_delta_field[...,0] = 0.10 * noise_x
+    hair_delta_field[...,1] = 0.14 * noise_y
 
-    # -------------------- Vent extrême --------------------
-    wind_dir = torch.tensor([[1.0,0.3],[0.5,0.2]], device=device).mean(dim=0).view(1,1,1,2)
-    wind_strength = 0.08 + 0.04 * torch.sin(t_wind1) + 0.02 * torch.sin(t_wind2)
+    # =========================
+    # 🔹 WIND STRENGTH (🔥 ton ajout)
+    # =========================
+    wind_strength = (
+        0.08
+        + 0.04 * torch.sin(t_wind1)
+        + 0.02 * torch.sin(t_wind2)
+        + 0.03 * torch.cos(t_wind1 * 1.3)
+        + 0.015 * torch.cos(t_wind2 * 0.7)
+    )
+
+    # =========================
+    # 🔹 Direction dynamique (IMPORTANT)
+    # =========================
+    angle = 0.5 * torch.sin(t_wind2) + 0.3 * torch.cos(t_wind1)
+
+    wind_dir = torch.stack([
+        torch.cos(angle),
+        torch.sin(angle) * 0.5
+    ], dim=-1).view(1,1,1,2)
+
     wind_delta = wind_dir * wind_strength
+    wind_delta = wind_delta.expand(B, H, W, 2).clone()  # FIX broadcast
 
-    # -------------------- Gravité plus marquée --------------------
-    gravity_delta = torch.zeros_like(grid)
-    gravity_delta[...,1] = 0.015  # fort tombant
+    # =========================
+    # 🔹 Gravité
+    # =========================
+    gravity_delta = torch.zeros((B, H, W, 2), device=device)
+    gravity_delta[...,1] = 0.012
 
-    # -------------------- Influence du torse amplifiée --------------------
+    # =========================
+    # 🔹 Influence torse
+    # =========================
     if delta_px is not None:
-        speed = torch.norm(delta_px, dim=-1, keepdim=True)
-        hair_delta_field *= (1.0 + 5.0 * speed)
-        wind_delta *= (1.0 + 3.0 * speed)
-        gravity_delta *= (1.0 + 1.5 * speed)
+        speed = torch.norm(delta_px, dim=-1, keepdim=True).view(B,1,1,1)
 
-    # -------------------- Inertie légère --------------------
-    inertia = 0.5  # moins d'amortissement → mouvements plus réactifs
+        hair_delta_field *= (1.0 + 4.0 * speed)
+        wind_delta = wind_delta * (1.0 + 2.5 * speed)
+        gravity_delta = gravity_delta * (1.0 + 1.2 * speed)
+
+    # =========================
+    # 🔹 Inertie
+    # =========================
+    inertia = 0.6
     if prev_hair_field is not None:
-        hair_delta_field = inertia * prev_hair_field + (1-inertia) * hair_delta_field
+        hair_delta_field = inertia * prev_hair_field + (1 - inertia) * hair_delta_field
 
-    # -------------------- Masque + falloff racine→pointe --------------------
+    # =========================
+    # 🔹 Masque + falloff
+    # =========================
     mask_hair_expand = mask_hair.permute(0,2,3,1)
+
     yy = torch.linspace(0,1,H,device=device).view(1,H,1,1)
-    extreme_falloff = yy**3 * (3 - 2*yy**1.5)  # pointes très dynamiques
-    mask_hair_expand = mask_hair_expand * extreme_falloff
+    falloff = yy**2.8
 
-    # -------------------- Micro-souplesse physique --------------------
-    spring = 0.01 * torch.sin(t*0.8 + grid[...,1:2]*5.0)
-    hair_delta_field[...,1:2] += spring
+    mask_hair_expand = mask_hair_expand * falloff
 
-    # -------------------- Micro noise --------------------
-    micro_noise = 0.003 * (torch.rand_like(hair_delta_field)-0.5)
-    hair_delta_field += micro_noise
+    # =========================
+    # 🔹 Micro mouvement vertical régulier
+    # =========================
+    vertical_wave = 0.01 * torch.sin(
+        t_wind1 + grid[...,1:2] * 0.05
+    )
+    hair_delta_field[...,1:2] += vertical_wave
 
-    # -------------------- Application --------------------
+    # =========================
+    # 🔹 Micro noise
+    # =========================
+    hair_delta_field += 0.002 * (torch.rand_like(hair_delta_field) - 0.5)
+
+    # =========================
+    # 🔹 Application
+    # =========================
     grid_hair = grid + hair_delta_field * mask_hair_expand
     grid_hair += wind_delta * mask_hair_expand
     grid_hair += gravity_delta * mask_hair_expand
 
-    # -------------------- Normalisation --------------------
+    # =========================
+    # 🔹 Normalisation
+    # =========================
     grid_hair[...,0] = 2.0 * grid_hair[...,0] / (W-1) - 1.0
     grid_hair[...,1] = 2.0 * grid_hair[...,1] / (H-1) - 1.0
 
-    # -------------------- Sampling --------------------
+    # =========================
+    # 🔹 Sampling
+    # =========================
     latents_out = F.grid_sample(latents, grid_hair, align_corners=True)
 
+    # =========================
+    # 🔹 Debug
+    # =========================
     if debug:
-        print("[DEBUG] Hair motion EXTREME applied")
+        print("[DEBUG] Hair motion Vent (sin+cos) applied")
 
     if debug and debug_dir is not None:
-        debug_save_mask_and_wind( mask=mask_hair, wind_delta=wind_delta, H=H, W=W, debug_dir=debug_dir, frame_counter=frame_counter )
+        debug_save_mask_and_wind(
+            mask=mask_hair,
+            wind_delta=wind_delta,
+            H=H,
+            W=W,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
+        )
+
     return latents_out, hair_delta_field
