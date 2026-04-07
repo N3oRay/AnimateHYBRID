@@ -34,12 +34,12 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_po
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, get_nose_coords_safe, get_shoulders_coords_safe, get_clavicules_coords_safe, get_neck_coords_safe, get_elbows_coords_safe, get_wrists_coords_safe, get_hips_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, get_nose_coords_safe, get_shoulders_coords_safe, get_clavicules_coords_safe, get_neck_coords_safe, get_elbows_coords_safe, get_wrists_coords_safe, get_hips_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth, get_ear_coords_safe, release_mediapipe_models, init_mediapipe_models, get_face_mesh
 
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, apply_controlnet_openpose_step, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe
 
-from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch
+from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch, update_keypoints_from_pose
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -81,7 +81,7 @@ def main(args):
 
     use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
     use_openpose = cfg.get("use_openpose", True)
-    open_pose_init = cfg.get("open_pose_init", True)
+    open_pose_init = cfg.get("open_pose_init", False)
 
     controlnet_scale = cfg.get("controlnet_scale", 1.0) # typiquement 0.5 → 1.0
     control_strength = cfg.get("control_strength", 1.5)
@@ -225,6 +225,7 @@ def main(args):
         external_path, (1, 4, cfg["H"]//facteur, cfg["W"]//facteur)
     ).to(device)
 
+    pose_model, face_mesh = init_mediapipe_models() # initialisation
     for img_idx, img_path in enumerate(input_paths):
         if stop_generation: break
         try:
@@ -255,24 +256,24 @@ def main(args):
             control_latent = base_control_latent + 0.01 * torch.randn_like(base_control_latent, dtype=torch.float16, device="cuda")
             control_latent = sanitize_latents(control_latent)
             # -----------------------------------------------------------------------------------------
-            nose_coords = get_nose_coords_safe(input_pil) # 0 nose / nez
-            neck_coords = get_neck_coords_safe(input_pil) # 1 neck / cou
-            shoulders_coords = get_shoulders_coords_safe(input_pil) # 2 right_shoulder / épaule droite # 5 left_shoulder / épaule gauche
-            clavicules_coords = get_clavicules_coords_safe(input_pil)
-            elbow_coords = get_elbows_coords_safe(input_pil)  # 3 right_elbow / coude droit # 6 left_elbow / coude gauche
-            wrists_coords = get_wrists_coords_safe(input_pil)  # 4 right_wrist / poignet droit # 7 left_wrist / poignet gauche
-            hips_coords = get_hips_coords_safe(input_pil)  # 8 right_hip / hanche droite # 11 left_hip / hanche gauche
+            face_mesh = get_face_mesh()
+            nose_coords = get_nose_coords_safe(input_pil, face_mesh)# 0 nose / nez
+            neck_coords = get_neck_coords_safe(input_pil, face_mesh) # 1 neck / cou
+            shoulders_coords = get_shoulders_coords_safe(input_pil) # 5 left_shoulder / épaule gauche # 2 right_shoulder / épaule droite
+            clavicules_coords = get_clavicules_coords_safe(input_pil, pose_model, face_mesh)
+            elbow_coords = get_elbows_coords_safe(input_pil)  # 6 left_elbow / coude gauche # 3 right_elbow / coude droit
+            wrists_coords = get_wrists_coords_safe(input_pil)   # 7 left_wrist / poignet gauche # 4 right_wrist / poignet droit
+            hips_coords = get_hips_coords_safe(input_pil)  # 11 left_hip / hanche gauche # 8 right_hip / hanche droite
             # 9 right_knee (absent)
             # 10 right_ankle (absent)
             # 12 left_knee (absent)
             # 13 left_ankle (absent)
-            # 14 right_eye / œil droit - 👁 Eyes detected:
-            # 15 left_eye / œil gauche - 👁 Eyes detected:
-            eye_coords = get_eye_coords_safe(input_pil)
-            # 16 right_ear / oreille droite
-            # 17 left_ear / oreille gauche
+            eye_coords = get_eye_coords_safe(input_pil, face_mesh) # 15 left_eye / œil gauche # 14 right_eye / œil droit - 👁 Eyes detected
+            ear_coords = get_ear_coords_safe(input_pil, face_mesh) # 17 left_ear / oreille gauche # 16 right_ear / oreille droite
             # coordonner masque eye et masque volumetrique
-            mouth_coords = get_mouth_coords_safe(input_pil)
+            mouth_coords = get_mouth_coords_safe(input_pil, face_mesh)
+
+
 
 
             # coordonner globale
@@ -487,6 +488,8 @@ def main(args):
                             #new code fonction --------------------------------------------------------------------------------------
                             # 🔹 Extraction / update des keypoints
                             current_keypoints = extract_keypoints_from_pose( pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter)
+                            # 🔹 Update des keypoints avec Mediapipe
+                            current_keypoints = update_keypoints_from_pose( pose_full, current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
 
                             # Mettre à jour les keypoints éventuellement modifiés
                             current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints, prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
@@ -497,10 +500,7 @@ def main(args):
                                 previous_latent=previous_latent_single,
                                 latents_before_openpose=latents_before_openpose if 'latents_before_openpose' in locals() else None,
                                 latents_after_openpose=latents_after if 'latents_after' in locals() else None,
-                                keypoints=current_keypoints,
-                                prev_keypoints=prev_keypoints,
-                                frame_counter=frame_counter,
-                                device=device,
+                                keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
                                 breathing=True,
                                 debug=True,
                                 debug_dir=output_dir
@@ -595,6 +595,7 @@ def main(args):
                             del locals()[var]
                     torch.cuda.empty_cache()
 
+
             previous_latent_single = current_latent_single
 
         except Exception as e:
@@ -602,6 +603,8 @@ def main(args):
             continue
 
     pbar.close()
+    # Libération à la fin
+    release_mediapipe_models()
     save_frames_as_video_from_folder(output_dir, out_video, fps=fps, upscale_factor=upscale_factor)
     print(f"🎬 Vidéo générée : {out_video}")
 
