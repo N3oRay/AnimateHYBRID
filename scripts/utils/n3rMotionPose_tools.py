@@ -78,7 +78,6 @@ def feather_outside_only_alpha(mask, radius=5, sigma=2.0):
 
     return torch.clamp(out, 0, 1)
 
-
 def debug_draw_openpose_skeleton(
     pose_full_image,
     keypoints_tensor,
@@ -86,11 +85,121 @@ def debug_draw_openpose_skeleton(
     frame_counter,
 ):
     """
-    Dessine les keypoints + squelette OpenPose sur l'image de pose.
+    Dessine tous les keypoints (25+) + squelette OpenPose sur une image transparente,
+    avec couleurs, coordonnées et alpha selon confiance.
+    """
+
+    os.makedirs(debug_dir, exist_ok=True)
+    B, C, H, W = pose_full_image.shape
+    keypoints = keypoints_tensor[0].detach().cpu().numpy()
+
+    # Image RGBA transparente
+    pose_img = np.zeros((H, W, 4), dtype=np.uint8)
+
+    def to_pixel(x, y):
+        return int(x * W), int(y * H)
+
+    # Couleurs par groupe
+    COLORS = {
+        "head": (255, 0, 255),
+        "eyes": (0, 0, 255),
+        "nose": (128, 0, 128),
+        "arms_r": (0, 200, 0),
+        "arms_l": (0, 255, 0),
+        "torso": (255, 0, 0),
+        "legs_r": (0, 255, 255),
+        "legs_l": (0, 200, 255),
+        "default": (200, 200, 200)
+    }
+
+    # Draw points
+    for i, (x, y, conf) in enumerate(keypoints):
+        if conf < 0.05:
+            continue
+        px, py = to_pixel(x, y)
+        # Choix couleur
+        if i in [14,15]:
+            color = COLORS["eyes"]
+        elif i == 0:
+            color = COLORS["nose"]
+        elif i in [16,17,18]:
+            color = COLORS["head"]
+        elif i in [2,3,4,19]:
+            color = COLORS["arms_r"]
+        elif i in [5,6,7,20]:
+            color = COLORS["arms_l"]
+        elif i in [1,8,11,21,22,23,24]:
+            color = COLORS["torso"]
+        elif i in [9,10]:
+            color = COLORS["legs_r"]
+        elif i in [12,13]:
+            color = COLORS["legs_l"]
+        else:
+            color = COLORS["default"]
+
+        # Dessin cercle avec alpha selon confiance
+        alpha = int(conf * 255)
+        pose_img[py-3:py+3, px-3:px+3, :3] = color
+        pose_img[py-3:py+3, px-3:px+3, 3] = alpha
+
+        # Affichage des coordonnées
+        cv2.putText(pose_img, f"{px},{py}", (px+5, py-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color + (alpha,), 1, cv2.LINE_AA)
+
+    # Skeleton connections
+    skeleton = [
+        (0,1),(1,19),(19,2),(2,3),(3,4),
+        (1,20),(20,5),(5,6),(6,7),
+        (1,8),(1,11),
+        (14,0),(15,0),(16,15),(17,14),
+        (8,9),(9,10),(11,12),(12,13),
+        (21,22),(21,23),(21,24)
+    ]
+
+    for i,j in skeleton:
+        xi, yi, ci = keypoints[i]
+        xj, yj, cj = keypoints[j]
+        if ci < 0.05 or cj < 0.05:
+            continue
+        p1, p2 = to_pixel(xi, yi), to_pixel(xj, yj)
+
+        # Couleur par type
+        if i in [2,3,4,19]:
+            color = COLORS["arms_r"]
+        elif i in [5,6,7,20]:
+            color = COLORS["arms_l"]
+        elif i in [1,8,11,21,22,23,24]:
+            color = COLORS["torso"]
+        elif i in [9,10]:
+            color = COLORS["legs_r"]
+        elif i in [12,13]:
+            color = COLORS["legs_l"]
+        elif i == 0:
+            color = COLORS["nose"]
+        else:
+            color = COLORS["default"]
+
+        thickness = 3 if i in [1,8,11] else 2
+        cv2.line(pose_img, p1, p2, color + (255,), thickness)
+
+    # Save RGBA
+    save_path = f"{debug_dir}/skeleton_{frame_counter:05d}.png"
+    cv2.imwrite(save_path, pose_img)
+    print(f"[DEBUG] Skeleton transparent sauvegardé : {save_path}")
+
+
+def debug_draw_openpose_skeleton_v2(
+    pose_full_image,
+    keypoints_tensor,
+    debug_dir,
+    frame_counter,
+):
+    """
+    Dessine tous les keypoints (25+) + squelette OpenPose sur une image transparente.
 
     Args:
         pose_full_image (torch.Tensor): [B,3,H,W] normalisé [-1,1]
-        keypoints_tensor (torch.Tensor): [B,18,3] (x,y,conf) normalisé [0,1]
+        keypoints_tensor (torch.Tensor): [B,25,3] (x,y,conf) normalisé [0,1]
         debug_dir (str): dossier de sauvegarde
         frame_counter (int): index frame
     """
@@ -98,29 +207,28 @@ def debug_draw_openpose_skeleton(
     os.makedirs(debug_dir, exist_ok=True)
 
     # ---------------------------
-    # 🔹 Convert tensor → image
+    # 🔹 Convert tensor → image transparente
     # ---------------------------
-    pose_img = pose_full_image[0].permute(1, 2, 0).detach().cpu().numpy()
-    pose_img = (pose_img + 1.0) / 2.0
-    pose_img = (pose_img * 255).astype(np.uint8).copy()
-
-    H, W, _ = pose_img.shape
-
+    B, C, H, W = pose_full_image.shape
     keypoints = keypoints_tensor[0].detach().cpu().numpy()
+
+    # Crée une image RGBA transparente
+    pose_img = np.zeros((H, W, 4), dtype=np.uint8)
 
     def to_pixel(x, y):
         return int(x * W), int(y * H)
 
     # ---------------------------
-    # 🎨 Couleurs
+    # 🎨 Couleurs par groupe
     # ---------------------------
     COLORS = {
-        "head": (255, 0, 255),   # rose
-        "eyes": (0, 0, 255),     # rouge
-        "nose": (128, 0, 128),   # violet
-        "arms": (0, 255, 0),     # vert
-        "torso": (255, 0, 0),    # bleu
-        "default": (200, 200, 200)
+        "head": (255, 0, 255, 255),        # rose
+        "eyes": (0, 0, 255, 255),          # rouge
+        "nose": (128, 0, 128, 255),        # violet
+        "arms": (0, 255, 0, 255),          # vert
+        "torso": (255, 0, 0, 255),         # bleu
+        "legs": (0, 255, 255, 255),        # cyan
+        "default": (200, 200, 200, 255)    # gris clair
     }
 
     # ---------------------------
@@ -129,55 +237,58 @@ def debug_draw_openpose_skeleton(
     for i, (x, y, conf) in enumerate(keypoints):
         if conf < 0.1:
             continue
-
         px, py = to_pixel(x, y)
 
-        if i in [16, 17]:        # ears
-            color = COLORS["head"]
-        elif i in [14, 15]:      # eyes
+        if i in [14,15]:            # eyes
             color = COLORS["eyes"]
-        elif i == 0:             # nose
+        elif i == 0:                # nose
             color = COLORS["nose"]
-        elif i in [2,3,19,20,4,5,6,7]: # arms
+        elif i in [16,17]:          # ears
+            color = COLORS["head"]
+        elif i in [2,3,4,5,6,7,19,20]: # arms/clavicles
             color = COLORS["arms"]
-        elif i in [1,8,11]:      # torso
+        elif i in [1,8,11,21,22,23,24]: # torso / neck
             color = COLORS["torso"]
+        elif i in [9,10,12,13]:     # jambes (si utilisées)
+            color = COLORS["legs"]
+        elif i == 18:               # mouth
+            color = COLORS["head"]
         else:
             color = COLORS["default"]
 
         cv2.circle(pose_img, (px, py), 6, color, -1)
 
     # ---------------------------
-    # 🔹 Skeleton connections
+    # 🔹 Skeleton connections (25 points)
     # ---------------------------
     skeleton = [
-        (0,1),        # nose → neck
-        (1,19), (19,2), (2,3), (3,4),   # right arm (1,2), (2,3), (3,4),   # right arm
-        (1,20), (20,5), (5,6), (6,7),   # left arm (1,5), (5,6), (6,7),   # left arm
-        (1,8), (1,11),         # torso
-        (14,0), (15,0),        # eyes → nose
-        (16,14), (17,15),      # ears → eyes
+        (0,1), (1,19),(19,2),(2,3),(3,4),      # right arm
+        (1,20),(20,5),(5,6),(6,7),              # left arm
+        (1,8),(1,11),                            # torso
+        (14,0),(15,0),(16,15),(17,14),           # head connections corrigées
+        (8,9),(9,10),(11,12),(12,13),            # legs
+        (21,22),(21,23),(21,24)                  # chin/neck/anchor
     ]
 
     for i, j in skeleton:
         xi, yi, ci = keypoints[i]
         xj, yj, cj = keypoints[j]
-
         if ci < 0.1 or cj < 0.1:
             continue
-
         p1 = to_pixel(xi, yi)
         p2 = to_pixel(xj, yj)
 
-        # couleurs par type de lien
-        if (i, j) == (0,1):
-            color = (128, 0, 128)  # nez → cou (violet)
-        elif i in [2,3,4,5,6,7]:
-            color = (0,255,0)      # bras
-        elif i in [1,8,11]:
-            color = (255,0,0)      # torse
+        # Couleurs par type de lien
+        if (i,j) == (0,1):
+            color = COLORS["nose"]
+        elif i in [2,3,4,5,6,7,19,20]:
+            color = COLORS["arms"]
+        elif i in [1,8,11,21,22,23,24]:
+            color = COLORS["torso"]
+        elif i in [9,10,12,13]:
+            color = COLORS["legs"]
         else:
-            color = (255,255,255)
+            color = COLORS["default"]
 
         cv2.line(pose_img, p1, p2, color, 2)
 
@@ -185,9 +296,10 @@ def debug_draw_openpose_skeleton(
     # 💾 Save
     # ---------------------------
     save_path = f"{debug_dir}/skeleton_{frame_counter:05d}.png"
-    cv2.imwrite(save_path, cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(save_path, pose_img)  # RGBA
+    print(f"[DEBUG] Skeleton transparent sauvegardé : {save_path}")
 
-    print(f"[DEBUG] Skeleton sauvegardé : {save_path}")
+
 
 # sigma correspond a la valeur du flou
 def gaussian_blur_tensor(x, kernel_size=3, sigma=0.5):
