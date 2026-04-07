@@ -622,6 +622,7 @@ def encode_images_to_latents_safe(images, vae, device="cuda", latent_scale=0.182
 def save_frames_as_video_from_folder(
     folder_path,
     out_path,
+    pattern=None,
     fps=12,
     upscale_factor=1
 ):
@@ -630,8 +631,11 @@ def save_frames_as_video_from_folder(
     - Utilise ffmpeg directement (plus besoin de imageio)
     - Supporte l'upscale des images
     """
+    if pattern is None:
+        pattern = "*.png"
+
     folder_path = Path(folder_path)
-    images = sorted(folder_path.glob("*.png"))
+    images = sorted(folder_path.glob(pattern))
 
     if not images:
         raise ValueError(f"Aucune image trouvée dans {folder_path}")
