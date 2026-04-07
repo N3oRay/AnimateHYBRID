@@ -524,7 +524,7 @@ def apply_breathing_simple(latents, mask_torso, frame_counter, breathing=True, d
     B, C, H, W = latents.shape
     device = latents.device
 
-    breath = 0.003 * math.sin(frame_counter * 0.1)
+    breath = 0.006 * math.sin(frame_counter * 0.1) * math.cos(frame_counter * 0.06)
 
     yy, xx = torch.meshgrid(
         torch.linspace(-1, 1, H, device=device),
