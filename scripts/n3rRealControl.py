@@ -605,9 +605,12 @@ def main(args):
     pbar.close()
     # Libération à la fin
     release_mediapipe_models()
-    save_frames_as_video_from_folder( folder_path=output_dir, out_path=output_dir / f"video_{timestamp}.mp4", pattern="frame_*.png", fps=fps, upscale_factor=upscale_factor )
-    save_frames_as_video_from_folder( folder_path=output_dir, out_path=output_dir / f"skeleton_{timestamp}.mp4", pattern="skeleton_*.png", fps=fps, upscale_factor=upscale_factor )
-    print(f"🎬 Vidéo générée : {out_video}")
+    video_path = output_dir / f"video_{timestamp}.mp4"
+    skeleton_path = output_dir / f"skeleton_{timestamp}.mp4"
+    save_frames_as_video_from_folder(folder_path=output_dir, out_path=video_path, pattern="frame_*.png", fps=fps, upscale_factor=upscale_factor)
+    print(f"🎬 Vidéo générée : {video_path}")
+    save_frames_as_video_from_folder(folder_path=output_dir, out_path=skeleton_path, pattern="skeleton_*.png", fps=fps, upscale_factor=upscale_factor)
+    print(f"🎬 Vidéo générée : {skeleton_path}")
 
 # ---------------- ENTRY ----------------
 if __name__=="__main__":
