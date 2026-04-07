@@ -164,7 +164,7 @@ def main(args):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(f"./outputs/RealControl{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_video = output_dir / f"output_{timestamp}.mp4"
+
 
     # ---------------- load_controlnet_openpose ----------------
     if use_openpose:
@@ -605,8 +605,8 @@ def main(args):
     pbar.close()
     # Libération à la fin
     release_mediapipe_models()
-    save_frames_as_video_from_folder(output_dir, out_video, pattern="frame_*.png", fps=fps, upscale_factor=upscale_factor) # video
-    save_frames_as_video_from_folder(output_dir, out_video, fps=fps, upscale_factor=upscale_factor) # video + debug
+    save_frames_as_video_from_folder( folder_path=output_dir, out_path=output_dir / f"video_{timestamp}.mp4", pattern="frame_*.png", fps=fps, upscale_factor=upscale_factor )
+    save_frames_as_video_from_folder( folder_path=output_dir, out_path=output_dir / f"skeleton_{timestamp}.mp4", pattern="skeleton_*.png", fps=fps, upscale_factor=upscale_factor )
     print(f"🎬 Vidéo générée : {out_video}")
 
 # ---------------- ENTRY ----------------
