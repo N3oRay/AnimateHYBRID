@@ -605,7 +605,8 @@ def main(args):
     pbar.close()
     # Libération à la fin
     release_mediapipe_models()
-    save_frames_as_video_from_folder(output_dir, out_video, fps=fps, upscale_factor=upscale_factor)
+    save_frames_as_video_from_folder(output_dir, out_video, pattern="frame_*.png", fps=fps, upscale_factor=upscale_factor) # video
+    save_frames_as_video_from_folder(output_dir, out_video, fps=fps, upscale_factor=upscale_factor) # video + debug
     print(f"🎬 Vidéo générée : {out_video}")
 
 # ---------------- ENTRY ----------------
