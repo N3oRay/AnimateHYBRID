@@ -901,7 +901,7 @@ class Pose:
             print(f"[DEBUG] Right eye mask saved: {save_path}")
 
         return mask
-
+    #-----------------------------------------------------------------------------------------------------------------------------------
     def create_mouth_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
         """
         Masque dynamique pour la bouche uniquement, arrondi avec bord glow.
@@ -957,6 +957,68 @@ class Pose:
             print(f"[DEBUG] Mouth mask saved: {save_path}")
 
         return mask, mouth_points_batch
+    #-----------------------------------------------------------------------------------------------------------------------------------
+    def create_mouth_corners_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
+        """
+        Masque dynamique pour les coins de la bouche uniquement (pour sourire subtil, micro-mouvements).
+        Les coins sont calculés à partir du point central de la bouche.
+
+        Args:
+            H, W: hauteur et largeur de l'image/latent
+            expand_w, expand_h: élargissement du masque horizontal/vertical
+            debug: si True, sauvegarde l'image du masque
+            debug_dir: répertoire de sauvegarde debug
+            frame_counter: numéro de frame (pour debug)
+
+        Returns:
+            mask (torch.Tensor): [B,1,H,W] masque des coins de bouche
+            corners_points_batch (list[dict]): coordonnées normalisées des coins par batch
+        """
+        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+        corners_points_batch = []
+
+        for b in range(self.B):
+            # Récupération du centre approximatif de la bouche
+            mouth_center = self.get_point('mouth')[b].cpu().numpy()
+            cx = mouth_center[0] * (W-1)
+            cy = mouth_center[1] * (H-1)
+
+            # Dimensions approximatives pour coins de bouche
+            w_corner = 0.03 * W * (1 + expand_w)
+            h_corner = 0.02 * H * (1 + expand_h)
+
+            # Calcul coins gauche/droite
+            mouth_left  = np.array([cx - w_corner/2, cy])
+            mouth_right = np.array([cx + w_corner/2, cy])
+
+            corners_points_batch.append({
+                'mouth_center': mouth_center,
+                'mouth_left': mouth_left / [W-1, H-1],
+                'mouth_right': mouth_right / [W-1, H-1],
+            })
+
+            # Création masque ovale pour les coins
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            cv2.ellipse(mask_np, (int(mouth_left[0]), int(mouth_left[1])), (int(w_corner/2), int(h_corner/2)), 0, 0, 360, 255, -1)
+            cv2.ellipse(mask_np, (int(mouth_right[0]), int(mouth_right[1])), (int(w_corner/2), int(h_corner/2)), 0, 0, 360, 255, -1)
+
+            mask[b,0] = torch.from_numpy(mask_np/255.0).to(self.device)
+
+        # Feather interne/externe pour adoucir le bord
+        mask = feather_inside_strict(mask, radius=2, blur_kernel=3, sigma=1.0)
+        mask = feather_outside_only_alpha(mask, radius=2, sigma=1.0)
+
+        # Debug
+        if debug and debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            save_path = os.path.join(debug_dir, f"mouth_corners_mask_{frame_counter:05d}.png")
+            mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
+            from PIL import Image
+            Image.fromarray(mask_img).save(save_path)
+            print(f"[DEBUG] Mouth corners mask saved: {save_path}")
+
+        return mask, corners_points_batch
+    #-----------------------------------------------------------------------------------------------------------------------------------
     def create_face_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0):
         """
         Masque facial dynamique et professionnel, en forme ovale réaliste, incluant bouche.
