@@ -259,10 +259,10 @@ def main(args):
             face_mesh = get_face_mesh()
             nose_coords = get_nose_coords_safe(input_pil, face_mesh)# 0 nose / nez
             neck_coords = get_neck_coords_safe(input_pil, face_mesh) # 1 neck / cou
-            shoulders_coords = get_shoulders_coords_safe(input_pil) # 5 left_shoulder / épaule gauche # 2 right_shoulder / épaule droite
+            shoulders_coords = get_shoulders_coords_safe(input_pil, pose_model, face_mesh) # 5 left_shoulder / épaule gauche # 2 right_shoulder / épaule droite
             clavicules_coords = get_clavicules_coords_safe(input_pil, pose_model, face_mesh)
-            elbow_coords = get_elbows_coords_safe(input_pil)  # 6 left_elbow / coude gauche # 3 right_elbow / coude droit
-            wrists_coords = get_wrists_coords_safe(input_pil)   # 7 left_wrist / poignet gauche # 4 right_wrist / poignet droit
+            elbow_coords = get_elbows_coords_safe(input_pil, pose_model)  # 6 left_elbow / coude gauche # 3 right_elbow / coude droit
+            wrists_coords = get_wrists_coords_safe(input_pil, pose_model, face_mesh)   # 7 left_wrist / poignet gauche # 4 right_wrist / poignet droit
             hips_coords = get_hips_coords_safe(input_pil)  # 11 left_hip / hanche gauche # 8 right_hip / hanche droite
             # 9 right_knee (absent)
             # 10 right_ankle (absent)
