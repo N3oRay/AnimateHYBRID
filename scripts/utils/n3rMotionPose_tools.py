@@ -20,12 +20,13 @@ import traceback
 
 def feather_outside_only_alpha2(mask: torch.Tensor, radius: int = 2, sigma: float = 1.0):
     """
-    Adoucit uniquement l'extérieur d'un masque (feathering glow externe).
+    Adoucit uniquement l'extérieur d'un masque (feathering glow externe)
+    de manière stable, avec recadrage pour éviter les erreurs de dimensions.
 
     Args:
         mask: Tensor [B,1,H,W], valeurs 0..1
-        radius: padding pour étendre le blur
-        sigma: écart-type du blur gaussien
+        radius: int, padding pour étendre le blur
+        sigma: float, écart-type du blur gaussien
 
     Returns:
         Tensor [B,1,H,W] adouci à l'extérieur
@@ -53,6 +54,9 @@ def feather_outside_only_alpha2(mask: torch.Tensor, radius: int = 2, sigma: floa
     # Retirer le padding
     blur = blur[:, :, radius:radius+H, radius:radius+W]
 
+    # ⚠️ Recadrage exact pour éviter les problèmes de dimension
+    blur = F.interpolate(blur, size=(H, W), mode='bilinear', align_corners=False)
+
     # Re-inverser pour récupérer la zone originale avec bord adouci
     mask_feathered = 1.0 - blur
 
@@ -64,14 +68,17 @@ def feather_outside_only_alpha2(mask: torch.Tensor, radius: int = 2, sigma: floa
 
 def feather_inside_strict2(mask: torch.Tensor, radius: int = 2, blur_kernel: int = 3, sigma: float = 1.0):
     """
-    Adoucit uniquement l'intérieur du masque (feathering interne strict).
+    Adoucit uniquement l'intérieur du masque (feathering interne strict)
+    de manière stable, avec recadrage pour éviter les erreurs de dimensions.
+
     Args:
         mask: Tensor [B,1,H,W], valeurs 0..1
-        radius: padding autour pour le blur
-        blur_kernel: taille du kernel gaussien (impair)
-        sigma: écart-type du blur gaussien
+        radius: int, padding autour pour le blur
+        blur_kernel: int, taille du kernel gaussien (impair)
+        sigma: float, écart-type du blur gaussien
+
     Returns:
-        mask adouci à l'intérieur
+        Tensor [B,1,H,W] adouci à l'intérieur
     """
     B, C, H, W = mask.shape
     device = mask.device
@@ -91,6 +98,9 @@ def feather_inside_strict2(mask: torch.Tensor, radius: int = 2, blur_kernel: int
 
     # Retirer padding
     mask_blur = mask_blur[:, :, radius:radius+H, radius:radius+W]
+
+    # ⚠️ Recadrage exact pour éviter les problèmes de dimension
+    mask_blur = F.interpolate(mask_blur, size=(H, W), mode='bilinear', align_corners=False)
 
     # Clamp 0..1
     mask_blur = mask_blur.clamp(0.0, 1.0)

@@ -818,6 +818,90 @@ class Pose:
 
         return mask_hair
     # version dynamique pro
+    def create_left_eye_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
+        """
+        Masque dynamique pour l’œil gauche, ovale réaliste.
+        """
+        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+
+        for b in range(self.B):
+            points = [self.get_point(15)[b].cpu().numpy()]  # left_eye keypoints
+            pts = np.array([[p[0]*(W-1), p[1]*(H-1)] for p in points], dtype=np.float32)
+
+            if len(pts) == 0:
+                continue
+
+            cx, cy = np.mean(pts[:,0]), np.mean(pts[:,1])
+            w_eye = np.max(pts[:,0]) - np.min(pts[:,0])
+            h_eye = np.max(pts[:,1]) - np.min(pts[:,1])
+
+            # Expansion proportionnelle
+            w_eye *= (1.0 + expand_w)
+            h_eye *= (1.0 + expand_h)
+
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            center = (int(cx), int(cy))
+            axes = (max(1, int(w_eye/2)), max(1, int(h_eye/2)))
+            cv2.ellipse(mask_np, center, axes, angle=0, startAngle=0, endAngle=360, color=255, thickness=-1)
+
+            mask[b,0] = torch.from_numpy(mask_np/255.0).to(self.device)
+
+        # Feather interne/externe pour adoucir
+        mask = feather_inside_strict(mask, radius=2, blur_kernel=3, sigma=0.8)
+        mask = feather_outside_only_alpha(mask, radius=2, sigma=1.2)
+
+        if debug and debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            save_path = os.path.join(debug_dir, f"left_eye_mask_{frame_counter:05d}.png")
+            mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
+            Image.fromarray(mask_img).save(save_path)
+            print(f"[DEBUG] Left eye mask saved: {save_path}")
+
+        return mask
+
+
+    def create_right_eye_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
+        """
+        Masque dynamique pour l’œil droit, ovale réaliste.
+        """
+
+        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+
+        for b in range(self.B):
+            points = [self.get_point(14)[b].cpu().numpy()]  # right_eye keypoints
+            pts = np.array([[p[0]*(W-1), p[1]*(H-1)] for p in points], dtype=np.float32)
+
+            if len(pts) == 0:
+                continue
+
+            cx, cy = np.mean(pts[:,0]), np.mean(pts[:,1])
+            w_eye = np.max(pts[:,0]) - np.min(pts[:,0])
+            h_eye = np.max(pts[:,1]) - np.min(pts[:,1])
+
+            # Expansion proportionnelle
+            w_eye *= (1.0 + expand_w)
+            h_eye *= (1.0 + expand_h)
+
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            center = (int(cx), int(cy))
+            axes = (max(1, int(w_eye/2)), max(1, int(h_eye/2)))
+            cv2.ellipse(mask_np, center, axes, angle=0, startAngle=0, endAngle=360, color=255, thickness=-1)
+
+            mask[b,0] = torch.from_numpy(mask_np/255.0).to(self.device)
+
+        # Feather interne/externe pour adoucir
+        mask = feather_inside_strict(mask, radius=2, blur_kernel=3, sigma=0.8)
+        mask = feather_outside_only_alpha(mask, radius=2, sigma=1.2)
+
+        if debug and debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            save_path = os.path.join(debug_dir, f"right_eye_mask_{frame_counter:05d}.png")
+            mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
+            Image.fromarray(mask_img).save(save_path)
+            print(f"[DEBUG] Right eye mask saved: {save_path}")
+
+        return mask
+
     def create_mouth_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
         """
         Masque dynamique pour la bouche uniquement, arrondi avec bord glow.
