@@ -20,6 +20,35 @@ class Pose:
         self.torce_expand_w=1.6
         self.torce_shrink_h=1.2
 
+        # -----------------------------
+        # Mapping global des points faciaux
+        # -----------------------------
+        self.FACIAL_POINT_IDX = {
+            'nose': 0,
+            'neck': 1,
+            'right_shoulder': 2,
+            'right_elbow': 3,
+            'right_wrist': 4,
+            'left_shoulder': 5,
+            'left_elbow': 6,
+            'left_wrist': 7,
+            'right_hip': 8,
+            'left_hip': 11,
+            'right_eye': 14,
+            'left_eye': 15,
+            'right_ear': 16,
+            'left_ear': 17,
+            'mouth': 18,
+            'chin': 21,
+            'left_side_neck': 22,
+            'right_side_neck': 23,
+            'anchor_neck': 24,
+            'mouth_left': 48,    # coin gauche des lèvres supérieures
+            'mouth_right': 49,   # coin droit des lèvres supérieures
+            'mouth_top': 50,     # index approximatif du haut de la bouche (à ajuster selon ton keypoints)
+            'mouth_bottom': 51,  # index approximatif du bas de la bouche
+        }
+
     # =========================
     # GETTER
     # =========================
@@ -205,7 +234,8 @@ class Pose:
 
     # ----------------- Keypoint utils -----------------
     def get_point(self, idx):
-        """Récupère un keypoint spécifique [B,2]"""
+        if isinstance(idx, str):
+            idx = self.FACIAL_POINT_IDX[idx]
         return self.keypoints[:, idx, :2]
 
     # ----------------- Torso angle -----------------
@@ -788,6 +818,61 @@ class Pose:
 
         return mask_hair
     # version dynamique pro
+    def create_mouth_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
+        """
+        Masque dynamique pour la bouche uniquement, arrondi avec bord glow.
+        expand_w / expand_h permettent d'élargir le rectangle de la bouche.
+        Retourne également les points calculés de la bouche pour suivi.
+        """
+        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+        mouth_points_batch = []
+
+        for b in range(self.B):
+            # Récupération du centre approximatif de la bouche
+            mouth_center = self.get_point('mouth')[b].cpu().numpy()
+            cx = mouth_center[0] * (W-1)
+            cy = mouth_center[1] * (H-1)
+
+            # Dimensions approximatives de la bouche
+            w_mouth = 0.06 * W * (1 + expand_w)
+            h_mouth = 0.04 * H * (1 + expand_h)
+
+            # Calcul des coins et haut/bas
+            mouth_left   = np.array([cx - w_mouth/2, cy])
+            mouth_right  = np.array([cx + w_mouth/2, cy])
+            mouth_top    = np.array([cx, cy - h_mouth/2])
+            mouth_bottom = np.array([cx, cy + h_mouth/2])
+
+            mouth_points_batch.append({
+                'mouth_center': mouth_center,
+                'mouth_left': mouth_left / [W-1, H-1],
+                'mouth_right': mouth_right / [W-1, H-1],
+                'mouth_top': mouth_top / [W-1, H-1],
+                'mouth_bottom': mouth_bottom / [W-1, H-1],
+            })
+
+            # Création d'un ovale pour la bouche
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            center = (int(cx), int(cy))
+            axes = (int(w_mouth/2), int(h_mouth/2))
+            cv2.ellipse(mask_np, center, axes, angle=0, startAngle=0, endAngle=360, color=255, thickness=-1)
+
+            # Conversion en tensor et ajout au batch
+            mask[b,0] = torch.from_numpy(mask_np/255.0).to(self.device)
+
+        # Feather interne/externe pour adoucir le bord
+        mask = feather_inside_strict(mask, radius=3, blur_kernel=3, sigma=1.0)
+        mask = feather_outside_only_alpha(mask, radius=3, sigma=1.5)
+
+        # Debug
+        if debug and debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+            save_path = os.path.join(debug_dir, f"mouth_mask_{frame_counter:05d}.png")
+            mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
+            Image.fromarray(mask_img).save(save_path)
+            print(f"[DEBUG] Mouth mask saved: {save_path}")
+
+        return mask, mouth_points_batch
     def create_face_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0):
         """
         Masque facial dynamique et professionnel, en forme ovale réaliste, incluant bouche.
