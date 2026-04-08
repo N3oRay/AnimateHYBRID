@@ -15,7 +15,87 @@ import traceback
 
 
 
-#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha, smooth_noise, apply_hair_motion_3D
+#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha, smooth_noise, apply_hair_motion_3D, feather_inside_strict2, feather_outside_only_alpha2
+
+
+def feather_outside_only_alpha2(mask: torch.Tensor, radius: int = 2, sigma: float = 1.0):
+    """
+    Adoucit uniquement l'extérieur d'un masque (feathering glow externe).
+
+    Args:
+        mask: Tensor [B,1,H,W], valeurs 0..1
+        radius: padding pour étendre le blur
+        sigma: écart-type du blur gaussien
+
+    Returns:
+        Tensor [B,1,H,W] adouci à l'extérieur
+    """
+    B, C, H, W = mask.shape
+    device = mask.device
+
+    # Inverse du masque pour travailler sur l'extérieur
+    mask_inv = 1.0 - mask
+
+    # Padding pour ne pas perdre les bords
+    mask_inv_pad = F.pad(mask_inv, (radius, radius, radius, radius), mode='reflect')
+
+    # Création du kernel gaussien 2D
+    kernel_size = radius * 2 + 1
+    coords = torch.arange(kernel_size, dtype=torch.float32, device=device) - kernel_size // 2
+    x_grid, y_grid = torch.meshgrid(coords, coords, indexing='ij')
+    kernel = torch.exp(-(x_grid**2 + y_grid**2) / (2 * sigma**2))
+    kernel = kernel / kernel.sum()
+    kernel = kernel.view(1, 1, kernel_size, kernel_size).repeat(C, 1, 1, 1)
+
+    # Convolution 2D pour blur
+    blur = F.conv2d(mask_inv_pad, kernel, padding=0, groups=C)
+
+    # Retirer le padding
+    blur = blur[:, :, radius:radius+H, radius:radius+W]
+
+    # Re-inverser pour récupérer la zone originale avec bord adouci
+    mask_feathered = 1.0 - blur
+
+    # Clamp 0..1
+    mask_feathered = mask_feathered.clamp(0.0, 1.0)
+
+    return mask_feathered
+
+
+def feather_inside_strict2(mask: torch.Tensor, radius: int = 2, blur_kernel: int = 3, sigma: float = 1.0):
+    """
+    Adoucit uniquement l'intérieur du masque (feathering interne strict).
+    Args:
+        mask: Tensor [B,1,H,W], valeurs 0..1
+        radius: padding autour pour le blur
+        blur_kernel: taille du kernel gaussien (impair)
+        sigma: écart-type du blur gaussien
+    Returns:
+        mask adouci à l'intérieur
+    """
+    B, C, H, W = mask.shape
+    device = mask.device
+
+    # Padding pour ne pas perdre les bords
+    mask_pad = F.pad(mask, (radius, radius, radius, radius), mode='reflect')
+
+    # Création du kernel gaussien 2D
+    coords = torch.arange(blur_kernel, dtype=torch.float32, device=device) - blur_kernel // 2
+    x_grid, y_grid = torch.meshgrid(coords, coords, indexing='ij')
+    kernel = torch.exp(-(x_grid**2 + y_grid**2) / (2 * sigma**2))
+    kernel = kernel / kernel.sum()
+    kernel = kernel.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1)
+
+    # Convolution 2D pour blur
+    mask_blur = F.conv2d(mask_pad, kernel, padding=0, groups=C)
+
+    # Retirer padding
+    mask_blur = mask_blur[:, :, radius:radius+H, radius:radius+W]
+
+    # Clamp 0..1
+    mask_blur = mask_blur.clamp(0.0, 1.0)
+
+    return mask_blur
 
 
 def smooth_noise(grid, frame, scale=0.05, time_scale=0.1):
