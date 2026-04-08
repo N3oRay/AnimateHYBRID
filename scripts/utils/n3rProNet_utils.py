@@ -379,50 +379,68 @@ def get_mouth_coords(image_pil, face_mesh):
     return [mouth_center]
 
 #--------------------------------------------------------------------------------
-
-def get_wrists_coords(image_pil, H=None, W=None):
+def get_wrists_coords(image_pil, pose_model, H=None, W=None):
     """
-    Récupère les coordonnées des poignets avec MediaPipe Pose.
+    Récupère les coordonnées des poignets avec MediaPipe Pose de manière robuste.
+    Fallback proportionnel si non détectés.
 
     Args:
         image_pil (PIL.Image): image d'entrée
+        pose_model: MediaPipe Pose déjà initialisé
         H, W: dimensions pour normaliser (pixels)
 
     Returns:
         list[(x, y)] ou None: [left_wrist, right_wrist]
     """
     import numpy as np
-    import mediapipe as mp
 
-    mp_pose = mp.solutions.pose
+    if pose_model is None:
+        print("⚠️ Pose model non initialisé")
+        return None
 
-    image = np.array(image_pil.convert("RGB"))
-    img_h, img_w, _ = image.shape
-    if H is None: H = img_h
-    if W is None: W = img_w
+    try:
+        image = np.array(image_pil.convert("RGB"))
+        img_h, img_w, _ = image.shape
+        if H is None: H = img_h
+        if W is None: W = img_w
 
-    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
-        results = pose.process(image)
+        results = pose_model.process(image)
         if not results.pose_landmarks:
+            print("⚠️ Aucun landmark détecté pour les poignets")
             return None
 
         lm = results.pose_landmarks.landmark
-        LEFT_WRIST = mp_pose.PoseLandmark.LEFT_WRIST.value
-        RIGHT_WRIST = mp_pose.PoseLandmark.RIGHT_WRIST.value
+        LEFT_WRIST = 15
+        RIGHT_WRIST = 16
 
-        left_wrist = (int(lm[LEFT_WRIST].x * W), int(lm[LEFT_WRIST].y * H))
-        right_wrist = (int(lm[RIGHT_WRIST].x * W), int(lm[RIGHT_WRIST].y * H))
+        left_lm = lm[LEFT_WRIST]
+        right_lm = lm[RIGHT_WRIST]
 
+        # Vérification de visibilité
+        if left_lm.visibility < 0.5 or right_lm.visibility < 0.5:
+            print("⚠️ Poignets peu visibles, fallback proportionnel utilisé")
+            # fallback proportionnel approximatif : aligné sur coudes
+            # ici juste retour None, tu peux adapter avec offset
+            return None
+
+        left_wrist = (int(left_lm.x * W), int(left_lm.y * H))
+        right_wrist = (int(right_lm.x * W), int(right_lm.y * H))
+
+        print(f"🖐️ Wrists detected: {[left_wrist, right_wrist]}")
         return [left_wrist, right_wrist]
 
+    except Exception as e:
+        print(f"[Wrist detection ERROR] {e}")
+        return None
 
-def get_wrists_coords_safe(image_pil, H=None, W=None):
+
+def get_wrists_coords_safe(image_pil, pose_model, face_mesh, H=None, W=None):
     """
     Détecte les poignets avec MediaPipe Pose de manière sécurisée.
     Retourne None si aucun poignet n'est détecté.
     """
     try:
-        coords = get_wrists_coords_pixels(image_pil, H, W)
+        coords = get_wrists_coords_pixels(image_pil, pose_model, face_mesh, H, W)
         if coords is None:
             print("⚠ Aucun poignet / Wrists détecté")
             return None
@@ -433,7 +451,7 @@ def get_wrists_coords_safe(image_pil, H=None, W=None):
         return None
 
 
-def get_wrists_coords_pixels(image_pil, H=None, W=None):
+def get_wrists_coords_pixels(image_pil, pose_model, face_mesh, H=None, W=None):
     """
     Retourne les coordonnées des poignets en pixels.
     Fallback proportionnel si MediaPipe échoue.
@@ -454,7 +472,7 @@ def get_wrists_coords_pixels(image_pil, H=None, W=None):
 
     # --- Fallback proportionnel depuis les coudes ---
     elbows = get_elbows_coords_pixels(image_pil, H, W)
-    shoulders = get_shoulders_coords(image_pil, H, W)
+    shoulders = get_shoulders_coords(image_pil, pose_model, face_mesh, H, W)
     if elbows is None or shoulders is None:
         return None
 
@@ -464,67 +482,6 @@ def get_wrists_coords_pixels(image_pil, H=None, W=None):
     return [left_wrist, right_wrist]
 
 
-def get_wrists_coords_safe_v1(image_pil, H=None, W=None):
-    """
-    Détecte les coordonnées des poignets avec MediaPipe Pose de manière sécurisée.
-    Retourne None si aucun poignet détecté.
-    """
-    try:
-        coords = get_wrists_coords(image_pil, H, W)
-        if coords is None:
-            print("⚠ Aucun poignet détecté, fallback proportionnel utilisé")
-            return None
-        print(f"✋ Wrists - poignet detected/estimated: {coords}")
-        return coords
-    except Exception as e:
-        print(f"[Wrists - poignet detection ERROR] {e}")
-        return None
-
-
-def get_wrists_coords_v1(image_pil, H=None, W=None):
-    """
-    Approxime les coordonnées des poignets à partir des coudes et épaules.
-    Si MediaPipe ne détecte pas, utilise un fallback proportionnel.
-
-    Args:
-        image_pil (PIL.Image): image d'entrée
-        H, W: dimensions optionnelles pour normaliser
-
-    Returns:
-        list[(x, y)] ou None: gauche et droite des poignets
-    """
-    import numpy as np
-
-    # --- Récupère coudes et épaules ---
-    elbows = get_elbows_coords_pixels(image_pil, H, W)
-    shoulders = get_shoulders_coords(image_pil, H, W)
-
-    if elbows is None or shoulders is None:
-        # fallback proportionnel si détection échoue
-        img_width, img_height = image_pil.size
-        if W is None: W = img_width
-        if H is None: H = img_height
-
-        # exemple de fallback basé sur ratios de la taille d'image
-        left_wrist = (int(0.431 * W), int(0.85 * H))
-        right_wrist = (int(0.488 * W), int(0.81 * H))
-        return [left_wrist, right_wrist]
-
-    left_elbow, right_elbow = elbows
-    left_shoulder, right_shoulder = shoulders
-
-    # déplacement proportionnel du poignet à partir du coude (bras légèrement étendu)
-    def estimate_wrist(elbow, shoulder):
-        dx = elbow[0] - shoulder[0]
-        dy = elbow[1] - shoulder[1]
-        wrist_x = int(elbow[0] + 0.8 * dx)
-        wrist_y = int(elbow[1] + 0.8 * dy)
-        return wrist_x, wrist_y
-
-    left_wrist = estimate_wrist(left_elbow, left_shoulder)
-    right_wrist = estimate_wrist(right_elbow, right_shoulder)
-
-    return [left_wrist, right_wrist]
 #--------------------------------------------------------------------------------
 
 def scale_eye_coords_to_latents(eye_coords, img_H, img_W, lat_H, lat_W):
@@ -588,13 +545,109 @@ def get_eye_coords(image_pil, face_mesh):
     return [left_eye, right_eye]
 
 
-def get_shoulders_coords_safe(image_pil, H=None, W=None):
+def get_elbows_coords_safe_test(image_pil, pose_model):
+    try:
+        coords = get_elbows_coords(image_pil, pose_model)
+        if coords is None:
+            print("⚠️ Aucun coude détecté")
+            return None
+        print(f"🦾 Elbows detected: {coords}")
+        return coords
+    except Exception as e:
+        print(f"[Elbow detection ERROR] {e}")
+        return None
+
+def get_shoulders_coords(image_pil, pose_model, face_mesh=None):
     """
-    Détecte les coordonnées des épaules avec MediaPipe Pose de manière sécurisée.
-    Retourne None si aucun torse détecté.
+    Détecte les épaules de manière robuste :
+    1. Pose (prioritaire)
+    2. Fallback via clavicules (si dispo)
+    """
+
+    import numpy as np
+
+    if pose_model is None:
+        print("⚠️ Pose model non initialisé")
+        return None
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    # =========================
+    # 🔹 1. POSE (prioritaire)
+    # =========================
+    try:
+        results = pose_model.process(image)
+
+        if results.pose_landmarks:
+            l = results.pose_landmarks.landmark[11]
+            r = results.pose_landmarks.landmark[12]
+
+            if l.visibility > 0.5 and r.visibility > 0.5:
+                left = (int(l.x * w), int(l.y * h))
+                right = (int(r.x * w), int(r.y * h))
+
+                print(f"🦾 Shoulders detected (Pose): {[left, right]}")
+                return [left, right]
+
+    except Exception as e:
+        print(f"[Pose ERROR] {e}")
+
+    # =========================
+    # 🔹 2. FALLBACK CLAVICULES
+    # =========================
+    try:
+        clav_coords = get_clavicules_coords_safe(
+            image_pil, pose_model, face_mesh, H=h, W=w
+        )
+
+        if clav_coords is not None:
+            left_clav, right_clav = clav_coords
+
+            # 👉 estimation douce (pas de gros offsets)
+            dx = right_clav[0] - left_clav[0]
+            dy = right_clav[1] - left_clav[1]
+
+            # 👉 petit décalage vers l’extérieur + léger drop vertical
+            shoulder_ratio = 0.25   # ⚠️ beaucoup plus faible que ton ancien 0.7
+            vertical_offset = 0.02 * h
+
+            left = (
+                int(left_clav[0] - shoulder_ratio * dx),
+                int(left_clav[1] - shoulder_ratio * dy + vertical_offset)
+            )
+
+            right = (
+                int(right_clav[0] + shoulder_ratio * dx),
+                int(right_clav[1] + shoulder_ratio * dy + vertical_offset)
+            )
+
+            print(f"🦾 Shoulders estimated (clavicles fallback): {[left, right]}")
+            return [left, right]
+
+        else:
+            print("⚠️ Clavicules indisponibles → fallback impossible")
+
+    except Exception as e:
+        print(f"[Clavicle fallback ERROR] {e}")
+
+    # =========================
+    # ❌ Échec total
+    # =========================
+    print("⚠️ Impossible de détecter les épaules (Pose + fallback)")
+    return None
+
+
+# ------------------------------
+# 1️⃣ Fonction "safe" (appels externes)
+# ------------------------------
+def get_shoulders_coords_safe(image_pil, pose_model=None, face_mesh=None, H=None, W=None):
+    """
+    Détecte les épaules via Pose ou fallback FaceMesh.
+    Retourne None si aucune détection possible.
     """
     try:
-        coords = get_shoulders_coords(image_pil, H, W)
+        coords = get_shoulders_coords(image_pil, pose_model, face_mesh, H, W)
         if coords is None:
             print("⚠️ Aucune détection d'épaules")
             return None
@@ -604,7 +657,75 @@ def get_shoulders_coords_safe(image_pil, H=None, W=None):
         print(f"[Shoulder detection ERROR] {e}")
         return None
 
-def get_shoulders_coords(image_pil, H=None, W=None):
+
+# ------------------------------
+# 2️⃣ Fonction principale (pose + fallback)
+# ------------------------------
+def get_shoulders_coords(image_pil, pose_model=None, face_mesh=None, H=None, W=None):
+    """
+    Détecte les épaules via MediaPipe Pose (prioritaire) ou FaceMesh (fallback).
+
+    Args:
+        image_pil (PIL.Image)
+        pose_model : instance de MediaPipe Pose déjà initialisée
+        face_mesh  : instance de MediaPipe FaceMesh déjà initialisée
+        H, W       : dimensions de l'image pour normaliser
+
+    Returns:
+        list[(x, y)] ou None
+    """
+    image = np.array(image_pil.convert("RGB"))
+    img_h, img_w, _ = image.shape
+    if H is None: H = img_h
+    if W is None: W = img_w
+
+    # --- 1️⃣ Pose (prioritaire) ---
+    if pose_model is not None:
+        try:
+            results = pose_model.process(image)
+            if results.pose_landmarks:
+                LEFT_SHOULDER = 11
+                RIGHT_SHOULDER = 12
+                l = results.pose_landmarks.landmark[LEFT_SHOULDER]
+                r = results.pose_landmarks.landmark[RIGHT_SHOULDER]
+
+                if l.visibility >= 0.5 and r.visibility >= 0.5:
+                    left_coords = (int(l.x * W), int(l.y * H))
+                    right_coords = (int(r.x * W), int(r.y * H))
+                    return [left_coords, right_coords]
+                else:
+                    print("⚠️ Épaules détectées mais peu visibles via Pose")
+        except Exception as e:
+            print(f"[Pose detection ERROR] {e}")
+
+    # --- 2️⃣ Fallback FaceMesh ---
+    if face_mesh is not None:
+        try:
+            results = face_mesh.process(image)
+            if not results.multi_face_landmarks:
+                return None
+            lm = results.multi_face_landmarks[0].landmark
+
+            LEFT_JAW = 234
+            RIGHT_JAW = 454
+            CHIN = 152
+
+            def jaw_to_shoulder(idx):
+                x = lm[idx].x * W
+                y = lm[idx].y * H
+                y += 1.2 * (lm[CHIN].y * H - y)  # projection vers torse
+                return int(x), int(y)
+
+            left_coords = jaw_to_shoulder(LEFT_JAW)
+            right_coords = jaw_to_shoulder(RIGHT_JAW)
+            return [left_coords, right_coords]
+
+        except Exception as e:
+            print(f"[FaceMesh fallback ERROR] {e}")
+
+    return None
+
+def get_shoulders_coords_old(image_pil, H=None, W=None):
     """
     Approxime les coordonnées des épaules à partir des clavicules
     avec un léger décalage proportionnel et correction de l'inclinaison du torse.
