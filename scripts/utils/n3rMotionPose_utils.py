@@ -2,6 +2,7 @@
 # n3rOpenPose_utils.py
 #********************************************
 import torch
+import time
 from diffusers import ControlNetModel
 import math
 import torch.nn.functional as F
@@ -1806,7 +1807,55 @@ def apply_face_warp_v1(
 
     return latents_out, face_delta_expanded, facial_points
 
+#------------------------------------------------------------------------------------------
+def apply_micro_boost(latents, frame_counter, device, masks):
+    """
+    Applique un micro-boost sinusoidal sur différentes zones pour rendre l'image vivante.
 
+    Args:
+        latents (torch.Tensor): latents [B,C,H,W]
+        frame_counter (int): compteur de frame
+        device (str / torch.device)
+        masks (dict): dictionnaire de la forme
+            {
+                "torso": (mask_tensor, phase, amplitude),
+                "hair":  (mask_tensor, phase, amplitude),
+                "face":  (mask_tensor, phase, amplitude)
+            }
+
+    Returns:
+        torch.Tensor: latents modifiés
+    """
+    import torch
+
+    t = torch.tensor(frame_counter / 6.0, device=device)  # base temporelle
+
+    for zone_name, (mask, phase, amp) in masks.items():
+        if mask is None:
+            continue
+        latents += amp * mask * torch.sin(t + phase)
+
+    return latents
+
+def calibrate_amplitude(mask, base_amp=0.002, max_amp=0.005):
+    """
+    Calibre automatiquement l'amplitude d'un micro-boost en fonction de la taille du masque.
+
+    Args:
+        mask (torch.Tensor): masque binaire [B,H,W] ou [H,W], valeurs 0-1
+        base_amp (float): amplitude minimale
+        max_amp (float): amplitude maximale
+
+    Returns:
+        float: amplitude calibrée
+    """
+    # Calculer proportion de pixels activés
+    mask_area_ratio = mask.mean().item()  # entre 0 et 1
+
+    # Interpolation linéaire
+    amplitude = base_amp + (max_amp - base_amp) * mask_area_ratio
+
+    return amplitude
 #------------------------------------------------------------------------------------------
 
 def apply_pose_driven_motion(
@@ -1832,7 +1881,8 @@ def apply_pose_driven_motion(
     - Stabilisation (face protected)
     - Micro-boost par zone pour éviter le rendu statique
     """
-
+    # dictionnaire pour stocker les temps
+    timings = {}
     # =========================
     # 🔹 Setup
     # =========================
@@ -1844,10 +1894,11 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 Pose
     # =========================
+    start = time.time()
     pose = Pose(keypoints.to(device))
     pose.compute_torso_delta(latent_h=H, latent_w=W)
     prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
-
+    timings["Pose"] = time.time() - start
     # =========================
     # 🔹 Grid
     # =========================
@@ -1872,19 +1923,15 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 GLOBAL POSE
     # =========================
+    start = time.time()
     latents_before = latents.clone()
     latents_global, global_delta = apply_global_pose(
-        latents=latents,
-        pose=pose,
-        prev_pose=prev_pose,
-        H=H,
-        W=W,
-        device=device,
+        latents=latents, pose=pose, prev_pose=prev_pose, H=H, W=W, device=device,
         debug=debug,
         debug_dir=debug_dir
     )
     latents = latents_global * (1.0 - mask_face_exp) + latents_before * mask_face_exp
-
+    timings["GLOBAL"] = time.time() - start
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="torso_global")
         print("[DEBUG] Global pose applied")
@@ -1892,20 +1939,15 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 TORSO
     # =========================
+    start = time.time()
     latents_before = latents.clone()
     latents_torso, delta_px = apply_torso_warp(
-        latents=latents,
-        pose=pose,
-        mask_torso=mask_torso,
-        grid=grid,
-        H=H,
-        W=W,
-        device=device,
+        latents=latents, pose=pose, mask_torso=mask_torso, grid=grid, H=H, W=W, device=device,
         debug=debug,
         debug_dir=debug_dir
     )
     latents = latents_torso * mask_torso_exp + latents_before * (1.0 - mask_torso_exp)
-
+    timings["TORSO"] = time.time() - start
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="torso_warp")
         print("[DEBUG] Torso warp applied")
@@ -1913,19 +1955,12 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 FACE (STATEFUL)
     # =========================
+    start = time.time()
     latents, face_delta, facial_points = apply_face_warp_v2(
-        latents=latents,
-        pose=pose,
-        mask_face=mask_face,
-        grid=grid,
-        H=H,
-        W=W,
-        frame_counter=frame_counter,
-        device=device,
-        debug=debug,
-        debug_dir=debug_dir,
+        latents=latents, pose=pose, mask_face=mask_face, grid=grid, H=H, W=W, frame_counter=frame_counter, device=device, debug=debug, debug_dir=debug_dir,
         smooth=0.85
     )
+    timings["STATEFUL"] = time.time() - start
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="face_warp")
         print("[DEBUG] Face warp applied")
@@ -1933,7 +1968,6 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 HAIR (ALTERNANCE CINÉMA)
     # =========================
-
     # Définir un dictionnaire global ou un buffer par batch
     if not hasattr(apply_pose_driven_motion, "prev_hair_fields"):
         apply_pose_driven_motion.prev_hair_fields = [None] * B
@@ -1941,25 +1975,18 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 HAIR (ALTERNANCE CINÉMA)
     # =========================
+    start = time.time()
     latents_before = latents.clone()
     latents_hair, hair_delta = apply_hair_motion_cycle(
-        latents=latents,
-        mask_hair=mask_hair,
-        grid=grid,
-        H=H,
-        W=W,
-        frame_counter=frame_counter,
-        device=device,
-        delta_px=delta_px,
+        latents=latents, mask_hair=mask_hair, grid=grid, H=H, W=W, frame_counter=frame_counter, device=device, delta_px=delta_px,
         prev_hair_field=apply_pose_driven_motion.prev_hair_fields[0] if B==1 else None,
         debug=debug,
         debug_dir=debug_dir
     )
     latents = latents_hair * mask_hair_exp + latents_before * (1.0 - mask_hair_exp)
-
     # Stocker pour la prochaine frame
     apply_pose_driven_motion.prev_hair_fields[0] = hair_delta
-
+    timings["HAIR"] = time.time() - start
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="hair")
         print("[DEBUG] Hair motion applied")
@@ -1967,30 +1994,27 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 BREATHING (TORSO ONLY)
     # =========================
+    start = time.time()
     latents_before = latents.clone()
     latents_breath = apply_breathing_simple( latents, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir )
-    #latents = latents_breath * mask_torso_exp + latents_before * (1.0 - mask_torso_exp)
-
-    #breath_strength = 0.25  # 🔥 ajuste entre 0.1 et 0.4
-
     t = torch.tensor(frame_counter / 10.0, device=latents.device)
-
     breath_strength = 0.2 + 0.1 * torch.sin(t)
-
     latents = (
         latents_before * (1.0 - breath_strength * mask_torso_exp)
         + latents_breath * (breath_strength * mask_torso_exp)
     )
-
+    timings["breathing"] = time.time() - start
     if debug:
         print("[DEBUG] Breathing applied")
 
     # =========================
     # 🔹 STABILISATION
     # =========================
+    start = time.time()
     latents_before = latents.clone()
     latents_stab = stabilize_latents_motion(latents)
     latents = latents_stab * (1.0 - mask_face_exp) + latents_before * mask_face_exp
+    timings["stabilisation"] = time.time() - start
 
     if debug:
         print("[DEBUG] Stabilization applied")
@@ -1998,11 +2022,14 @@ def apply_pose_driven_motion(
     # =========================
     # 🔹 MICRO BOOST GLOBAL PAR ZONE
     # =========================
-    micro_amp = 0.002
-    t = torch.tensor(frame_counter / 6.0, device=device)
-    latents += micro_amp * mask_torso_exp * torch.sin(t + 0.1)
-    latents += micro_amp * mask_hair_exp  * torch.sin(t + 0.2)
-    latents += micro_amp * mask_face_exp  * torch.sin(t + 0.3)
+    masks = {
+        "torso": (mask_torso_exp, 0.1, calibrate_amplitude(mask_torso_exp, base_amp=0.002, max_amp=0.004)),
+        "hair":  (mask_hair_exp,  0.2, calibrate_amplitude(mask_hair_exp, base_amp=0.003, max_amp=0.0035)),
+        "face":  (mask_face_exp,  0.3, calibrate_amplitude(mask_face_exp, base_amp=0.002, max_amp=0.0035)),
+    }
+    start = time.time()
+    latents = apply_micro_boost(latents, frame_counter, device, masks)
+    timings["micro_boost"] = time.time() - start
 
     # =========================
     # 🔹 DEBUG FINAL
@@ -2010,6 +2037,7 @@ def apply_pose_driven_motion(
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="final")
         print("[DEBUG] Full motion pipeline applied")
+        print("[DEBUG] Timings per step:", timings)
 
     return latents
 
