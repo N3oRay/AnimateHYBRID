@@ -4,20 +4,138 @@
 import os, math, threading
 from pathlib import Path
 from PIL import Image, ImageFilter, ImageEnhance, ImageChops
-
+import cv2
 import torch
 import numpy as np
 import subprocess
 from torchvision.transforms import functional as F
+from .n3rMotionPose_tools import feather_inside_strict2, feather_outside_only_alpha2
 import torch.nn.functional as Fu
 import torch.nn.functional as TF
 import torch.nn.functional as FF
 LATENT_SCALE = 0.18215
 
 
+def sanitize_coords(coords):
+    valid = []
+    if isinstance(coords, dict) and "center" in coords:
+        coords = [coords["center"]]
+    for p in coords:
+        try:
+            if len(p) != 2:
+                #print(f"⚠ Coordonnée ignorée car invalide: {p}")
+                continue
+            x, y = int(p[0]), int(p[1])
+            valid.append([x, y])
+        except (ValueError, TypeError):
+            #print(f"⚠ Coordonnée ignorée car invalide: {p}")
+            continue
+    return valid
+
+# --- Normalisation sécurisée et filtrage des coordonnées ---
+def safe_coords_list(coords_list):
+    """Convertit en float et ignore tout élément non convertible"""
+    safe_list = []
+    for p in coords_list:
+        try:
+            # supporte tuple/list ou dict {'x':..,'y':..}
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                x, y = float(p[0]), float(p[1])
+            elif isinstance(p, dict) and 'x' in p and 'y' in p:
+                x, y = float(p['x']), float(p['y'])
+            else:
+                continue
+            safe_list.append([x, y])
+        except (ValueError, TypeError, KeyError):
+            continue
+    return safe_list
+
+
+# Crée une fonction helper pour filtrer et forcer des tuples valides
+def valid_tuples(coords_list):
+    valid = []
+    for c in coords_list:
+        if c is None:
+            continue
+        # Si c'est un tuple de deux nombres
+        if isinstance(c, tuple) and len(c) == 2 and all(isinstance(x, (int, float)) for x in c):
+            valid.append(c)
+        # Si c'est une liste de tuples
+        elif isinstance(c, list):
+            for t in c:
+                if isinstance(t, tuple) and len(t) == 2 and all(isinstance(x, (int, float)) for x in t):
+                    valid.append(t)
+    return valid
+
+
+# Assurer que tout est une liste de tuples
+def normalize_coords(c):
+    if c is None:
+        return []
+    if isinstance(c, dict):
+        # prendre juste le point central si c'est un dict (ex: nose, neck)
+        if "center" in c:
+            return [tuple(c["center"])]
+        # sinon prendre le premier point disponible
+        for k in c.keys():
+            if isinstance(c[k], (tuple, list)):
+                return [tuple(c[k])]
+        return []
+    elif isinstance(c, (tuple, list)) and len(c) > 0 and isinstance(c[0], (int,float)):
+        # tuple simple (x,y)
+        return [tuple(c)]
+    elif isinstance(c, (tuple, list)):
+        # liste déjà de tuples
+        return [tuple(p) for p in c]
+    return []
+
+
+def ensure_coords_tuple(coords, keys):
+    """
+    Normalise les coordonnées en dictionnaire.
+    Retour : dict {key: tuple(x, y)}
+    """
+    out = {}
+    for i, key in enumerate(keys):
+        if i >= len(coords) or coords[i] is None:
+            out[key] = None
+            continue
+
+        c = coords[i]
+        if isinstance(c, tuple) and all(isinstance(x, (int, float)) for x in c):
+            out[key] = c  # <- juste le tuple
+        elif isinstance(c, (list, tuple)) and len(c) == 2 and all(isinstance(x, (int, float)) for x in c):
+            out[key] = tuple(c)
+        else:
+            out[key] = None
+            print(f"⚠ Warning: unexpected type for key '{key}': {type(c)}. Using None.")
+
+    return out
+
+
+def coords_to_dict(batch_coords, keys):
+    """
+    Transforme une liste de tuples/arrays en dictionnaire par batch.
+
+    batch_coords: list of tuples/arrays, shape par batch
+    keys: list des noms des clés, longueur doit correspondre à chaque tuple
+
+    Exemple:
+        eye_coords_dict = coords_to_dict(eye_coords, ["left_eye", "right_eye"])
+        mouth_coords_dict = coords_to_dict(mouth_coords, ["mouth"])
+    """
+    batch_dict = []
+    for coords in batch_coords:
+        if isinstance(coords, tuple) or isinstance(coords, list) or isinstance(coords, np.ndarray):
+            d = {k: coords[i] for i, k in enumerate(keys)}
+            batch_dict.append(d)
+        else:
+            raise TypeError(f"Expected tuple/list/array, got {type(coords)}")
+    return batch_dict
+
+
 
 def compress_highlights(frame_pil, threshold=235, strength=0.6):
-    import numpy as np
     arr = np.array(frame_pil).astype("float32")
 
     # luminance approx
@@ -600,41 +718,179 @@ def encode_images_to_latents_hybrid_safe(images, vae, device="cuda", latent_scal
 
     return latents
 
-def encode_images_to_latents_hybrid_pro(images, vae, mask_face, device="cuda", latent_scale=LATENT_SCALE):
+#---------------------------------------------------------------------------------------------
 
+def create_eye_mask_from_coords(eye_coords_dict, size, device="cuda", expand=0.15):
+    """
+    Crée un masque pour les yeux à partir des coordonnées (dict) :
+    - eye_coords_dict : list de dicts [{ "left_eye": (x,y), "right_eye": (x,y) }, ...]
+    - size : tuple (H,W) du masque final
+    - expand : fraction pour agrandir légèrement l'ellipse autour de l'œil
+    """
+    B = len(eye_coords_dict)
+    H, W = size
+    mask = torch.zeros(B, 1, H, W, device=device)
+
+    for b in range(B):
+        for key in ["left_eye", "right_eye"]:
+            eye = eye_coords_dict[b].get(key)
+            if eye is None:
+                continue
+            cx, cy = eye
+            cx = int(cx * (W-1))
+            cy = int(cy * (H-1))
+            radius = int(max(H, W) * 0.03 * (1 + expand))  # rayon relatif à l'image
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            cv2.ellipse(mask_np, (cx, cy), (radius, radius), 0, 0, 360, color=255, thickness=-1)
+            mask[b,0] = torch.clamp(mask[b,0] + torch.from_numpy(mask_np/255.0).to(device), 0, 1)
+
+    return mask
+
+def create_mouth_mask_from_coords(mouth_coords_dict, size=(512,512), device="cuda", expand=0.15):
+    H, W = size
+    mask = torch.zeros(1, 1, H, W, device=device, dtype=torch.float32)
+
+    for k, mouth_list in mouth_coords_dict.items():
+        for mouth in mouth_list.get("mouth", []):  # chaque point de la bouche
+            if len(mouth) != 2:
+                print(f"⚠ Warning: coordonnée bouche invalide {mouth}, ignorée")
+                continue
+            cx, cy = map(float, mouth)
+
+            # Masque ellipse simple
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+            radius = 10  # taille par défaut ou calculable
+            cv2.circle(mask_np, (int(cx), int(cy)), radius, color=255, thickness=-1)
+
+            mask += torch.from_numpy(mask_np / 255.0).to(device).unsqueeze(0).unsqueeze(0)
+
+    return mask.clamp(0, 1)
+
+
+
+import torch.nn.functional as F
+
+def create_face_mask_from_coords(face_coords_dict, size=(512,512), device="cuda", expand=0.15):
+    H, W = size
+    mask = torch.zeros(1, 1, H, W, device=device, dtype=torch.float32)
+
+    for key, coords in face_coords_dict.items():
+        if not coords:
+            continue
+
+        # coords peut être un dict (nez)
+        if isinstance(coords, dict) and "center" in coords:
+            coords_list = [coords["center"]]
+        else:
+            coords_list = [tuple(p) for p in coords]
+
+        # Filtrer uniquement les coordonnées valides
+        valid_coords_list = []
+        for p in coords_list:
+            try:
+                x = int(p[0])
+                y = int(p[1])
+                valid_coords_list.append([x, y])
+            except (ValueError, TypeError):
+                print(f"⚠ Warning: coordonnée ignorée car invalide: {p}")
+
+        if not valid_coords_list:
+            continue
+
+        pts_px = np.array(valid_coords_list, dtype=np.int32)
+
+        x_min, y_min = pts_px.min(axis=0)
+        x_max, y_max = pts_px.max(axis=0)
+
+        cx = (x_min + x_max) // 2
+        cy = (y_min + y_max) // 2
+        w = int((x_max - x_min) * (1 + expand))
+        h = int((y_max - y_min) * (1 + expand))
+
+        dx = pts_px[-1][0] - pts_px[0][0]
+        dy = pts_px[-1][1] - pts_px[0][1]
+        angle = int(np.degrees(np.arctan2(dy, dx)))
+
+        mask_np = np.zeros((H, W), dtype=np.uint8)
+
+        if key in ["mouth", "eyes"]:
+            cv2.ellipse(
+                mask_np,
+                (cx, cy),
+                (w//2, h//2),
+                angle=angle,
+                startAngle=0,
+                endAngle=360,
+                color=255,
+                thickness=-1
+            )
+        else:
+            radius = max(w,h)//2
+            cv2.circle(mask_np, (cx, cy), radius, color=255, thickness=-1)
+
+        mask += torch.from_numpy(mask_np / 255.0).to(device).unsqueeze(0).unsqueeze(0)
+
+    return mask.clamp(0,1)
+#----------------------------------------------------------------------------------------------------------
+
+import torch
+import torch.nn.functional as F
+
+def encode_images_to_latents_hybrid_pro(
+    images,
+    vae,
+    eye_coords,     # [(x1, y1), (x2, y2), ...]
+    mouth_coords,   # [(x, y), ...]
+    ear_coords,     # [(x1, y1), (x2, y2)]
+    nose_coords,    # {'center': (x, y), ...}
+    device="cuda",
+    latent_scale=1.0
+):
     images = images.to(device=device, dtype=torch.float32)
     vae = vae.to(device=device, dtype=torch.float32)
+    B, C, H, W = images.shape
 
+    # --- Encodage latents ---
     with torch.no_grad():
         dist = vae.encode(images).latent_dist
-        mean = dist.mean
-        sample = dist.sample()
+        latents = 0.88 * dist.mean + 0.12 * dist.sample()
+        latents = latents * latent_scale
 
-        latents = 0.88 * mean + 0.12 * sample
+    # --- Normalisation douce + soft clamp ---
+    latents_norm = latents / (latents.std(dim=(1,2,3), keepdim=True) + 1e-6)
+    latents_soft = torch.tanh(latents / 3.0) * 3.0
 
-    latents = latents * latent_scale
+    # --- Préparer les dicts pour les fonctions de masque ---
+    eye_coords_dict = {0: {"eyes": [list(map(float, p)) for p in eye_coords]}}
+    mouth_coords_dict = {0: {"mouth": [list(map(float, p)) for p in mouth_coords]}}
+    nose_coords_dict = {0: {"nose": [list(map(float, p)) for p in nose_coords]}}
 
-    # =========================
-    # 🔥 DOUBLE VERSION
-    # =========================
+    face_coords_dict = {0: {
+        "eyes": [list(map(float, p)) for p in eye_coords],
+        "mouth": [list(map(float, p)) for p in mouth_coords],
+        "ears": [list(map(float, p)) for p in ear_coords],
+        "nose": [list(map(float, p)) for p in nose_coords],
+    }}
 
-    std = latents.std(dim=(1,2,3), keepdim=True)
+    # --- Masques ---
+    mask_face = create_face_mask_from_coords(face_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device)
+    mask_eyes = create_eye_mask_from_coords(eye_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device)
+    mask_mouth = create_mouth_mask_from_coords(mouth_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device)
 
-    latents_norm = latents / (std + 1e-6)              # sharp
-    latents_soft = torch.tanh(latents / 3.0) * 3.0    # smooth
+    # --- Compatibilité channels ---
+    mask_face = mask_face.expand(B, latents.shape[1], -1, -1)
+    mask_eyes = mask_eyes.expand(B, latents.shape[1], -1, -1)
+    mask_mouth = mask_mouth.expand(B, latents.shape[1], -1, -1)
 
-    # =========================
-    # 🔥 BLEND PAR MASQUE
-    # =========================
+    # --- Blend hiérarchique ---
+    remaining = (1.0 - mask_face - mask_eyes - mask_mouth).clamp(0,1)
+    latents = latents_norm * mask_face \
+            + latents_norm * mask_eyes \
+            + latents_norm * mask_mouth \
+            + latents_soft * remaining
 
-    mask_face = mask_face.to(latents.device)
-
-    latents = (
-        latents_norm * mask_face +                 # visage → sharp
-        latents_soft * (1.0 - mask_face)          # reste → smooth
-    )
-
-    if latents.ndim == 4 and latents.shape[1] == 1:
+    # --- Assurer 4 channels si nécessaire ---
+    if latents.shape[1] == 1:
         latents = latents.repeat(1, 4, 1, 1)
 
     return latents
