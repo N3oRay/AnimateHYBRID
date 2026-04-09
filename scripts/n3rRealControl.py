@@ -326,7 +326,13 @@ def main(args):
                 current_latent_single = encode_images_to_latents_hybrid_pro( input_image, vae,
                                         eye_coords=eye_coords_list, mouth_coords=mouth_coords_list, ear_coords=ear_coords_list,       # liste de tuples
                                         nose_coords=nose_coords_list,     # dict
-                                        device=device, latent_scale=LATENT_SCALE )
+                                        device=device, latent_scale=LATENT_SCALE,
+                                        creative_mode="anime", # cinematic # dream # anime # unstable #glitch
+                                        frame_idx=frame_counter,
+                                        total_frames=total_frames,
+                                        debug=True,
+                                        debug_dir=output_dir
+                                        )
 
             current_latent_single = torch.nn.functional.interpolate(
                 current_latent_single, size=(cfg["H"]//facteur, cfg["W"]//facteur),
