@@ -976,12 +976,10 @@ def encode_images_to_latents_hybrid_pro(
     mask_eyes = mask_eyes.expand(B, latents.shape[1], -1, -1)
     mask_mouth = mask_mouth.expand(B, latents.shape[1], -1, -1)
 
-    # --- Blend hiérarchique ---
-    remaining = (1.0 - mask_face - mask_eyes - mask_mouth).clamp(0,1)
-    latents = latents_norm * mask_face \
-            + latents_norm * mask_eyes \
-            + latents_norm * mask_mouth \
-            + latents_soft * remaining
+    # Fusion des latents directement sans la notion de "remaining"
+    latents = latents * mask_face + latents_soft * (1.0 - mask_face)
+    latents = latents * mask_eyes + latents_soft * (1.0 - mask_eyes)
+    latents = latents * mask_mouth + latents_soft * (1.0 - mask_mouth)
 
 
     # =========================================================
@@ -995,33 +993,62 @@ def encode_images_to_latents_hybrid_pro(
         log_latents_stats(latents, "BEFORE CREATIVE")
 
         if creative_mode == "cinematic":
-            noise = torch.randn_like(latents) * 0.03
+            # Bruit léger et fluide à base de cosinus
+            noise = torch.randn_like(latents) * 0.03  # Bruit de base léger
 
-            importance = (
-                0.2 * mask_face +
-                0.4 * mask_eyes +
-                0.3 * mask_mouth
-            )
+            # Modulateur cosinusoïdal pour introduire de la fluidité au bruit
+            t = frame_idx / max(total_frames, 1)
+            cos_mod = (torch.cos(torch.tensor(t * 3.14)) + 1) / 2  # Valeur entre 0 et 1
 
-            # 👉 boost au lieu de suppression
-            latents = latents * (1.0 + importance)
-
-            # bruit uniquement hors visage
-            latents = latents + noise * 0.3 * remaining
+            # Appliquer un bruit léger, modulé par le cosinus pour donner une dynamique douce
+            latents = latents + noise * cos_mod  # Le bruit varie en fonction du temps
 
             log_latents_stats(latents, "CINEMATIC")
 
-        elif creative_mode == "dream":
+        elif creative_mode == "soft":
             noise = torch.randn_like(latents) * 0.03
 
+            # Variation douce du flou avec modulation temporelle
+            blur_strength = 0.5 + 0.5 * torch.sin(t_tensor * 3.14)
+
+            latents = latents * (1 - 0.25 * mask_face) + latents_soft * 0.25 * mask_face
+            latents = latents + noise * blur_strength
+
+            log_latents_stats(latents, "SOFT")
+
+        elif creative_mode == "dream": # Fonctionne correctement
+            noise = torch.randn_like(latents) * 0.03  # Bruit léger
+
+            # Variation du flou en fonction du temps
             blur_strength = 0.6 + 0.4 * torch.sin(t_tensor * 3.14)
 
+            # Appliquer le flou en préservant une partie du visage
             latents = latents * (1 - 0.3 * mask_face) + latents_soft * 0.3 * mask_face
+
+            # Appliquer le bruit et le flou avec une légère modulation de l'intensité
             latents = latents + noise * blur_strength
 
             log_latents_stats(latents, "DREAM")
 
         elif creative_mode == "anime":
+            # Appliquer une amplification douce à l'aide d'une fonction sigmoïde
+            mask_eyes_sigmoid = 1 / (1 + torch.exp(-8 * (mask_eyes - 0.5)))  # Douce transition pour les yeux
+            mask_mouth_sigmoid = 1 / (1 + torch.exp(-8 * (mask_mouth - 0.5)))  # Douce transition pour la bouche
+
+            # Amplification subtile
+            latents = latents * (1 + 0.18 * mask_eyes_sigmoid)  # Légère réduction de l'intensité
+            latents = latents * (1 + 0.12 * mask_mouth_sigmoid)  # Légère réduction pour la bouche
+
+            # 🎨 ajout de détails directionnels
+            latents = latents + 0.25 * mask_eyes * (latents_norm - latents)
+
+            # 💫 micro-variation temporelle
+            pulse = torch.sin(torch.tensor(t * 6.28)).to(latents.device) * 0.1
+            latents = latents + pulse * mask_eyes
+
+            log_latents_stats(latents, "ANIME")
+
+        elif creative_mode == "manga": # Légère saturation du visage
 
             # Appliquer une amplification douce à l'aide d'une fonction sigmoïde
             mask_eyes_sigmoid = 1 / (1 + torch.exp(-10 * (mask_eyes - 0.5)))  # Douce transition
@@ -1038,16 +1065,9 @@ def encode_images_to_latents_hybrid_pro(
             pulse = torch.sin(torch.tensor(t * 6.28)).to(latents.device) * 0.1
             latents = latents + pulse * mask_eyes
 
-        elif creative_mode == "unstable":
-            noise = torch.randn_like(latents) * 0.03
+            log_latents_stats(latents, "MANGA")
 
-            jitter = torch.sin(t_tensor * 10) * 0.05
-            latents = latents + jitter * mask_face
-            latents = latents + noise * 0.8 * remaining
-
-            log_latents_stats(latents, "UNSTABLE")
-
-        elif creative_mode == "glitch":
+        elif creative_mode == "glitch": #Visage stable pas de régression
             noise = torch.randn_like(latents) * 0.03
 
             shift = int(2 * torch.sin(t_tensor * 6).item())
