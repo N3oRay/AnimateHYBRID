@@ -578,7 +578,7 @@ def apply_post_processing_blur(frame_pil, blur_radius=0.2, contrast=1.0, brightn
     return frame_pil
 
 
-def encode_images_to_latents_hybrid(images, vae, device="cuda", latent_scale=LATENT_SCALE):
+def encode_images_to_latents_hybrid_safe(images, vae, device="cuda", latent_scale=LATENT_SCALE):
     """
     Encodage hybride pour conserver la fidélité et la richesse de détails.
     - Utilise un échantillon de la distribution (plus vivant que mean)
@@ -599,6 +599,77 @@ def encode_images_to_latents_hybrid(images, vae, device="cuda", latent_scale=LAT
         latents = latents.repeat(1, 4, 1, 1)
 
     return latents
+
+def encode_images_to_latents_hybrid_pro(images, vae, mask_face, device="cuda", latent_scale=LATENT_SCALE):
+
+    images = images.to(device=device, dtype=torch.float32)
+    vae = vae.to(device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        dist = vae.encode(images).latent_dist
+        mean = dist.mean
+        sample = dist.sample()
+
+        latents = 0.88 * mean + 0.12 * sample
+
+    latents = latents * latent_scale
+
+    # =========================
+    # 🔥 DOUBLE VERSION
+    # =========================
+
+    std = latents.std(dim=(1,2,3), keepdim=True)
+
+    latents_norm = latents / (std + 1e-6)              # sharp
+    latents_soft = torch.tanh(latents / 3.0) * 3.0    # smooth
+
+    # =========================
+    # 🔥 BLEND PAR MASQUE
+    # =========================
+
+    mask_face = mask_face.to(latents.device)
+
+    latents = (
+        latents_norm * mask_face +                 # visage → sharp
+        latents_soft * (1.0 - mask_face)          # reste → smooth
+    )
+
+    if latents.ndim == 4 and latents.shape[1] == 1:
+        latents = latents.repeat(1, 4, 1, 1)
+
+    return latents
+
+# Qualité de l'image supérieur !'
+def encode_images_to_latents_hybrid(images, vae, device="cuda", latent_scale=LATENT_SCALE):
+    """
+    Encodage hybride STABLE :
+    - mix mean + sample pour micro-variations contrôlées
+    - normalisation douce (pas de clamp brutal)
+    - préserve les couleurs
+    """
+    images = images.to(device=device, dtype=torch.float32)
+    vae = vae.to(device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        dist = vae.encode(images).latent_dist
+
+        mean = dist.mean
+        sample = dist.sample()
+
+        # 🔥 Mélange contrôlé (clé !)
+        latents = 0.85 * mean + 0.15 * sample
+
+    latents = latents * latent_scale
+
+    # 🔥 Normalisation douce (au lieu de clamp brutal)
+    latents = latents / (latents.std(dim=(1,2,3), keepdim=True) + 1e-6)
+
+    # Assurer 4 channels si nécessaire
+    if latents.ndim == 4 and latents.shape[1] == 1:
+        latents = latents.repeat(1, 4, 1, 1)
+
+    return latents
+
 
 def encode_images_to_latents_safe(images, vae, device="cuda", latent_scale=0.18215):
     """
