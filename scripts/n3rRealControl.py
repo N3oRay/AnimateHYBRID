@@ -29,7 +29,7 @@ from scripts.utils.tools_utils import ensure_4_channels, print_generation_params
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, remove_white_noise, encode_images_to_latents_hybrid_pro
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, remove_white_noise, encode_images_to_latents_hybrid_pro, ensure_coords_tuple, normalize_coords, valid_tuples, safe_coords_list, sanitize_coords
 
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
@@ -273,9 +273,6 @@ def main(args):
             # coordonner masque eye et masque volumetrique
             mouth_coords = get_mouth_coords_safe(input_pil, face_mesh)
 
-
-
-
             # coordonner globale
             coords_v = get_coords_safe( input_pil, H=cfg["H"], W=cfg["W"] )
             input_image = ensure_4_channels(input_image)
@@ -285,12 +282,58 @@ def main(args):
                 initframe = frame_counter
             save_input_frame( input_image, output_dir, initframe, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=1.0, apply_post=False )
 
-            #current_latent_single = encode_images_to_latents_hybrid_pro(input_image, vae, mask_face, device=device, latent_scale=LATENT_SCALE)
-            current_latent_single = encode_images_to_latents_hybrid(input_image, vae, device=device, latent_scale=LATENT_SCALE)
+
+
+            # --- Normalisation sécurisée des coordonnées ---
+            # Convertir toutes les coordonnées en [[x, y]] et sécuriser
+            print(f"eye_coords: {eye_coords}")
+            eye_coords_list = [[float(x), float(y)] for x, y in eye_coords]  # pas de "left/right"
+            print(f"mouth_coords: {mouth_coords}")
+            mouth_coords_list = [[float(x), float(y)] for x, y in mouth_coords]  # déjà liste de tuples
+            print(f"ear_coords: {ear_coords}")
+            ear_coords_list = [[float(x), float(y)] for x, y in ear_coords]  # déjà liste de tuples
+            print(f"nose_coords: {nose_coords}")
+            # Pour le masque global, on transforme le dict du nez en [[x,y]]
+            nose_coords_list  = sanitize_coords([nose_coords["center"]]) if nose_coords else []
+            # Pour encode_images_to_latents_hybrid_pro, garder le dict original
+            nose_coords_dict  = nose_coords if nose_coords else None
+
+
+            eye_coords_list   = sanitize_coords(eye_coords)
+            print(f"eye_coords sanitize_coords: {eye_coords_list}")
+            mouth_coords_list = sanitize_coords(mouth_coords)
+            print(f"mouth_coords_list sanitize_coords: {mouth_coords_list}")
+            ear_coords_list   = sanitize_coords(ear_coords)
+            print(f"ear_coords_list sanitize_coords: {ear_coords_list}")
+            nose_coords_list  = sanitize_coords(nose_coords)
+            print(f"nose_coords_list sanitize_coords: {nose_coords_list}")
+
+            # Pour le masque global
+            face_coords_dict = { "eyes": eye_coords_list, "mouth": mouth_coords_list, "ears": ear_coords_list, "nose": nose_coords_list }
+
+            # --- Debug ---
+            print("🟢 Debug coords:")
+            print(f"Face coords dict: {face_coords_dict}")
+
+            # --- Vérifier que les listes ne sont pas vides avant l'appel ---
+            if not any(face_coords_dict.values()):
+                print("🟢  Aucune coordonnée de visage valide détectée ! On passe en full HD")
+                current_latent_single = encode_images_to_latents_hybrid(input_image, vae, device=device, latent_scale=LATENT_SCALE)
+            else:
+                print("🟢  Visage valide détectée !")
+                current_latent_single = encode_images_to_latents_hybrid_pro( input_image, vae,
+                                        eye_coords=eye_coords_list,       # liste de tuples
+                                        mouth_coords=mouth_coords_list,   # liste de tuples
+                                        ear_coords=ear_coords_list,       # liste de tuples
+                                        nose_coords=nose_coords_list,     # dict
+                                        device=device, latent_scale=LATENT_SCALE )
+
             current_latent_single = torch.nn.functional.interpolate(
                 current_latent_single, size=(cfg["H"]//facteur, cfg["W"]//facteur),
                 mode='bilinear', align_corners=False
             )
+            # --- Debug final ---
+            print("✅ Latents shape:", current_latent_single.shape)
 
             # 🔥 FIX NaN / stabilité
             current_latent_single = sanitize_latents(current_latent_single)
