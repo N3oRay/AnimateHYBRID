@@ -327,7 +327,7 @@ def main(args):
                                         eye_coords=eye_coords_list, mouth_coords=mouth_coords_list, ear_coords=ear_coords_list,       # liste de tuples
                                         nose_coords=nose_coords_list,     # dict
                                         device=device, latent_scale=LATENT_SCALE,
-                                        creative_mode="anime", # cinematic # dream # anime # unstable #glitch
+                                        creative_mode="dream", # cinematic # dream # anime # unstable #glitch
                                         frame_idx=frame_counter,
                                         total_frames=total_frames,
                                         debug=True,
