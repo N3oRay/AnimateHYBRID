@@ -9,7 +9,7 @@ import torch
 import numpy as np
 import subprocess
 from torchvision.transforms import functional as F
-from .n3rMotionPose_tools import feather_inside_strict2, feather_outside_only_alpha2
+from .n3rMotionPose_tools import save_debug_mask, feather_inside_strict2, feather_outside_only_alpha2
 import torch.nn.functional as Fu
 import torch.nn.functional as TF
 import torch.nn.functional as FF
@@ -24,12 +24,12 @@ def sanitize_coords(coords):
     for p in coords:
         try:
             if len(p) != 2:
-                #print(f"⚠ Coordonnée ignorée car invalide: {p}")
+                print(f"⚠ Coordonnée ignorée car invalide: {p}")
                 continue
             x, y = int(p[0]), int(p[1])
             valid.append([x, y])
         except (ValueError, TypeError):
-            #print(f"⚠ Coordonnée ignorée car invalide: {p}")
+            print(f"⚠ Coordonnée ignorée car invalide: {p}")
             continue
     return valid
 
@@ -619,7 +619,7 @@ def encode_images_to_latents_hybrid_safe(images, vae, device="cuda", latent_scal
 
 #---------------------------------------------------------------------------------------------
 
-def create_eye_mask_from_coords(eye_coords_dict, size, device="cuda", expand=0.15):
+def create_eye_mask_from_coords(eye_coords_dict, size, device="cuda", expand=0.15, frame_idx=0, debug=False, debug_dir=None):
     """
     Crée un masque pour les yeux à partir des coordonnées (dict) :
     - eye_coords_dict : list de dicts [{ "left_eye": (x,y), "right_eye": (x,y) }, ...]
@@ -643,9 +643,13 @@ def create_eye_mask_from_coords(eye_coords_dict, size, device="cuda", expand=0.1
             cv2.ellipse(mask_np, (cx, cy), (radius, radius), 0, 0, 360, color=255, thickness=-1)
             mask[b,0] = torch.clamp(mask[b,0] + torch.from_numpy(mask_np/255.0).to(device), 0, 1)
 
+    # Debug
+    if debug and debug_dir is not None:
+        save_debug_mask(mask, H, W, debug_dir, frame_counter=frame_idx, prefix="create_eye_mask_from_coords")
+
     return mask
 
-def create_mouth_mask_from_coords(mouth_coords_dict, size=(512,512), device="cuda", expand=0.15):
+def create_mouth_mask_from_coords(mouth_coords_dict, size=(512,512), device="cuda", expand=0.15, frame_idx=0, debug=False, debug_dir=None):
     H, W = size
     mask = torch.zeros(1, 1, H, W, device=device, dtype=torch.float32)
 
@@ -663,10 +667,14 @@ def create_mouth_mask_from_coords(mouth_coords_dict, size=(512,512), device="cud
 
             mask += torch.from_numpy(mask_np / 255.0).to(device).unsqueeze(0).unsqueeze(0)
 
+            # Debug
+            if debug and debug_dir is not None:
+                save_debug_mask(mask, H, W, debug_dir, frame_counter=frame_idx, prefix="create_mouth_mask_from_coords")
+
     return mask.clamp(0, 1)
 
 
-def create_face_mask_from_coords(face_coords_dict, size=(512,512), device="cuda", expand=0.15):
+def create_face_mask_from_coords(face_coords_dict, size=(512,512), device="cuda", expand=0.15, frame_idx=0, debug=False, debug_dir=None):
     H, W = size
     mask = torch.zeros(1, 1, H, W, device=device, dtype=torch.float32)
 
@@ -725,9 +733,22 @@ def create_face_mask_from_coords(face_coords_dict, size=(512,512), device="cuda"
             cv2.circle(mask_np, (cx, cy), radius, color=255, thickness=-1)
 
         mask += torch.from_numpy(mask_np / 255.0).to(device).unsqueeze(0).unsqueeze(0)
+        # Debug
+        if debug and debug_dir is not None:
+            save_debug_mask(mask, H, W, debug_dir, frame_counter=frame_idx, prefix="create_face_mask_from_coords")
 
     return mask.clamp(0,1)
 #----------------------------------------------------------------------------------------------------------
+
+def log_latents_stats(latents, label="LATENTS"):
+    with torch.no_grad():
+        min_val = latents.min().item()
+        max_val = latents.max().item()
+        mean_val = latents.mean().item()
+        std_val = latents.std().item()
+        has_nan = torch.isnan(latents).any().item()
+
+        print(f"[DEBUG] {label} | min={min_val:.4f} max={max_val:.4f} mean={mean_val:.4f} std={std_val:.4f} NaN={has_nan}")
 
 def encode_images_to_latents_hybrid_pro(
     images,
@@ -737,7 +758,12 @@ def encode_images_to_latents_hybrid_pro(
     ear_coords,     # [(x1, y1), (x2, y2)]
     nose_coords,    # {'center': (x, y), ...}
     device="cuda",
-    latent_scale=1.0
+    latent_scale=1.0,
+    creative_mode=None,   # 👈 NEW
+    frame_idx=0,
+    total_frames=1,
+    debug=False,
+    debug_dir=None
 ):
     images = images.to(device=device, dtype=torch.float32)
     vae = vae.to(device=device, dtype=torch.float32)
@@ -757,18 +783,25 @@ def encode_images_to_latents_hybrid_pro(
     eye_coords_dict = {0: {"eyes": [list(map(float, p)) for p in eye_coords]}}
     mouth_coords_dict = {0: {"mouth": [list(map(float, p)) for p in mouth_coords]}}
     nose_coords_dict = {0: {"nose": [list(map(float, p)) for p in nose_coords]}}
-
+    """
     face_coords_dict = {0: {
         "eyes": [list(map(float, p)) for p in eye_coords],
         "mouth": [list(map(float, p)) for p in mouth_coords],
         "ears": [list(map(float, p)) for p in ear_coords],
         "nose": [list(map(float, p)) for p in nose_coords],
     }}
+    """
+    face_coords_dict = {
+        "eyes": [list(map(float, p)) for p in eye_coords],
+        "mouth": [list(map(float, p)) for p in mouth_coords],
+        "ears": [list(map(float, p)) for p in ear_coords],
+        "nose": [list(map(float, p)) for p in nose_coords],
+    }
 
     # --- Masques ---
-    mask_face = create_face_mask_from_coords(face_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device)
-    mask_eyes = create_eye_mask_from_coords(eye_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device)
-    mask_mouth = create_mouth_mask_from_coords(mouth_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device)
+    mask_face = create_face_mask_from_coords(face_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device, frame_idx=frame_idx, debug=debug, debug_dir=debug_dir)
+    mask_eyes = create_eye_mask_from_coords(eye_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device, frame_idx=frame_idx, debug=debug, debug_dir=debug_dir)
+    mask_mouth = create_mouth_mask_from_coords(mouth_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device, frame_idx=frame_idx, debug=debug, debug_dir=debug_dir)
 
     # --- Compatibilité channels ---
     mask_face = mask_face.expand(B, latents.shape[1], -1, -1)
@@ -781,6 +814,81 @@ def encode_images_to_latents_hybrid_pro(
             + latents_norm * mask_eyes \
             + latents_norm * mask_mouth \
             + latents_soft * remaining
+
+
+    # =========================================================
+    # 🎨 CREATIVE MODES + DEBUG
+    # =========================================================
+    if creative_mode is not None:
+
+        t = frame_idx / max(total_frames, 1)
+        t_tensor = torch.tensor(t, device=latents.device)
+
+        log_latents_stats(latents, "BEFORE CREATIVE")
+
+        if creative_mode == "cinematic":
+            noise = torch.randn_like(latents) * 0.03
+
+            importance = (
+                0.2 * mask_face +
+                0.4 * mask_eyes +
+                0.3 * mask_mouth
+            )
+
+            # 👉 boost au lieu de suppression
+            latents = latents * (1.0 + importance)
+
+            # bruit uniquement hors visage
+            latents = latents + noise * 0.3 * remaining
+
+            log_latents_stats(latents, "CINEMATIC")
+
+        elif creative_mode == "dream":
+            noise = torch.randn_like(latents) * 0.03
+
+            blur_strength = 0.6 + 0.4 * torch.sin(t_tensor * 3.14)
+
+            latents = latents * (1 - 0.3 * mask_face) + latents_soft * 0.3 * mask_face
+            latents = latents + noise * blur_strength
+
+            log_latents_stats(latents, "DREAM")
+
+        elif creative_mode == "anime":
+            # ✨ amplification locale (plus fort)
+            latents = latents * (1 + 0.4 * mask_eyes)
+            latents = latents * (1 + 0.25 * mask_mouth)
+
+            # 🎨 ajout de détails directionnels
+            latents = latents + 0.25 * mask_eyes * (latents_norm - latents)
+
+            # 💫 micro-variation temporelle
+            pulse = torch.sin(torch.tensor(t * 6.28)).to(latents.device) * 0.1
+            latents = latents + pulse * mask_eyes
+
+        elif creative_mode == "unstable":
+            noise = torch.randn_like(latents) * 0.03
+
+            jitter = torch.sin(t_tensor * 10) * 0.05
+            latents = latents + jitter * mask_face
+            latents = latents + noise * 0.8 * remaining
+
+            log_latents_stats(latents, "UNSTABLE")
+
+        elif creative_mode == "glitch":
+            noise = torch.randn_like(latents) * 0.03
+
+            shift = int(2 * torch.sin(t_tensor * 6).item())
+
+            if shift != 0:
+                latents = torch.roll(latents, shifts=shift, dims=3)
+
+            latents = latents + noise * 0.1
+
+            log_latents_stats(latents, "GLITCH")
+
+    # --- sécurité finale ---
+    latents = latents.clamp(-3, 3)
+    log_latents_stats(latents, "FINAL CLAMP")
 
     # --- Assurer 4 channels si nécessaire ---
     if latents.shape[1] == 1:

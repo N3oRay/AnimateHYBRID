@@ -1013,7 +1013,6 @@ class Pose:
             os.makedirs(debug_dir, exist_ok=True)
             save_path = os.path.join(debug_dir, f"mouth_corners_mask_{frame_counter:05d}.png")
             mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
-            from PIL import Image
             Image.fromarray(mask_img).save(save_path)
             print(f"[DEBUG] Mouth corners mask saved: {save_path}")
 
