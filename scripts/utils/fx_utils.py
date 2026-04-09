@@ -1109,6 +1109,20 @@ def encode_images_to_latents_hybrid_pro(
 
             log_latents_stats(latents, "HYBRID")
 
+        elif creative_mode == "smooth":
+            # Appliquer un léger bruit au début et augmenter progressivement l'intensité
+            noise = torch.randn_like(latents) * 0.02  # Bruit modéré au début
+            t = frame_idx / max(total_frames, 1)
+            cos_mod = (torch.cos(torch.tensor(t * 3.14)) + 1) / 2  # Modulation douce
+
+            # Graduellement augmenter le bruit au fil du temps
+            latents = latents + noise * cos_mod
+
+            # Application progressive du flou et de la saturation sur le visage, doucement
+            latents = latents * (1 - 0.25 * mask_face) + latents_soft * 0.25 * mask_face
+
+            log_latents_stats(latents, "SMOOTH")
+
         elif creative_mode == "extreme":
             # 1. Bruit explosif et fluctuant
             noise = torch.randn_like(latents) * 0.1  # Bruit très intense
