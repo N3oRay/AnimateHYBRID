@@ -282,8 +282,6 @@ def main(args):
                 initframe = frame_counter
             save_input_frame( input_image, output_dir, initframe, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=1.0, apply_post=False )
 
-
-
             # --- Normalisation sécurisée des coordonnées ---
             # Convertir toutes les coordonnées en [[x, y]] et sécuriser
             print(f"eye_coords: {eye_coords}")
@@ -310,8 +308,6 @@ def main(args):
 
             # Pour le masque global
             face_coords_dict = { "eyes": eye_coords_list, "mouth": mouth_coords_list, "ears": ear_coords_list, "nose": nose_coords_list }
-
-            # --- Debug ---
             print("🟢 Debug coords:")
             print(f"Face coords dict: {face_coords_dict}")
 
@@ -328,9 +324,7 @@ def main(args):
             else:
                 print("🟢  Visage valide détectée !")
                 current_latent_single = encode_images_to_latents_hybrid_pro( input_image, vae,
-                                        eye_coords=eye_coords_list,       # liste de tuples
-                                        mouth_coords=mouth_coords_list,   # liste de tuples
-                                        ear_coords=ear_coords_list,       # liste de tuples
+                                        eye_coords=eye_coords_list, mouth_coords=mouth_coords_list, ear_coords=ear_coords_list,       # liste de tuples
                                         nose_coords=nose_coords_list,     # dict
                                         device=device, latent_scale=LATENT_SCALE )
 
@@ -452,8 +446,7 @@ def main(args):
                             fused_latents = fuse_with_memory(n3r_latents, memory_dict, cf_embeds, frame_counter)
                             external_weight = 0.2 * (1 - frame_counter / total_frames)
                             fused_latents = (1 - external_weight) * fused_latents + external_weight * external_latent
-                            latents = fuse_n3r_latents_adaptive_new(latents, fused_latents, frame_counter,
-                                                                    total_frames=total_frames,
+                            latents = fuse_n3r_latents_adaptive_new(latents, fused_latents, frame_counter, total_frames=total_frames,
                                                                     latent_injection_start=0.90, latent_injection_end=0.55)
                             latents = sanitize_latents(latents)
                         except Exception as e:
@@ -466,8 +459,7 @@ def main(args):
                     # ---------------- Mini-GPU diffusion ----------------
                     elif use_mini_gpu:
                         latents = generate_latents_mini_gpu_320(
-                            unet=unet, scheduler=scheduler,
-                            input_latents=latents_frame, embeddings=cf_embeds,
+                            unet=unet, scheduler=scheduler, input_latents=latents_frame, embeddings=cf_embeds,
                             motion_module=motion_module, guidance_scale=current_guidance_scale, device=device, fp16=True, steps=steps,
                             debug=verbose, init_image_scale=current_init_image_scale, creative_noise=current_creative_noise
                         )
@@ -510,13 +502,11 @@ def main(args):
 
                             # → device + dtype
                             pose_full = pose_full.to(device=device, dtype=target_dtype)
-
                             print(f"[DEBUG] Pose full {pose_full.shape} dtype={pose_full.dtype}")
 
                             # 🔹 ===== 2. BUILD LATENT-SPACE POSE (CRUCIAL) =====
                             latent_h, latent_w = latents.shape[2], latents.shape[3]
-                            pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype) # ou bilinear
-                            #pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='nearest').to(device=device, dtype=target_dtype)
+                            pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype)
                             print(f"[DEBUG] Pose latent {pose_latent_full.shape} dtype={pose_latent_full.dtype}")
 
                             # ------------------- Backup latents -------------------
@@ -551,9 +541,7 @@ def main(args):
                                 latents_before_openpose=latents_before_openpose if 'latents_before_openpose' in locals() else None,
                                 latents_after_openpose=latents_after if 'latents_after' in locals() else None,
                                 keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
-                                breathing=True,
-                                debug=True,
-                                debug_dir=output_dir
+                                breathing=True, debug=True, debug_dir=output_dir
                             )
 
                             # 🔹 Nettoyage / stabilisation
