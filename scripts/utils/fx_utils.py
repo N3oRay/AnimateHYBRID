@@ -1,11 +1,11 @@
 # fx_utils.py
 # ------------------- ENCODE -------------------
 
+import torch
 import os, math, threading
 from pathlib import Path
 from PIL import Image, ImageFilter, ImageEnhance, ImageChops
 import cv2
-import torch
 import numpy as np
 import subprocess
 from torchvision.transforms import functional as F
@@ -619,70 +619,223 @@ def encode_images_to_latents_hybrid_safe(images, vae, device="cuda", latent_scal
 
 #---------------------------------------------------------------------------------------------
 
-def create_eye_mask_from_coords(eye_coords_dict, size, device="cuda", expand=0.15, frame_idx=0, debug=False, debug_dir=None):
+def save_debug_mask_green(mask_np, H, W, debug_dir, frame_counter=0, prefix="debug"):
     """
-    Crée un masque pour les yeux à partir des coordonnées (dict) :
-    - eye_coords_dict : list de dicts [{ "left_eye": (x,y), "right_eye": (x,y) }, ...]
-    - size : tuple (H,W) du masque final
+    Sauvegarde un masque débogué avec une couleur verte.
+
+    :param mask_np: Masque binaire (numpy array 2D) à visualiser
+    :param H: Hauteur de l'image
+    :param W: Largeur de l'image
+    :param debug_dir: Répertoire où sauvegarder les images de débogage
+    :param frame_counter: Compteur de frames, utilisé pour nommer les fichiers
+    :param prefix: Préfixe du nom du fichier
+    """
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # Création de l'image RGB en utilisant la couleur verte (canal vert)
+    dbg_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+    # Assigner le masque à la composante verte (channel 1)
+    dbg_rgb[..., 1] = mask_np.astype(np.uint8)
+
+    # Construction du chemin de sauvegarde pour l'image
+    debug_image_path = os.path.join(debug_dir, f"{prefix}_{frame_counter}.png")
+
+    # Sauvegarde de l'image
+    Image.fromarray(dbg_rgb).save(debug_image_path)
+
+    print(f"[DEBUG] Debug image saved to: {debug_image_path}")
+#-----------------------------------------------------------------------------------------
+
+import cv2
+import numpy as np
+import torch
+
+def create_eye_mask_from_coords(
+    eye_coords_dict,
+    size,
+    image_size=None,
+    device="cuda",
+    expand=0.15,
+    frame_idx=0,
+    debug=False,
+    debug_dir=None
+):
+    """
+    Crée un masque pour les yeux à partir des coordonnées (dict).
+    - eye_coords_dict : liste de dictionnaires [{'eyes': [(x1, y1), (x2, y2)]}, ...]
+    - size : tuple (H, W) du masque final
     - expand : fraction pour agrandir légèrement l'ellipse autour de l'œil
     """
-    B = len(eye_coords_dict)
-    H, W = size
-    mask = torch.zeros(B, 1, H, W, device=device)
+    B = len(eye_coords_dict)  # Nombre d'éléments dans le dictionnaire
+    H, W = size  # Taille du masque final
+    mask = torch.zeros(B, 1, H, W, device=device)  # Masque initialisé avec des zéros
+
+    # Mise à l'échelle si image_size est défini
+    if image_size is not None:
+        img_H, img_W = image_size
+        scale_x = W / img_W
+        scale_y = H / img_H
+    else:
+        scale_x = 1.0
+        scale_y = 1.0
 
     for b in range(B):
-        for key in ["left_eye", "right_eye"]:
-            eye = eye_coords_dict[b].get(key)
-            if eye is None:
-                continue
+        # Extraire les coordonnées des yeux
+        eyes = eye_coords_dict[b].get("eyes")
+        if eyes is None:
+            continue
+
+        # Itérer sur les deux yeux (si existants)
+        for eye in eyes:
             cx, cy = eye
-            cx = int(cx * (W-1))
-            cy = int(cy * (H-1))
-            radius = int(max(H, W) * 0.03 * (1 + expand))  # rayon relatif à l'image
+            # Mise à l'échelle des coordonnées pour le masque
+            cx = int(cx * scale_x)
+            cy = int(cy * scale_y)
+
+            # Validation des coordonnées (en dehors des limites de l'image)
+            if not (0 <= cx < W and 0 <= cy < H):
+                print(f"⚠ Coordonnée de l'œil invalide après mise à l'échelle (hors limites): ({cx}, {cy})")
+                continue
+
+            # Ajustement des coordonnées pour les maintenir dans les limites du masque
+            cx = max(0, min(cx, W-1))
+            cy = max(0, min(cy, H-1))
+
+            # Rayon dynamique ajusté pour l'ellipse
+            radius = int(max(H, W) * 0.05 * (1 + expand))  # Rayon relatif à l'image
+            max_radius = 20  # Limite de la taille maximale du rayon
+            radius = min(radius, max_radius)  # Application de la limite maximale
+
+            # Création du masque local pour l'œil
             mask_np = np.zeros((H, W), dtype=np.uint8)
             cv2.ellipse(mask_np, (cx, cy), (radius, radius), 0, 0, 360, color=255, thickness=-1)
-            mask[b,0] = torch.clamp(mask[b,0] + torch.from_numpy(mask_np/255.0).to(device), 0, 1)
 
-    # Debug
-    if debug and debug_dir is not None:
-        save_debug_mask(mask, H, W, debug_dir, frame_counter=frame_idx, prefix="create_eye_mask_from_coords")
+            # Addition du masque local au masque global
+            mask[b, 0] = torch.max(mask[b, 0], torch.from_numpy(mask_np / 255.0).to(device))
+
+        # Débogage
+        if debug and debug_dir is not None:
+            save_debug_mask_green(mask_np, H, W, debug_dir, frame_counter=frame_idx, prefix="create_eye_mask_from_coords")
 
     return mask
 
-def create_mouth_mask_from_coords(mouth_coords_dict, size=(512,512), device="cuda", expand=0.15, frame_idx=0, debug=False, debug_dir=None):
+
+
+def create_mouth_mask_from_coords(
+    mouth_coords_dict,
+    size=(512, 512),
+    image_size=None,
+    device="cuda",
+    expand=0.15,
+    frame_idx=0,
+    debug=False,
+    debug_dir=None
+):
     H, W = size
     mask = torch.zeros(1, 1, H, W, device=device, dtype=torch.float32)
 
-    for k, mouth_list in mouth_coords_dict.items():
-        for mouth in mouth_list.get("mouth", []):  # chaque point de la bouche
-            if len(mouth) != 2:
-                print(f"⚠ Warning: coordonnée bouche invalide {mouth}, ignorée")
-                continue
-            cx, cy = map(float, mouth)
+    if image_size is not None:
+        img_H, img_W = image_size
+        scale_x = W / img_W
+        scale_y = H / img_H
+    else:
+        scale_x = 1.0
+        scale_y = 1.0
 
-            # Masque ellipse simple
+    total_points = 0
+
+    for k, value in mouth_coords_dict.items():
+
+        if isinstance(value, dict):
+            mouth_points = value.get("mouth", [])
+        else:
+            mouth_points = value if isinstance(value, list) else []
+
+        if not mouth_points:
+            print(f"⚠ Mouth mask: empty for key={k}")
+            continue
+
+        for mouth in mouth_points:
+
+            if mouth is None or len(mouth) != 2:
+                print(f"⚠ Invalid mouth point skipped: {mouth}")
+                continue
+
+            try:
+                cx = float(mouth[0]) * scale_x
+                cy = float(mouth[1]) * scale_y
+                print("[DEBUG MOUTH COORD RAW]", cx, cy)
+                print(f"[DEBUG MOUTH CLIP CHECK] cx={cx}, cy={cy}, H={H}, W={W}")
+                print(f"[DEBUG MOUTH IN BOUNDS] {0 <= cx < W and 0 <= cy < H}")
+            except Exception as e:
+                print(f"⚠ Mouth conversion error {mouth}: {e}")
+                continue
+
+            total_points += 1
+
+            # --- mask local ---
             mask_np = np.zeros((H, W), dtype=np.uint8)
-            radius = 10  # taille par défaut ou calculable
-            cv2.circle(mask_np, (int(cx), int(cy)), radius, color=255, thickness=-1)
+
+            # Augmenter le rayon pour tester la visibilité
+            radius = max(8, int(min(H, W) * 0.01))  # Nouveau rayon plus grand
+            print("[DEBUG MOUTH RADIUS]", radius)
+
+            cv2.circle(
+                mask_np,
+                (int(cx), int(cy)),
+                radius,
+                color=255,
+                thickness=-1
+            )
 
             mask += torch.from_numpy(mask_np / 255.0).to(device).unsqueeze(0).unsqueeze(0)
 
-            # Debug
+            # --- debug individuel ---
             if debug and debug_dir is not None:
-                save_debug_mask(mask, H, W, debug_dir, frame_counter=frame_idx, prefix="create_mouth_mask_from_coords")
+                save_debug_mask_green(mask_np, H, W, debug_dir, frame_counter=frame_idx, prefix="create_mouth_mask_from_coords")
+
+    # --- DEBUG FINAL IMPORTANT ---
+    if debug:
+        print(f"[DEBUG MOUTH MASK] points_used={total_points} min={mask.min().item():.4f} max={mask.max().item():.4f}")
+
+        if total_points == 0:
+            print("🚨 WARNING: mouth mask is EMPTY → check input coords pipeline")
 
     return mask.clamp(0, 1)
 
 
-def create_face_mask_from_coords(face_coords_dict, size=(512,512), device="cuda", expand=0.15, frame_idx=0, debug=False, debug_dir=None):
+def create_face_mask_from_coords(
+    face_coords_dict,
+    size=(512, 512),
+    image_size=None,
+    device="cuda",
+    expand=0.15,
+    frame_idx=0,
+    debug=False,
+    debug_dir=None
+):
     H, W = size
     mask = torch.zeros(1, 1, H, W, device=device, dtype=torch.float32)
+
+    # Si image_size est défini, appliquer une mise à l'échelle
+    if image_size is not None:
+        img_H, img_W = image_size
+        scale_x = W / img_W
+        scale_y = H / img_H
+    else:
+        scale_x = 1.0
+        scale_y = 1.0
+
+    # Debug: Affichage des coordonnées de face et des échelles
+    print(f"[DEBUG] Image size: {image_size}, Mask size: {(H, W)}")
+    print(f"[DEBUG] Scale X: {scale_x}, Scale Y: {scale_y}")
 
     for key, coords in face_coords_dict.items():
         if not coords:
             continue
 
-        # coords peut être un dict (nez)
+        # coords peut être un dict (par exemple pour le nez)
         if isinstance(coords, dict) and "center" in coords:
             coords_list = [coords["center"]]
         else:
@@ -692,9 +845,11 @@ def create_face_mask_from_coords(face_coords_dict, size=(512,512), device="cuda"
         valid_coords_list = []
         for p in coords_list:
             try:
-                x = int(p[0])
-                y = int(p[1])
+                x = float(p[0]) * scale_x
+                y = float(p[1]) * scale_y
                 valid_coords_list.append([x, y])
+                # Debug: Affichage des coordonnées après mise à l'échelle
+                print(f"[DEBUG] Coordinate {p} -> Scaled: ({x}, {y})")
             except (ValueError, TypeError):
                 print(f"⚠ Warning: coordonnée ignorée car invalide: {p}")
 
@@ -706,38 +861,50 @@ def create_face_mask_from_coords(face_coords_dict, size=(512,512), device="cuda"
         x_min, y_min = pts_px.min(axis=0)
         x_max, y_max = pts_px.max(axis=0)
 
+        # Si nous avons un seul point (comme pour la bouche), remplacez la largeur et la hauteur par une valeur par défaut
+        if x_min == x_max:
+            w = 30  # Largeur par défaut
+        else:
+            w = int((x_max - x_min) * (1 + expand))
+
+        if y_min == y_max:
+            h = 30  # Hauteur par défaut
+        else:
+            h = int((y_max - y_min) * (1 + expand))
+
         cx = (x_min + x_max) // 2
         cy = (y_min + y_max) // 2
-        w = int((x_max - x_min) * (1 + expand))
-        h = int((y_max - y_min) * (1 + expand))
 
         dx = pts_px[-1][0] - pts_px[0][0]
         dy = pts_px[-1][1] - pts_px[0][1]
         angle = int(np.degrees(np.arctan2(dy, dx)))
 
+        # Debug: Affichage de la taille et de l'angle de l'ellipse
+        print(f"[DEBUG] Mask key: {key}")
+        print(f"[DEBUG] cx: {cx}, cy: {cy}, width: {w}, height: {h}, angle: {angle}")
+
         mask_np = np.zeros((H, W), dtype=np.uint8)
 
-        if key in ["mouth", "eyes"]:
-            cv2.ellipse(
-                mask_np,
-                (cx, cy),
-                (w//2, h//2),
-                angle=angle,
-                startAngle=0,
-                endAngle=360,
-                color=255,
-                thickness=-1
-            )
+        # Masques pour les yeux et la bouche
+        if key == "mouth" or key == "eyes":
+            # Ajustement du rayon pour les yeux et la bouche
+            max_radius = max(H, W) * 0.1  # Rayon plus grand pour les yeux et la bouche
+            radius = min(int(max_radius * (1 + expand)), 40)  # Limiter la taille du rayon
+            print(f"[DEBUG] Eye/Mouth mask radius: {radius}")  # Debug du rayon
+            cv2.ellipse(mask_np, (cx, cy), (radius, radius), angle=angle, startAngle=0, endAngle=360, color=255, thickness=-1)
         else:
-            radius = max(w,h)//2
+            # Rayon pour d'autres parties (comme le nez ou la tête)
+            radius = max(w, h) // 2
+            print(f"[DEBUG] Face mask radius: {radius}")  # Debug du rayon
             cv2.circle(mask_np, (cx, cy), radius, color=255, thickness=-1)
 
         mask += torch.from_numpy(mask_np / 255.0).to(device).unsqueeze(0).unsqueeze(0)
+
         # Debug
         if debug and debug_dir is not None:
-            save_debug_mask(mask, H, W, debug_dir, frame_counter=frame_idx, prefix="create_face_mask_from_coords")
+            save_debug_mask_green(mask_np, H, W, debug_dir, frame_counter=frame_idx, prefix=f"create_{key}_mask")
 
-    return mask.clamp(0,1)
+    return mask.clamp(0, 1)
 #----------------------------------------------------------------------------------------------------------
 
 def log_latents_stats(latents, label="LATENTS"):
@@ -749,6 +916,7 @@ def log_latents_stats(latents, label="LATENTS"):
         has_nan = torch.isnan(latents).any().item()
 
         print(f"[DEBUG] {label} | min={min_val:.4f} max={max_val:.4f} mean={mean_val:.4f} std={std_val:.4f} NaN={has_nan}")
+
 
 def encode_images_to_latents_hybrid_pro(
     images,
@@ -769,6 +937,8 @@ def encode_images_to_latents_hybrid_pro(
     vae = vae.to(device=device, dtype=torch.float32)
     B, C, H, W = images.shape
 
+    img_H, img_W = H, W
+
     # --- Encodage latents ---
     with torch.no_grad():
         dist = vae.encode(images).latent_dist
@@ -783,14 +953,7 @@ def encode_images_to_latents_hybrid_pro(
     eye_coords_dict = {0: {"eyes": [list(map(float, p)) for p in eye_coords]}}
     mouth_coords_dict = {0: {"mouth": [list(map(float, p)) for p in mouth_coords]}}
     nose_coords_dict = {0: {"nose": [list(map(float, p)) for p in nose_coords]}}
-    """
-    face_coords_dict = {0: {
-        "eyes": [list(map(float, p)) for p in eye_coords],
-        "mouth": [list(map(float, p)) for p in mouth_coords],
-        "ears": [list(map(float, p)) for p in ear_coords],
-        "nose": [list(map(float, p)) for p in nose_coords],
-    }}
-    """
+
     face_coords_dict = {
         "eyes": [list(map(float, p)) for p in eye_coords],
         "mouth": [list(map(float, p)) for p in mouth_coords],
@@ -798,10 +961,15 @@ def encode_images_to_latents_hybrid_pro(
         "nose": [list(map(float, p)) for p in nose_coords],
     }
 
+    print("[DEBUG][FACE MASK INPUT TYPE]", type(face_coords_dict))
+
+    for k, v in face_coords_dict.items():
+        print(f"[DEBUG][FACE MASK KEY={k}] type={type(v)} value={v}")
+
     # --- Masques ---
-    mask_face = create_face_mask_from_coords(face_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device, frame_idx=frame_idx, debug=debug, debug_dir=debug_dir)
-    mask_eyes = create_eye_mask_from_coords(eye_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device, frame_idx=frame_idx, debug=debug, debug_dir=debug_dir)
-    mask_mouth = create_mouth_mask_from_coords(mouth_coords_dict, size=(latents.shape[2], latents.shape[3]), device=device, frame_idx=frame_idx, debug=debug, debug_dir=debug_dir)
+    mask_face = create_face_mask_from_coords(face_coords_dict, size=(latents.shape[2], latents.shape[3]), image_size=(img_H, img_W), device=device, frame_idx=frame_idx, debug=debug, debug_dir=debug_dir)
+    mask_eyes = create_eye_mask_from_coords(eye_coords_dict, size=(latents.shape[2], latents.shape[3]), image_size=(img_H, img_W), device=device, frame_idx=frame_idx, debug=debug, debug_dir=debug_dir)
+    mask_mouth = create_mouth_mask_from_coords(mouth_coords_dict, size=(latents.shape[2], latents.shape[3]), image_size=(img_H, img_W), device=device, frame_idx=frame_idx, debug=debug, debug_dir=debug_dir)
 
     # --- Compatibilité channels ---
     mask_face = mask_face.expand(B, latents.shape[1], -1, -1)
@@ -854,9 +1022,14 @@ def encode_images_to_latents_hybrid_pro(
             log_latents_stats(latents, "DREAM")
 
         elif creative_mode == "anime":
-            # ✨ amplification locale (plus fort)
-            latents = latents * (1 + 0.4 * mask_eyes)
-            latents = latents * (1 + 0.25 * mask_mouth)
+
+            # Appliquer une amplification douce à l'aide d'une fonction sigmoïde
+            mask_eyes_sigmoid = 1 / (1 + torch.exp(-10 * (mask_eyes - 0.5)))  # Douce transition
+            mask_mouth_sigmoid = 1 / (1 + torch.exp(-10 * (mask_mouth - 0.5)))  # Douce transition
+
+            # Amplification subtile
+            latents = latents * (1 + 0.2 * mask_eyes_sigmoid)
+            latents = latents * (1 + 0.15 * mask_mouth_sigmoid)
 
             # 🎨 ajout de détails directionnels
             latents = latents + 0.25 * mask_eyes * (latents_norm - latents)
