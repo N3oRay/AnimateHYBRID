@@ -13,6 +13,7 @@ from .n3rMotionPose_tools import feather_inside_strict2, feather_outside_only_al
 import torch.nn.functional as Fu
 import torch.nn.functional as TF
 import torch.nn.functional as FF
+import torch.nn.functional as F
 LATENT_SCALE = 0.18215
 
 
@@ -31,108 +32,6 @@ def sanitize_coords(coords):
             #print(f"⚠ Coordonnée ignorée car invalide: {p}")
             continue
     return valid
-
-# --- Normalisation sécurisée et filtrage des coordonnées ---
-def safe_coords_list(coords_list):
-    """Convertit en float et ignore tout élément non convertible"""
-    safe_list = []
-    for p in coords_list:
-        try:
-            # supporte tuple/list ou dict {'x':..,'y':..}
-            if isinstance(p, (list, tuple)) and len(p) >= 2:
-                x, y = float(p[0]), float(p[1])
-            elif isinstance(p, dict) and 'x' in p and 'y' in p:
-                x, y = float(p['x']), float(p['y'])
-            else:
-                continue
-            safe_list.append([x, y])
-        except (ValueError, TypeError, KeyError):
-            continue
-    return safe_list
-
-
-# Crée une fonction helper pour filtrer et forcer des tuples valides
-def valid_tuples(coords_list):
-    valid = []
-    for c in coords_list:
-        if c is None:
-            continue
-        # Si c'est un tuple de deux nombres
-        if isinstance(c, tuple) and len(c) == 2 and all(isinstance(x, (int, float)) for x in c):
-            valid.append(c)
-        # Si c'est une liste de tuples
-        elif isinstance(c, list):
-            for t in c:
-                if isinstance(t, tuple) and len(t) == 2 and all(isinstance(x, (int, float)) for x in t):
-                    valid.append(t)
-    return valid
-
-
-# Assurer que tout est une liste de tuples
-def normalize_coords(c):
-    if c is None:
-        return []
-    if isinstance(c, dict):
-        # prendre juste le point central si c'est un dict (ex: nose, neck)
-        if "center" in c:
-            return [tuple(c["center"])]
-        # sinon prendre le premier point disponible
-        for k in c.keys():
-            if isinstance(c[k], (tuple, list)):
-                return [tuple(c[k])]
-        return []
-    elif isinstance(c, (tuple, list)) and len(c) > 0 and isinstance(c[0], (int,float)):
-        # tuple simple (x,y)
-        return [tuple(c)]
-    elif isinstance(c, (tuple, list)):
-        # liste déjà de tuples
-        return [tuple(p) for p in c]
-    return []
-
-
-def ensure_coords_tuple(coords, keys):
-    """
-    Normalise les coordonnées en dictionnaire.
-    Retour : dict {key: tuple(x, y)}
-    """
-    out = {}
-    for i, key in enumerate(keys):
-        if i >= len(coords) or coords[i] is None:
-            out[key] = None
-            continue
-
-        c = coords[i]
-        if isinstance(c, tuple) and all(isinstance(x, (int, float)) for x in c):
-            out[key] = c  # <- juste le tuple
-        elif isinstance(c, (list, tuple)) and len(c) == 2 and all(isinstance(x, (int, float)) for x in c):
-            out[key] = tuple(c)
-        else:
-            out[key] = None
-            print(f"⚠ Warning: unexpected type for key '{key}': {type(c)}. Using None.")
-
-    return out
-
-
-def coords_to_dict(batch_coords, keys):
-    """
-    Transforme une liste de tuples/arrays en dictionnaire par batch.
-
-    batch_coords: list of tuples/arrays, shape par batch
-    keys: list des noms des clés, longueur doit correspondre à chaque tuple
-
-    Exemple:
-        eye_coords_dict = coords_to_dict(eye_coords, ["left_eye", "right_eye"])
-        mouth_coords_dict = coords_to_dict(mouth_coords, ["mouth"])
-    """
-    batch_dict = []
-    for coords in batch_coords:
-        if isinstance(coords, tuple) or isinstance(coords, list) or isinstance(coords, np.ndarray):
-            d = {k: coords[i] for i, k in enumerate(keys)}
-            batch_dict.append(d)
-        else:
-            raise TypeError(f"Expected tuple/list/array, got {type(coords)}")
-    return batch_dict
-
 
 
 def compress_highlights(frame_pil, threshold=235, strength=0.6):
@@ -767,9 +666,6 @@ def create_mouth_mask_from_coords(mouth_coords_dict, size=(512,512), device="cud
     return mask.clamp(0, 1)
 
 
-
-import torch.nn.functional as F
-
 def create_face_mask_from_coords(face_coords_dict, size=(512,512), device="cuda", expand=0.15):
     H, W = size
     mask = torch.zeros(1, 1, H, W, device=device, dtype=torch.float32)
@@ -832,9 +728,6 @@ def create_face_mask_from_coords(face_coords_dict, size=(512,512), device="cuda"
 
     return mask.clamp(0,1)
 #----------------------------------------------------------------------------------------------------------
-
-import torch
-import torch.nn.functional as F
 
 def encode_images_to_latents_hybrid_pro(
     images,
