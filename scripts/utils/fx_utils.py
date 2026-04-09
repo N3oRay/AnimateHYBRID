@@ -1079,6 +1079,76 @@ def encode_images_to_latents_hybrid_pro(
 
             log_latents_stats(latents, "GLITCH")
 
+        elif creative_mode == "hybrid":
+            # Bruit léger et dynamique avec modulation cosinusoïdale
+            noise = torch.randn_like(latents) * 0.03  # Bruit de base léger
+
+            # Modulateur cosinusoïdal pour introduire de la fluidité au bruit
+            t = frame_idx / max(total_frames, 1)
+            cos_mod = (torch.cos(torch.tensor(t * 3.14)) + 1) / 2  # Valeur entre 0 et 1
+
+            # Appliquer un bruit léger et modulé en fonction du temps
+            latents = latents + noise * cos_mod  # Le bruit varie de manière fluide au fil du temps
+
+            # Amplification de certaines zones, comme les yeux et la bouche
+            mask_eyes_sigmoid = 1 / (1 + torch.exp(-8 * (mask_eyes - 0.5)))  # Douce transition pour les yeux
+            mask_mouth_sigmoid = 1 / (1 + torch.exp(-8 * (mask_mouth - 0.5)))  # Douce transition pour la bouche
+
+            # Amplification subtile dans les zones des yeux et de la bouche
+            latents = latents * (1 + 0.15 * mask_eyes_sigmoid)
+            latents = latents * (1 + 0.12 * mask_mouth_sigmoid)
+
+            # Flou directionnel en fonction du temps
+            blur_strength = 0.5 + 0.5 * torch.sin(t_tensor * 3.14)
+            latents = latents * (1 - 0.25 * mask_face) + latents_soft * 0.25 * mask_face  # Flou plus fort autour du visage
+            latents = latents + noise * blur_strength  # Appliquer le bruit et le flou
+
+            # Déplacement léger des latents (effet de fluctuation)
+            pulse = torch.sin(torch.tensor(t * 6.28)).to(latents.device) * 0.1
+            latents = latents + pulse * mask_eyes  # Pulsation sur les yeux pour plus de dynamisme
+
+            log_latents_stats(latents, "HYBRID")
+
+        elif creative_mode == "extreme":
+            # 1. Bruit explosif et fluctuant
+            noise = torch.randn_like(latents) * 0.1  # Bruit très intense
+
+            # 2. Modulation cosinusoïdale rapide pour des variations extrêmes
+            t = frame_idx / max(total_frames, 1)
+            cos_mod = (torch.cos(torch.tensor(t * 8.0)) + 1) / 2  # Modulation très rapide
+
+            # 3. Application du bruit explosif avec la modulation rapide
+            latents = latents + noise * cos_mod * 2  # Bruit bien plus fort avec une modulation rapide
+
+            # 4. Amplification agressive des zones cibles (yeux, bouche)
+            mask_eyes_sigmoid = 1 / (1 + torch.exp(-15 * (mask_eyes - 0.5)))  # Transition super agressive pour les yeux
+            mask_mouth_sigmoid = 1 / (1 + torch.exp(-15 * (mask_mouth - 0.5)))  # Transition hyper nette pour la bouche
+
+            # Amplification violente des zones des yeux et de la bouche
+            latents = latents * (1 + 0.4 * mask_eyes_sigmoid)
+            latents = latents * (1 + 0.35 * mask_mouth_sigmoid)
+
+            # 5. Flou exponentiel et bruit sur les zones périphériques
+            blur_strength = 1.5 + 0.5 * torch.sin(t_tensor * 4.0)  # Flou rapide et irrégulier
+            latents = latents * (1 - 0.5 * mask_face) + latents_soft * 0.5 * mask_face  # Flou agressif sur les bords
+            latents = latents + noise * blur_strength * 1.5  # Augmenter le bruit avec un facteur de 1.5
+
+            # 6. Distorsion géométrique violente
+            shift_x = int(6 * torch.sin(t_tensor * 6).item())  # Décalage important dans la dimension X
+            shift_y = int(6 * torch.cos(t_tensor * 6).item())  # Décalage important dans la dimension Y
+
+            if shift_x != 0 or shift_y != 0:
+                latents = torch.roll(latents, shifts=(shift_x, shift_y), dims=(2, 3))  # Déplacement violent des latents
+
+            # 7. Saturation intense du visage
+            latents = latents * (1 + 0.6 * mask_face)  # Saturation extrême sur le visage
+
+            # 8. Effet de pulsation rapide
+            pulse = torch.sin(torch.tensor(t * 12.0)).to(latents.device) * 0.2
+            latents = latents + pulse * mask_eyes  # Effet de pulsation intense sur les yeux
+
+            log_latents_stats(latents, "EXTREME")
+
     # --- sécurité finale ---
     latents = latents.clamp(-3, 3)
     log_latents_stats(latents, "FINAL CLAMP")
