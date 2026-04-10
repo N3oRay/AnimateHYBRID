@@ -1005,6 +1005,63 @@ def encode_images_to_latents_hybrid_pro(
 
             log_latents_stats(latents, "CINEMATIC")
 
+        elif creative_mode == "quality":
+
+            # --- 1. Débruitage léger (anti-grain latent) ---
+            denoise_strength = 0.15
+            latents = latents * (1 - denoise_strength) + latents_norm * denoise_strength
+
+            # --- 2. Sharpen doux (renforce contours sans casser) ---
+            sharpen = latents - latents_soft
+            latents = latents + 0.2 * sharpen
+
+            # --- 3. Boost local intelligent (yeux + bouche uniquement) ---
+            mask_detail = torch.clamp(mask_eyes + mask_mouth, 0, 1)
+
+            detail_boost = (latents_norm - latents)
+            latents = latents + 0.25 * mask_detail * detail_boost
+
+            # --- 4. Stabilisation visage (TRÈS IMPORTANT) ---
+            face_stability = 0.2
+            latents = latents * (1 - face_stability * mask_face) + latents_soft * (face_stability * mask_face)
+
+            # --- 5. Micro-contraste global (safe) ---
+            contrast = 1.05
+            latents = latents * contrast
+
+            log_latents_stats(latents, "QUALITY")
+
+        elif creative_mode == "pro":
+            # --- 1. Débruitage léger global ---
+            denoise_strength = 0.12
+            latents = latents * (1 - denoise_strength) + latents_norm * denoise_strength
+
+            # --- 2. Zones utiles ---
+            mask_detail = torch.clamp(mask_eyes + mask_mouth, 0, 1)
+            mask_background = (1.0 - mask_face).clamp(0, 1)
+
+            # --- 3. Détail (structure propre uniquement) ---
+            detail_signal = latents_norm - latents
+
+            # --- 4. Boost YEUX (fort mais propre) ---
+            latents = latents + 0.30 * mask_eyes * detail_signal
+
+            # --- 5. Boost BOUCHE (modéré) ---
+            latents = latents + 0.22 * mask_mouth * detail_signal
+
+            # --- 6. Boost BACKGROUND (léger enrichissement) ---
+            latents = latents + 0.15 * mask_background * detail_signal
+
+            # --- 7. Stabilisation stricte du visage (clé 🔥) ---
+            face_lock = 0.35
+            latents = latents * (1 - face_lock * mask_face) + latents_soft * (face_lock * mask_face)
+
+            # --- 8. Micro-contraste uniquement hors visage ---
+            contrast = 1.04
+            latents = latents * (1 + (contrast - 1) * mask_background)
+
+            log_latents_stats(latents, "QUALITY_PRO")
+
         elif creative_mode == "soft":
             noise = torch.randn_like(latents) * 0.03
 
@@ -1123,48 +1180,33 @@ def encode_images_to_latents_hybrid_pro(
 
             log_latents_stats(latents, "SMOOTH")
 
-        elif creative_mode == "extreme":
-            # 1. Bruit explosif et fluctuant
-            noise = torch.randn_like(latents) * 0.1  # Bruit très intense
+        elif creative_mode == "distorsion":
 
-            # 2. Modulation cosinusoïdale rapide pour des variations extrêmes
+            # 1. Modulation cosinusoïdale rapide pour des variations extrêmes
             t = frame_idx / max(total_frames, 1)
             cos_mod = (torch.cos(torch.tensor(t * 8.0)) + 1) / 2  # Modulation très rapide
 
-            # 3. Application du bruit explosif avec la modulation rapide
-            latents = latents + noise * cos_mod * 2  # Bruit bien plus fort avec une modulation rapide
-
-            # 4. Amplification agressive des zones cibles (yeux, bouche)
-            mask_eyes_sigmoid = 1 / (1 + torch.exp(-15 * (mask_eyes - 0.5)))  # Transition super agressive pour les yeux
-            mask_mouth_sigmoid = 1 / (1 + torch.exp(-15 * (mask_mouth - 0.5)))  # Transition hyper nette pour la bouche
-
-            # Amplification violente des zones des yeux et de la bouche
-            latents = latents * (1 + 0.4 * mask_eyes_sigmoid)
-            latents = latents * (1 + 0.35 * mask_mouth_sigmoid)
-
-            # 5. Flou exponentiel et bruit sur les zones périphériques
+            # 2. Flou exponentiel et bruit sur les zones périphériques
             blur_strength = 1.5 + 0.5 * torch.sin(t_tensor * 4.0)  # Flou rapide et irrégulier
             latents = latents * (1 - 0.5 * mask_face) + latents_soft * 0.5 * mask_face  # Flou agressif sur les bords
-            latents = latents + noise * blur_strength * 1.5  # Augmenter le bruit avec un facteur de 1.5
 
-            # 6. Distorsion géométrique violente
+            # 3. Distorsion géométrique violente
             shift_x = int(6 * torch.sin(t_tensor * 6).item())  # Décalage important dans la dimension X
             shift_y = int(6 * torch.cos(t_tensor * 6).item())  # Décalage important dans la dimension Y
 
             if shift_x != 0 or shift_y != 0:
                 latents = torch.roll(latents, shifts=(shift_x, shift_y), dims=(2, 3))  # Déplacement violent des latents
 
-            # 7. Saturation intense du visage
-            latents = latents * (1 + 0.6 * mask_face)  # Saturation extrême sur le visage
-
             # 8. Effet de pulsation rapide
             pulse = torch.sin(torch.tensor(t * 12.0)).to(latents.device) * 0.2
             latents = latents + pulse * mask_eyes  # Effet de pulsation intense sur les yeux
 
-            log_latents_stats(latents, "EXTREME")
+            log_latents_stats(latents, "DISTORSION")
 
     # --- sécurité finale ---
     latents = latents.clamp(-3, 3)
+
+    print("LATENTS RAW:", latents.min().item(), latents.max().item(), latents.std().item())
     log_latents_stats(latents, "FINAL CLAMP")
 
     # --- Assurer 4 channels si nécessaire ---
