@@ -1051,49 +1051,83 @@ def encode_images_to_latents_hybrid_pro(
             latents = latents + noise * cos_mod  # Le bruit varie en fonction du temps
             log_latents_stats(latents, "CINEMATIC")
 
-        elif creative_mode == "quality":
+        elif creative_mode == "cyber":
+            # --- temps ---
+            t = frame_idx / max(total_frames, 1)
+            t_tensor = torch.tensor(t, device=latents.device)
 
-            # --- zones ---
-            mask_detail = torch.clamp(mask_eyes + mask_mouth, 0, 1)
-            mask_background = (1.0 - mask_face).clamp(0, 1)
-            # --- 1. débruitage léger (safe global) ---
-            latents = latents * 0.9 + latents_norm * 0.1
-            # --- 2. détail UNIQUEMENT hors visage ---
-            detail = latents_norm - latents
-            latents = latents + 0.2 * mask_detail * detail
-            latents = latents + 0.1 * mask_background * detail
-            # --- 3. sharpen doux hors visage ---
-            sharpen = latents - latents_norm
-            latents = latents + 0.15 * mask_background * sharpen
-            # --- 4. LOCK visage (clé absolue) ---
-            face_lock = 0.4
-            latents = latents * (1 - face_lock * mask_face) + latents_norm * (face_lock * mask_face)
-            # --- 5. micro contraste hors visage ---
-            latents = latents * (1 + 0.03 * mask_background)
-            log_latents_stats(latents, "QUALITY_FIXED")
+            # --- base stable ---
+            base = latents
+
+            # --- signal de détail stable ---
+            detail = latents_norm - latents_norm.mean(dim=(2,3), keepdim=True)
+
+            # =========================================================
+            # ⚡ 1. ÉNERGIE ÉLECTRIQUE (high-frequency boost contrôlé)
+            # =========================================================
+            hf_detail = detail - torch.nn.functional.avg_pool2d(detail, kernel_size=3, stride=1, padding=1)
+
+            latents = latents + 0.18 * hf_detail
+
+            # =========================================================
+            # 🌐 2. PULSATION CYBER (néon / énergie)
+            # =========================================================
+            pulse = (torch.sin(t_tensor * 6.28) + 1) * 0.5  # 0 → 1
+
+            latents = latents + pulse * 0.08 * detail
+
+            # =========================================================
+            # ⚡ 3. BRUIT "ÉLECTRIQUE" (pas gaussian pur)
+            # =========================================================
+            noise = torch.randn_like(latents)
+
+            # structuration du bruit (donne un effet “signal électrique”)
+            noise = noise - torch.roll(noise, shifts=1, dims=-1)
+
+            latents = latents + noise * 0.02 * (0.5 + 0.5 * pulse)
+
+            # =========================================================
+            # 👁 4. ACCENT ZONES IMPORTANTES (yeux / bouche)
+            # =========================================================
+            mask_focus = torch.clamp(mask_eyes + mask_mouth, 0, 1)
+
+            latents = latents + 0.15 * mask_focus * detail
+
+            # =========================================================
+            # 🧠 5. STABILISATION VISAGE (évite dérive)
+            # =========================================================
+            face_lock = 0.35
+            latents = (
+                latents * (1 - face_lock * mask_face) +
+                base * (face_lock * mask_face)
+            )
+
+            log_latents_stats(latents, "CYBER")
 
         elif creative_mode == "pro":
-            # --- 1. Débruitage léger global ---
-            denoise_strength = 0.12
-            latents = latents * (1 - denoise_strength) + latents_norm * denoise_strength
-            # --- 2. Zones utiles ---
+            # --- 1. léger stabilisation globale ---
+            latents = latents * 0.88 + latents_norm * 0.12
+            # --- 2. signal de détail unique (référence stable) ---
+            detail = latents_norm - latents_norm.mean(dim=(2,3), keepdim=True)
+            # --- 3. masques combinés ---
+            mask_face = mask_face
             mask_detail = torch.clamp(mask_eyes + mask_mouth, 0, 1)
-            mask_background = (1.0 - mask_face).clamp(0, 1)
-            # --- 3. Détail (structure propre uniquement) ---
-            detail_signal = latents_norm - latents
-            # --- 4. Boost YEUX (fort mais propre) ---
-            latents = latents + 0.30 * mask_eyes * detail_signal
-            # --- 5. Boost BOUCHE (modéré) ---
-            latents = latents + 0.22 * mask_mouth * detail_signal
-            # --- 6. Boost BACKGROUND (léger enrichissement) ---
-            latents = latents + 0.15 * mask_background * detail_signal
-            # --- 7. Stabilisation stricte du visage (clé 🔥) ---
-            face_lock = 0.35
-            latents = latents * (1 - face_lock * mask_face) + latents_norm * (face_lock * mask_face)
-            # --- 8. Micro-contraste uniquement hors visage ---
-            contrast = 1.04
-            latents = latents * (1 + (contrast - 1) * mask_background)
+            mask_bg = (1.0 - mask_face)
 
+            # --- 4. modulation locale unifiée ---
+            local_gain = (
+                0.30 * mask_eyes +
+                0.22 * mask_mouth +
+                0.12 * mask_bg
+            )
+            latents = latents + local_gain * detail
+
+            # --- 5. stabilisation visage (UNE seule fois) ---
+            face_lock = 0.4
+            latents = latents * (1 - face_lock * mask_face) + latents_norm * (face_lock * mask_face)
+
+            # --- 6. normalisation finale légère ---
+            latents = latents / (latents.std(dim=(1,2,3), keepdim=True).clamp(0.5, 1.5))
             log_latents_stats(latents, "QUALITY_PRO")
 
         elif creative_mode == "soft":
@@ -1103,17 +1137,6 @@ def encode_images_to_latents_hybrid_pro(
             latents = latents * (1 - 0.25 * mask_face) + latents_norm * 0.25 * mask_face
             latents = latents + noise * blur_strength
             log_latents_stats(latents, "SOFT")
-
-        elif creative_mode == "dream": # Fonctionne correctement
-            noise = torch.randn_like(latents) * 0.03  # Bruit léger
-            # Variation du flou en fonction du temps
-            blur_strength = 0.6 + 0.4 * torch.sin(t_tensor * 3.14)
-            # Appliquer le flou en préservant une partie du visage
-            latents = latents * (1 - 0.3 * mask_face) + latents_norm * 0.3 * mask_face
-            # Appliquer le bruit et le flou avec une légère modulation de l'intensité
-            latents = latents + noise * blur_strength
-
-            log_latents_stats(latents, "DREAM")
 
         elif creative_mode == "anime":
             # Appliquer une amplification douce à l'aide d'une fonction sigmoïde
@@ -1127,31 +1150,11 @@ def encode_images_to_latents_hybrid_pro(
             # 💫 micro-variation temporelle
             pulse = torch.sin(torch.tensor(t * 6.28)).to(latents.device) * 0.1
             latents = latents + pulse * mask_eyes
+            # gain:
+            feature_gain = 1 + 0.25 * mask_eyes + 0.15 * mask_mouth
+            latents = latents * feature_gain
             log_latents_stats(latents, "ANIME")
 
-        elif creative_mode == "manga": # Légère saturation du visage
-
-            # Appliquer une amplification douce à l'aide d'une fonction sigmoïde
-            mask_eyes_sigmoid = 1 / (1 + torch.exp(-10 * (mask_eyes - 0.5)))  # Douce transition
-            mask_mouth_sigmoid = 1 / (1 + torch.exp(-10 * (mask_mouth - 0.5)))  # Douce transition
-            # Amplification subtile
-            latents = latents * (1 + 0.2 * mask_eyes_sigmoid)
-            latents = latents * (1 + 0.15 * mask_mouth_sigmoid)
-            # 🎨 ajout de détails directionnels
-            latents = latents + 0.25 * mask_eyes * (latents_norm - latents)
-            # 💫 micro-variation temporelle
-            pulse = torch.sin(torch.tensor(t * 6.28)).to(latents.device) * 0.1
-            latents = latents + pulse * mask_eyes
-            log_latents_stats(latents, "MANGA")
-
-        elif creative_mode == "glitch": #Visage stable pas de régression
-            noise = torch.randn_like(latents) * 0.03
-            shift = int(2 * torch.sin(t_tensor * 6).item())
-            if shift != 0:
-                latents = torch.roll(latents, shifts=shift, dims=3)
-
-            latents = latents + noise * 0.1
-            log_latents_stats(latents, "GLITCH")
 
         elif creative_mode == "hybrid":
             # Bruit léger et dynamique avec modulation cosinusoïdale
