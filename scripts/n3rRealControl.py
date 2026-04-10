@@ -22,6 +22,7 @@ from tqdm import tqdm
 from PIL import Image, ImageFilter
 from diffusers import PNDMScheduler
 from transformers import CLIPTokenizerFast, CLIPTextModel
+from scripts.utils.logging_utils import debug_latents
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
 from scripts.utils.n3rModelUtils import generate_n3r_coords, process_n3r_latents, fuse_with_memory, inject_external, fuse_n3r_latents_adaptive_new
@@ -291,8 +292,7 @@ def main(args):
             print(f"ear_coords: {ear_coords}")
             ear_coords_list = [[float(x), float(y)] for x, y in ear_coords]  # déjà liste de tuples
             print(f"nose_coords: {nose_coords}")
-            # Pour le masque global, on transforme le dict du nez en [[x,y]]
-            nose_coords_list  = sanitize_coords([nose_coords["center"]]) if nose_coords else []
+            nose_coords_list  = sanitize_coords([nose_coords["center"]]) if nose_coords else [] # Pour le masque, on transforme le dict du nez en [[x,y]]
             # Pour encode_images_to_latents_hybrid_pro, garder le dict original
             nose_coords_dict  = nose_coords if nose_coords else None
 
@@ -327,7 +327,7 @@ def main(args):
                                         eye_coords=eye_coords_list, mouth_coords=mouth_coords_list, ear_coords=ear_coords_list,       # liste de tuples
                                         nose_coords=nose_coords_list,     # dict
                                         device=device, latent_scale=LATENT_SCALE,
-                                        creative_mode="cinematic", # cinematic # dream # anime  #glitch # soft
+                                        creative_mode="cyber", # cinematic # dream # anime  #glitch # soft # distortion hybrid ********
                                         frame_idx=frame_counter,
                                         total_frames=total_frames,
                                         debug=True,
@@ -435,13 +435,9 @@ def main(args):
                     control_latent, control_weight_map = match_latent_size(latents, control_latent, control_weight_map)
 
                     # ---------------- N3R avec mémoire latente conditionnée ----------------
-                    #use_n3r_this_frame = math.sin(frame_counter * 0.2) > 0.7
                     use_n3r_this_frame = use_n3r_model and (frame_counter % random.choice([4,5,6]) == 0)
-                    #control_strength = 0.05 * (1 - frame_counter / total_frames) + 0.02
                     controlnet_scale = 1.0 + 0.1 * torch.sin(torch.tensor(frame_counter * 0.1))
-                    print(f"[DEBUG] 🧠 Pose control_strength ={control_strength:.4f}")
-                    print(f"[DEBUG] 🧠 Pose controlnet_scale ={controlnet_scale:.4f}")
-
+                    print(f"[DEBUG] 🧠 Pose | control_strength={control_strength:.4f} | controlnet_scale={controlnet_scale:.4f}")
 
                     if use_n3r_this_frame and use_n3r_model:
                         print(f"[DEBUG] N3R active: {use_n3r_this_frame}")
@@ -517,22 +513,20 @@ def main(args):
 
                             # ------------------- Backup latents -------------------
                             latents_before_openpose = latents.clone()
-                            print(f"[DEBUG] Latents avant OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
+                            debug_latents("Latents avant OpenPose", latents)
 
 
                             # ------------------- Tile-wise OpenPose -------------------
                             if open_pose_init:
                                 tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, )
 
-                                # 🔹 Appel correct de apply_openpose_tilewise
+                                # 🔹 Appel de apply_openpose_tilewise
                                 latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
 
                             # BOOST
                             latents_after = latents.clone()  # sortie OpenPose
 
-
-                            #new code fonction --------------------------------------------------------------------------------------
-                            # 🔹 Extraction / update des keypoints
+                            # 🔹 Extraction / update des keypoints --------------------------------------------------------------------------------------
                             current_keypoints = extract_keypoints_from_pose( pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter)
                             # 🔹 Update des keypoints avec Mediapipe
                             current_keypoints = update_keypoints_from_pose( pose_full, current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
@@ -579,7 +573,7 @@ def main(args):
 
                             diff = (latents - latents_before_openpose).abs().mean()
                             print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
-                            print(f"[DEBUG] Latents après OpenPose min={latents.min().item():.4f}, max={latents.max().item():.4f}")
+                            debug_latents("Latents après OpenPose", latents)
 
                         except Exception:
                             print("[ERROR] ControlNet OpenPose failed:")
@@ -599,26 +593,26 @@ def main(args):
                         latents_seq, applied = apply_motion_safe(latents_seq, motion_module)
                         latents = latents_seq[:, :, 1, :, :] if applied else latents
                         latents = sanitize_latents(latents)
-                        print(f"[DEBUG] Après Motion module min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
+                        debug_latents("Après Motion module", latents)
 
                     # ---------------- ProNet yeux ----------------
                     if use_n3r_pro_net:
                         latents = apply_pro_net_volumetrique(latents, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
-                        print(f"[DEBUG] Après ProNet volumetrique min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
+                        debug_latents("Après ProNet volumetrique", latents)
 
                         eye_coords_latent = scale_eye_coords_to_latents(eye_coords, img_H=cfg["H"], img_W=cfg["W"],
                                                                         lat_H=latents.shape[-2], lat_W=latents.shape[-1])
                         if eye_coords_latent:
                             latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength,
                                                             sanitize_fn=sanitize_latents)
-                            print(f"[DEBUG] Après ProNet yeux min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
+                            debug_latents("Après ProNet yeux", latents)
 
                         mouth_coords_latent = scale_mouth_coords_to_latents(mouth_coords, img_H=cfg["H"], img_W=cfg["W"],
                                                                         lat_H=latents.shape[-2], lat_W=latents.shape[-1])
                         if mouth_coords_latent:
                             latents = apply_pro_net_with_mouth(latents, mouth_coords_latent, n3r_pro_net, n3r_pro_strength,
                                                             sanitize_fn=sanitize_latents)
-                            print(f"[DEBUG] Après ProNet Bouche min={latents.min().item():.4f}, max={latents.max().item():.4f}, NaN={torch.isnan(latents).any().item()}")
+                            debug_latents("Après ProNet Bouche", latents)
                         latents = sanitize_latents(latents)
                     # ---------------- Décodage final ----------------
                     # 🔥 SANITY AVANT DECODE
