@@ -3,6 +3,15 @@ import os
 import csv
 import torch
 
+
+def debug_latents(tag, latents):
+    print(
+        f"[DEBUG] {tag} "
+        f"min={latents.min().item():.4f}, "
+        f"max={latents.max().item():.4f}, "
+        f"NaN={torch.isnan(latents).any().item()}"
+    )
+
 def log_latent_stats(frame_idx, latents, csv_path="latent_stats.csv"):
     """
     Écrit les stats latentes dans un CSV.
