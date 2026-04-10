@@ -3860,50 +3860,333 @@ def apply_intelligent_glow_froid(
 
 def apply_post_processing_adaptive(
     frame_pil,
-    blur_radius=0.03,
-    contrast=1.10,
-    vibrance_strength=0.25,   # 🔥 contrôle simple (0 → off, 0.3 = doux)
-    sharpen=False,
-    sharpen_radius=1,
-    sharpen_percent=90,
-    sharpen_threshold=2,
-    clamp_r=True
+    blur_radius=0.01,
+    denoise_strength=0.03,
+    detail_strength=0.55,
+    contrast_strength=1.08,
+    vibrance_strength=0.2,
+    shadow_lift=0.30,
+    shadow_threshold=0.35,
 ):
-    from PIL import ImageEnhance, ImageFilter
     import numpy as np
+    from PIL import Image, ImageFilter
 
     if frame_pil.mode != "RGB":
         frame_pil = frame_pil.convert("RGB")
 
-    # ---------------- 1️⃣ Micro blur (anti pixel) ----------------
+    # ---------------- 1️⃣ MICRO BLUR ----------------
     if blur_radius > 0:
         frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
-    # ---------------- 2️⃣ Contrast (seul vrai levier global) ----------------
-    if contrast != 1.0:
-        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(contrast)
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
 
-    # ---------------- 3️⃣ Vibrance douce (version stable) ----------------
-    if vibrance_strength > 0:
+    # ---------------- 2️⃣ DENOISE (léger, préserver texture) ----------------
+    if denoise_strength > 0:
+        mean = np.mean(arr, axis=(0, 1))
+        arr = arr * (1.0 - denoise_strength) + mean * denoise_strength
+
+    # ---------------- 3️⃣ LOCAL CONTRAST (volume) ----------------
+    mean_lum = np.mean(arr, axis=2, keepdims=True)
+    arr = mean_lum + contrast_strength * (arr - mean_lum)
+
+    # ---------------- 4️⃣ DETAIL BOOST ----------------
+    blurred = np.zeros_like(arr)
+
+    for c in range(3):
+        channel = Image.fromarray((arr[..., c] * 255).astype(np.uint8))
+        blurred[..., c] = np.array(
+            channel.filter(ImageFilter.GaussianBlur(radius=0.6))
+        ).astype(np.float32) / 255.0
+
+    arr = arr + detail_strength * (arr - blurred)
+
+    # ---------------- 5️⃣ VIBRANCE ----------------
+    max_rgb = np.max(arr, axis=2)
+    min_rgb = np.min(arr, axis=2)
+    sat = np.clip(max_rgb - min_rgb, 0, 1)
+
+    arr *= (1.0 + vibrance_strength * (1.0 - sat))[..., None]
+
+    # ---------------- 6️⃣ SHADOW + BLACK SPLIT (FIX IMPORTANT) ----------------
+    luminance = (
+        0.2126 * arr[..., 0] +
+        0.7152 * arr[..., 1] +
+        0.0722 * arr[..., 2]
+    )
+
+    # 🌑 shadows (midtones only)
+    shadow_mask = np.clip((shadow_threshold - luminance) / shadow_threshold, 0, 1)
+    shadow_mask = shadow_mask ** 1.8
+
+    # 🖤 deep blacks protection (plus strict que avant)
+    black_mask = np.clip((luminance - 0.03) / 0.10, 0, 1)
+    black_mask = black_mask ** 3.0
+
+    shadow_gain = shadow_lift * shadow_mask * black_mask
+    arr = arr + shadow_gain[..., None]
+
+    # 🖤 BLACK ANCHOR (FIX DU “VELOUR LOOK”)
+    black_anchor = np.clip(0.06 - luminance, 0, 0.06) / 0.06
+    arr = arr * (1.0 - 0.04 * black_anchor[..., None])
+
+    # ---------------- 7️⃣ FINAL TOUCHE CINÉ (léger, propre) ----------------
+    arr = np.clip(arr, 0, 1)
+
+    # ⭐ très léger ajustement exposition (évite perte de luminosité globale)
+    exposure = 0.97
+    arr = arr * exposure
+
+    # ⭐ stabilisation noirs (évite haze sans écraser)
+    luma = (
+        0.2126 * arr[..., 0] +
+        0.7152 * arr[..., 1] +
+        0.0722 * arr[..., 2]
+    )
+
+    # 🎯 masque shadows (on évite noirs purs)
+    shadow_mask = np.clip((0.35 - luma) / 0.35, 0, 1)
+    shadow_mask = shadow_mask ** 2.0
+
+    # ---------------- 1. dominante globale (midtones only) ----------------
+    mid_mask = np.clip((luma - 0.15) / 0.6, 0, 1) * np.clip((0.9 - luma) / 0.6, 0, 1)
+    mid_mask = mid_mask / (np.max(mid_mask) + 1e-6)
+
+    mean_color = np.sum(arr * mid_mask[..., None], axis=(0, 1))
+    norm = np.sum(mid_mask) + 1e-6
+    mean_color = mean_color / norm
+
+    # ---------------- 2. neutralisation ----------------
+    neutral = np.mean(arr, axis=(0,1))
+
+    tint_direction = (mean_color - neutral) * 0.6
+
+    # ---------------- 3. shadows mask safe ----------------
+    shadow_mask_final = np.clip((0.35 - luma) / 0.35, 0, 1) ** 2.0
+
+    black_protect = np.clip(luma / 0.10, 0, 1) ** 2.0
+
+    # ---------------- 4. apply ----------------
+    arr = arr + tint_direction * shadow_mask_final[..., None] * black_protect[..., None] * 0.25
+
+
+
+    anchor = np.clip(0.07 - luma, 0, 0.07) / 0.07
+    arr = arr * (1.0 - 0.02 * anchor[..., None])
+
+    arr = np.clip(arr, 0, 1)
+
+    return Image.fromarray((arr * 255).astype(np.uint8))
+
+
+def apply_post_processing_adaptive_v4(
+    frame_pil,
+    blur_radius=0.01,        # 🔽 réduit (moins de soft blur global)
+    denoise_strength=0.03,   # 🔽 beaucoup plus léger
+    detail_strength=0.7,     # 🔼 plus de texture (compense le lissage)
+    contrast_strength=1.08,  # 🔼 légèrement plus de micro-contraste
+    vibrance_strength=0.2,
+    shadow_lift=0.35,
+    shadow_threshold=0.35,
+):
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
+
+    # ---------------- 1️⃣ MICRO BLUR (très léger) ----------------
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+    # ---------------- DENOISE (réduit pour garder texture) ----------------
+    if denoise_strength > 0:
+        mean = np.mean(arr, axis=(0, 1))
+        arr = arr * (1.0 - denoise_strength) + mean * denoise_strength
+
+    # ---------------- LOCAL CONTRAST (volume) ----------------
+    mean_lum = np.mean(arr, axis=2, keepdims=True)
+    arr = mean_lum + contrast_strength * (arr - mean_lum)
+
+    # ---------------- DETAIL (moins blur, plus net) ----------------
+    blurred = np.zeros_like(arr)
+
+    for c in range(3):
+        channel = Image.fromarray((arr[..., c] * 255).astype(np.uint8))
+
+        # 🔽 blur réduit (clé du changement)
+        blurred[..., c] = np.array(
+            channel.filter(ImageFilter.GaussianBlur(radius=0.6))
+        ).astype(np.float32) / 255.0
+
+    arr = arr + detail_strength * (arr - blurred)
+
+    # ---------------- VIBRANCE ----------------
+    max_rgb = np.max(arr, axis=2)
+    min_rgb = np.min(arr, axis=2)
+    sat = np.clip(max_rgb - min_rgb, 0, 1)
+
+    arr *= (1.0 + vibrance_strength * (1.0 - sat))[..., None]
+
+    # ---------------- SHADOW + BLACK SPLIT ----------------
+    luminance = (
+        0.2126 * arr[..., 0]
+        + 0.7152 * arr[..., 1]
+        + 0.0722 * arr[..., 2]
+    )
+
+    shadow_mask = np.clip((shadow_threshold - luminance) / shadow_threshold, 0, 1)
+    shadow_mask = shadow_mask ** 1.8
+
+    black_mask = np.clip(luminance / 0.12, 0, 1)
+    black_mask = black_mask ** 2.5
+
+    shadow_gain = shadow_lift * shadow_mask * black_mask
+
+    arr = arr + shadow_gain[..., None]
+
+    # ---------------- FINAL ----------------
+    arr = np.clip(arr, 0, 1)
+
+    # ⭐ separation luminance
+    luma = (0.2126 * arr[..., 0] +
+            0.7152 * arr[..., 1] +
+            0.0722 * arr[..., 2])
+
+    # ⭐ mask uniquement mid shadows (pas deep blacks)
+    shadow_only = np.clip((luma - 0.02) / 0.25, 0, 1)
+    shadow_only = shadow_only * (1.0 - np.clip(luma / 0.08, 0, 1)) ** 2
+
+    # ⭐ micro "toe compression" (film-like)
+    toe = 1.0 - 0.03 * shadow_only
+
+    arr = arr * toe[..., None]
+
+    arr = np.clip(arr, 0, 1)
+
+    return Image.fromarray((arr * 255).astype(np.uint8))
+
+
+def apply_post_processing_adaptive_v3(
+    frame_pil,
+    blur_radius=0.02,
+    denoise_strength=0.06,
+    detail_strength=0.5,
+    contrast_strength=1.05,
+    vibrance_strength=0.2,
+    shadow_lift=0.35,
+    shadow_threshold=0.35,
+):
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
+
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+    # ---------------- DENOISE ----------------
+    if denoise_strength > 0:
+        mean = np.mean(arr, axis=(0, 1))
+        arr = arr * (1.0 - denoise_strength) + mean * denoise_strength
+
+    # ---------------- LOCAL CONTRAST (volume) ----------------
+    mean_lum = np.mean(arr, axis=2, keepdims=True)
+    arr = mean_lum + contrast_strength * (arr - mean_lum)
+
+    # ---------------- DETAIL ----------------
+    blurred = np.zeros_like(arr)
+    for c in range(3):
+        channel = Image.fromarray((arr[..., c] * 255).astype(np.uint8))
+        blurred[..., c] = np.array(
+            channel.filter(ImageFilter.GaussianBlur(radius=1.0))
+        ).astype(np.float32) / 255.0
+
+    arr = arr + detail_strength * (arr - blurred)
+
+    # ---------------- VIBRANCE ----------------
+    max_rgb = np.max(arr, axis=2)
+    min_rgb = np.min(arr, axis=2)
+    sat = np.clip(max_rgb - min_rgb, 0, 1)
+
+    arr *= (1.0 + vibrance_strength * (1.0 - sat))[..., None]
+
+    # ---------------- SHADOW + BLACK SPLIT ----------------
+    luminance = (
+        0.2126 * arr[..., 0]
+        + 0.7152 * arr[..., 1]
+        + 0.0722 * arr[..., 2]
+    )
+
+    # 🎯 shadows (mid dark)
+    shadow_mask = np.clip((shadow_threshold - luminance) / shadow_threshold, 0, 1)
+    shadow_mask = shadow_mask ** 1.8  # smooth rolloff
+
+    # 🎯 deep blacks protection (important change)
+    black_mask = np.clip(luminance / 0.12, 0, 1)
+    black_mask = black_mask ** 2.5
+
+    # 👉 lift seulement les shadows, pas les vrais noirs
+    shadow_gain = shadow_lift * shadow_mask * black_mask
+
+    arr = arr + shadow_gain[..., None]
+
+    # ---------------- FINAL ----------------
+    arr = np.clip(arr, 0, 1)
+
+    return Image.fromarray((arr * 255).astype(np.uint8))
+
+def apply_post_processing_adaptive_v2(
+    frame_pil,
+    blur_radius=0.03,
+    vibrance_strength=0.25,
+    shadow_lift=0.5,        # ⭐ NEW : récupère les détails sombres
+    shadow_threshold=0.35,   # zone considérée "ombre"
+    clamp_r=True
+):
+
+    if frame_pil.mode != "RGB":
+        frame_pil = frame_pil.convert("RGB")
+
+    # ---------------- 1️⃣ Micro blur ----------------
+    if blur_radius > 0:
+        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # ---------------- 3️⃣ Vibrance + Shadow preservation ----------------
+    if vibrance_strength > 0 or shadow_lift > 0:
         try:
-            arr = np.array(frame_pil).astype(np.float32)
+            arr = np.array(frame_pil).astype(np.float32) / 255.0
 
-            # saturation simple
-            max_rgb = arr.max(axis=2)
-            min_rgb = arr.min(axis=2)
-            sat = (max_rgb - min_rgb) / 255.0
+            r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
 
-            # 🔥 boost UNIQUEMENT zones peu saturées
-            boost = 1.0 + vibrance_strength * (1.0 - sat)
+            max_rgb = np.max(arr, axis=2)
+            min_rgb = np.min(arr, axis=2)
+            sat = (max_rgb - min_rgb)
 
-            arr = arr * boost[..., None]
+            # ---------------- Vibrance (zones peu saturées uniquement)
+            vibrance_boost = 1.0 + vibrance_strength * (1.0 - sat)
 
-            frame_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+            # ---------------- Shadows mask (zones sombres)
+            luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            shadow_mask = np.clip((shadow_threshold - luminance) / shadow_threshold, 0, 1)
+
+            # 👉 lift shadows sans casser les couleurs
+            shadow_boost = 1.0 + shadow_lift * shadow_mask
+
+            # combinaison propre
+            arr *= vibrance_boost[..., None]
+            arr *= shadow_boost[..., None]
+
+            frame_pil = Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8))
 
         except Exception as e:
-            print(f"[WARNING] vibrance skipped: {e}")
+            print(f"[WARNING] vibrance/shadows skipped: {e}")
 
-    # ---------------- 4️⃣ Clamp rouge (anti rose / peau cramée) ----------------
+    # ---------------- 4️⃣ Clamp rouge ----------------
     if clamp_r:
         try:
             arr = np.array(frame_pil).astype(np.float32)
@@ -3911,7 +4194,7 @@ def apply_post_processing_adaptive(
             r = arr[:, :, 0]
             r_mean = r.mean()
 
-            if r_mean > 160:  # 🔥 seuil plus bas = plus stable
+            if r_mean > 160:
                 factor = 160 / (r_mean + 1e-6)
                 arr[:, :, 0] *= factor
 
@@ -3920,20 +4203,7 @@ def apply_post_processing_adaptive(
         except Exception as e:
             print(f"[WARNING] clamp rouge skipped: {e}")
 
-    # ---------------- 5️⃣ Sharpen léger ----------------
-    if sharpen:
-        try:
-            frame_pil = frame_pil.filter(ImageFilter.UnsharpMask(
-                radius=sharpen_radius,
-                percent=sharpen_percent,
-                threshold=sharpen_threshold
-            ))
-        except Exception as e:
-            print(f"[WARNING] sharpening skipped: {e}")
-
     return frame_pil
-
-
 
 
 def smooth_edges(frame_pil, strength=0.4, blur_radius=1.2):
@@ -5016,13 +5286,7 @@ def full_frame_postprocess_add( frame_pil: Image.Image, output_dir: Path, frame_
         frame_pil = apply_post_processing_adaptive(
             frame_pil,
             blur_radius=0.03,
-            contrast=1.10,
-            vibrance_strength=0.05,   # 🔥 contrôle simple (0 → off, 0.3 = doux)
-            sharpen=False,
-            sharpen_radius=1,
-            sharpen_percent=90,
-            sharpen_threshold=2,
-            clamp_r=True
+            vibrance_strength=0.05   # 🔥 contrôle simple (0 → off, 0.3 = doux)
         )
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="05", psave=psave)
 
@@ -5099,10 +5363,7 @@ def full_frame_postprocess(
     frame_pil = apply_post_processing_adaptive(
         frame_pil,
         blur_radius=blur_radius,
-        contrast=contrast,
-        vibrance_strength=0.22,   # 🔥 légèrement réduit
-        sharpen=False,
-        clamp_r=True
+        vibrance_strength=0.22   # 🔥 légèrement réduit
     )
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="05", psave=psave)
 
