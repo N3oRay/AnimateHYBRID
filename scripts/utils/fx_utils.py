@@ -714,6 +714,8 @@ def create_eye_mask_from_coords(
             # Addition du masque local au masque global
             mask[b, 0] = torch.max(mask[b, 0], torch.from_numpy(mask_np / 255.0).to(device))
 
+            mask = feather_inside_strict2(mask, radius=2, sigma=1.0)
+
         # Débogage
         if debug and debug_dir is not None:
             save_debug_mask_green(mask_np, H, W, debug_dir, frame_counter=frame_idx, prefix="create_eye_mask_from_coords")
@@ -735,16 +737,19 @@ def create_mouth_mask_from_coords(
     H, W = size
     mask = torch.zeros(1, 1, H, W, device=device, dtype=torch.float32)
 
+    # --- scaling coords ---
     if image_size is not None:
         img_H, img_W = image_size
         scale_x = W / img_W
         scale_y = H / img_H
     else:
-        scale_x = 1.0
-        scale_y = 1.0
+        scale_x, scale_y = 1.0, 1.0
 
     total_points = 0
 
+    # =========================================================
+    # 1. BUILD RAW MASK (NO BLUR, NO FEATHER HERE)
+    # =========================================================
     for k, value in mouth_coords_dict.items():
 
         if isinstance(value, dict):
@@ -753,57 +758,77 @@ def create_mouth_mask_from_coords(
             mouth_points = value if isinstance(value, list) else []
 
         if not mouth_points:
-            print(f"⚠ Mouth mask: empty for key={k}")
             continue
 
         for mouth in mouth_points:
 
             if mouth is None or len(mouth) != 2:
-                print(f"⚠ Invalid mouth point skipped: {mouth}")
                 continue
 
             try:
                 cx = float(mouth[0]) * scale_x
                 cy = float(mouth[1]) * scale_y
-                print("[DEBUG MOUTH COORD RAW]", cx, cy)
-                print(f"[DEBUG MOUTH CLIP CHECK] cx={cx}, cy={cy}, H={H}, W={W}")
-                print(f"[DEBUG MOUTH IN BOUNDS] {0 <= cx < W and 0 <= cy < H}")
-            except Exception as e:
-                print(f"⚠ Mouth conversion error {mouth}: {e}")
+            except Exception:
                 continue
 
-            total_points += 1
+            # clamp safety (évite points hors image)
+            if not (0 <= cx < W and 0 <= cy < H):
+                continue
 
-            # --- mask local ---
+            radius = max(8, int(min(H, W) * 0.01))
+
             mask_np = np.zeros((H, W), dtype=np.uint8)
-
-            # Augmenter le rayon pour tester la visibilité
-            radius = max(8, int(min(H, W) * 0.01))  # Nouveau rayon plus grand
-            print("[DEBUG MOUTH RADIUS]", radius)
 
             cv2.circle(
                 mask_np,
                 (int(cx), int(cy)),
                 radius,
-                color=255,
+                255,
                 thickness=-1
             )
 
-            mask += torch.from_numpy(mask_np / 255.0).to(device).unsqueeze(0).unsqueeze(0)
+            new_mask = torch.from_numpy(mask_np).to(device).float() / 255.0
+            new_mask = new_mask.unsqueeze(0).unsqueeze(0)
 
-            # --- debug individuel ---
-            if debug and debug_dir is not None:
-                save_debug_mask_green(mask_np, H, W, debug_dir, frame_counter=frame_idx, prefix="create_mouth_mask_from_coords")
+            # 🔥 accumulation SAFE (pas de dépassement implicite)
+            mask = torch.maximum(mask, new_mask)
 
-    # --- DEBUG FINAL IMPORTANT ---
+            total_points += 1
+
+            # debug ponctuel (optionnel)
+            if debug:
+                print(f"[MOUTH] point={cx:.1f},{cy:.1f} r={radius}")
+
+    # =========================================================
+    # 2. NORMALISATION ROBUSTE
+    # =========================================================
+    if total_points == 0:
+        return mask  # masque vide stable
+
+    mask = mask / (mask.max() + 1e-6)
+    mask = mask.clamp(0.0, 1.0)
+
+    # léger gating pour éviter bruit de fond
+    mask = (mask > 0.1).float()
+
+    mask = feather_inside_strict2( mask, radius=2, sigma=1.0 )
+
+    # =========================================================
+    # 4. DEBUG FINAL
+    # =========================================================
     if debug:
-        print(f"[DEBUG MOUTH MASK] points_used={total_points} min={mask.min().item():.4f} max={mask.max().item():.4f}")
+        print(
+            f"[DEBUG MOUTH MASK] "
+            f"points={total_points} "
+            f"min={mask.min().item():.4f} "
+            f"max={mask.max().item():.4f}"
+        )
 
-        if total_points == 0:
-            print("🚨 WARNING: mouth mask is EMPTY → check input coords pipeline")
+    # Débogage
+    if debug and debug_dir is not None:
+        save_debug_mask_green(mask_np, H, W, debug_dir, frame_counter=frame_idx, prefix="create_mouth_mask_from_coords")
 
-    return mask.clamp(0, 1)
-
+    return mask.clamp(0.0, 1.0)
 
 def create_face_mask_from_coords(
     face_coords_dict,
@@ -900,6 +925,8 @@ def create_face_mask_from_coords(
 
         mask += torch.from_numpy(mask_np / 255.0).to(device).unsqueeze(0).unsqueeze(0)
 
+        mask = feather_outside_only_alpha2(mask, radius=3, sigma=1.2)
+
         # Debug
         if debug and debug_dir is not None:
             save_debug_mask_green(mask_np, H, W, debug_dir, frame_counter=frame_idx, prefix=f"create_{key}_mask")
@@ -954,6 +981,7 @@ def encode_images_to_latents_hybrid_pro(
     std = latents.std(dim=(1,2,3), keepdim=True).clamp(min=0.5, max=1.5)
     latents_norm = latents / std
 
+    latents_centered = latents - latents.mean(dim=(1,2,3), keepdim=True)
     # --- Préparer les dicts pour les fonctions de masque ---
     eye_coords_dict = {0: {"eyes": [list(map(float, p)) for p in eye_coords]}}
     mouth_coords_dict = {0: {"mouth": [list(map(float, p)) for p in mouth_coords]}}
@@ -985,10 +1013,21 @@ def encode_images_to_latents_hybrid_pro(
     mask_background = (1.0 - mask_face).clamp(0, 1)
     mask_background = torch.clamp(mask_background, 0, 1)
 
-    latents = (
-        latents_norm * mask_face +                 # visage intact
-        latents_norm * mask_background
-    )
+    # base propre  🔥 Important
+    latents = latents_norm
+    # signal de détail SAFE
+    detail = latents_norm - latents_norm.mean(dim=(2,3), keepdim=True)
+    # masques
+    mask_detail = torch.clamp(mask_eyes + mask_mouth, 0, 1)
+    mask_background = (1.0 - mask_face).clamp(0, 1)
+    # 🔥 boost local UNIQUEMENT
+    latents = latents + 0.25 * mask_eyes * detail
+    latents = latents + 0.18 * mask_mouth * detail
+    # 🔥 léger enrichissement fond
+    latents = latents + 0.12 * mask_background * detail
+    # 🔥 LOCK visage (clé)
+    face_lock = 0.35
+    latents = latents * (1 - face_lock * mask_face) + latents_norm * (face_lock * mask_face)
     std = latents.std(dim=(1,2,3), keepdim=True).clamp(min=0.5, max=1.5)
     latents = latents / std
 
@@ -1005,14 +1044,11 @@ def encode_images_to_latents_hybrid_pro(
         if creative_mode == "cinematic":
             # Bruit léger et fluide à base de cosinus
             noise = torch.randn_like(latents) * 0.03  # Bruit de base léger
-
             # Modulateur cosinusoïdal pour introduire de la fluidité au bruit
             t = frame_idx / max(total_frames, 1)
             cos_mod = (torch.cos(torch.tensor(t * 3.14)) + 1) / 2  # Valeur entre 0 et 1
-
             # Appliquer un bruit léger, modulé par le cosinus pour donner une dynamique douce
             latents = latents + noise * cos_mod  # Le bruit varie en fonction du temps
-
             log_latents_stats(latents, "CINEMATIC")
 
         elif creative_mode == "quality":
@@ -1020,53 +1056,40 @@ def encode_images_to_latents_hybrid_pro(
             # --- zones ---
             mask_detail = torch.clamp(mask_eyes + mask_mouth, 0, 1)
             mask_background = (1.0 - mask_face).clamp(0, 1)
-
             # --- 1. débruitage léger (safe global) ---
             latents = latents * 0.9 + latents_norm * 0.1
-
             # --- 2. détail UNIQUEMENT hors visage ---
             detail = latents_norm - latents
             latents = latents + 0.2 * mask_detail * detail
             latents = latents + 0.1 * mask_background * detail
-
             # --- 3. sharpen doux hors visage ---
             sharpen = latents - latents_norm
             latents = latents + 0.15 * mask_background * sharpen
-
             # --- 4. LOCK visage (clé absolue) ---
             face_lock = 0.4
             latents = latents * (1 - face_lock * mask_face) + latents_norm * (face_lock * mask_face)
-
             # --- 5. micro contraste hors visage ---
             latents = latents * (1 + 0.03 * mask_background)
-
             log_latents_stats(latents, "QUALITY_FIXED")
 
         elif creative_mode == "pro":
             # --- 1. Débruitage léger global ---
             denoise_strength = 0.12
             latents = latents * (1 - denoise_strength) + latents_norm * denoise_strength
-
             # --- 2. Zones utiles ---
             mask_detail = torch.clamp(mask_eyes + mask_mouth, 0, 1)
             mask_background = (1.0 - mask_face).clamp(0, 1)
-
             # --- 3. Détail (structure propre uniquement) ---
             detail_signal = latents_norm - latents
-
             # --- 4. Boost YEUX (fort mais propre) ---
             latents = latents + 0.30 * mask_eyes * detail_signal
-
             # --- 5. Boost BOUCHE (modéré) ---
             latents = latents + 0.22 * mask_mouth * detail_signal
-
             # --- 6. Boost BACKGROUND (léger enrichissement) ---
             latents = latents + 0.15 * mask_background * detail_signal
-
             # --- 7. Stabilisation stricte du visage (clé 🔥) ---
             face_lock = 0.35
             latents = latents * (1 - face_lock * mask_face) + latents_norm * (face_lock * mask_face)
-
             # --- 8. Micro-contraste uniquement hors visage ---
             contrast = 1.04
             latents = latents * (1 + (contrast - 1) * mask_background)
@@ -1075,24 +1098,18 @@ def encode_images_to_latents_hybrid_pro(
 
         elif creative_mode == "soft":
             noise = torch.randn_like(latents) * 0.03
-
             # Variation douce du flou avec modulation temporelle
             blur_strength = 0.5 + 0.5 * torch.sin(t_tensor * 3.14)
-
             latents = latents * (1 - 0.25 * mask_face) + latents_norm * 0.25 * mask_face
             latents = latents + noise * blur_strength
-
             log_latents_stats(latents, "SOFT")
 
         elif creative_mode == "dream": # Fonctionne correctement
             noise = torch.randn_like(latents) * 0.03  # Bruit léger
-
             # Variation du flou en fonction du temps
             blur_strength = 0.6 + 0.4 * torch.sin(t_tensor * 3.14)
-
             # Appliquer le flou en préservant une partie du visage
             latents = latents * (1 - 0.3 * mask_face) + latents_norm * 0.3 * mask_face
-
             # Appliquer le bruit et le flou avec une légère modulation de l'intensité
             latents = latents + noise * blur_strength
 
@@ -1102,18 +1119,14 @@ def encode_images_to_latents_hybrid_pro(
             # Appliquer une amplification douce à l'aide d'une fonction sigmoïde
             mask_eyes_sigmoid = 1 / (1 + torch.exp(-8 * (mask_eyes - 0.5)))  # Douce transition pour les yeux
             mask_mouth_sigmoid = 1 / (1 + torch.exp(-8 * (mask_mouth - 0.5)))  # Douce transition pour la bouche
-
             # Amplification subtile
             latents = latents * (1 + 0.18 * mask_eyes_sigmoid)  # Légère réduction de l'intensité
             latents = latents * (1 + 0.12 * mask_mouth_sigmoid)  # Légère réduction pour la bouche
-
             # 🎨 ajout de détails directionnels
             latents = latents + 0.25 * mask_eyes * (latents_norm - latents)
-
             # 💫 micro-variation temporelle
             pulse = torch.sin(torch.tensor(t * 6.28)).to(latents.device) * 0.1
             latents = latents + pulse * mask_eyes
-
             log_latents_stats(latents, "ANIME")
 
         elif creative_mode == "manga": # Légère saturation du visage
@@ -1121,56 +1134,43 @@ def encode_images_to_latents_hybrid_pro(
             # Appliquer une amplification douce à l'aide d'une fonction sigmoïde
             mask_eyes_sigmoid = 1 / (1 + torch.exp(-10 * (mask_eyes - 0.5)))  # Douce transition
             mask_mouth_sigmoid = 1 / (1 + torch.exp(-10 * (mask_mouth - 0.5)))  # Douce transition
-
             # Amplification subtile
             latents = latents * (1 + 0.2 * mask_eyes_sigmoid)
             latents = latents * (1 + 0.15 * mask_mouth_sigmoid)
-
             # 🎨 ajout de détails directionnels
             latents = latents + 0.25 * mask_eyes * (latents_norm - latents)
-
             # 💫 micro-variation temporelle
             pulse = torch.sin(torch.tensor(t * 6.28)).to(latents.device) * 0.1
             latents = latents + pulse * mask_eyes
-
             log_latents_stats(latents, "MANGA")
 
         elif creative_mode == "glitch": #Visage stable pas de régression
             noise = torch.randn_like(latents) * 0.03
-
             shift = int(2 * torch.sin(t_tensor * 6).item())
-
             if shift != 0:
                 latents = torch.roll(latents, shifts=shift, dims=3)
 
             latents = latents + noise * 0.1
-
             log_latents_stats(latents, "GLITCH")
 
         elif creative_mode == "hybrid":
             # Bruit léger et dynamique avec modulation cosinusoïdale
             noise = torch.randn_like(latents) * 0.03  # Bruit de base léger
-
             # Modulateur cosinusoïdal pour introduire de la fluidité au bruit
             t = frame_idx / max(total_frames, 1)
             cos_mod = (torch.cos(torch.tensor(t * 3.14)) + 1) / 2  # Valeur entre 0 et 1
-
             # Appliquer un bruit léger et modulé en fonction du temps
             latents = latents + noise * cos_mod  # Le bruit varie de manière fluide au fil du temps
-
             # Amplification de certaines zones, comme les yeux et la bouche
             mask_eyes_sigmoid = 1 / (1 + torch.exp(-8 * (mask_eyes - 0.5)))  # Douce transition pour les yeux
             mask_mouth_sigmoid = 1 / (1 + torch.exp(-8 * (mask_mouth - 0.5)))  # Douce transition pour la bouche
-
             # Amplification subtile dans les zones des yeux et de la bouche
             latents = latents * (1 + 0.15 * mask_eyes_sigmoid)
             latents = latents * (1 + 0.12 * mask_mouth_sigmoid)
-
             # Flou directionnel en fonction du temps
             blur_strength = 0.5 + 0.5 * torch.sin(t_tensor * 3.14)
             latents = latents * (1 - 0.25 * mask_face) + latents_norm * 0.25 * mask_face  # Flou plus fort autour du visage
             latents = latents + noise * blur_strength  # Appliquer le bruit et le flou
-
             # Déplacement léger des latents (effet de fluctuation)
             pulse = torch.sin(torch.tensor(t * 6.28)).to(latents.device) * 0.1
             latents = latents + pulse * mask_eyes  # Pulsation sur les yeux pour plus de dynamisme
@@ -1182,10 +1182,8 @@ def encode_images_to_latents_hybrid_pro(
             noise = torch.randn_like(latents) * 0.02  # Bruit modéré au début
             t = frame_idx / max(total_frames, 1)
             cos_mod = (torch.cos(torch.tensor(t * 3.14)) + 1) / 2  # Modulation douce
-
             # Graduellement augmenter le bruit au fil du temps
             latents = latents + noise * cos_mod
-
             # Application progressive du flou et de la saturation sur le visage, doucement
             latents = latents * (1 - 0.25 * mask_face) + latents_norm * 0.25 * mask_face
 
@@ -1196,22 +1194,17 @@ def encode_images_to_latents_hybrid_pro(
             # 1. Modulation cosinusoïdale rapide pour des variations extrêmes
             t = frame_idx / max(total_frames, 1)
             cos_mod = (torch.cos(torch.tensor(t * 8.0)) + 1) / 2  # Modulation très rapide
-
             # 2. Flou exponentiel et bruit sur les zones périphériques
             blur_strength = 1.5 + 0.5 * torch.sin(t_tensor * 4.0)  # Flou rapide et irrégulier
             latents = latents * (1 - 0.5 * mask_face) + latents_norm * 0.5 * mask_face  # Flou agressif sur les bords
-
             # 3. Distorsion géométrique violente
             shift_x = int(6 * torch.sin(t_tensor * 6).item())  # Décalage important dans la dimension X
             shift_y = int(6 * torch.cos(t_tensor * 6).item())  # Décalage important dans la dimension Y
-
             if shift_x != 0 or shift_y != 0:
                 latents = torch.roll(latents, shifts=(shift_x, shift_y), dims=(2, 3))  # Déplacement violent des latents
-
             # 8. Effet de pulsation rapide
             pulse = torch.sin(torch.tensor(t * 12.0)).to(latents.device) * 0.2
             latents = latents + pulse * mask_eyes  # Effet de pulsation intense sur les yeux
-
             log_latents_stats(latents, "DISTORSION")
 
     # --- sécurité finale ---
