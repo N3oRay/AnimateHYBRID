@@ -25,12 +25,13 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 from scripts.utils.logging_utils import debug_latents
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
+from scripts.utils.n3rcoords import process_coords, prepare_face_coords, has_valid_coords
 from scripts.utils.n3rModelUtils import generate_n3r_coords, process_n3r_latents, fuse_with_memory, inject_external, fuse_n3r_latents_adaptive_new
 from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet, get_dynamic_latent_injection, save_input_frame, apply_motion_safe, encode_prompts_batch
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
-from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, remove_white_noise, encode_images_to_latents_hybrid_pro, sanitize_coords
+from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, remove_white_noise, encode_images_to_latents_hybrid_pro
 
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
@@ -67,10 +68,8 @@ def main(args):
     fps, upscale_factor = cfg.get("fps", 12), cfg.get("upscale_factor", 1)
     transition_frames, num_fraps_per_image = cfg.get("transition_frames", 4), cfg.get("num_fraps_per_image", 2)
     steps = max(cfg.get("steps", 16), 4)
-    guidance_scale = cfg.get("guidance_scale", 6.5) # 0.15 peut de créativité 4.5 moderé
-    guidance_scale_end = cfg.get("guidance_scale_end", 7.0) # 0.15 peut de créativité 4.5 moderé
-    init_image_scale = cfg.get("init_image_scale", 0.75) # 0.85 ou 0.95 proche de l'init' (0.75)
-    init_image_scale_end = cfg.get("init_image_scale_end", 0.9) # 0.85 ou 0.95 proche de l'init'
+    guidance_scale, guidance_scale_end = cfg.get("guidance_scale", 6.5), cfg.get("guidance_scale_end", 7.0)
+    init_image_scale, init_image_scale_end = cfg.get("init_image_scale", 0.75), cfg.get("init_image_scale_end", 0.9)
     creative_noise, creative_noise_end = cfg.get("creative_noise", 0.0), cfg.get("creative_noise_end", 0.08)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 20)  # nombre de frames par prompt
@@ -265,13 +264,9 @@ def main(args):
             elbow_coords = get_elbows_coords_safe(input_pil, pose_model)  # 6 left_elbow / coude gauche # 3 right_elbow / coude droit
             wrists_coords = get_wrists_coords_safe(input_pil, pose_model, face_mesh)   # 7 left_wrist / poignet gauche # 4 right_wrist / poignet droit
             hips_coords = get_hips_coords_safe(input_pil)  # 11 left_hip / hanche gauche # 8 right_hip / hanche droite
-            # 9 right_knee (absent)
-            # 10 right_ankle (absent)
-            # 12 left_knee (absent)
-            # 13 left_ankle (absent)
+            # 9 right_knee (absent) # 10 right_ankle (absent) # 12 left_knee (absent) # 13 left_ankle (absent)
             eye_coords = get_eye_coords_safe(input_pil, face_mesh) # 15 left_eye / œil gauche # 14 right_eye / œil droit - 👁 Eyes detected
             ear_coords = get_ear_coords_safe(input_pil, face_mesh) # 17 left_ear / oreille gauche # 16 right_ear / oreille droite
-            # coordonner masque eye et masque volumetrique
             mouth_coords = get_mouth_coords_safe(input_pil, face_mesh)
 
             # coordonner globale
@@ -284,39 +279,7 @@ def main(args):
             save_input_frame( input_image, output_dir, initframe, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=1.0, apply_post=False )
 
             # --- Normalisation sécurisée des coordonnées ---
-            # Convertir toutes les coordonnées en [[x, y]] et sécuriser
-            print(f"eye_coords: {eye_coords}")
-            eye_coords_list = [[float(x), float(y)] for x, y in eye_coords]  # pas de "left/right"
-            print(f"mouth_coords: {mouth_coords}")
-            mouth_coords_list = [[float(x), float(y)] for x, y in mouth_coords]  # déjà liste de tuples
-            print(f"ear_coords: {ear_coords}")
-            ear_coords_list = [[float(x), float(y)] for x, y in ear_coords]  # déjà liste de tuples
-            print(f"nose_coords: {nose_coords}")
-            nose_coords_list  = sanitize_coords([nose_coords["center"]]) if nose_coords else [] # Pour le masque, on transforme le dict du nez en [[x,y]]
-            # Pour encode_images_to_latents_hybrid_pro, garder le dict original
-            nose_coords_dict  = nose_coords if nose_coords else None
-
-
-            eye_coords_list   = sanitize_coords(eye_coords)
-            print(f"eye_coords sanitize_coords: {eye_coords_list}")
-            mouth_coords_list = sanitize_coords(mouth_coords)
-            print(f"mouth_coords_list sanitize_coords: {mouth_coords_list}")
-            ear_coords_list   = sanitize_coords(ear_coords)
-            print(f"ear_coords_list sanitize_coords: {ear_coords_list}")
-            nose_coords_list  = sanitize_coords(nose_coords)
-            print(f"nose_coords_list sanitize_coords: {nose_coords_list}")
-
-            # Pour le masque global
-            face_coords_dict = { "eyes": eye_coords_list, "mouth": mouth_coords_list, "ears": ear_coords_list, "nose": nose_coords_list }
-            print("🟢 Debug coords:")
-            print(f"Face coords dict: {face_coords_dict}")
-
-            # --- Vérifier que les listes ne sont pas vides avant l'appel ---
-            def has_valid_coords(face_coords_dict):
-                for k, coords in face_coords_dict.items():
-                    if coords and all(isinstance(c, (list, tuple)) and len(c) == 2 for c in coords):
-                        return True
-                return False
+            face_coords_dict, nose_coords_dict, eye_coords_list, mouth_coords_list, ear_coords_list, nose_coords_list = prepare_face_coords( eye_coords, mouth_coords, ear_coords, nose_coords, process_coords)
 
             if not has_valid_coords(face_coords_dict):
                 print("🟢  Aucune coordonnée de visage valide détectée ! On passe en full HD")
@@ -327,11 +290,8 @@ def main(args):
                                         eye_coords=eye_coords_list, mouth_coords=mouth_coords_list, ear_coords=ear_coords_list,       # liste de tuples
                                         nose_coords=nose_coords_list,     # dict
                                         device=device, latent_scale=LATENT_SCALE,
-                                        creative_mode="cyber", # cinematic # dream # anime  #glitch # soft # distortion hybrid ********
-                                        frame_idx=frame_counter,
-                                        total_frames=total_frames,
-                                        debug=True,
-                                        debug_dir=output_dir
+                                        creative_mode="hybrid", # cinematic # dream # anime  #glitch # soft # distortion hybrid ********
+                                        frame_idx=frame_counter, total_frames=total_frames, debug=True, debug_dir=output_dir
                                         )
 
             current_latent_single = torch.nn.functional.interpolate(
@@ -347,8 +307,7 @@ def main(args):
             pos_embeds, neg_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device, debug=False)
             try:
                 current_latent_single = generate_latents_robuste_4D(
-                    latents=current_latent_single.to(device),
-                    pos_embeds=pos_embeds, neg_embeds=neg_embeds, unet=unet, scheduler=scheduler,
+                    latents=current_latent_single.to(device), pos_embeds=pos_embeds, neg_embeds=neg_embeds, unet=unet, scheduler=scheduler,
                     motion_module=None, device=device, dtype=dtype, guidance_scale=current_guidance_scale,
                     init_image_scale=current_init_image_scale, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
                     creative_noise=current_creative_noise, seed=seed  # 42, 1234, 2026, 5555
@@ -525,7 +484,6 @@ def main(args):
 
                             # BOOST
                             latents_after = latents.clone()  # sortie OpenPose
-
                             # 🔹 Extraction / update des keypoints --------------------------------------------------------------------------------------
                             current_keypoints = extract_keypoints_from_pose( pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter)
                             # 🔹 Update des keypoints avec Mediapipe
@@ -581,7 +539,6 @@ def main(args):
                             latents = latents_before_openpose.clone()
 
                         # 🔹 debug image
-                        #save_debug_pose_image(pose_full, frame_counter, output_dir, cfg, prefix="openpose")
                         save_debug_pose_image_with_skeleton( pose_tensor=pose_full, keypoints_tensor=current_keypoints, frame_counter=frame_counter, output_dir=output_dir, cfg=cfg, prefix="openpose" )
 
 
