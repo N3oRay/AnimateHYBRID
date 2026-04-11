@@ -1,5 +1,45 @@
 #n3rcoords.py
 
+import torch
+
+def prepare_pose_tensor(pose_full, device, target_dtype):
+    """
+    Convertit un tensor image en format BCHW, corrige les channels,
+    normalise en [-1, 1], et envoie sur le bon device/dtype.
+
+    Args:
+        pose_full (torch.Tensor): input tensor (HWC, CHW ou BCHW)
+        device (torch.device): device cible
+        target_dtype (torch.dtype): dtype cible
+
+    Returns:
+        torch.Tensor: tensor prêt à l'emploi (B,3,H,W)
+    """
+
+    # --- Format BCHW ---
+    if pose_full.ndim == 3:
+        if pose_full.shape[0] in [1, 3]:  # CHW
+            pose_full = pose_full.unsqueeze(0)
+        else:  # HWC
+            pose_full = pose_full.permute(2, 0, 1).unsqueeze(0)
+
+    # --- Fix channels ---
+    if pose_full.shape[1] > 3:
+        pose_full = pose_full[:, :3]
+    elif pose_full.shape[1] == 1:
+        pose_full = pose_full.repeat(1, 3, 1, 1)
+
+    # --- Normalisation [-1,1] ---
+    pose_full = (pose_full - 0.5) * 2.0
+    pose_full = torch.clamp(pose_full, -1.0, 1.0)
+
+    # --- Device + dtype ---
+    pose_full = pose_full.to(device=device, dtype=target_dtype)
+
+    # --- Debug ---
+    print(f"[DEBUG] Pose full {pose_full.shape} dtype={pose_full.dtype}")
+
+    return pose_full
 
 # --- Vérifier que les listes ne sont pas vides avant l'appel ---
 def has_valid_coords(face_coords_dict):
