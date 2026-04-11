@@ -1437,7 +1437,7 @@ def apply_global_pose(
 
 
 #------------------------------------------------------------------------------------------
-def apply_micro_boost(latents, frame_counter, device, masks):
+def apply_micro_boost_v1(latents, frame_counter, device, masks):
     """
     Applique un micro-boost sinusoidal sur différentes zones pour rendre l'image vivante.
 
@@ -1465,6 +1465,19 @@ def apply_micro_boost(latents, frame_counter, device, masks):
         latents += amp * mask * torch.sin(t + phase)
 
     return latents
+
+def apply_micro_boost(latents, frame_counter, device, masks):
+    t = torch.tensor(frame_counter / 6.0, device=device)
+
+    total = torch.zeros_like(latents)
+
+    for zone_name, (mask, phase, amp) in masks.items():
+        if mask is None:
+            continue
+
+        total = total + amp * mask * torch.sin(t + phase)
+
+    return latents + total
 
 
 def apply_micro_motion(latents: torch.Tensor, frame_counter: int, device, masks: dict, randomize: bool = True):
@@ -2046,7 +2059,7 @@ def apply_pose_driven_motion(
 
     return latents
 
-#------------------------------------------------------------------------------------------
+#-------Gestion de l'animation -----------------------------------------------------------------------------------
 def update_pose_sequence_from_keypoints_batch(
     keypoints_tensor,
     prev_keypoints=None,
@@ -2079,7 +2092,9 @@ def update_pose_sequence_from_keypoints_batch(
 
         # Balancement gauche/droite
         sway = 0.010 * math.sin(t * 0.08)
-        kp[:, :, 0] += sway
+        #kp[:, :, 0] += sway
+        torso_ids = [0,1,2,5,8,11]
+        kp[:, torso_ids, 0] += sway
 
         # Head motion
         head_idx = 0
