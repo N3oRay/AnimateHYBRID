@@ -19,7 +19,7 @@ VAE & Tokenizer : Gère les embeddings texte pour une meilleure cohérence avec 
 
 
 python -m scripts.n3rRealControl \
-                      --pretrained-model-path "/mnt/62G/huggingface/miniSD" \
+                      --pretrained-model-path "/**********/huggingface/miniSD" \
                       --config "configs/prompts/0_n3r/512-c.yaml" \
                       --device "cuda" \
                       --vae-offload \
