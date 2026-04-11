@@ -2083,7 +2083,7 @@ def update_pose_sequence_from_keypoints_batch(
     # 🔹 2. MOTION PROCÉDURAL
     # =========================
     if add_motion:
-        t = frame_idx
+        t = frame_idx * 0.1
 
         # Respiration (vertical torso + épaules)
         breath = 0.009 * math.sin(t * 0.15)
@@ -2104,8 +2104,12 @@ def update_pose_sequence_from_keypoints_batch(
         # Drift lent
         drift_x = 0.002 * math.sin(t * 0.03)
         drift_y = 0.002 * math.cos(t * 0.025)
-        kp[:, :, 0] += drift_x
-        kp[:, :, 1] += drift_y
+        #kp[:, :, 0] += drift_x
+        #kp[:, :, 1] += drift_y
+        valid_ids = [0,1,2,5,8,11,14,15,16,17,18,19,20,21,22,23,24]
+
+        kp[:, valid_ids, 0] += drift_x
+        kp[:, valid_ids, 1] += drift_y
 
         # Micro noise (anti-freeze)
         noise = torch.randn_like(kp[..., :2]) * 0.0015
