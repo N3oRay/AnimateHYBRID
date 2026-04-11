@@ -25,7 +25,7 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 from scripts.utils.logging_utils import debug_latents
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
-from scripts.utils.n3rcoords import process_coords, prepare_face_coords, has_valid_coords
+from scripts.utils.n3rcoords import prepare_pose_tensor, process_coords, prepare_face_coords, has_valid_coords
 from scripts.utils.n3rModelUtils import generate_n3r_coords, process_n3r_latents, fuse_with_memory, inject_external, fuse_n3r_latents_adaptive_new
 from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet, get_dynamic_latent_injection, save_input_frame, apply_motion_safe, encode_prompts_batch
 from scripts.utils.config_loader import load_config
@@ -81,7 +81,7 @@ def main(args):
 
     use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
     use_openpose = cfg.get("use_openpose", True)
-    open_pose_init = cfg.get("open_pose_init", False)
+    open_pose_dev = cfg.get("open_pose_dev", False)
 
     controlnet_scale = cfg.get("controlnet_scale", 1.0) # typiquement 0.5 → 1.0
     control_strength = cfg.get("control_strength", 1.5)
@@ -433,7 +433,6 @@ def main(args):
                                 latents = torch.nn.functional.interpolate( latents, size=latents_frame.shape[-2:], mode='bilinear', align_corners=False ).contiguous()
                             latents = latent_injection*latents_frame + (1-latent_injection)*latents
 
-
                     # ---------------- ControlNet OpenPose ----------------------------------------------------------
                     # 🔹 Si motion_module est None, injecter un léger bruit temporel
                     if use_openpose:
@@ -442,85 +441,53 @@ def main(args):
                             target_dtype = next(unet.parameters()).dtype
                             # ------------------- Load pose frame -------------------
                             pose_full = pose_sequence[frame_counter % pose_sequence.shape[0]]
-                            # Format BCHW et channels fix
-                            if pose_full.ndim == 3:
-                                if pose_full.shape[0] in [1, 3]:  # C,H,W
-                                    pose_full = pose_full.unsqueeze(0)
-                                else:  # H,W,C
-                                    pose_full = pose_full.permute(2, 0, 1).unsqueeze(0)
-
-                            # → channels fix
-                            if pose_full.shape[1] > 3:
-                                pose_full = pose_full[:, :3]
-                            elif pose_full.shape[1] == 1:
-                                pose_full = pose_full.repeat(1, 3, 1, 1)
-
-                            # → normalize [-1,1]
-                            pose_full = (pose_full - 0.5) * 2.0
-                            pose_full = torch.clamp(pose_full, -1.0, 1.0)
-
-                            # → device + dtype
-                            pose_full = pose_full.to(device=device, dtype=target_dtype)
-                            print(f"[DEBUG] Pose full {pose_full.shape} dtype={pose_full.dtype}")
-
-                            # 🔹 ===== 2. BUILD LATENT-SPACE POSE (CRUCIAL) =====
-                            latent_h, latent_w = latents.shape[2], latents.shape[3]
-                            pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype)
-                            print(f"[DEBUG] Pose latent {pose_latent_full.shape} dtype={pose_latent_full.dtype}")
-
+                            # Format BCHW et channels fix  → channels fix → normalize [-1,1] → device + dtype
+                            pose_full = prepare_pose_tensor(pose_full=pose_full, device=device, target_dtype=target_dtype)
                             # ------------------- Backup latents -------------------
                             latents_before_openpose = latents.clone()
                             debug_latents("Latents avant OpenPose", latents)
 
-
                             # ------------------- Tile-wise OpenPose -------------------
-                            if open_pose_init:
+                            if open_pose_dev: # Open Pose simple 6 points - PROTO
+                                # 🔹 BUILD LATENT-SPACE POSE (CRUCIAL) =====
+                                latent_h, latent_w = latents.shape[2], latents.shape[3]
+                                pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype)
+                                print(f"[DEBUG] Pose latent {pose_latent_full.shape} dtype={pose_latent_full.dtype}")
+
                                 tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, )
 
                                 # 🔹 Appel de apply_openpose_tilewise
                                 latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
 
-                            # BOOST
-                            latents_after = latents.clone()  # sortie OpenPose
-                            # 🔹 Extraction / update des keypoints --------------------------------------------------------------------------------------
-                            current_keypoints = extract_keypoints_from_pose( pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter)
-                            # 🔹 Update des keypoints avec Mediapipe
-                            current_keypoints = update_keypoints_from_pose( pose_full, current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
+                                delta = latents - latents_before_openpose
+                                # 🔥 masque pose plus agressif mais propre
+                                pose_strength = pose_latent_full.abs().mean(dim=1, keepdim=True)
+                                pose_mask = torch.clamp(pose_strength * 4.0, 0.0, 1.0)
+                                motion_energy = delta.abs().mean(dim=1, keepdim=True) # 🔥 énergie de mouvement locale
+                                motion_boost = 1.0 + torch.pow(torch.clamp(motion_energy * 3.0, 0.0, 1.0), 0.7) # 🔥 amplification NON linéaire (clé)
+                                # Fusion intelligente
+                                latents = latents + 1.2 * delta * pose_mask * motion_boost
 
-                            # Mettre à jour les keypoints éventuellement modifiés
-                            current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints, prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
+                            else:
+                                # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION -------------------------------------------------------
+                                current_keypoints = extract_keypoints_from_pose( pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter)
+                                # 🔹 Update des keypoints avec Mediapipe
+                                current_keypoints = update_keypoints_from_pose( pose_full, current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
 
-                            # 🔹 Appliquer le mouvement du haut du corps / OpenPose
-                            latents = apply_pose_driven_motion(
-                                latents=latents, keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
-                                breathing=True, debug=True, debug_dir=output_dir
-                            )
+                                # Mettre à jour les keypoints éventuellement modifiés
+                                current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints, prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
 
-                            # 🔹 Nettoyage / stabilisation
+                                # 🔹 Appliquer le mouvement du haut du corps / OpenPose
+                                latents = apply_pose_driven_motion(
+                                    latents=latents, keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
+                                    breathing=True, debug=True, debug_dir=output_dir
+                                )
+
+                                # 🔹 Stocker les keypoints pour la frame suivante
+                                prev_keypoints = current_keypoints.clone()
+
+                            # ------------------- 🔹 Nettoyage / stabilisation -------------------
                             latents = sanitize_latents(latents)
-
-                            # 🔹 Stocker les keypoints pour la frame suivante
-                            prev_keypoints = current_keypoints.clone()
-
-                            #-------------------------------------------------------------------------------------------------------------
-                            delta = latents_after - latents_before_openpose
-                            # 🔥 masque pose plus agressif mais propre
-                            pose_strength = pose_latent_full.abs().mean(dim=1, keepdim=True)
-                            pose_mask = torch.clamp(pose_strength * 4.0, 0.0, 1.0)
-                            # 🔥 énergie de mouvement locale
-                            motion_energy = delta.abs().mean(dim=1, keepdim=True)
-                            # 🔥 amplification NON linéaire (clé)
-                            motion_boost = 1.0 + torch.pow(torch.clamp(motion_energy * 3.0, 0.0, 1.0), 0.7)
-
-                            # Fusion intelligente
-                            latents = latents + 1.2 * delta * pose_mask * motion_boost
-                            # ------------------- Cleanup -------------------
-                            latents = torch.nan_to_num(latents)
-                            latents = sanitize_latents(latents)
-                            latents_max = latents.abs().amax(dim=(2,3), keepdim=True)
-                            latents = latents / (latents_max + 1e-6) * 1.05
-                            latents = torch.clamp(latents, -1.3, 1.3)
-
                             diff = (latents - latents_before_openpose).abs().mean()
                             print(f"[DEBUG] OpenPose impact: {diff.item():.6f}")
                             debug_latents("Latents après OpenPose", latents)
@@ -532,7 +499,6 @@ def main(args):
 
                         # 🔹 debug image
                         save_debug_pose_image_with_skeleton( pose_tensor=pose_full, keypoints_tensor=current_keypoints, frame_counter=frame_counter, output_dir=output_dir, cfg=cfg, prefix="openpose" )
-
 
                     # ---------------- Motion module --------------------------------------------------------------------------------------------------
                     if motion_module is not None:
