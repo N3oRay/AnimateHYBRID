@@ -94,8 +94,7 @@ def main(args):
     params = { 'use_mini_gpu': use_mini_gpu,  'fps': fps, 'upscale_factor': upscale_factor, 'num_fraps_per_image': num_fraps_per_image, 'steps': steps, 'guidance_scale': guidance_scale, 'guidance_scale_end': guidance_scale_end, 'init_image_scale': init_image_scale, 'init_image_scale_end': init_image_scale_end, 'creative_noise': creative_noise, 'creative_noise_end': creative_noise_end, 'latent_scale_boost': latent_scale_boost, 'final_latent_scale': final_latent_scale, 'seed': seed, 'latent_injection': latent_injection, 'transition_frames': transition_frames, 'block_size': block_size, 'use_n3r_model': use_n3r_model }
     print_generation_params(params)
 
-    scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012,
-                              beta_schedule="scaled_linear", num_train_timesteps=1000)
+    scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
     scheduler.set_timesteps(steps, device=device)
 
     # 🔥 FIX CRITIQUE GLOBAL
@@ -220,9 +219,7 @@ def main(args):
     external_embeddings = None
     # Charger latent externe avant la génération
     external_path = "/mnt/62G/huggingface/cyber-fp16/pt/KnxCOmiXNeg.safetensors"
-    external_latent = load_external_embedding_as_latent(
-        external_path, (1, 4, cfg["H"]//facteur, cfg["W"]//facteur)
-    ).to(device)
+    external_latent = load_external_embedding_as_latent( external_path, (1, 4, cfg["H"]//facteur, cfg["W"]//facteur) ).to(device)
 
     pose_model, face_mesh = init_mediapipe_models() # initialisation
     for img_idx, img_path in enumerate(input_paths):
@@ -458,15 +455,6 @@ def main(args):
 
                                 # 🔹 Appel de apply_openpose_tilewise
                                 latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
-
-                                delta = latents - latents_before_openpose
-                                # 🔥 masque pose plus agressif mais propre
-                                pose_strength = pose_latent_full.abs().mean(dim=1, keepdim=True)
-                                pose_mask = torch.clamp(pose_strength * 4.0, 0.0, 1.0)
-                                motion_energy = delta.abs().mean(dim=1, keepdim=True) # 🔥 énergie de mouvement locale
-                                motion_boost = 1.0 + torch.pow(torch.clamp(motion_energy * 3.0, 0.0, 1.0), 0.7) # 🔥 amplification NON linéaire (clé)
-                                # Fusion intelligente
-                                latents = latents + 1.2 * delta * pose_mask * motion_boost
 
                             else:
                                 # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION -------------------------------------------------------
