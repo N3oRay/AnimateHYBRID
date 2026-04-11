@@ -39,7 +39,7 @@ from scripts.utils.n3rProNet import N3RProNet
 from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, get_nose_coords_safe, get_shoulders_coords_safe, get_clavicules_coords_safe, get_neck_coords_safe, get_elbows_coords_safe, get_wrists_coords_safe, get_hips_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth, get_ear_coords_safe, release_mediapipe_models, init_mediapipe_models, get_face_mesh
 
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
-from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe
+from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, gaussian_blur
 
 from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch, update_keypoints_from_pose
 
@@ -449,6 +449,8 @@ def main(args):
                                 # 🔹 BUILD LATENT-SPACE POSE (CRUCIAL) =====
                                 latent_h, latent_w = latents.shape[2], latents.shape[3]
                                 pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype)
+                                pose_latent_full = pose_latent_full.clamp(-1, 1)
+                                pose_latent_full = gaussian_blur(pose_latent_full, sigma=0.5)
                                 print(f"[DEBUG] Pose latent {pose_latent_full.shape} dtype={pose_latent_full.dtype}")
 
                                 tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, )
