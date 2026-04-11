@@ -1831,9 +1831,6 @@ def apply_mouth_warp(
 
 def apply_pose_driven_motion(
     latents,
-    previous_latent,
-    latents_before_openpose,
-    latents_after_openpose,
     keypoints,
     prev_keypoints=None,
     frame_counter=0,
@@ -1886,6 +1883,9 @@ def apply_pose_driven_motion(
     mask_face  = torch.clamp(pose.create_face_mask(H, W, debug=debug, debug_dir=debug_dir), 0, 1).float()
     mask_mouth, mouth_points = pose.create_mouth_mask(H, W, debug=debug, debug_dir=debug_dir)
     mask_mouth = torch.clamp(mask_mouth, 0, 1).float()
+    mask_mouth_corners, corners_points_batch = pose.create_mouth_corners_mask(H, W, debug=debug, debug_dir=debug_dir)
+    mask_mouth_corners = torch.clamp(mask_mouth_corners, 0, 1).float()
+
     mask_torso = torch.clamp(pose.create_upper_body_mask(H, W, debug=debug, debug_dir=debug_dir), 0, 1).float()
     mask_hair  = torch.clamp(pose.create_hair_mask(H, W, debug=debug, debug_dir=debug_dir), 0, 1).float()
     mask_left_eye = pose.create_left_eye_mask(H, W, debug=debug, debug_dir=debug_dir)
@@ -2024,15 +2024,12 @@ def apply_pose_driven_motion(
         "face":  (mask_face_exp,  0.3, calibrate_amplitude(mask_face_exp, base_amp=0.002, max_amp=0.006)),
         "mouth":  (mask_mouth_exp,  0.3, calibrate_amplitude(mask_mouth_exp, base_amp=0.003, max_amp=0.008)),
         # Yeux (clignements / micro-mouvements)
-        "left_eye":  (mask_left_eye,  0.5, calibrate_amplitude(mask_left_eye, 0.0015, 0.003)),
-        "right_eye": (mask_right_eye, 0.6, calibrate_amplitude(mask_right_eye, 0.0015, 0.003)),
+        "left_eye":  (mask_left_eye,  0.5, calibrate_amplitude(mask_left_eye, 0.0015, 0.004)),
+        "right_eye": (mask_right_eye, 0.6, calibrate_amplitude(mask_right_eye, 0.0015, 0.004)),
+        # Coins de bouche pour sourire subtil
+        "mouth_corners": (mask_mouth_corners, 0.3, calibrate_amplitude(mask_mouth_corners, 0.002, 0.006)),
     }
 
-    # Yeux (clignements / micro-mouvements)
-    #"left_eye":  (mask_left_eye,  0.5, calibrate_amplitude(mask_left_eye, 0.0015, 0.003)),
-    #"right_eye": (mask_right_eye, 0.6, calibrate_amplitude(mask_right_eye, 0.0015, 0.003)),
-    # Coins de bouche pour sourire subtil
-    #"mouth_corners": (mask_mouth_corners, 0.3, calibrate_amplitude(mask_mouth_corners, 0.002, 0.004)),
     start = time.time()
     latents = apply_micro_boost(latents, frame_counter, device, masks)
     latents = apply_micro_motion(latents, frame_counter, device, masks, randomize = True)
