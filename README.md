@@ -41,8 +41,18 @@ Adaptive embeddings for UNet → avoids dimension mismatch errors.
 
 decode_latents_ultrasafe_blockwise → stable decoding with high-quality output.
 
-💡 Bottom Line: With these settings, AnimateDiff can run even on GPUs with 3–4 GB VRAM without sacrificing output quality.
+n3rRealControl.py - Description and Options
 
+The n3rRealControl.py script enables the generation of animated videos and images from diffusion models with advanced adjustments. It provides maximum flexibility through customization options for quality, speed, and VRAM usage.
+```
+python -m scripts.n3rRealControl \
+                      --pretrained-model-path "/huggingface/miniSD" \
+                      --config "configs/prompts/0_n3r/512-c.yaml" \
+                      --device "cuda" \
+                      --vae-offload \
+                      --fp16
+
+```
 And yes… N3R did it for you! 🚀
 n3rProtoBoost:
 ```
