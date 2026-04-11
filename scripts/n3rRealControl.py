@@ -218,7 +218,6 @@ def main(args):
 
     # ---------------- Frames principales avec interpolation prompts ----------------
     external_embeddings = None
-
     # Charger latent externe avant la génération
     external_path = "/mnt/62G/huggingface/cyber-fp16/pt/KnxCOmiXNeg.safetensors"
     external_latent = load_external_embedding_as_latent(
@@ -288,9 +287,8 @@ def main(args):
                 print("🟢  Visage valide détectée !")
                 current_latent_single = encode_images_to_latents_hybrid_pro( input_image, vae,
                                         eye_coords=eye_coords_list, mouth_coords=mouth_coords_list, ear_coords=ear_coords_list,       # liste de tuples
-                                        nose_coords=nose_coords_list,     # dict
-                                        device=device, latent_scale=LATENT_SCALE,
-                                        creative_mode="hybrid", # cinematic # dream # anime  #glitch # soft # distortion hybrid ********
+                                        nose_coords=nose_coords_list, device=device, latent_scale=LATENT_SCALE,
+                                        creative_mode=None, # cinematic # dream # anime  #glitch # soft # distortion hybrid ********
                                         frame_idx=frame_counter, total_frames=total_frames, debug=True, debug_dir=output_dir
                                         )
 
@@ -494,11 +492,7 @@ def main(args):
 
                             # 🔹 Appliquer le mouvement du haut du corps / OpenPose
                             latents = apply_pose_driven_motion(
-                                latents=latents,
-                                previous_latent=previous_latent_single,
-                                latents_before_openpose=latents_before_openpose if 'latents_before_openpose' in locals() else None,
-                                latents_after_openpose=latents_after if 'latents_after' in locals() else None,
-                                keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
+                                latents=latents, keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
                                 breathing=True, debug=True, debug_dir=output_dir
                             )
 
@@ -513,10 +507,8 @@ def main(args):
                             # 🔥 masque pose plus agressif mais propre
                             pose_strength = pose_latent_full.abs().mean(dim=1, keepdim=True)
                             pose_mask = torch.clamp(pose_strength * 4.0, 0.0, 1.0)
-
                             # 🔥 énergie de mouvement locale
                             motion_energy = delta.abs().mean(dim=1, keepdim=True)
-
                             # 🔥 amplification NON linéaire (clé)
                             motion_boost = 1.0 + torch.pow(torch.clamp(motion_energy * 3.0, 0.0, 1.0), 0.7)
 
