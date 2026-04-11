@@ -1273,7 +1273,7 @@ def unsharp_mask_adaptive(x, blur_kernel=3, blur_sigma=0.5, strength=1.0):
     return x + detail * adaptive_strength
 
 
-def apply_openpose_tilewise_safe(
+def apply_openpose_tilewise_safe_test(
     latents,
     pose,
     apply_fn,
@@ -1380,7 +1380,7 @@ def apply_openpose_tilewise_safe(
 
     return latents_out
 
-def apply_openpose_tilewise_safe_low(
+def apply_openpose_tilewise_safe(
     latents,
     pose,
     apply_fn,
