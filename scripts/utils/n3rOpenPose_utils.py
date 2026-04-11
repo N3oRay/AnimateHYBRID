@@ -99,7 +99,6 @@ def compute_noise_pred(unet, controlnet, latent_input, t, embeds, pose):
 
     return torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
 
-
 def merge_cfg(noise_pred, guidance_scale, use_cfg):
     if use_cfg:
         noise_uncond, noise_text = noise_pred.chunk(2)
@@ -1274,8 +1273,114 @@ def unsharp_mask_adaptive(x, blur_kernel=3, blur_sigma=0.5, strength=1.0):
     return x + detail * adaptive_strength
 
 
-
 def apply_openpose_tilewise_safe(
+    latents,
+    pose,
+    apply_fn,
+    past_latents=None,
+    temporal_smoothing=0.3,
+    block_size=64,
+    overlap=32,
+    device='cuda',
+    debug=False,
+    debug_dir=None,
+    frame_idx=None
+):
+
+    B, C, H, W = latents.shape
+
+    # --- align pose once ---
+    pose = F.interpolate(pose, size=(H, W), mode='bilinear', align_corners=False)
+
+    latents_out = torch.zeros_like(latents)
+    weight_map = torch.zeros_like(latents)
+
+    stride = block_size - overlap
+
+    # -------------------------
+    # TILE PROCESSING (SAFE)
+    # -------------------------
+    for i in range(0, H, stride):
+        for j in range(0, W, stride):
+
+            i_end = min(i + block_size, H)
+            j_end = min(j + block_size, W)
+
+            h, w = i_end - i, j_end - j
+
+            latent_tile = latents[:, :, i:i_end, j:j_end]
+            pose_tile = pose[:, :, i:i_end, j:j_end]
+
+            # --- skip empty pose ---
+            if pose_tile.abs().max() < 0.01:
+                latents_out[:, :, i:i_end, j:j_end] += latent_tile
+                weight_map[:, :, i:i_end, j:j_end] += 1.0
+                continue
+
+            # --- padding ---
+            pad_h = block_size - h
+            pad_w = block_size - w
+
+            if pad_h > 0 or pad_w > 0:
+                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
+                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
+
+            try:
+                with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.float16):
+
+                    out = apply_fn(latent_tile, pose_tile)
+
+            except RuntimeError as e:
+                if debug:
+                    print(f"[WARN] tile failed ({i},{j}): {e}")
+                out = latent_tile
+
+            # --- crop back ---
+            out = out[:, :, :h, :w]
+
+            # --- blend ---
+            latents_out[:, :, i:i_end, j:j_end] += out
+            weight_map[:, :, i:i_end, j:j_end] += 1.0
+
+    # -------------------------
+    # NORMALIZATION
+    # -------------------------
+    weight_map = torch.clamp(weight_map, min=1.0)
+    latents_out = latents_out / weight_map
+
+    # -------------------------
+    # TEMPORAL SMOOTHING
+    # -------------------------
+    if past_latents is not None and len(past_latents) > 0 and temporal_smoothing > 0.0:
+        smoothed = sum(past_latents[-3:] + [latents_out]) / (len(past_latents[-3:]) + 1)
+        latents_out = latents_out * (1 - temporal_smoothing) + smoothed * temporal_smoothing
+
+    # -------------------------
+    # DEBUG IMPACT MAP
+    # -------------------------
+    if debug and debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+
+        impact_map = torch.abs(latents_out - latents).mean(1, keepdim=True)
+        impact_map = F.interpolate(
+            impact_map,
+            size=(H, W),
+            mode='bilinear',
+            align_corners=False
+        )
+
+        impact_np = impact_map[0, 0].detach().cpu().numpy()
+        impact_np -= impact_np.min()
+        if impact_np.max() > 0:
+            impact_np /= impact_np.max()
+
+        Image.fromarray((impact_np * 255).astype(np.uint8)).save(
+            os.path.join(debug_dir, f"impact_map_{frame_idx:05d}.png")
+        )
+
+    return latents_out
+
+def apply_openpose_tilewise_safe_low(
     latents,
     pose,
     apply_fn,
@@ -1295,31 +1400,38 @@ def apply_openpose_tilewise_safe(
     weight_map = torch.zeros_like(latents)
     stride = block_size - overlap
 
-    # Tile-wise processing
-    for i in range(0, H_latent, stride):
-        for j in range(0, W_latent, stride):
-            i_end = min(i + block_size, H_latent)
-            j_end = min(j + block_size, W_latent)
-            tile_h, tile_w = i_end - i, j_end - j
-            latent_tile = latents[:, :, i:i_end, j:j_end]
-            i_full_start, i_full_end = int(i * H_full / H_latent), int(i_end * H_full / H_latent)
-            j_full_start, j_full_end = int(j * W_full / W_latent), int(j_end * W_full / W_latent)
-            pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
-            pad_h, pad_w = block_size - tile_h, block_size - tile_w
-            if pad_h > 0 or pad_w > 0:
-                latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
-                pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
-            try:
-                latent_tile_processed = apply_fn(latent_tile, pose_tile)
-            except Exception as e:
-                if debug:
-                    print(f"[DEBUG] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
-                latent_tile_processed = latent_tile
-            finally:
-                torch.cuda.empty_cache()
-            latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
-            latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
-            weight_map[:, :, i:i_end, j:j_end] += 1.0
+    with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.float16):
+
+        # Tile-wise processing
+        for i in range(0, H_latent, stride):
+            for j in range(0, W_latent, stride):
+                i_end = min(i + block_size, H_latent)
+                j_end = min(j + block_size, W_latent)
+                tile_h, tile_w = i_end - i, j_end - j
+                latent_tile = latents[:, :, i:i_end, j:j_end]
+                i_full_start, i_full_end = int(i * H_full / H_latent), int(i_end * H_full / H_latent)
+                j_full_start, j_full_end = int(j * W_full / W_latent), int(j_end * W_full / W_latent)
+                pose_tile = pose[:, :, i_full_start:i_full_end, j_full_start:j_full_end]
+                if pose_tile.abs().max() < 0.01:
+                    latents_out[:, :, i:i_end, j:j_end] += latent_tile[:, :, :tile_h, :tile_w]
+                    weight_map[:, :, i:i_end, j:j_end] += 1.0
+                    continue
+                pad_h, pad_w = block_size - tile_h, block_size - tile_w
+                if pad_h > 0 or pad_w > 0:
+                    latent_tile = F.pad(latent_tile, (0, pad_w, 0, pad_h))
+                    pose_tile = F.pad(pose_tile, (0, pad_w, 0, pad_h))
+                try:
+                    latent_tile_processed = apply_fn(latent_tile, pose_tile)
+                except Exception as e:
+                    if debug:
+                        print(f"[DEBUG] Tile failed at ({i},{j}) frame {frame_idx}: {e}")
+                    latent_tile_processed = latent_tile
+                finally:
+                    if (i + j) % 10 == 0:
+                        torch.cuda.empty_cache()
+                latent_tile_processed = latent_tile_processed[:, :, :tile_h, :tile_w]
+                latents_out[:, :, i:i_end, j:j_end] += latent_tile_processed
+                weight_map[:, :, i:i_end, j:j_end] += 1.0
 
     # Moyenne sur overlaps
     weight_map[weight_map == 0] = 1.0
@@ -1338,7 +1450,8 @@ def apply_openpose_tilewise_safe(
 
 
     # Clamp et ajustement delta pour éviter saturation
-    min_val, max_val = latents.min().item() - 0.3, latents.max().item() + 0.3
+    min_val = latents.amin() - 0.3
+    max_val = latents.amax() + 0.3
     latents_out = torch.clamp(latents_out, min_val, max_val)
     delta = latents_out - latents
     latents_out = latents + torch.sigmoid(delta*2.0) * delta
