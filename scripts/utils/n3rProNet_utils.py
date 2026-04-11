@@ -3857,15 +3857,15 @@ def apply_intelligent_glow_froid(
 
     return Image.fromarray((result * 255).astype(np.uint8))
 
-
+# Version final !
 def apply_post_processing_adaptive(
     frame_pil,
     blur_radius=0.01,
     denoise_strength=0.03,
-    detail_strength=0.55,
-    contrast_strength=1.08,
-    vibrance_strength=0.2,
-    shadow_lift=0.30,
+    detail_strength=0.5,
+    contrast_strength=1.22,
+    vibrance_strength=0.25,
+    shadow_lift=0.25,
     shadow_threshold=0.35,
 ):
     import numpy as np
@@ -3907,35 +3907,6 @@ def apply_post_processing_adaptive(
 
     arr *= (1.0 + vibrance_strength * (1.0 - sat))[..., None]
 
-    # ---------------- 6️⃣ SHADOW + BLACK SPLIT (FIX IMPORTANT) ----------------
-    luminance = (
-        0.2126 * arr[..., 0] +
-        0.7152 * arr[..., 1] +
-        0.0722 * arr[..., 2]
-    )
-
-    # 🌑 shadows (midtones only)
-    shadow_mask = np.clip((shadow_threshold - luminance) / shadow_threshold, 0, 1)
-    shadow_mask = shadow_mask ** 1.8
-
-    # 🖤 deep blacks protection (plus strict que avant)
-    black_mask = np.clip((luminance - 0.03) / 0.10, 0, 1)
-    black_mask = black_mask ** 3.0
-
-    shadow_gain = shadow_lift * shadow_mask * black_mask
-    arr = arr + shadow_gain[..., None]
-
-    # 🖤 BLACK ANCHOR (FIX DU “VELOUR LOOK”)
-    black_anchor = np.clip(0.06 - luminance, 0, 0.06) / 0.06
-    arr = arr * (1.0 - 0.04 * black_anchor[..., None])
-
-    # ---------------- 7️⃣ FINAL TOUCHE CINÉ (léger, propre) ----------------
-    arr = np.clip(arr, 0, 1)
-
-    # ⭐ très léger ajustement exposition (évite perte de luminosité globale)
-    exposure = 0.97
-    arr = arr * exposure
-
     # ⭐ stabilisation noirs (évite haze sans écraser)
     luma = (
         0.2126 * arr[..., 0] +
@@ -3957,188 +3928,32 @@ def apply_post_processing_adaptive(
 
     # ---------------- 2. neutralisation ----------------
     neutral = np.mean(arr, axis=(0,1))
-
     tint_direction = (mean_color - neutral) * 0.6
-
     # ---------------- 3. shadows mask safe ----------------
     shadow_mask_final = np.clip((0.35 - luma) / 0.35, 0, 1) ** 2.0
-
     black_protect = np.clip(luma / 0.10, 0, 1) ** 2.0
 
     # ---------------- 4. apply ----------------
     arr = arr + tint_direction * shadow_mask_final[..., None] * black_protect[..., None] * 0.25
 
-
-
     anchor = np.clip(0.07 - luma, 0, 0.07) / 0.07
     arr = arr * (1.0 - 0.02 * anchor[..., None])
 
+    # ---------------- 7️⃣ FINAL TOUCHE CINÉ (léger, propre) ----------------
     arr = np.clip(arr, 0, 1)
+
+    # ⭐ très léger ajustement exposition (évite perte de luminosité globale)
+    exposure = 0.90
+    arr = arr * exposure
+
+    # ⭐ gamma très doux (corrige velour sans casser ton look)
+    gamma = 1.03
+    arr = np.power(arr, gamma)
+    arr = np.clip(arr, 0, 1)
+    arr = arr ** 1.01
 
     return Image.fromarray((arr * 255).astype(np.uint8))
 
-
-def apply_post_processing_adaptive_v4(
-    frame_pil,
-    blur_radius=0.01,        # 🔽 réduit (moins de soft blur global)
-    denoise_strength=0.03,   # 🔽 beaucoup plus léger
-    detail_strength=0.7,     # 🔼 plus de texture (compense le lissage)
-    contrast_strength=1.08,  # 🔼 légèrement plus de micro-contraste
-    vibrance_strength=0.2,
-    shadow_lift=0.35,
-    shadow_threshold=0.35,
-):
-    import numpy as np
-    from PIL import Image, ImageFilter
-
-    if frame_pil.mode != "RGB":
-        frame_pil = frame_pil.convert("RGB")
-
-    # ---------------- 1️⃣ MICRO BLUR (très léger) ----------------
-    if blur_radius > 0:
-        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-
-    arr = np.array(frame_pil).astype(np.float32) / 255.0
-
-    # ---------------- DENOISE (réduit pour garder texture) ----------------
-    if denoise_strength > 0:
-        mean = np.mean(arr, axis=(0, 1))
-        arr = arr * (1.0 - denoise_strength) + mean * denoise_strength
-
-    # ---------------- LOCAL CONTRAST (volume) ----------------
-    mean_lum = np.mean(arr, axis=2, keepdims=True)
-    arr = mean_lum + contrast_strength * (arr - mean_lum)
-
-    # ---------------- DETAIL (moins blur, plus net) ----------------
-    blurred = np.zeros_like(arr)
-
-    for c in range(3):
-        channel = Image.fromarray((arr[..., c] * 255).astype(np.uint8))
-
-        # 🔽 blur réduit (clé du changement)
-        blurred[..., c] = np.array(
-            channel.filter(ImageFilter.GaussianBlur(radius=0.6))
-        ).astype(np.float32) / 255.0
-
-    arr = arr + detail_strength * (arr - blurred)
-
-    # ---------------- VIBRANCE ----------------
-    max_rgb = np.max(arr, axis=2)
-    min_rgb = np.min(arr, axis=2)
-    sat = np.clip(max_rgb - min_rgb, 0, 1)
-
-    arr *= (1.0 + vibrance_strength * (1.0 - sat))[..., None]
-
-    # ---------------- SHADOW + BLACK SPLIT ----------------
-    luminance = (
-        0.2126 * arr[..., 0]
-        + 0.7152 * arr[..., 1]
-        + 0.0722 * arr[..., 2]
-    )
-
-    shadow_mask = np.clip((shadow_threshold - luminance) / shadow_threshold, 0, 1)
-    shadow_mask = shadow_mask ** 1.8
-
-    black_mask = np.clip(luminance / 0.12, 0, 1)
-    black_mask = black_mask ** 2.5
-
-    shadow_gain = shadow_lift * shadow_mask * black_mask
-
-    arr = arr + shadow_gain[..., None]
-
-    # ---------------- FINAL ----------------
-    arr = np.clip(arr, 0, 1)
-
-    # ⭐ separation luminance
-    luma = (0.2126 * arr[..., 0] +
-            0.7152 * arr[..., 1] +
-            0.0722 * arr[..., 2])
-
-    # ⭐ mask uniquement mid shadows (pas deep blacks)
-    shadow_only = np.clip((luma - 0.02) / 0.25, 0, 1)
-    shadow_only = shadow_only * (1.0 - np.clip(luma / 0.08, 0, 1)) ** 2
-
-    # ⭐ micro "toe compression" (film-like)
-    toe = 1.0 - 0.03 * shadow_only
-
-    arr = arr * toe[..., None]
-
-    arr = np.clip(arr, 0, 1)
-
-    return Image.fromarray((arr * 255).astype(np.uint8))
-
-
-def apply_post_processing_adaptive_v3(
-    frame_pil,
-    blur_radius=0.02,
-    denoise_strength=0.06,
-    detail_strength=0.5,
-    contrast_strength=1.05,
-    vibrance_strength=0.2,
-    shadow_lift=0.35,
-    shadow_threshold=0.35,
-):
-    import numpy as np
-    from PIL import Image, ImageFilter
-
-    if frame_pil.mode != "RGB":
-        frame_pil = frame_pil.convert("RGB")
-
-    if blur_radius > 0:
-        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-
-    arr = np.array(frame_pil).astype(np.float32) / 255.0
-
-    # ---------------- DENOISE ----------------
-    if denoise_strength > 0:
-        mean = np.mean(arr, axis=(0, 1))
-        arr = arr * (1.0 - denoise_strength) + mean * denoise_strength
-
-    # ---------------- LOCAL CONTRAST (volume) ----------------
-    mean_lum = np.mean(arr, axis=2, keepdims=True)
-    arr = mean_lum + contrast_strength * (arr - mean_lum)
-
-    # ---------------- DETAIL ----------------
-    blurred = np.zeros_like(arr)
-    for c in range(3):
-        channel = Image.fromarray((arr[..., c] * 255).astype(np.uint8))
-        blurred[..., c] = np.array(
-            channel.filter(ImageFilter.GaussianBlur(radius=1.0))
-        ).astype(np.float32) / 255.0
-
-    arr = arr + detail_strength * (arr - blurred)
-
-    # ---------------- VIBRANCE ----------------
-    max_rgb = np.max(arr, axis=2)
-    min_rgb = np.min(arr, axis=2)
-    sat = np.clip(max_rgb - min_rgb, 0, 1)
-
-    arr *= (1.0 + vibrance_strength * (1.0 - sat))[..., None]
-
-    # ---------------- SHADOW + BLACK SPLIT ----------------
-    luminance = (
-        0.2126 * arr[..., 0]
-        + 0.7152 * arr[..., 1]
-        + 0.0722 * arr[..., 2]
-    )
-
-    # 🎯 shadows (mid dark)
-    shadow_mask = np.clip((shadow_threshold - luminance) / shadow_threshold, 0, 1)
-    shadow_mask = shadow_mask ** 1.8  # smooth rolloff
-
-    # 🎯 deep blacks protection (important change)
-    black_mask = np.clip(luminance / 0.12, 0, 1)
-    black_mask = black_mask ** 2.5
-
-    # 👉 lift seulement les shadows, pas les vrais noirs
-    shadow_gain = shadow_lift * shadow_mask * black_mask
-
-    arr = arr + shadow_gain[..., None]
-
-    # ---------------- FINAL ----------------
-    arr = np.clip(arr, 0, 1)
-
-    return Image.fromarray((arr * 255).astype(np.uint8))
 
 def apply_post_processing_adaptive_v2(
     frame_pil,
