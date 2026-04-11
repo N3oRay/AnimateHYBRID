@@ -46,6 +46,7 @@ n3rRealControl.py - Description and Options
 The n3rRealControl.py script enables the generation of animated videos and images from diffusion models with advanced adjustments. It provides maximum flexibility through customization options for quality, speed, and VRAM usage.
 
 <img src="__assets__/animations/output.gif">
+
 ```
 python -m scripts.n3rRealControl \
                       --pretrained-model-path "/huggingface/miniSD" \
