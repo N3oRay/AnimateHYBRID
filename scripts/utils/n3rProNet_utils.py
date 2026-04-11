@@ -3868,12 +3868,9 @@ def apply_post_processing_adaptive(
     shadow_lift=0.25,
     shadow_threshold=0.35,
 ):
-    import numpy as np
-    from PIL import Image, ImageFilter
 
     if frame_pil.mode != "RGB":
         frame_pil = frame_pil.convert("RGB")
-
     # ---------------- 1️⃣ MICRO BLUR ----------------
     if blur_radius > 0:
         frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
@@ -3906,7 +3903,6 @@ def apply_post_processing_adaptive(
     sat = np.clip(max_rgb - min_rgb, 0, 1)
 
     arr *= (1.0 + vibrance_strength * (1.0 - sat))[..., None]
-
     # ⭐ stabilisation noirs (évite haze sans écraser)
     luma = (
         0.2126 * arr[..., 0] +
@@ -3925,7 +3921,6 @@ def apply_post_processing_adaptive(
     mean_color = np.sum(arr * mid_mask[..., None], axis=(0, 1))
     norm = np.sum(mid_mask) + 1e-6
     mean_color = mean_color / norm
-
     # ---------------- 2. neutralisation ----------------
     neutral = np.mean(arr, axis=(0,1))
     tint_direction = (mean_color - neutral) * 0.6
@@ -3954,8 +3949,8 @@ def apply_post_processing_adaptive(
 
     return Image.fromarray((arr * 255).astype(np.uint8))
 
-
-def apply_post_processing_adaptive_v2(
+# version précédente !
+def apply_post_processing_adaptive_old(
     frame_pil,
     blur_radius=0.03,
     vibrance_strength=0.25,
@@ -3966,7 +3961,6 @@ def apply_post_processing_adaptive_v2(
 
     if frame_pil.mode != "RGB":
         frame_pil = frame_pil.convert("RGB")
-
     # ---------------- 1️⃣ Micro blur ----------------
     if blur_radius > 0:
         frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
