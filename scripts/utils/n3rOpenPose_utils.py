@@ -15,6 +15,49 @@ import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
 import traceback
 
+def gaussian_blur(x, kernel_size=5, sigma=0.5):
+    """
+    Gaussian blur 2D pour tenseurs BCHW.
+
+    Args:
+        x: Tensor (B, C, H, W)
+        kernel_size: taille du kernel (impair recommandé: 3,5,7)
+        sigma: écart-type du blur
+
+    Returns:
+        Tensor flouté (même shape)
+    """
+
+    if kernel_size % 2 == 0:
+        raise ValueError("kernel_size must be odd")
+
+    device = x.device
+    dtype = x.dtype
+
+    # --- Create 1D Gaussian kernel ---
+    ax = torch.arange(kernel_size, device=device, dtype=torch.float32) - kernel_size // 2
+    gauss = torch.exp(-(ax ** 2) / (2 * sigma ** 2))
+    gauss = gauss / gauss.sum()
+
+    # --- Convert to 2D kernel ---
+    kernel_2d = gauss[:, None] * gauss[None, :]
+    kernel_2d = kernel_2d.to(dtype=dtype)
+
+    # --- Reshape for conv2d ---
+    kernel = kernel_2d.expand(x.shape[1], 1, kernel_size, kernel_size)
+
+    # --- Apply depthwise convolution ---
+    padding = kernel_size // 2
+
+    x = F.conv2d(
+        x,
+        kernel,
+        padding=padding,
+        groups=x.shape[1]
+    )
+
+    return x
+
 
 # sigma correspond a la valeur du flou
 def gaussian_blur_tensor(x, kernel_size=3, sigma=0.5):
