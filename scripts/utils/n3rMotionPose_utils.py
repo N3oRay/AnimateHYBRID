@@ -1483,6 +1483,109 @@ def apply_global_pose(
     H=None,
     W=None,
     device="cuda",
+    strength=0.4,
+    clamp=True,
+    debug=True,
+    debug_dir=None
+):
+    """
+    Warp global basé sur le centre des points du torse, avec debug complet.
+
+    Parameters
+    ----------
+    latents : torch.Tensor
+        Latents à transformer [B, C, H, W]
+    pose : Pose
+        Pose actuelle
+    prev_pose : Pose
+        Pose précédente
+    H, W : int
+        Taille des latents
+    strength : float
+        Poids du warp global
+    clamp : bool
+        Si True, limite le delta (anti-extinction)
+    debug : bool
+        Affiche les deltas par joint clé
+    debug_dir : str
+        Répertoire pour sauvegarder images de debug
+    """
+    B = latents.shape[0]
+    device = latents.device
+
+    if prev_pose is None:
+        if debug:
+            print("[DEBUG] Aucun prev_pose : warp global désactivé")
+        return latents, torch.zeros((B,1,1,2), device=device)
+
+    # -------------------- Points du torse --------------------
+    key_joints = ["left_shoulder","right_shoulder","left_hip","right_hip"]
+    idx_list = [pose.FACIAL_POINT_IDX[j] for j in key_joints]
+
+    pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)
+    prev_pts = torch.stack([prev_pose.get_point(i) for i in idx_list], dim=1)
+
+    # Centre
+    center = pts.mean(dim=1)
+    prev_center = prev_pts.mean(dim=1)
+
+    # Delta normalisé
+    delta = center - prev_center  # [-1,1] relatif latents
+    delta_px = delta.clone()
+    delta_px[...,0] *= W
+    delta_px[...,1] *= H
+
+    # Clamp pour éviter extinction du mouvement
+    if clamp:
+        delta_px = torch.tanh(delta_px / 5.0) * 5.0
+
+    if debug:
+        for i, joint in enumerate(key_joints):
+            move_px = (pts[:,i,:] - prev_pts[:,i,:]) * torch.tensor([W,H], device=device)
+            print(f"[DEBUG] {joint} movement px: {move_px.squeeze().tolist()}")
+
+        print(f"[DEBUG] Global center delta px mean: {delta_px.abs().mean().item():.4f}")
+
+    delta_px = delta_px.view(B,1,1,2)
+
+    # -------------------- Grid --------------------
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
+
+    # -------------------- Warp global --------------------
+    grid_global = grid + delta_px * strength * 3.0
+
+    # Normalize pour grid_sample
+    grid_global[...,0] = 2.0 * grid_global[...,0] / (W-1) - 1.0
+    grid_global[...,1] = 2.0 * grid_global[...,1] / (H-1) - 1.0
+
+    latents_out = F.grid_sample(latents, grid_global, align_corners=True)
+
+    # -------------------- Debug save --------------------
+    if debug and debug_dir is not None:
+        import torchvision
+        latents_img = latents_out[0].detach().cpu()
+        if latents_img.shape[0] == 4:  # RGBA latent
+            latents_img = latents_img[:3]
+        torchvision.utils.save_image(
+            (latents_img + 1.0)/2.0, f"{debug_dir}/global_warp_debug.png"
+        )
+        print(f"[DEBUG] Global warp image saved: {debug_dir}/global_warp_debug.png")
+
+    return latents_out, delta_px
+
+
+def apply_global_pose_v2(
+    latents,
+    pose,
+    prev_pose=None,
+    H=None,
+    W=None,
+    device="cuda",
     strength=0.4,   # 🔥 IMPORTANT: boost réel
     debug=False,
     debug_dir=None
@@ -2170,7 +2273,7 @@ def apply_pose_driven_motion_ultra2(
             state=pose_copy,
             inputs=upper_body_inputs,
             mode="smooth",
-            strength=0.35
+            strength=0.35, debug=debug
         )
         n = min(pose.keypoints.shape[1], updated_upper_body.shape[1])
         pose.keypoints[:, :n] = updated_upper_body[:, :n]
@@ -2224,7 +2327,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     start = time.time()
     latents_before = latents.clone()
-    latents_global, global_delta = apply_global_pose(latents, pose, prev_pose, H, W, device=device, debug=debug, debug_dir=debug_dir)
+    latents_global, global_delta = apply_global_pose(latents, pose, prev_pose, H, W, device=device, strength=1.2, debug=debug, debug_dir=debug_dir)
     if prev_pose is not None:
         key_joints = ['neck','left_shoulder','right_shoulder','left_hip','right_hip']
         for joint in key_joints:
