@@ -49,6 +49,70 @@ class Pose:
             'mouth_bottom': 51,  # index approximatif du bas de la bouche
         }
 
+    # -----------------------------
+    # 🔹 UPDATE HAUT DU CORPS (smooth)
+    # -----------------------------
+    def update_upper_body(self, coords_dict, strength=0.35):
+        """
+        coords_dict : dict avec les points détectés (nose, neck, shoulder, elbow, wrist, clavicle, eyes, ears, mouth)
+        strength : interpolation entre l'ancien et le nouveau (0=full old, 1=full new)
+        """
+        keypoints_np = self.keypoints.clone().cpu().numpy()[0]
+
+        for name, idx in self.FACIAL_POINT_IDX.items():
+            if name in coords_dict:
+                new_coord = np.array(coords_dict[name], dtype=np.float32)
+
+                # Smooth
+                prev_coord = keypoints_np[idx] if self._prev_keypoints is None else self._prev_keypoints[0, idx].cpu().numpy()
+                keypoints_np[idx] = prev_coord * (1 - strength) + new_coord * strength
+
+        # Mise à jour du tensor
+        keypoints_np = np.expand_dims(keypoints_np, axis=0)
+        keypoints_tensor = torch.from_numpy(keypoints_np).to(self.device)
+
+        # Update memory
+        self._prev_keypoints = keypoints_tensor.clone()
+        self.keypoints = keypoints_tensor.clone()
+
+        return keypoints_tensor
+
+    # -----------------------------
+    # 🔹 ROTATION TORSE
+    # -----------------------------
+    def rotate_torso(self, angle_deg: float, strength: float = 1.0):
+        """
+        Applique une rotation 2D du torse (hips + épaules) autour du centre du buste.
+        angle_deg : rotation en degrés (+ = sens horaire)
+        strength  : 0 = pas de rotation, 1 = rotation totale
+        """
+        if self.B == 0:
+            return
+
+        # Points du torse à affecter
+        torso_points = ['right_shoulder', 'left_shoulder', 'right_hip', 'left_hip']
+        idxs = [self.FACIAL_POINT_IDX[p] for p in torso_points]
+
+        # Centre du torse
+        center = self.keypoints[:, idxs, :2].mean(dim=1, keepdim=True)  # [B,1,2]
+
+        # Conversion angle -> radians
+        angle_rad = angle_deg * (np.pi / 180.0) * strength
+
+        # Matrice de rotation 2D
+        rot_matrix = torch.tensor([
+            [torch.cos(angle_rad), -torch.sin(angle_rad)],
+            [torch.sin(angle_rad),  torch.cos(angle_rad)]
+        ], device=self.device)
+
+        # Appliquer rotation
+        torso_coords = self.keypoints[:, idxs, :2] - center  # centrer
+        torso_coords_rot = torch.matmul(torso_coords, rot_matrix.T) + center  # rotation + recentrage
+
+        # Mise à jour keypoints
+        self.keypoints[:, idxs, :2] = torso_coords_rot
+        return self.keypoints[:, idxs, :2]
+
     # =========================
     # GETTER
     # =========================
