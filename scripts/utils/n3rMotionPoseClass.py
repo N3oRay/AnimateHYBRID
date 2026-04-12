@@ -70,6 +70,19 @@ class Pose:
     def set_prev_facial_points(self, points):
         self._prev_facial_points = points
 
+    def get_center(self):
+        # suppose keypoints shape: (B, N, 2) ou (N, 2)
+        kpts = self.keypoints
+
+        if kpts.dim() == 3:
+            kpts = kpts[0]
+
+        valid = kpts[kpts[..., 0] > 0]  # filtre simple si coords invalides
+        if valid.shape[0] == 0:
+            return torch.zeros(2, device=kpts.device)
+
+        return valid.mean(dim=0)
+
     def estimate_facial_points_full(self, smooth=0.8):
         """
         Version complète + temporelle + stable

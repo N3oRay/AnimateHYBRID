@@ -1374,7 +1374,68 @@ def apply_torso_warp(
 
     return latents_out, delta_px
 
+
 def apply_global_pose(
+    latents,
+    pose,
+    prev_pose=None,
+    H=None,
+    W=None,
+    device="cuda",
+    strength=0.4,   # 🔥 IMPORTANT: boost réel
+    debug=False,
+    debug_dir=None
+):
+    B = latents.shape[0]
+
+    if prev_pose is None:
+        return latents, torch.zeros((B,1,1,2), device=device)
+
+    # -------------------- centre --------------------
+    idx = [2, 5, 8, 11]
+    pts = torch.stack([pose.get_point(i) for i in idx], dim=1)
+    prev_pts = torch.stack([prev_pose.get_point(i) for i in idx], dim=1)
+
+    center = pts.mean(dim=1)
+    prev_center = prev_pts.mean(dim=1)
+
+    # -------------------- delta --------------------
+    delta = center - prev_center
+
+    delta_px = delta.clone()
+    delta_px[..., 0] *= W
+    delta_px[..., 1] *= H
+
+    # 🔥 anti extinction du mouvement
+    delta_px = torch.tanh(delta_px / 5.0) * 5.0
+
+    delta_px = delta_px.view(B, 1, 1, 2)
+
+    # -------------------- grid --------------------
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
+
+    # 🔥 BOOST IMPORTANT ICI
+    grid_global = grid + delta_px * strength * 3.0
+
+    # -------------------- normalize --------------------
+    grid_global[..., 0] = 2.0 * grid_global[..., 0] / (W - 1) - 1.0
+    grid_global[..., 1] = 2.0 * grid_global[..., 1] / (H - 1) - 1.0
+
+    # -------------------- warp --------------------
+    latents_out = F.grid_sample(latents, grid_global, align_corners=True)
+
+    if debug:
+        print(f"[DEBUG] Global delta px mean: {delta_px.abs().mean().item():.4f}")
+
+    return latents_out, delta_px
+
+def apply_global_pose_v1(
     latents,
     pose,
     prev_pose=None,
@@ -1455,7 +1516,6 @@ def apply_micro_boost_v1(latents, frame_counter, device, masks):
     Returns:
         torch.Tensor: latents modifiés
     """
-    import torch
 
     t = torch.tensor(frame_counter / 6.0, device=device)  # base temporelle
 
@@ -1466,7 +1526,7 @@ def apply_micro_boost_v1(latents, frame_counter, device, masks):
 
     return latents
 
-def apply_micro_boost(latents, frame_counter, device, masks):
+def apply_micro_boost_v2(latents, frame_counter, device, masks):
     t = torch.tensor(frame_counter / 6.0, device=device)
 
     total = torch.zeros_like(latents)
@@ -1476,6 +1536,29 @@ def apply_micro_boost(latents, frame_counter, device, masks):
             continue
 
         total = total + amp * mask * torch.sin(t + phase)
+
+    return latents + total
+
+
+def apply_micro_boost(latents, frame_counter, device, masks, keypoints, prev_keypoints=None):
+
+    t = torch.tensor(frame_counter / 6.0, device=device, dtype=latents.dtype)
+
+    total = torch.zeros_like(latents)
+
+    # safety guard
+    if prev_keypoints is None:
+        motion_strength = 0.0
+    else:
+        motion_strength = (keypoints[:, :, :2] - prev_keypoints[:, :, :2]).abs().mean()
+        motion_strength = torch.clamp(motion_strength, 0.0, 0.01)
+        motion_strength = 0.002 + motion_strength
+
+    for zone_name, (mask, phase, amp) in masks.items():
+        if mask is None:
+            continue
+
+        total += amp * mask * motion_strength * torch.sin(t + phase)
 
     return latents + total
 
@@ -1865,7 +1948,7 @@ def apply_pose_driven_motion(
     # dictionnaire pour stocker les temps
     timings = {}
     # =========================
-    # 🔹 Setup
+    # 🔹 SETUP
     # =========================
     B, C, H, W = latents.shape
     device = latents.device
@@ -1873,13 +1956,33 @@ def apply_pose_driven_motion(
     latents_in = latents.clone()
 
     # =========================
-    # 🔹 Pose
+    # 🔹 POSE (NOW CONSISTENT)
     # =========================
     start = time.time()
     pose = Pose(keypoints.to(device))
     pose.compute_torso_delta(latent_h=H, latent_w=W)
+
     prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
     timings["Pose"] = time.time() - start
+
+    # =========================
+    # 🔥 GLOBAL COMPENSATION
+    # =========================
+
+
+    global_shift = None
+
+    if prev_pose is not None:
+        # centers en pixels directement (IMPORTANT)
+        c1 = pose.get_center()
+        c0 = prev_pose.get_center()
+
+        c1 = pose.get_center()[..., :2]
+        c0 = prev_pose.get_center()[..., :2]
+
+        global_shift = (c1 - c0).to(device)
+        global_shift = global_shift.view(B, 1, 1, 2)
+
     # =========================
     # 🔹 Grid
     # =========================
@@ -1924,6 +2027,11 @@ def apply_pose_driven_motion(
         debug=debug,
         debug_dir=debug_dir
     )
+    if debug:
+        print("GLOBAL delta mean:", global_delta.abs().mean())
+
+
+
     latents = latents_global * (1.0 - mask_face_exp) + latents_before * mask_face_exp
     timings["GLOBAL"] = time.time() - start
     if debug:
@@ -1946,26 +2054,33 @@ def apply_pose_driven_motion(
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="torso_warp")
         print("[DEBUG] Torso warp applied")
 
+    # ========================
+    # FIX FACE + BOUCHE
+    # ========================
+    grid_base = grid
+
+    global_shift = global_shift if global_shift is not None else torch.zeros((B,1,1,2), device=device)
+    grid_base = grid_base + global_shift
     # =========================
     # 🔹 FACE (STATEFUL)
     # =========================
+    face_grid = grid_base
     start = time.time()
     latents, face_delta, facial_points = apply_face_warp(
-        latents=latents, pose=pose, mask_face=mask_face, grid=grid, H=H, W=W, frame_counter=frame_counter, device=device, debug=debug, debug_dir=debug_dir,
+        latents=latents, pose=pose, mask_face=mask_face, grid=face_grid, H=H, W=W, frame_counter=frame_counter, device=device, debug=debug, debug_dir=debug_dir,
         smooth=0.85
     )
     timings["face_warp"] = time.time() - start
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="face_warp")
         print("[DEBUG] Face warp applied")
-
     # =========================
     # 🔹 BOUCHE (STATEFUL)
     # =========================
-
+    mouth_grid = grid_base
     start = time.time()
     latents, mouth_delta, _ = apply_mouth_smil(
-        latents=latents, pose=pose, mask_mouth=mask_mouth, grid=grid, H=H, W=W, frame_counter=frame_counter, device=device, debug=debug, debug_dir=debug_dir,
+        latents=latents, pose=pose, mask_mouth=mask_mouth, grid=mouth_grid, H=H, W=W, frame_counter=frame_counter, device=device, debug=debug, debug_dir=debug_dir,
         smooth=0.85
     )
     timings["mouth_warp"] = time.time() - start
@@ -2044,7 +2159,7 @@ def apply_pose_driven_motion(
     }
 
     start = time.time()
-    latents = apply_micro_boost(latents, frame_counter, device, masks)
+    latents = apply_micro_boost(latents, frame_counter, device, masks, keypoints, prev_keypoints)
     latents = apply_micro_motion(latents, frame_counter, device, masks, randomize = True)
 
     timings["micro_boost"] = time.time() - start
