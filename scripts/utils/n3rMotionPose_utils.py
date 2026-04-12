@@ -6,7 +6,7 @@ import time
 from diffusers import ControlNetModel
 import math
 import torch.nn.functional as F
-from .n3rcoords import pair, safe_xy, safe_update, norm
+from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_3D, apply_hair_motion_cycle, apply_breathing_simple, feather_inside_strict2, feather_outside_only_alpha2
@@ -129,6 +129,127 @@ def extract_keypoints_from_pose(
 
 
 def update_keypoints_from_pose(
+    pose_full_image,
+    current_keypoints,
+    nose_coords,
+    neck_coords,
+    shoulders_coords,
+    clavicules_coords,
+    elbow_coords,
+    wrists_coords,
+    hips_coords,
+    eye_coords,
+    ear_coords,
+    mouth_coords,
+    device="cuda",
+    strength=0.35,
+    debug=False,
+    debug_dir=None,
+    frame_counter=None
+):
+    """
+    Version factorisée PRO :
+    - Mapping centralisé
+    - Safe update générique
+    - Compatible 100% avec ton pipeline actuel
+    """
+
+
+
+    B, C, H, W = pose_full_image.shape
+
+    # =========================
+    # 🔹 INIT KEYPOINTS
+    # =========================
+    keypoints_np = current_keypoints.clone().cpu().numpy()[0]
+
+    # =========================
+    # 🔹 NORMALISATION INPUTS
+    # =========================
+    left_shoulder, right_shoulder = pair(shoulders_coords, debug=debug)
+    left_clavicle, right_clavicle = pair(clavicules_coords, debug=debug)
+    left_elbow, right_elbow = pair(elbow_coords, debug=debug)
+    left_wrist, right_wrist = pair(wrists_coords, debug=debug)
+    left_hip, right_hip = pair(hips_coords, debug=debug)
+    left_eye, right_eye = pair(eye_coords, debug=debug)
+    left_ear, right_ear = pair(ear_coords, debug=debug)
+
+    # Neck dict safe
+    if isinstance(neck_coords, dict):
+        neck_map = {
+            "neck": neck_coords.get("center"),
+            "chin": neck_coords.get("chin"),
+            "left_side_neck": neck_coords.get("left"),
+            "right_side_neck": neck_coords.get("right"),
+            "anchor": neck_coords.get("anchor"),
+        }
+    else:
+        neck_map = {"neck": neck_coords}
+
+    # =========================
+    # 🔹 MAPPING CENTRALISÉ 🔥
+    # =========================
+
+    updates = {
+        0: ("nose", nose_coords),
+        1: ("neck", norm(neck_map.get("neck"))),
+
+        2: ("right_shoulder", right_shoulder),
+        3: ("right_elbow", right_elbow),
+        4: ("right_wrist", right_wrist),
+
+        5: ("left_shoulder", left_shoulder),
+        6: ("left_elbow", left_elbow),
+        7: ("left_wrist", left_wrist),
+
+        8: ("right_hip", right_hip),
+        11: ("left_hip", left_hip),
+
+        14: ("right_eye", right_eye),
+        15: ("left_eye", left_eye),
+        16: ("right_ear", right_ear),
+        17: ("left_ear", left_ear),
+
+        18: ("mouth", mouth_coords),
+
+        19: ("right_clavicle", right_clavicle),
+        20: ("left_clavicle", left_clavicle),
+
+        21: ("chin", neck_map.get("chin")),
+        22: ("left_side_neck", neck_map.get("left_side_neck")),
+        23: ("right_side_neck", neck_map.get("right_side_neck")),
+        24: ("anchor", neck_map.get("anchor")),
+    }
+
+    # =========================
+    # 🔹 APPLY UPDATES
+    # =========================
+    for idx, (label, coord) in updates.items():
+        safe_update(idx, coord, keypoints_np, W, H, label, debug=debug)
+
+
+    # ========= Valeur initial================
+    # 🔹 TO TENSOR
+    # =========================
+    keypoints_np = np.expand_dims(keypoints_np, axis=0)
+    keypoints_np = np.repeat(keypoints_np, B, axis=0)
+    keypoints_tensor = torch.from_numpy(keypoints_np).to(device)
+
+    # =========================
+    # 🔹 DEBUG
+    # =========================
+    if debug and debug_dir is not None and frame_counter is not None:
+        debug_draw_openpose_skeleton(
+            pose_full_image=pose_full_image,
+            keypoints_tensor=keypoints_tensor,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
+        )
+
+    return keypoints_tensor
+
+
+def update_keypoints_from_pose_v1(
     pose_full_image,
     current_keypoints,
     nose_coords,
@@ -2026,6 +2147,43 @@ def apply_pose_driven_motion_ultra2(
     timings["Pose"] = time.time() - start
 
     # =========================
+    # 🔹 Animation Upper Body
+    # =========================
+    try:
+        # On récupère les coordonnées brutes depuis keypoints
+        upper_body_inputs = {
+            "nose": keypoints[:, pose.FACIAL_POINT_IDX["nose"], :2],
+            "neck": keypoints[:, pose.FACIAL_POINT_IDX["neck"], :2],
+            "right_shoulder": keypoints[:, pose.FACIAL_POINT_IDX["right_shoulder"], :2],
+            "right_elbow": keypoints[:, pose.FACIAL_POINT_IDX["right_elbow"], :2],
+            "right_wrist": keypoints[:, pose.FACIAL_POINT_IDX["right_wrist"], :2],
+            "left_shoulder": keypoints[:, pose.FACIAL_POINT_IDX["left_shoulder"], :2],
+            "left_elbow": keypoints[:, pose.FACIAL_POINT_IDX["left_elbow"], :2],
+            "left_wrist": keypoints[:, pose.FACIAL_POINT_IDX["left_wrist"], :2],
+            "right_clavicle": keypoints[:, pose.FACIAL_POINT_IDX.get("right_clavicle", 19), :2],
+            "left_clavicle": keypoints[:, pose.FACIAL_POINT_IDX.get("left_clavicle", 20), :2],
+        }
+
+        # Mise à jour via animate_upper_body
+        pose_copy = Pose(pose.keypoints.clone())
+        updated_upper_body = animate_upper_body(
+            state=pose_copy,
+            inputs=upper_body_inputs,
+            mode="smooth",
+            strength=0.35
+        )
+        n = min(pose.keypoints.shape[1], updated_upper_body.shape[1])
+        pose.keypoints[:, :n] = updated_upper_body[:, :n]
+
+        if debug:
+            print(f"[DEBUG] Upper body animated, first shoulder delta:",
+                (pose.keypoints[0, pose.FACIAL_POINT_IDX['left_shoulder'], :2] -
+                keypoints[0, pose.FACIAL_POINT_IDX['left_shoulder'], :2]))
+
+    except Exception as e:
+        print("[WARN] Upper body animation failed:", e)
+
+    # =========================
     # 🔹 Global compensation
     # =========================
     global_shift = torch.zeros((B,1,1,2), device=device)
@@ -2066,7 +2224,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     start = time.time()
     latents_before = latents.clone()
-    latents_global, global_delta = apply_global_pose(latents, pose, prev_pose, H, W, device, debug=debug, debug_dir=debug_dir)
+    latents_global, global_delta = apply_global_pose(latents, pose, prev_pose, H, W, device=device, debug=debug, debug_dir=debug_dir)
     if prev_pose is not None:
         key_joints = ['neck','left_shoulder','right_shoulder','left_hip','right_hip']
         for joint in key_joints:
@@ -2084,7 +2242,7 @@ def apply_pose_driven_motion_ultra2(
     # 🔹 Torso + breathing dynamique
     # =========================
     latents_before = latents.clone()
-    latents_torso, delta_px = apply_torso_warp(latents, pose, mask_torso, grid, H, W, device, debug=debug, debug_dir=debug_dir)
+    latents_torso, delta_px = apply_torso_warp(latents, pose, mask_torso, grid, H, W, device=device, debug=debug, debug_dir=debug_dir)
     t = torch.tensor(frame_counter/10.0, device=device)
     breath_strength = 0.2 + 0.1 * torch.sin(t)
     latents = latents_torso*(breath_strength*mask_torso_exp) + latents_before*(1.0 - breath_strength*mask_torso_exp)

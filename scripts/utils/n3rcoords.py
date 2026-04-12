@@ -1,6 +1,11 @@
 #n3rcoords.py
 
 import torch
+import numpy as np
+from .n3rMotionPoseClass import Pose
+
+def lerp(a, b, t):
+    return a * (1 - t) + b * t
 
 def prepare_pose_tensor(pose_full, device, target_dtype):
     """
@@ -205,3 +210,208 @@ def safe_update(idx, coord, keypoints_np, W, H, label="", debug=False):
     keypoints_np[idx, 0] = x / W
     keypoints_np[idx, 1] = y / H
     keypoints_np[idx, 2] = 1.0
+
+#--------------------------------- Moteur d'animation Class ---------------------------
+
+UPPER_BODY_MAP = {
+    "nose": 0,
+    "neck": 1,
+
+    "right_shoulder": 2,
+    "right_elbow": 3,
+    "right_wrist": 4,
+
+    "left_shoulder": 5,
+    "left_elbow": 6,
+    "left_wrist": 7,
+
+    "right_clavicle": 8,
+    "left_clavicle": 9,
+
+    "chin": 10,
+    "left_side_neck": 11,
+    "right_side_neck": 12,
+    "anchor": 13,
+
+    "right_eye": 14,
+    "left_eye": 15,
+    "right_ear": 16,
+    "left_ear": 17,
+    "mouth": 18,
+
+    "hips_center": 19
+}
+
+class UpperBodySkeleton:
+    """
+    Mini skeleton pour le haut du corps uniquement
+    Index convention:
+        0 - nose
+        1 - neck
+        2 - right_shoulder
+        3 - right_elbow
+        4 - right_wrist
+        5 - left_shoulder
+        6 - left_elbow
+        7 - left_wrist
+        8 - right_clavicle
+        9 - left_clavicle
+        10 - chin
+        11 - left_side_neck
+        12 - right_side_neck
+        13 - anchor
+        14 - right_eye
+        15 - left_eye
+        16 - right_ear
+        17 - left_ear
+        18 - mouth
+        19 - hips_center  # uniquement pour ancrage portrait
+    """
+    def __init__(self):
+        self.joints = np.zeros((20, 2), dtype=np.float32)
+        self.velocity = np.zeros((20, 2), dtype=np.float32)
+
+class UpperBodyClip:
+    def __init__(self):
+        self.keyframes = []
+
+    def add_keyframe(self, frame_id, pose):
+        """
+        pose = (20,2) np.array
+        """
+        self.keyframes.append(Keyframe(frame_id, pose))
+        self.keyframes.sort(key=lambda x: x.frame_id)
+
+def evaluate_upper_body_clip(clip, frame):
+    if len(clip.keyframes) == 0:
+        return None
+
+    kf0, kf1 = None, None
+    for i in range(len(clip.keyframes) - 1):
+        if clip.keyframes[i].frame_id <= frame <= clip.keyframes[i + 1].frame_id:
+            kf0 = clip.keyframes[i]
+            kf1 = clip.keyframes[i + 1]
+            break
+
+    if kf0 is None:
+        return clip.keyframes[0].pose
+
+    t = (frame - kf0.frame_id) / (kf1.frame_id - kf0.frame_id + 1e-6)
+    return lerp(kf0.pose, kf1.pose, t)
+
+
+
+def build_upper_body_inputs(
+    nose_coords,
+    neck_coords,
+    shoulders_coords,
+    clavicules_coords,
+    elbow_coords,
+    wrists_coords,
+    hips_coords,
+    eye_coords,
+    ear_coords,
+    mouth_coords
+):
+    left_shoulder, right_shoulder = pair(shoulders_coords)
+    left_clavicle, right_clavicle = pair(clavicules_coords)
+    left_elbow, right_elbow = pair(elbow_coords)
+    left_wrist, right_wrist = pair(wrists_coords)
+    left_hip, right_hip = pair(hips_coords)
+    left_eye, right_eye = pair(eye_coords)
+    left_ear, right_ear = pair(ear_coords)
+
+    neck_map = (
+        neck_coords if isinstance(neck_coords, dict)
+        else {"center": neck_coords}
+    )
+
+    return {
+        "nose": nose_coords,
+        "neck": norm(neck_map.get("center")),
+
+        "right_shoulder": right_shoulder,
+        "left_shoulder": left_shoulder,
+
+        "right_elbow": right_elbow,
+        "left_elbow": left_elbow,
+
+        "right_wrist": right_wrist,
+        "left_wrist": left_wrist,
+
+        "right_clavicle": right_clavicle,
+        "left_clavicle": left_clavicle,
+
+        "chin": neck_map.get("chin"),
+        "left_side_neck": neck_map.get("left"),
+        "right_side_neck": neck_map.get("right"),
+        "anchor": neck_map.get("anchor"),
+
+        "right_eye": right_eye,
+        "left_eye": left_eye,
+        "right_ear": right_ear,
+        "left_ear": left_ear,
+        "mouth": mouth_coords,
+
+        "hips_center": None if hips_coords is None else np.mean(hips_coords, axis=0)
+    }
+
+
+def animate_upper_body(
+    state: Pose,
+    inputs: dict,
+    mapping: dict = None,
+    mode: str = "smooth",
+    strength: float = 0.35
+):
+    """
+    Met à jour les keypoints du haut du corps à partir des inputs détectés.
+
+    Parameters
+    ----------
+    state : Pose
+        Objet Pose contenant les keypoints actuels et mémoire.
+    inputs : dict
+        Coordonnées détectées { 'nose': [x,y], 'neck': [x,y], ... }
+    mapping : dict
+        Optionnel. Mapping nom_points -> indices dans state.FACIAL_POINT_IDX
+        Si None, mapping interne est utilisé.
+    mode : str
+        'smooth' -> interpolation entre ancien et nouveau
+        'instant' -> update direct
+    strength : float
+        Poids de l'interpolation si mode='smooth' (0=ancien, 1=nouveau)
+    """
+
+    if mapping is None:
+        mapping = state.FACIAL_POINT_IDX
+
+    # Cloner les keypoints pour ne pas modifier directement l'original
+    keypoints = state.keypoints.clone()  # shape: (1, N, 2)
+
+    # -----------------------------
+    # Update des points du haut du corps
+    # -----------------------------
+    for name, idx in mapping.items():
+        if name in inputs:
+            new_coord = inputs[name]  # tensor sur le même device que keypoints
+            if not isinstance(new_coord, torch.Tensor):
+                # convertit au tensor si nécessaire
+                new_coord = torch.tensor(new_coord, device=keypoints.device, dtype=keypoints.dtype)
+
+            old_coord = keypoints[0, idx, :2]
+
+            if mode == "smooth":
+                keypoints[0, idx, :2] = old_coord * (1 - strength) + new_coord * strength
+            elif mode == "instant":
+                keypoints[0, idx, :2] = new_coord
+            else:
+                raise ValueError(f"Mode '{mode}' non supporté, choisir 'smooth' ou 'instant'")
+
+    # -----------------------------
+    # Mise à jour interne
+    # -----------------------------
+    state._prev_keypoints = keypoints.clone()
+    state.keypoints = keypoints.clone()
+
+    return keypoints
