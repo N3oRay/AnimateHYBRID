@@ -114,3 +114,94 @@ def prepare_face_coords(
     print(f"Face coords dict: {face_coords_dict}")
 
     return face_coords_dict, nose_coords_dict, eye_coords_list, mouth_coords_list, ear_coords_list, nose_coords_list
+
+# =========================
+# 🔹 NORMALISATION INPUTS
+# =========================
+def pair(coords, debug=False):
+    if coords:
+        out = [safe_xy(c, debug=debug) for c in coords]
+        if debug:
+            print(f"[pair] input={coords} → output={out}")
+        return out
+    if debug:
+        print("[pair] coords=None → fallback (0,0)")
+    return [(0, 0), (0, 0)]
+
+# =========================
+# 🔹 SAFE UTILS
+# =========================
+def safe_xy(coord, debug=False):
+    if coord is None:
+        if debug:
+            print("[safe_xy] None → (0,0)")
+        return (0, 0)
+
+    if isinstance(coord, list) and len(coord) == 1:
+        val = tuple(coord[0])
+        if debug:
+            print(f"[safe_xy] list[1] {coord} → {val}")
+        return val
+
+    if isinstance(coord, (list, tuple)) and len(coord) == 2:
+        val = tuple(coord)
+        if debug:
+            print(f"[safe_xy] tuple/list {coord} → {val}")
+        return val
+
+    if debug:
+        print(f"[safe_xy] format inconnu {coord} → (0,0)")
+    return (0, 0)
+
+def norm(coord):
+    if isinstance(coord, (list, tuple)) and len(coord) == 1:
+        return coord[0]
+    return coord
+
+
+def safe_update(idx, coord, keypoints_np, W, H, label="", debug=False):
+    # =========================
+    # 🔹 NORMALISATION ROBUSTE
+    # =========================
+    if coord is None:
+        x, y = 0, 0
+    elif isinstance(coord, dict):
+        # sécurité si jamais MediaPipe ou autre passe un dict
+        x, y = 0, 0
+    elif isinstance(coord, (list, tuple)):
+
+        # cas [[x,y]]
+        if len(coord) == 1 and isinstance(coord[0], (list, tuple)):
+            coord = coord[0]
+
+        if len(coord) == 2:
+            x, y = coord
+        else:
+            x, y = 0, 0
+    else:
+        x, y = 0, 0
+
+    old_x, old_y = keypoints_np[idx, 0] * W, keypoints_np[idx, 1] * H
+
+    # =========================
+    # 🔹 LOGIQUE SAFE IDENTIQUE V1
+    # =========================
+    if x == 0 and y == 0:
+        if old_x != 0 or old_y != 0:
+            if debug:
+                print(f"[safe_update] {label} fallback → garde ({old_x:.1f},{old_y:.1f})")
+        else:
+            if debug:
+                print(f"[safe_update] ⚠ {label} ignoré (aucune valeur valide)")
+        return
+
+    # clamp sécurité (optionnel mais utile)
+    x = max(0, min(x, W))
+    y = max(0, min(y, H))
+
+    if debug:
+        print(f"[safe_update] {label}: ({old_x:.1f},{old_y:.1f}) → ({x:.1f},{y:.1f})")
+
+    keypoints_np[idx, 0] = x / W
+    keypoints_np[idx, 1] = y / H
+    keypoints_np[idx, 2] = 1.0
