@@ -467,8 +467,8 @@ def main(args):
                                 # Mettre à jour les keypoints éventuellement modifiés
                                 current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints, prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
 
-                                # 🔹 Appliquer le mouvement du haut du corps / OpenPose - apply_pose_driven_motion_stable or apply_pose_driven_motion
-                                latents = apply_pose_driven_motion_stable(
+                                # 🔹 Appliquer le mouvement du haut du corps / OpenPose - apply_pose_driven_motion_stable or apply_pose_driven_motion or apply_pose_driven_motion_ultra2
+                                latents = apply_pose_driven_motion_ultra2(
                                     latents=latents, keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
                                     breathing=True, debug=True, debug_dir=output_dir
                                 )
