@@ -1153,7 +1153,7 @@ class Pose:
 
         return mask
     #-----------------------------------------------------------------------------------------------------------------------------------
-    def create_mouth_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
+    def create_mouth_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.5, expand_h=0.2):
         """
         Masque dynamique pour la bouche uniquement, arrondi avec bord glow.
         expand_w / expand_h permettent d'élargir le rectangle de la bouche.
@@ -1209,7 +1209,7 @@ class Pose:
 
         return mask, mouth_points_batch
     #-----------------------------------------------------------------------------------------------------------------------------------
-    def create_mouth_corners_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
+    def create_mouth_corners_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.5, expand_h=0.2):
         """
         Masque dynamique pour les coins de la bouche uniquement (pour sourire subtil, micro-mouvements).
         Les coins sont calculés à partir du point central de la bouche.
