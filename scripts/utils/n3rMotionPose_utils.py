@@ -1767,43 +1767,42 @@ def apply_micro_boost(latents, frame_counter, device, masks, keypoints, prev_key
     return latents + total
 
 
-def apply_micro_motion(latents: torch.Tensor, frame_counter: int, device, masks: dict, randomize: bool = True):
+def apply_micro_motion(
+    latents: torch.Tensor,
+    frame_counter: int,
+    device,
+    masks: dict,
+    strength: float = 0.5,   # 🔥 NOUVEAU 0.3 - 0.6 → très réaliste (cinéma) - stable 0.25
+    randomize: bool = True
+):
     """
-    Applique un micro-boost sinusoidal sur différentes zones pour rendre l'image vivante.
-
-    Args:
-        latents (torch.Tensor): latents [B,C,H,W]
-        frame_counter (int): compteur de frame
-        device (str / torch.device)
-        masks (dict): dictionnaire de la forme
-            {
-                "torso": (mask_tensor, phase, amplitude),
-                "hair":  (mask_tensor, phase, amplitude),
-                "face":  (mask_tensor, phase, amplitude),
-                "mouth": (mask_tensor, phase, amplitude),  # optionnel
-            }
-        randomize (bool): si True, ajoute une légère variation aléatoire sur la sinusoïde
-
-    Returns:
-        torch.Tensor: latents modifiés
+    Micro motion avec contrôle global de l'intensité.
+    strength : 0 = OFF, 1 = normal, >1 = amplifié
     """
-    t = torch.tensor(frame_counter / 6.0, device=device)  # base temporelle
+
+    # 🔹 Clamp sécurité (évite explosion)
+    strength = max(0.0, min(strength, 5.0))
+
+    t = torch.tensor(frame_counter / 6.0, device=device)
 
     for zone_name, params in masks.items():
         if params is None:
             continue
+
         mask, phase, amplitude = params
         if mask is None:
             continue
 
-        # S'assurer que le mask est float et sur le bon device
         mask = mask.to(dtype=latents.dtype, device=device)
 
-        # Variation aléatoire légère pour éviter un mouvement trop mécanique
-        noise = torch.rand_like(mask) * 0.005 if randomize else 0.0
+        # 🔹 Micro random plus stable (moins agressif)
+        if randomize:
+            noise = (torch.rand_like(mask) - 0.5) * 0.01
+        else:
+            noise = 0.0
 
-        # Calcul du micro-mouvement sinusoidal
-        delta = amplitude * mask * torch.sin(t + phase + noise)
+        # 🔥 Application du strength AU BON ENDROIT
+        delta = strength * amplitude * mask * torch.sin(t + phase + noise)
 
         latents = latents + delta
 
@@ -2434,7 +2433,7 @@ def apply_pose_driven_motion_ultra2(
         mask_exp = mask.repeat(1, C, 1, 1)  # broadcast sur les canaux
         latents += amplitude * mask_exp * torch.sin(t * speed)
 
-    latents = apply_micro_motion(latents, frame_counter, device, masks, randomize=True)
+    latents = apply_micro_motion(latents, frame_counter, device, masks, strength=0.25, randomize=True)
     timings["MICRO_BOOST"] = time.time() - start
 
     # =========================
