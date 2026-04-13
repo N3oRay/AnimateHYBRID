@@ -1886,8 +1886,10 @@ def apply_pose_driven_motion_ultra2(
     latents = latents_global # new code
     timings["GLOBAL"] = time.time() - start
     if debug:
+        print("[DEBUG] GLOBAL WARP REPORT")
+        print("  - delta mean px:", global_delta.abs().mean().item())
+        print("  - delta max px:", global_delta.abs().max().item())
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="torso_global")
-        print("[DEBUG] Ultra2 Global pose applied, delta mean:", global_delta.abs().mean())
 
     # =========================
     # 🔹 Torso + breathing dynamique
@@ -1936,8 +1938,9 @@ def apply_pose_driven_motion_ultra2(
 
     eye_motion = 0.0015 * (mask_left_eye_broadcast  * torch.sin(t*3.0) +
                        mask_right_eye_broadcast * torch.cos(t*3.0))
-    #latents +=
+
     eye_motion = eye_motion * mask_face_exp
+    latents += eye_motion
 
     timings["MOUTH+EYES"] = time.time() - start
 
