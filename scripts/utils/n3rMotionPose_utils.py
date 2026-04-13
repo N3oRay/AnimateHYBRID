@@ -975,7 +975,7 @@ def apply_torso_warp(
     W,
     device,
     prev_delta_px=None,
-    strength=0.5,   # 🔥 NEW
+    strength=0.3,   # 🔥 NEW 0.3–1.2
     debug=False,
     debug_dir=None
 ):
@@ -1001,7 +1001,8 @@ def apply_torso_warp(
         delta_px = alpha * delta_px + (1 - alpha) * prev_delta_px
 
     # -------------------- strength control --------------------
-    delta_px = delta_px * strength
+    #delta_px = delta_px * strength
+    delta_px = torch.tanh(delta_px) * 5.0 * strength
 
     # -------------------- Feather dynamique --------------------
     mask_torso = feather_dynamic_vectorized(
@@ -1022,8 +1023,12 @@ def apply_torso_warp(
     falloff = torch.exp(-distance / (0.35 * W))
 
     # -------------------- Warp torse --------------------
-    grid_torso = grid + delta_px * mask_expand * falloff
-
+    #grid_torso = grid + delta_px * mask_expand * falloff
+    warp = delta_px * strength
+    # safety clamp (IMPORTANT)
+    warp = torch.tanh(warp / 5.0) * 5.0
+    #grid_torso = grid + warp * mask_expand * falloff
+    grid_torso = grid + strength * delta_px * mask_expand * falloff
     # -------------------- Normalisation --------------------
     grid_torso[...,0] = 2.0 * grid_torso[...,0] / (W-1) - 1.0
     grid_torso[...,1] = 2.0 * grid_torso[...,1] / (H-1) - 1.0
@@ -1032,8 +1037,11 @@ def apply_torso_warp(
     latents_out = F.grid_sample(latents, grid_torso, align_corners=True)
 
     if debug:
-        print("  - delta mean px:", delta_px.abs().mean().item())
-        print("  - delta max px:", delta_px.abs().max().item())
+        print("[DEBUG][TORSO] strength:", strength)
+        print("[DEBUG][TORSO] delta_px mean:", delta_px.abs().mean().item())
+        print("[DEBUG][TORSO] delta_px max:", delta_px.abs().max().item())
+        print("[DEBUG][TORSO] falloff mean:", falloff.mean().item())
+        print("[DEBUG][TORSO] mask mean:", mask_expand.mean().item())
 
     return latents_out, delta_px
 
@@ -2007,9 +2015,8 @@ def apply_pose_driven_motion_ultra2(
         mask_exp = mask.repeat(1, C, 1, 1)  # broadcast sur les canaux
         latents += amplitude * mask_exp * torch.sin(t * speed)
 
-    latents = apply_micro_motion(latents, frame_counter, device, masks, strength=0.15, randomize=True)
+    latents = apply_micro_motion(latents, frame_counter, device, masks, strength=0.05, randomize=True, debug=debug)
     timings["MICRO_BOOST"] = time.time() - start
-
 
     # =========================
     # 🔹 DECOR MASK (post-process)

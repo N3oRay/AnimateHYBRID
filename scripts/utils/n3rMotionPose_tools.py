@@ -1058,7 +1058,8 @@ def apply_micro_motion(
     device,
     masks: dict,
     strength: float = 0.3,   # 🔥 NOUVEAU 0.3 - 0.6 → très réaliste (cinéma) - stable 0.25
-    randomize: bool = True
+    randomize: bool = True,
+    debug=False
 ):
     """
     Micro motion avec contrôle global de l'intensité.
@@ -1090,6 +1091,11 @@ def apply_micro_motion(
         delta = strength * amplitude * mask * torch.sin(t + phase + noise)
 
         latents = latents + delta
+
+        if debug:
+            print("[DEBUG] apply_micro_motion")
+            print("  - delta mean px:", delta.abs().mean().item())
+            print("  - delta max px:", delta.abs().max().item())
 
     return latents
 #-------------------------------------------- Gestion du vent ------------------------------------------------
@@ -1157,6 +1163,11 @@ def apply_hair_motion_cycle(
             debug=debug,
             debug_dir=debug_dir
         )
+
+        if debug:
+            print("[DEBUG] apply_hair_motion_cycle")
+            print("  - hair_delta mean px:", hair_delta.abs().mean().item())
+            print("  - hair_delta max px:", hair_delta.abs().max().item())
 
     return latents_hair, hair_delta
 #----------------------------------------------------------------------------------------------
