@@ -1839,6 +1839,13 @@ def apply_pose_driven_motion_ultra2(
     mask_face_exp = mask_face
     mask_mouth_exp = mask_mouth
 
+    # 🔥 NOUVEAU MASQUE DÉCOR
+    mask_decor = pose.create_decor_mask(H, W)  # à implémenter
+    mask_decor = torch.clamp(mask_decor, 0, 1).float()
+
+    # Exemple : éviter conflit avec visage
+    mask_decor = mask_decor * (1.0 - mask_face)
+
     # =========================
     # 🔹 Global pose & stabilisation avancée
     # =========================
@@ -1953,6 +1960,14 @@ def apply_pose_driven_motion_ultra2(
 
     latents = apply_micro_motion(latents, frame_counter, device, masks, strength=0.25, randomize=True)
     timings["MICRO_BOOST"] = time.time() - start
+
+
+    # =========================
+    # 🔹 DECOR MASK (post-process)
+    # =========================
+    decor_strength = 0.5  # 🔥 réglable
+
+    latents = latents * (1.0 - decor_strength * mask_decor) + latents_in * (decor_strength * mask_decor)
 
     # =========================
     # 🔹 DEBUG FINAL
