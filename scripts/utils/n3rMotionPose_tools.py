@@ -1051,13 +1051,89 @@ def draw_wind_icon(img, wind_delta, pos=(50,50), scale=100, color=(0,255,255), t
     return img
 
 #-------------------------------------------- Micro moton ------------------------------------------------
+def apply_micro_boost(
+    latents,
+    frame_counter,
+    device,
+    masks,
+    keypoints,
+    prev_keypoints=None,
+    strength=1.0,
+    debug=False
+):
+
+    t = torch.tensor(frame_counter / 6.0, device=device, dtype=latents.dtype)
+
+    total = torch.zeros_like(latents)
+
+    # ---------------------------
+    # 🔹 Motion strength compute
+    # ---------------------------
+    if prev_keypoints is None:
+        motion_strength = torch.tensor(0.0, device=device, dtype=latents.dtype)
+    else:
+        motion_strength = (keypoints[:, :, :2] - prev_keypoints[:, :, :2]).abs().mean()
+
+        motion_strength = torch.clamp(motion_strength, 0.0, 0.01)
+
+        motion_strength = 0.002 + motion_strength
+
+    # 🔥 apply global strength
+    motion_strength = motion_strength * strength
+
+    # ---------------------------
+    # 🔹 Debug motion signal
+    # ---------------------------
+    if debug:
+        print("[DEBUG][MICRO_BOOST]")
+        print("  - strength:", float(strength))
+        print("  - motion_strength:", float(motion_strength))
+        print("  - frame_counter:", frame_counter)
+        print("  - keypoints delta mean:",
+              float((keypoints[:, :, :2] - prev_keypoints[:, :, :2]).abs().mean())
+              if prev_keypoints is not None else 0.0)
+
+    # ---------------------------
+    # 🔹 Apply per-zone motion
+    # ---------------------------
+    zone_stats = {}
+
+    for zone_name, (mask, phase, amp) in masks.items():
+
+        if mask is None:
+            continue
+
+        contribution = amp * mask * motion_strength * torch.sin(t + phase)
+
+        total += contribution
+
+        if debug:
+            zone_stats[zone_name] = {
+                "amp": float(amp),
+                "mean_mask": float(mask.mean()),
+                "contrib_mean": float(contribution.abs().mean())
+            }
+
+    # ---------------------------
+    # 🔹 Debug summary
+    # ---------------------------
+    if debug:
+        print("[DEBUG][MICRO_BOOST SUMMARY]")
+        for k, v in zone_stats.items():
+            print(f"  - {k}: amp={v['amp']:.6f} "
+                  f"mask={v['mean_mask']:.6f} "
+                  f"contrib={v['contrib_mean']:.8f}")
+
+        print("[DEBUG][MICRO_BOOST] total mean:", float(total.abs().mean()))
+
+    return latents + total
 
 def apply_micro_motion(
     latents: torch.Tensor,
     frame_counter: int,
     device,
     masks: dict,
-    strength: float = 0.3,   # 🔥 NOUVEAU 0.3 - 0.6 → très réaliste (cinéma) - stable 0.25
+    strength: float = 0.25,   # 🔥 NOUVEAU 0.3 - 0.6 → très réaliste (cinéma) - stable 0.25
     randomize: bool = True,
     debug=False
 ):
@@ -1092,10 +1168,10 @@ def apply_micro_motion(
 
         latents = latents + delta
 
-        if debug:
-            print("[DEBUG] apply_micro_motion")
-            print("  - delta mean px:", delta.abs().mean().item())
-            print("  - delta max px:", delta.abs().max().item())
+    if debug:
+        print("[DEBUG] apply_micro_motion")
+        print("  - delta mean px:", delta.abs().mean().item())
+        print("  - delta max px:", delta.abs().max().item())
 
     return latents
 #-------------------------------------------- Gestion du vent ------------------------------------------------

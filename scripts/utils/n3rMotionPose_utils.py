@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_simple, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_simple, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
 from .n3rMotionPoseClass import Pose
 import numpy as np
 import cv2
@@ -1018,16 +1018,12 @@ def apply_torso_warp(
     # -------------------- Déformation non-linéaire (IMPORTANT) --------------------
     offset = grid - torso_center_px
     distance = torch.norm(offset, dim=-1, keepdim=True)
-
-    # falloff spatial → centre bouge plus que les bords
     falloff = torch.exp(-distance / (0.35 * W))
 
     # -------------------- Warp torse --------------------
-    #grid_torso = grid + delta_px * mask_expand * falloff
     warp = delta_px * strength
     # safety clamp (IMPORTANT)
     warp = torch.tanh(warp / 5.0) * 5.0
-    #grid_torso = grid + warp * mask_expand * falloff
     grid_torso = grid + strength * delta_px * mask_expand * falloff
     # -------------------- Normalisation --------------------
     grid_torso[...,0] = 2.0 * grid_torso[...,0] / (W-1) - 1.0
@@ -1298,73 +1294,6 @@ def apply_global_pose_v1(
 
 
 #------------------------------------------------------------------------------------------
-def apply_micro_boost_v1(latents, frame_counter, device, masks):
-    """
-    Applique un micro-boost sinusoidal sur différentes zones pour rendre l'image vivante.
-
-    Args:
-        latents (torch.Tensor): latents [B,C,H,W]
-        frame_counter (int): compteur de frame
-        device (str / torch.device)
-        masks (dict): dictionnaire de la forme
-            {
-                "torso": (mask_tensor, phase, amplitude),
-                "hair":  (mask_tensor, phase, amplitude),
-                "face":  (mask_tensor, phase, amplitude)
-            }
-
-    Returns:
-        torch.Tensor: latents modifiés
-    """
-
-    t = torch.tensor(frame_counter / 6.0, device=device)  # base temporelle
-
-    for zone_name, (mask, phase, amp) in masks.items():
-        if mask is None:
-            continue
-        latents += amp * mask * torch.sin(t + phase)
-
-    return latents
-
-def apply_micro_boost_v2(latents, frame_counter, device, masks):
-    t = torch.tensor(frame_counter / 6.0, device=device)
-
-    total = torch.zeros_like(latents)
-
-    for zone_name, (mask, phase, amp) in masks.items():
-        if mask is None:
-            continue
-
-        total = total + amp * mask * torch.sin(t + phase)
-
-    return latents + total
-
-
-def apply_micro_boost(latents, frame_counter, device, masks, keypoints, prev_keypoints=None):
-
-    t = torch.tensor(frame_counter / 6.0, device=device, dtype=latents.dtype)
-
-    total = torch.zeros_like(latents)
-
-    # safety guard
-    if prev_keypoints is None:
-        motion_strength = 0.0
-    else:
-        motion_strength = (keypoints[:, :, :2] - prev_keypoints[:, :, :2]).abs().mean()
-        motion_strength = torch.clamp(motion_strength, 0.0, 0.01)
-        motion_strength = 0.002 + motion_strength
-
-    for zone_name, (mask, phase, amp) in masks.items():
-        if mask is None:
-            continue
-
-        total += amp * mask * motion_strength * torch.sin(t + phase)
-
-    return latents + total
-
-
-
-
 def calibrate_amplitude(mask, base_amp=0.002, max_amp=0.005):
     """
     Calibre automatiquement l'amplitude d'un micro-boost en fonction de la taille du masque.
@@ -2006,7 +1935,7 @@ def apply_pose_driven_motion_ultra2(
         "decor": (mask_decor, 0.05, calibrate_amplitude(mask_decor, 0.001, 0.002))
     }
     start = time.time()
-    latents = apply_micro_boost(latents, frame_counter, device, masks, keypoints, prev_keypoints)
+    latents = apply_micro_boost(latents, frame_counter, device, masks, keypoints, prev_keypoints, strength=0.05, debug=debug)
 
     for key, (mask, speed, amplitude) in masks.items():
         # mask: [B, 1, H, W] ou [B, H, W]
