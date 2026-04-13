@@ -1886,10 +1886,16 @@ def apply_pose_driven_motion_ultra2(
     #latents_local = latents_world * (1.0 - face_mix) + latents_local * face_mix
     face_mix = feather_inside_strict2(mask_face_exp, radius=6, blur_kernel=5, sigma=1.5)
 
-    face_strength = 0.6
+    face_strength = 0.9
     latents_local = (
         latents_world * (1 - face_strength * face_mix) +
         latents_local * (face_strength * face_mix)
+    )
+
+    face_strength_mouth = 0.9
+    latents_local = (
+        latents_world * (1 - face_strength_mouth * mask_mouth_exp) +
+        latents_local * (face_strength_mouth * mask_mouth_exp)
     )
     timings["FACE"] = time.time() - start
 
@@ -1955,26 +1961,15 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 Micro boost global
     # =========================
-    """
-    masks = {
-        "torso": (mask_torso_exp, 0.1, calibrate_amplitude(mask_torso_exp,0.002,0.004)),
-        "hair": (mask_hair_exp,0.2,calibrate_amplitude(mask_hair_exp,0.003,0.0035)),
-        "face": (mask_face_exp,0.3,calibrate_amplitude(mask_face_exp,0.002,0.006)),
-        "mouth": (mask_mouth_exp,0.3,calibrate_amplitude(mask_mouth_exp,0.003,0.008)),
-        "left_eye": (mask_left_eye,0.5,calibrate_amplitude(mask_left_eye,0.0015,0.004)),
-        "right_eye": (mask_right_eye,0.6,calibrate_amplitude(mask_right_eye,0.0015,0.004)),
-        "mouth_corners": (mask_mouth_corners,0.3,calibrate_amplitude(mask_mouth_corners,0.002,0.006)),
-        "decor": (mask_decor, 0.05, calibrate_amplitude(mask_decor, 0.001, 0.002))
-    }
-    """
+
     masks = {
         "torso": (mask_torso_exp, 0.05, calibrate_amplitude(mask_torso_exp, 0.001, 0.003)),
         "hair": (mask_hair_exp, 0.20, calibrate_amplitude(mask_hair_exp, 0.002, 0.006)),
         "face": (mask_face_exp, 0.15, calibrate_amplitude(mask_face_exp, 0.001, 0.004)),
-        "mouth": (mask_mouth_exp, 0.25, calibrate_amplitude(mask_mouth_exp, 0.0015, 0.005)),
         "left_eye": (mask_left_eye, 0.6, calibrate_amplitude(mask_left_eye, 0.0008, 0.0025)),
         "right_eye": (mask_right_eye, 0.6, calibrate_amplitude(mask_right_eye, 0.0008, 0.0025)),
-        "mouth_corners": (mask_mouth_corners, 0.2, calibrate_amplitude(mask_mouth_corners, 0.001, 0.003)),
+        "mouth": (mask_mouth_exp, 0.25, calibrate_amplitude(mask_mouth_exp, 0.0075, 0.05)),
+        "mouth_corners": (mask_mouth_corners, 0.2, calibrate_amplitude(mask_mouth_corners, 0.005, 0.03)),
         "decor": (mask_decor, 0.02, calibrate_amplitude(mask_decor, 0.0005, 0.0015))
     }
 
@@ -1999,7 +1994,7 @@ def apply_pose_driven_motion_ultra2(
     decor_mask_soft = mask_decor * 0.8  # 🔥 réduit impact
 
     latents = latents * (1.0 - decor_strength * decor_mask_soft) + \
-            (latents_base * (1.0 - decor_mix) + latents * decor_mix) * (decor_strength * decor_mask_soft)
+            (latents_world * (1.0 - decor_mix) + latents * decor_mix) * (decor_strength * decor_mask_soft)
 
     # =========================
     # 🔹 DEBUG FINAL
