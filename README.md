@@ -1,6 +1,6 @@
 # AnimateHYBRID
 
-Mini-Guide: AnimateDiff <4 GB VRAM with N3R
+Mini-Guide: AnimateDiff <4 GB VRAM with N3R 
 1️⃣ Pick the Right Model
 
 N3RModelOptimized → ~3.6 GB VRAM, full features, stable.
@@ -19,11 +19,7 @@ block_size & overlap → tweak for streaming decoding efficiency.
 
 Channel-wise normalization to prevent artifacts.
 
-Strict clamping of latents: torch.clamp(latents, -1.0, 1.0).
-
-Controlled latent injection:
-
-fused_latents = latent_injection * latents_frame + (1 - latent_injection) * n3r_latents
+Controlled latent injection.
 4️⃣ Motion / LoRA / VAE
 
 Motion modules and LoRA can be enabled, but watch VRAM usage → use attention slicing if needed.
@@ -33,9 +29,7 @@ Light VAE + blockwise decoding ensures GPU stability.
 5️⃣ Pro Tips
 
 Free VRAM after each frame:
-
-del latents
-torch.cuda.empty_cache()
+del latents torch.cuda.empty_cache()
 
 Adaptive embeddings for UNet → avoids dimension mismatch errors.
 
