@@ -975,6 +975,7 @@ def apply_torso_warp(
     W,
     device,
     prev_delta_px=None,
+    strength=0.5,   # 🔥 NEW
     debug=False,
     debug_dir=None
 ):
@@ -998,6 +999,9 @@ def apply_torso_warp(
     if prev_delta_px is not None:
         alpha = 0.7
         delta_px = alpha * delta_px + (1 - alpha) * prev_delta_px
+
+    # -------------------- strength control --------------------
+    delta_px = delta_px * strength
 
     # -------------------- Feather dynamique --------------------
     mask_torso = feather_dynamic_vectorized(
@@ -1028,7 +1032,8 @@ def apply_torso_warp(
     latents_out = F.grid_sample(latents, grid_torso, align_corners=True)
 
     if debug:
-        print("[DEBUG] Torso warp applied")
+        print("  - delta mean px:", delta_px.abs().mean().item())
+        print("  - delta max px:", delta_px.abs().max().item())
 
     return latents_out, delta_px
 
@@ -1874,7 +1879,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     start = time.time()
     #latents_before = latents.clone()
-    latents_global, global_delta, grid_raw, grid_global = apply_global_pose(latents, pose, prev_pose, H, W, device=device, strength=1.2, debug=debug, debug_dir=debug_dir)
+    latents_global, global_delta, grid_raw, grid_global = apply_global_pose(latents, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
     if prev_pose is not None:
         key_joints = ['neck','left_shoulder','right_shoulder','left_hip','right_hip']
         for joint in key_joints:
@@ -1882,7 +1887,6 @@ def apply_pose_driven_motion_ultra2(
             diff = keypoints[:,idx,:2] - prev_keypoints[:,idx,:2]
             diff = torch.clamp(diff, -3.0, 3.0)
             latents_global += diff.mean() * 0.001
-    #latents = latents_global * (1.0 - mask_face_exp) + latents_before * mask_face_exp
     latents = latents_global # new code
     timings["GLOBAL"] = time.time() - start
     if debug:
@@ -1901,6 +1905,9 @@ def apply_pose_driven_motion_ultra2(
     breath_strength = 0.2 + 0.1 * torch.sin(t)
     latents = latents_torso*(breath_strength*mask_torso_exp) + latents_before*(1.0 - breath_strength*mask_torso_exp)
     timings["TORSO+BREATH"] = time.time() - start
+    if debug:
+        save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="torso_warp")
+
 
     # =========================
     # 🔹 Face + temporal smoothing
@@ -2000,7 +2007,7 @@ def apply_pose_driven_motion_ultra2(
         mask_exp = mask.repeat(1, C, 1, 1)  # broadcast sur les canaux
         latents += amplitude * mask_exp * torch.sin(t * speed)
 
-    latents = apply_micro_motion(latents, frame_counter, device, masks, strength=0.25, randomize=True)
+    latents = apply_micro_motion(latents, frame_counter, device, masks, strength=0.15, randomize=True)
     timings["MICRO_BOOST"] = time.time() - start
 
 
