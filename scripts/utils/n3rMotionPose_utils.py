@@ -1032,7 +1032,7 @@ def apply_torso_warp(
 
     return latents_out, delta_px
 
-
+# version corriger
 def apply_global_pose(
     latents,
     pose,
@@ -1045,95 +1045,121 @@ def apply_global_pose(
     debug=True,
     debug_dir=None
 ):
-    """
-    Warp global basé sur le centre des points du torse, avec debug complet.
+    import time
+    import torchvision
+    import os
 
-    Parameters
-    ----------
-    latents : torch.Tensor
-        Latents à transformer [B, C, H, W]
-    pose : Pose
-        Pose actuelle
-    prev_pose : Pose
-        Pose précédente
-    H, W : int
-        Taille des latents
-    strength : float
-        Poids du warp global
-    clamp : bool
-        Si True, limite le delta (anti-extinction)
-    debug : bool
-        Affiche les deltas par joint clé
-    debug_dir : str
-        Répertoire pour sauvegarder images de debug
-    """
     B = latents.shape[0]
     device = latents.device
 
+    t0 = time.time()
+
+    # =========================================================
+    # 🔹 No previous pose → no motion
+    # =========================================================
     if prev_pose is None:
         if debug:
-            print("[DEBUG] Aucun prev_pose : warp global désactivé")
-        return latents, torch.zeros((B,1,1,2), device=device)
+            print("[DEBUG][GLOBAL] No prev_pose → identity warp")
 
-    # -------------------- Points du torse --------------------
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing='ij'
+        )
+        grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
+
+        return latents, torch.zeros((B,1,1,2), device=device), grid, None
+
+    # =========================================================
+    # 🔹 Torso joints
+    # =========================================================
     key_joints = ["left_shoulder","right_shoulder","left_hip","right_hip"]
     idx_list = [pose.FACIAL_POINT_IDX[j] for j in key_joints]
 
     pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)
     prev_pts = torch.stack([prev_pose.get_point(i) for i in idx_list], dim=1)
 
-    # Centre
     center = pts.mean(dim=1)
     prev_center = prev_pts.mean(dim=1)
 
-    # Delta normalisé
-    delta = center - prev_center  # [-1,1] relatif latents
-    delta_px = delta.clone()
-    delta_px[...,0] *= W
-    delta_px[...,1] *= H
+    delta = center - prev_center
 
-    # Clamp pour éviter extinction du mouvement
+    # pixels
+    delta_px = delta.clone()
+    delta_px[..., 0] *= W
+    delta_px[..., 1] *= H
+
     if clamp:
         delta_px = torch.tanh(delta_px / 5.0) * 5.0
 
-    if debug:
-        for i, joint in enumerate(key_joints):
-            move_px = (pts[:,i,:] - prev_pts[:,i,:]) * torch.tensor([W,H], device=device)
-            print(f"[DEBUG] {joint} movement px: {move_px.squeeze().tolist()}")
-
-        print(f"[DEBUG] Global center delta px mean: {delta_px.abs().mean().item():.4f}")
-
     delta_px = delta_px.view(B,1,1,2)
 
-    # -------------------- Grid --------------------
+    # =========================================================
+    # 🔹 Grid (RAW)
+    # =========================================================
     yy, xx = torch.meshgrid(
         torch.arange(H, device=device),
         torch.arange(W, device=device),
         indexing='ij'
     )
-    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
 
-    # -------------------- Warp global --------------------
-    grid_global = grid + delta_px * strength * 3.0
+    grid_raw = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
 
-    # Normalize pour grid_sample
-    grid_global[...,0] = 2.0 * grid_global[...,0] / (W-1) - 1.0
-    grid_global[...,1] = 2.0 * grid_global[...,1] / (H-1) - 1.0
+    # =========================================================
+    # 🔹 Warp
+    # =========================================================
+    grid_warp = grid_raw + delta_px * strength * 3.0
 
-    latents_out = F.grid_sample(latents, grid_global, align_corners=True)
+    # =========================================================
+    # 🔹 Normalize for grid_sample
+    # =========================================================
+    grid_norm = grid_warp.clone()
+    grid_norm[..., 0] = 2.0 * grid_norm[..., 0] / (W - 1) - 1.0
+    grid_norm[..., 1] = 2.0 * grid_norm[..., 1] / (H - 1) - 1.0
 
-    # -------------------- Debug save --------------------
-    if debug and debug_dir is not None:
-        import torchvision
-        latents_img = latents_out[0].detach().cpu()
-        if latents_img.shape[0] == 4:  # RGBA latent
-            latents_img = latents_img[:3]
-        torchvision.utils.save_image(
-            (latents_img + 1.0)/2.0, f"{debug_dir}/global_warp_debug.png"
-        )
-        print(f"[DEBUG] Global warp image saved: {debug_dir}/global_warp_debug.png")
+    # =========================================================
+    # 🔹 Apply warp
+    # =========================================================
+    latents_out = F.grid_sample(latents, grid_norm, align_corners=True)
 
-    return latents_out, delta_px
+    # =========================================================
+    # 🔹 DEBUG
+    # =========================================================
+    if debug:
+
+        print("\n[DEBUG][GLOBAL] ===============================")
+        print(f"[DEBUG][GLOBAL] Time: {time.time() - t0:.5f}s")
+        print(f"[DEBUG][GLOBAL] Strength: {strength}")
+
+        # --- joint motion ---
+        for i, j in enumerate(key_joints):
+            move_px = (pts[:, i, :] - prev_pts[:, i, :]) * torch.tensor([W, H], device=device)
+            print(f"[DEBUG][GLOBAL] {j} movement (px): {move_px.squeeze().tolist()}")
+
+        print(f"[DEBUG][GLOBAL] Mean delta_px: {delta_px.abs().mean().item():.4f}")
+
+        # --- sanity checks ---
+        print(f"[DEBUG][GLOBAL] grid_raw min/max: {grid_raw.min().item():.2f} / {grid_raw.max().item():.2f}")
+        print(f"[DEBUG][GLOBAL] grid_warp min/max: {grid_warp.min().item():.2f} / {grid_warp.max().item():.2f}")
+
+        # =====================================================
+        # 🔹 optional debug image
+        # =====================================================
+        if debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+
+            img = latents_out[0].detach().float().cpu()
+            if img.shape[0] > 3:
+                img = img[:3]
+
+            torchvision.utils.save_image(
+                (img + 1.0) / 2.0,
+                os.path.join(debug_dir, "global_pose_debug.png")
+            )
+
+            print(f"[DEBUG][GLOBAL] Saved: {debug_dir}/global_pose_debug.png")
+
+    return latents_out, delta_px, grid_raw, grid_norm
 
 
 def apply_global_pose_v2(
@@ -1819,7 +1845,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
     grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
-    grid_base = grid + global_shift
+    #grid_base = grid + global_shift
 
     # =========================
     # 🔹 Masks
@@ -1840,20 +1866,15 @@ def apply_pose_driven_motion_ultra2(
     mask_mouth_exp = mask_mouth
 
     # 🔥 NOUVEAU MASQUE DÉCOR
-    #mask_decor = pose.create_decor_outpose_mask(H, W, debug=debug, debug_dir=debug_dir)
-    #mask_decor = mask_decor * (1.0 - mask_face) * (1.0 - mask_torso) * (1.0 - mask_hair)
     mask_decor = pose.create_decor_mask(H, W, mask_face, mask_torso, mask_hair, debug=debug, debug_dir=debug_dir)  # doit devenir
     mask_decor = torch.clamp(mask_decor, 0, 1).float()
-
-    # Pour éviter tout chevauchement avec le torse ou les bras
-
 
     # =========================
     # 🔹 Global pose & stabilisation avancée
     # =========================
     start = time.time()
-    latents_before = latents.clone()
-    latents_global, global_delta = apply_global_pose(latents, pose, prev_pose, H, W, device=device, strength=1.2, debug=debug, debug_dir=debug_dir)
+    #latents_before = latents.clone()
+    latents_global, global_delta, grid_raw, grid_global = apply_global_pose(latents, pose, prev_pose, H, W, device=device, strength=1.2, debug=debug, debug_dir=debug_dir)
     if prev_pose is not None:
         key_joints = ['neck','left_shoulder','right_shoulder','left_hip','right_hip']
         for joint in key_joints:
@@ -1861,7 +1882,8 @@ def apply_pose_driven_motion_ultra2(
             diff = keypoints[:,idx,:2] - prev_keypoints[:,idx,:2]
             diff = torch.clamp(diff, -3.0, 3.0)
             latents_global += diff.mean() * 0.001
-    latents = latents_global * (1.0 - mask_face_exp) + latents_before * mask_face_exp
+    #latents = latents_global * (1.0 - mask_face_exp) + latents_before * mask_face_exp
+    latents = latents_global # new code
     timings["GLOBAL"] = time.time() - start
     if debug:
         save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="torso_global")
@@ -1885,11 +1907,14 @@ def apply_pose_driven_motion_ultra2(
         apply_pose_driven_motion_ultra2.prev_face_grid = [None]*B
     start = time.time()
     latents, face_delta, facial_points = apply_face_warp(
-        latents, pose, mask_face, grid_base, H, W, frame_counter,
+        latents, pose, mask_face, grid, H, W, frame_counter,
         device=device, debug=debug, debug_dir=debug_dir, smooth=0.85,
         prev_grid=apply_pose_driven_motion_ultra2.prev_face_grid[0] if B==1 else None
     )
-    apply_pose_driven_motion_ultra2.prev_face_grid[0] = grid_base.clone() if B==1 else None
+    apply_pose_driven_motion_ultra2.prev_face_grid[0] = grid.clone() if B==1 else None
+
+    face_mix = feather_inside_strict2(mask_face_exp, radius=6, blur_kernel=5, sigma=1.5) # new code
+    latents = latents * face_mix + latents_global * (1.0 - face_mix) # new code
     timings["FACE"] = time.time() - start
 
     # =========================
@@ -1897,7 +1922,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     start = time.time()
     latents, mouth_delta, _ = apply_mouth_smil(
-        latents, pose, mask_mouth, grid_base, H, W, frame_counter,
+        latents, pose, mask_mouth, grid, H, W, frame_counter,
         device=device, debug=debug, debug_dir=debug_dir, smooth=0.85
     )
 
@@ -1911,7 +1936,8 @@ def apply_pose_driven_motion_ultra2(
 
     eye_motion = 0.0015 * (mask_left_eye_broadcast  * torch.sin(t*3.0) +
                        mask_right_eye_broadcast * torch.cos(t*3.0))
-    latents += eye_motion
+    #latents +=
+    eye_motion = eye_motion * mask_face_exp
 
     timings["MOUTH+EYES"] = time.time() - start
 
@@ -1938,9 +1964,9 @@ def apply_pose_driven_motion_ultra2(
         apply_pose_driven_motion_ultra2.prev_decor_fields = [None]*B
     start = time.time()
     latents_before = latents.clone()
-    decor_time_scale = 0.35  # 🔥 clé du réalisme
+
     latents_decor, decor_delta = apply_hair_motion_cycle(
-        latents, mask_decor, grid, H, W, frame_counter * decor_time_scale, device, delta_px,
+        latents, mask_decor, grid, H, W, frame_counter, device, delta_px,
         prev_hair_field=apply_pose_driven_motion_ultra2.prev_decor_fields[0] if B==1 else None,
         debug=debug, debug_dir=debug_dir
     )
@@ -1984,9 +2010,6 @@ def apply_pose_driven_motion_ultra2(
 
     latents = latents * (1.0 - decor_strength * decor_mask_soft) + \
             (latents_in * (1.0 - decor_mix) + latents * decor_mix) * (decor_strength * decor_mask_soft)
-
-
-    #latents = latents / (latents.abs().max(dim=1, keepdim=True)[0] + 1e-6)
 
     # =========================
     # 🔹 DEBUG FINAL
