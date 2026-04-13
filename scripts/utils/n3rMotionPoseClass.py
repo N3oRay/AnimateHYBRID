@@ -659,7 +659,98 @@ class Pose:
         self.delta = delta
         return delta
     # --------------- Mask decor ---------------------------------------------
-    def create_decor_mask( self, H: int, W: int, debug: bool = False, debug_dir: str = None, frame_counter: int = 0, expand=2.2, vertical_bias=1.2, falloff_strength=2.0 ):
+    def create_decor_mask( self, H: int, W: int, mask_face=None, mask_torso=None, mask_hair=None, debug: bool = False, debug_dir: str = None, frame_counter: int = 0, expand=2.2, vertical_bias=1.2, falloff_strength=2.0 ):
+        device = self.device
+        B = self.B
+
+        mask = torch.zeros(B, 1, H, W, device=device)
+
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij"
+        )
+
+        def to_px(kp):
+            return kp * torch.tensor([W - 1, H - 1], device=device)
+
+        for b in range(B):
+
+            # 🔹 Points clés
+            r_sh = to_px(self.get_point(self.FACIAL_POINT_IDX["right_shoulder"])[b])
+            l_sh = to_px(self.get_point(self.FACIAL_POINT_IDX["left_shoulder"])[b])
+            r_hip = to_px(self.get_point(self.FACIAL_POINT_IDX["right_hip"])[b])
+            l_hip = to_px(self.get_point(self.FACIAL_POINT_IDX["left_hip"])[b])
+            head = to_px(self.get_point(self.FACIAL_POINT_IDX["nose"])[b])
+
+            pts = torch.stack([r_sh, l_sh, r_hip, l_hip])
+
+            # 🔹 Bounding
+            min_xy = pts.min(dim=0).values
+            max_xy = pts.max(dim=0).values
+            center = (min_xy + max_xy) / 2
+
+            width = (max_xy[0] - min_xy[0]) * expand
+            height = (max_xy[1] - head[1]) * expand * vertical_bias
+
+            # 🔹 Ellipse corps
+            dx = xx - center[0]
+            dy = yy - center[1]
+
+            ellipse = (dx / (width / 2 + 1e-6))**2 + (dy / (height / 2 + 1e-6))**2
+            inside = torch.exp(-ellipse * falloff_strength)
+
+            # 🔥 Décor = extérieur
+            mask[b, 0] = 1.0 - inside
+
+        # =========================
+        # 🔹 Exclusion simple
+        # =========================
+        if mask_face is not None:
+            mask *= (1.0 - mask_face)
+        if mask_torso is not None:
+            mask *= (1.0 - mask_torso)
+        if mask_hair is not None:
+            mask *= (1.0 - mask_hair)
+
+        # =========================
+        # 🔹 Edge falloff (clé)
+        # =========================
+        yy_n, xx_n = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device),
+            torch.linspace(-1, 1, W, device=device),
+            indexing="ij"
+        )
+
+        radial = torch.sqrt(xx_n**2 + yy_n**2)
+        edge_falloff = (1.0 - radial).clamp(0, 1)
+
+        mask *= edge_falloff.unsqueeze(0).unsqueeze(0)
+
+        # =========================
+        # 🔹 Smooth léger
+        # =========================
+        mask = torch.nn.functional.avg_pool2d(
+            mask,
+            kernel_size=5,
+            stride=1,
+            padding=2
+        )
+
+        # =========================
+        # 🔹 Clamp final
+        # =========================
+        mask = torch.clamp(mask, 0.0, 1.0)
+
+        # =========================
+        # 🔹 Debug
+        # =========================
+        if debug and debug_dir is not None:
+            save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="decor_mask")
+
+        return mask
+    # -------- version pose
+    def create_decor_outpose_mask( self, H: int, W: int, debug: bool = False, debug_dir: str = None, frame_counter: int = 0, expand=2.2, vertical_bias=1.2, falloff_strength=2.0 ):
         mask = torch.zeros(self.B, 1, H, W, device=self.device)
 
         yy, xx = torch.meshgrid(

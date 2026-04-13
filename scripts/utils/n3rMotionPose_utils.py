@@ -1840,11 +1840,13 @@ def apply_pose_driven_motion_ultra2(
     mask_mouth_exp = mask_mouth
 
     # 🔥 NOUVEAU MASQUE DÉCOR
-    mask_decor = pose.create_decor_mask(H, W)  # à implémenter
+    #mask_decor = pose.create_decor_outpose_mask(H, W, debug=debug, debug_dir=debug_dir)
+    #mask_decor = mask_decor * (1.0 - mask_face) * (1.0 - mask_torso) * (1.0 - mask_hair)
+    mask_decor = pose.create_decor_mask(H, W, mask_face, mask_torso, mask_hair, debug=debug, debug_dir=debug_dir)  # doit devenir
     mask_decor = torch.clamp(mask_decor, 0, 1).float()
 
-    # Exemple : éviter conflit avec visage
-    mask_decor = mask_decor * (1.0 - mask_face)
+    # Pour éviter tout chevauchement avec le torse ou les bras
+
 
     # =========================
     # 🔹 Global pose & stabilisation avancée
@@ -1868,6 +1870,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 Torso + breathing dynamique
     # =========================
+    start = time.time()
     latents_before = latents.clone()
     latents_torso, delta_px = apply_torso_warp(latents, pose, mask_torso, grid, H, W, device=device, debug=debug, debug_dir=debug_dir)
     t = torch.tensor(frame_counter/10.0, device=device)
@@ -1905,20 +1908,12 @@ def apply_pose_driven_motion_ultra2(
     # Broadcasting correct pour les yeux
     mask_left_eye_broadcast  = mask_left_eye.repeat(1, C, 1, 1)
     mask_right_eye_broadcast = mask_right_eye.repeat(1, C, 1, 1)
-    latents += 0.0015 * (mask_left_eye_broadcast  * torch.sin(t*3.0))
-    latents += 0.0015 * (mask_right_eye_broadcast * torch.cos(t*3.0))
+
+    eye_motion = 0.0015 * (mask_left_eye_broadcast  * torch.sin(t*3.0) +
+                       mask_right_eye_broadcast * torch.cos(t*3.0))
+    latents += eye_motion
 
     timings["MOUTH+EYES"] = time.time() - start
-
-    # =========================
-    # 🔹 Eyes micro-motion
-    # =========================
-    # Correct broadcasting pour les yeux
-    mask_left_eye_broadcast  = mask_left_eye.repeat(1, C, 1, 1)
-    mask_right_eye_broadcast = mask_right_eye.repeat(1, C, 1, 1)
-
-    latents += 0.0015 * (mask_left_eye_broadcast  * torch.sin(t*3.0))
-    latents += 0.0015 * (mask_right_eye_broadcast * torch.cos(t*3.0))
 
     # =========================
     # 🔹 Hair motion cycle
@@ -1937,6 +1932,23 @@ def apply_pose_driven_motion_ultra2(
     timings["HAIR"] = time.time() - start
 
     # =========================
+    # 🔹 Decor motion cycle
+    # =========================
+    if not hasattr(apply_pose_driven_motion_ultra2,"prev_decor_fields"):
+        apply_pose_driven_motion_ultra2.prev_decor_fields = [None]*B
+    start = time.time()
+    latents_before = latents.clone()
+    decor_time_scale = 0.35  # 🔥 clé du réalisme
+    latents_decor, decor_delta = apply_hair_motion_cycle(
+        latents, mask_decor, grid, H, W, frame_counter * decor_time_scale, device, delta_px,
+        prev_hair_field=apply_pose_driven_motion_ultra2.prev_decor_fields[0] if B==1 else None,
+        debug=debug, debug_dir=debug_dir
+    )
+    latents = latents_decor * mask_decor + latents_before * (1.0 - mask_decor)
+    apply_pose_driven_motion_ultra2.prev_decor_fields[0] = decor_delta
+    timings["DECOR"] = time.time() - start
+
+    # =========================
     # 🔹 Micro boost global
     # =========================
     masks = {
@@ -1946,7 +1958,8 @@ def apply_pose_driven_motion_ultra2(
         "mouth": (mask_mouth_exp,0.3,calibrate_amplitude(mask_mouth_exp,0.003,0.008)),
         "left_eye": (mask_left_eye,0.5,calibrate_amplitude(mask_left_eye,0.0015,0.004)),
         "right_eye": (mask_right_eye,0.6,calibrate_amplitude(mask_right_eye,0.0015,0.004)),
-        "mouth_corners": (mask_mouth_corners,0.3,calibrate_amplitude(mask_mouth_corners,0.002,0.006))
+        "mouth_corners": (mask_mouth_corners,0.3,calibrate_amplitude(mask_mouth_corners,0.002,0.006)),
+        "decor": (mask_decor, 0.05, calibrate_amplitude(mask_decor, 0.001, 0.002))
     }
     start = time.time()
     latents = apply_micro_boost(latents, frame_counter, device, masks, keypoints, prev_keypoints)
@@ -1965,9 +1978,15 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 DECOR MASK (post-process)
     # =========================
-    decor_strength = 0.5  # 🔥 réglable
+    decor_strength = 0.25  # 🔥 réglable
+    decor_mix = 0.2  # conserve un peu du mouvement
+    decor_mask_soft = mask_decor * 0.8  # 🔥 réduit impact
 
-    latents = latents * (1.0 - decor_strength * mask_decor) + latents_in * (decor_strength * mask_decor)
+    latents = latents * (1.0 - decor_strength * decor_mask_soft) + \
+            (latents_in * (1.0 - decor_mix) + latents * decor_mix) * (decor_strength * decor_mask_soft)
+
+
+    #latents = latents / (latents.abs().max(dim=1, keepdim=True)[0] + 1e-6)
 
     # =========================
     # 🔹 DEBUG FINAL
