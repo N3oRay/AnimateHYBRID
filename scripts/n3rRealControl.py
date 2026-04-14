@@ -462,10 +462,13 @@ def main(args):
                                 # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION -------------------------------------------------------
                                 current_keypoints = extract_keypoints_from_pose( pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter)
                                 # 🔹 Update des keypoints avec Mediapipe
+
                                 current_keypoints = update_keypoints_from_pose( pose_full, current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
 
                                 # Mettre à jour les keypoints éventuellement modifiés
-                                current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints, prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
+                                #if frame_counter % 2 == 0:
+                                current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints,
+                                                                                              prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
 
                                 # 🔹 Appliquer le mouvement du haut du corps / OpenPose - apply_pose_driven_motion_stable or apply_pose_driven_motion or apply_pose_driven_motion_ultra2
                                 latents = apply_pose_driven_motion_ultra2(
