@@ -12,7 +12,7 @@ import os
 import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
 import traceback
-
+import torchvision.utils as vutils
 
 
 #from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha, smooth_noise, apply_hair_motion_3D, feather_inside_strict2, feather_outside_only_alpha2
@@ -681,7 +681,77 @@ def apply_breathing_mask(latents, previous_latent, frame_counter, breathing=True
     return latents
 
 
-def apply_breathing_simple(latents, mask_torso, frame_counter, breathing=True, debug=False, debug_dir=None):
+
+def apply_breathing_simple(
+    latents,
+    mask_torso,
+    frame_counter,
+    breathing=True,
+    amplitude=1.0,
+    debug=False,
+    debug_dir=None,
+):
+    if not breathing:
+        return latents
+
+    B, C, H, W = latents.shape
+    device = latents.device
+
+    breath = amplitude * 0.06 * math.sin(frame_counter * 0.1) * math.cos(frame_counter * 0.06)
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )
+
+    xx = xx.unsqueeze(0).expand(B, H, W)
+    yy = yy.unsqueeze(0).expand(B, H, W)
+
+    mask = mask_torso.permute(0, 2, 3, 1)
+
+    # déplacement
+    delta_y = breath * mask[..., 0]
+    delta_x = torch.zeros_like(delta_y)
+
+    grid = torch.stack((xx + delta_x, yy + delta_y), dim=-1)
+
+    latents_out = F.grid_sample(latents, grid, align_corners=True)
+
+    # =========================
+    # 🔍 DEBUG DELTA
+    # =========================
+    if debug:
+        # delta global (vecteur)
+        global_delta = torch.stack((delta_x, delta_y), dim=-1)
+
+        print("  - delta mean px:", global_delta.abs().mean().item())
+        print("  - delta max px:", global_delta.abs().max().item())
+
+        if debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+
+            delta_mag = torch.sqrt(delta_x**2 + delta_y**2)
+
+            def normalize(x):
+                x_min = x.amin(dim=(1,2), keepdim=True)
+                x_max = x.amax(dim=(1,2), keepdim=True)
+                return (x - x_min) / (x_max - x_min + 1e-8)
+
+            delta_vis = normalize(delta_mag).unsqueeze(1)
+            mask_vis = mask[..., 0].unsqueeze(1)
+
+            debug_img = torch.cat([delta_vis, mask_vis], dim=0)
+
+            vutils.save_image(
+                debug_img,
+                os.path.join(debug_dir, f"delta_{frame_counter:05d}.png"),
+                nrow=B
+            )
+
+    return latents_out
+
+def apply_breathing_simple_v1(latents, mask_torso, frame_counter, breathing=True, debug=False, debug_dir=None):
 
     if not breathing:
         return latents
@@ -1050,7 +1120,7 @@ def draw_wind_icon(img, wind_delta, pos=(50,50), scale=100, color=(0,255,255), t
 
     return img
 
-#-------------------------------------------- Micro moton ------------------------------------------------
+#-------------------------------------------- Micro Boost & Micro moton ------------------------------------------------
 def apply_micro_boost(
     latents,
     frame_counter,
@@ -1059,72 +1129,59 @@ def apply_micro_boost(
     keypoints,
     prev_keypoints=None,
     strength=1.0,
-    debug=False
+    debug=False,
+    debug_dir=None
 ):
 
     t = torch.tensor(frame_counter / 6.0, device=device, dtype=latents.dtype)
 
     total = torch.zeros_like(latents)
 
-    # ---------------------------
-    # 🔹 Motion strength compute
-    # ---------------------------
+    # -------------------- Motion strength --------------------
     if prev_keypoints is None:
         motion_strength = torch.tensor(0.0, device=device, dtype=latents.dtype)
     else:
         motion_strength = (keypoints[:, :, :2] - prev_keypoints[:, :, :2]).abs().mean()
 
+        if torch.isnan(motion_strength):
+            motion_strength = torch.tensor(0.0, device=device, dtype=latents.dtype)
+
         motion_strength = torch.clamp(motion_strength, 0.0, 0.01)
+        motion_strength = (0.002 + motion_strength) * strength
 
-        motion_strength = 0.002 + motion_strength
-
-    # 🔥 apply global strength
-    motion_strength = motion_strength * strength
-
-    # ---------------------------
-    # 🔹 Debug motion signal
-    # ---------------------------
+    # -------------------- Debug header --------------------
     if debug:
-        print("[DEBUG][MICRO_BOOST]")
-        print("  - strength:", float(strength))
-        print("  - motion_strength:", float(motion_strength))
-        print("  - frame_counter:", frame_counter)
-        print("  - keypoints delta mean:",
-              float((keypoints[:, :, :2] - prev_keypoints[:, :, :2]).abs().mean())
-              if prev_keypoints is not None else 0.0)
+        print(f"[DEBUG][MICRO_BOOST]")
+        print(f"  - strength: {strength}")
+        print(f"  - motion_strength: {motion_strength.item():.6f}")
+        print(f"  - frame_counter: {frame_counter}")
 
-    # ---------------------------
-    # 🔹 Apply per-zone motion
-    # ---------------------------
-    zone_stats = {}
+    zone_summaries = []
 
+    # -------------------- Zones --------------------
     for zone_name, (mask, phase, amp) in masks.items():
-
         if mask is None:
+            if debug:
+                print(f"  - {zone_name}: SKIP (mask=None)")
             continue
 
-        contribution = amp * mask * motion_strength * torch.sin(t + phase)
+        contrib = amp * mask * motion_strength * torch.sin(t + phase)
 
-        total += contribution
+        total += contrib
 
         if debug:
-            zone_stats[zone_name] = {
-                "amp": float(amp),
-                "mean_mask": float(mask.mean()),
-                "contrib_mean": float(contribution.abs().mean())
-            }
+            zone_summaries.append(
+                (zone_name, float(amp), float(mask.mean().item()), float(contrib.mean().item()))
+            )
 
-    # ---------------------------
-    # 🔹 Debug summary
-    # ---------------------------
+    # -------------------- Debug summary --------------------
     if debug:
         print("[DEBUG][MICRO_BOOST SUMMARY]")
-        for k, v in zone_stats.items():
-            print(f"  - {k}: amp={v['amp']:.6f} "
-                  f"mask={v['mean_mask']:.6f} "
-                  f"contrib={v['contrib_mean']:.8f}")
+        for name, amp, mmean, cmean in zone_summaries:
+            print(f"  - {name}: amp={amp:.6f} mask={mmean:.6f} contrib={cmean:.8f}")
 
-        print("[DEBUG][MICRO_BOOST] total mean:", float(total.abs().mean()))
+        print(f"[DEBUG][MICRO_BOOST] total mean: {total.mean().item():.8f}")
+        print(f"[DEBUG][MICRO_BOOST] total max: {total.max().item():.8f}")
 
     return latents + total
 
@@ -1186,7 +1243,7 @@ def apply_hair_motion_cycle(
     device,
     delta_px=None,
     prev_hair_field=None,
-    strength=0.5,
+    strength=1.5,
     debug=False,
     debug_dir=None
 ):

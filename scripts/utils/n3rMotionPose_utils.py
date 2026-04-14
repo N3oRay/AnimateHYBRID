@@ -1970,7 +1970,7 @@ def apply_pose_driven_motion_ultra2(
     latents_before = latents_world.clone()
     latents_breath = apply_breathing_simple(latents_world, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
     t = torch.tensor(frame_counter/10.0, device=latents_world.device)
-    breath_strength = 0.2 + 0.1 * torch.sin(t)
+    breath_strength = 0.2 + 0.2 * torch.sin(t)
     latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_breath*(breath_strength*mask_torso_exp)
     timings["breathing"] = time.time() - start
     if debug:
@@ -1992,9 +1992,6 @@ def apply_pose_driven_motion_ultra2(
     )
     apply_pose_driven_motion_ultra2.prev_face_grid[0] = grid.clone() if B==1 else None
 
-    #face_mix = feather_inside_strict2(mask_face_exp, radius=6, blur_kernel=5, sigma=1.5) # new code
-    #latents_local = latents_local * face_mix + latents_local * (1.0 - face_mix) # new code
-    #latents_local = latents_world * (1.0 - face_mix) + latents_local * face_mix
     face_mix = feather_inside_strict2(mask_face_exp, radius=6, blur_kernel=5, sigma=1.5)
 
     face_strength = 0.9
@@ -2010,9 +2007,9 @@ def apply_pose_driven_motion_ultra2(
     )
     timings["FACE"] = time.time() - start
 
-    # =========================
-    # 🔹 Mouth & micro-expressions
-    # =========================
+    # ===================================
+    # 🔹 Mouth & micro-expressions - OK
+    # ==================================
     start = time.time()
     latents_local, mouth_delta, _ = apply_mouth_smil(
         latents_local, pose, mask_mouth, grid, H, W, frame_counter,
@@ -2036,9 +2033,9 @@ def apply_pose_driven_motion_ultra2(
 
     timings["MOUTH+EYES"] = time.time() - start
 
-    # =========================
-    # 🔹 Hair motion cycle
-    # =========================
+    # ==============================
+    # 🔹 Hair motion cycle - OK
+    # ==============================
     if not hasattr(apply_pose_driven_motion_ultra2,"prev_hair_fields"):
         apply_pose_driven_motion_ultra2.prev_hair_fields = [None]*B
     start = time.time()
@@ -2054,9 +2051,9 @@ def apply_pose_driven_motion_ultra2(
     timings["HAIR"] = time.time() - start
 
 
-    # =========================
-    # 🔹 Decor motion cycle
-    # =========================
+    # ===========================
+    # 🔹 Decor motion cycle - OK
+    # ===========================
     if not hasattr(apply_pose_driven_motion_ultra2,"prev_decor_fields"):
         apply_pose_driven_motion_ultra2.prev_decor_fields = [None]*B
     start = time.time()
@@ -2068,6 +2065,7 @@ def apply_pose_driven_motion_ultra2(
         debug=debug, debug_dir=debug_dir
     )
     latents_local = latents_decor * mask_decor + latents_before * (1.0 - mask_decor)
+    print("DECOR DELTA MEAN:", decor_delta.abs().mean().item())
     apply_pose_driven_motion_ultra2.prev_decor_fields[0] = decor_delta
     timings["DECOR"] = time.time() - start
 
