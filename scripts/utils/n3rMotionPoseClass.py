@@ -4,6 +4,18 @@ import cv2
 import os
 from PIL import Image, ImageDraw
 from .n3rMotionPose_tools import save_debug_mask, feather_inside_strict, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, feather_outside_only_alpha, feather_inside_strict2, feather_outside_only_alpha2
+
+
+def ensure_2d(x):
+    """
+    Force shape [2] (x,y)
+    """
+    if x is None:
+        return None
+    if x.ndim == 2:
+        x = x[0]
+    return x[:2]
+
 #---------------------------------- CLASS POSE ------------------------------------------------------
 class Pose:
     def __init__(self, keypoints: torch.Tensor):
@@ -157,6 +169,127 @@ class Pose:
         return valid.mean(dim=0)
 
     def estimate_facial_points_full(self, smooth=0.8):
+        """
+        Version complète + head-aware + stable + frame facial cohérent
+        """
+
+        points = {}
+
+        kp = self.keypoints
+        nose = kp[:, 0, :2]
+
+        right_eye = kp[:, 14, :2] if kp.shape[1] > 14 else None
+        left_eye  = kp[:, 15, :2] if kp.shape[1] > 15 else None
+
+        right_ear = kp[:, 16, :2] if kp.shape[1] > 16 else None
+        left_ear  = kp[:, 17, :2] if kp.shape[1] > 17 else None
+
+        # =========================
+        # FALLBACK STABLE DISTANCE
+        # =========================
+        if right_eye is not None and left_eye is not None:
+            eye_center = (left_eye + right_eye) * 0.5
+            eye_vec = left_eye - right_eye
+            eye_dist = torch.norm(eye_vec, dim=1, keepdim=True).clamp(min=1e-5)
+        else:
+            eye_center = nose + torch.tensor([0.0, -0.08], device=self.device)
+            eye_vec = torch.tensor([1.0, 0.0], device=self.device).repeat(self.B, 1)
+            eye_dist = torch.full((self.B, 1), 0.12, device=self.device)
+
+        # =========================
+        # HEAD FRAME (IMPORTANT)
+        # =========================
+        eye_dir = eye_vec / eye_dist
+
+        # vertical axis = nose -> eyes center
+        head_up = (eye_center - nose)
+        head_up = head_up / (torch.norm(head_up, dim=1, keepdim=True) + 1e-6)
+
+        # perpendicular axis (face width direction)
+        head_right = torch.stack([-head_up[:, 1], head_up[:, 0]], dim=1)
+
+        # =========================
+        # HEAD CENTER STABLE
+        # =========================
+        head_center = (nose + eye_center) * 0.5
+
+        # =========================
+        # SCALE FACTORS
+        # =========================
+        face_w = eye_dist
+        face_h = eye_dist * 1.4
+
+        # =========================
+        # MOUTH (FRAME-BASED)
+        # =========================
+        mouth_center = head_center + head_up * (0.65 * face_h)
+
+        mouth_left = mouth_center - head_right * (0.35 * face_w)
+        mouth_right = mouth_center + head_right * (0.35 * face_w)
+        mouth_top = mouth_center - head_up * (0.15 * face_h)
+        mouth_bottom = mouth_center + head_up * (0.15 * face_h)
+
+        # =========================
+        # YEUX (FRAME-BASED + STABLE)
+        # =========================
+        if right_eye is not None and left_eye is not None:
+            points["eye_center"] = eye_center
+
+            points["right_eye"] = right_eye
+            points["left_eye"] = left_eye
+
+            # inner/outer stable via head frame (pas vector brut)
+            points["right_eye_inner"] = right_eye + head_right * (0.15 * face_w)
+            points["right_eye_outer"] = right_eye - head_right * (0.25 * face_w)
+
+            points["left_eye_inner"] = left_eye - head_right * (0.15 * face_w)
+            points["left_eye_outer"] = left_eye + head_right * (0.25 * face_w)
+
+        # =========================
+        # EARS (IMPORTANT POUR HAI R MASK)
+        # =========================
+        if right_ear is not None and left_ear is not None:
+            points["right_ear"] = right_ear
+            points["left_ear"] = left_ear
+
+        # =========================
+        # NOSE + CHIN + HEAD CORE
+        # =========================
+        points["nose"] = nose
+        points["head_center"] = head_center
+
+        # chin approx (important pour hair mask stability)
+        points["chin"] = nose + head_up * (1.6 * face_h)
+
+        # =========================
+        # MOUTH POINTS
+        # =========================
+        points.update({
+            "mouth_center": mouth_center,
+            "mouth_left": mouth_left,
+            "mouth_right": mouth_right,
+            "mouth_top": mouth_top,
+            "mouth_bottom": mouth_bottom,
+        })
+
+        # =========================
+        # TEMPORAL SMOOTHING
+        # =========================
+        prev = self.get_prev_facial_points()
+
+        if prev is not None:
+            for k in points:
+                if k in prev:
+                    points[k] = smooth * prev[k] + (1 - smooth) * points[k]
+
+        # =========================
+        # MEMORY UPDATE
+        # =========================
+        self.set_prev_facial_points(points)
+
+        return points
+
+    def estimate_facial_points_simple(self, smooth=0.8):
         """
         Version complète + temporelle + stable
         """
@@ -1144,8 +1277,149 @@ class Pose:
 
         return mask
 
+    def create_hair_mask(
+        self,
+        H: int,
+        W: int,
+        debug: bool = False,
+        debug_dir: str = None,
+        frame_counter: int = 0,
+        top_extend=0.55,
+        side_extend=0.25,
+        height_factor=1.15,
+    ):
+        """
+        Hair mask basé sur keypoints :
+        - ears + eyes + nose → orientation de tête
+        - ellipse inclinée (tilt head-aware)
+        - centre stabilisé
+        """
 
-    def create_hair_mask(self, H: int, W: int,
+        mask_face = self.create_face_mask(
+            H, W,
+            debug=debug,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
+        )
+
+        mask_hair = torch.zeros_like(mask_face)
+
+        for b in range(self.B):
+
+            fp = self.estimate_facial_points_full(smooth=True)
+
+            # =========================
+            # KEYPOINTS SAFE (FIX IMPORTANT)
+            # =========================
+            nose = ensure_2d(fp['nose'])
+            left_eye = ensure_2d(fp['left_eye'])
+            right_eye = ensure_2d(fp['right_eye'])
+            left_ear = ensure_2d(fp['left_ear'])
+            right_ear = ensure_2d(fp['right_ear'])
+
+            # skip si invalid
+            if any(k is None for k in [nose, left_eye, right_eye, left_ear, right_ear]):
+                continue
+
+            # =========================
+            # pixels conversion
+            # =========================
+            def to_px(p):
+                return p * torch.tensor([W - 1, H - 1], device=self.device)
+
+            nose_px = to_px(nose)
+            leye_px = to_px(left_eye)
+            reye_px = to_px(right_eye)
+            lear_px = to_px(left_ear)
+            rear_px = to_px(right_ear)
+
+            # =========================
+            # HEAD CENTER ROBUST
+            # =========================
+            eye_center = (leye_px + reye_px) * 0.5
+            ear_center = (lear_px + rear_px) * 0.5
+            head_center = (nose_px + eye_center + ear_center) / 3.0
+
+            cx = head_center[0]
+            cy = head_center[1]
+
+            # =========================
+            # HEAD ORIENTATION
+            # =========================
+            eye_vec = reye_px - leye_px
+            angle = torch.atan2(eye_vec[1], eye_vec[0])
+            angle_deg = angle * 180.0 / 3.14159265
+
+            # =========================
+            # HEAD SIZE
+            # =========================
+            head_width = torch.norm(reye_px - leye_px)
+            head_height = torch.norm(nose_px - eye_center)
+
+            h_face = head_height * 2.2
+            w_face = head_width * 1.6
+
+            # =========================
+            # HAIR EXTENSION
+            # =========================
+            rx = (w_face * 0.5) * (1.0 + side_extend)
+            ry = (h_face * 0.5) * (1.0 + top_extend) * height_factor
+
+            cy = cy - h_face * 0.55  # shift scalp upward
+
+            # =========================
+            # SAFE CLAMP
+            # =========================
+            cx = int(torch.clamp(cx, 0, W - 1).item())
+            cy = int(torch.clamp(cy, 0, H - 1).item())
+            rx = max(2, int(rx.item()))
+            ry = max(2, int(ry.item()))
+
+            # =========================
+            # ELLIPSE MASK
+            # =========================
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+
+            cv2.ellipse(
+                mask_np,
+                (cx, cy),
+                (rx, ry),
+                angle=float(angle_deg),
+                startAngle=0,
+                endAngle=360,
+                color=255,
+                thickness=-1
+            )
+
+            mask_hair[b, 0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+
+        # =========================
+        # REMOVE FACE AREA
+        # =========================
+        mask_hair = mask_hair * (1.0 - mask_face)
+
+        # =========================
+        # SOFTENING
+        # =========================
+        mask_hair = mask_hair ** 2.1
+        mask_hair = feather_outside_only_alpha(mask_hair, radius=6, sigma=2.2)
+
+        # =========================
+        # DEBUG
+        # =========================
+        if debug and debug_dir is not None:
+            save_debug_mask(
+                mask_hair,
+                H,
+                W,
+                debug_dir,
+                frame_counter,
+                prefix="hair_mask_keypoint_"
+            )
+
+        return mask_hair
+
+    def create_hair_mask_v1(self, H: int, W: int,
                              debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
                              top_extend=0.5, side_extend=0.2, height_factor=1.0):
         """
@@ -1205,7 +1479,7 @@ class Pose:
 
         return mask_hair
     # version dynamique pro
-    def create_left_eye_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
+    def create_left_eye_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.3, expand_h=0.3):
         """
         Masque dynamique pour l’œil gauche, ovale réaliste.
         """
@@ -1247,7 +1521,7 @@ class Pose:
         return mask
 
 
-    def create_right_eye_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.2, expand_h=0.2):
+    def create_right_eye_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.3, expand_h=0.3):
         """
         Masque dynamique pour l’œil droit, ovale réaliste.
         """
