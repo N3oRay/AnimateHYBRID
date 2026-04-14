@@ -2576,12 +2576,16 @@ def apply_pose_driven_motion_stable(
     return latents
 
 #-------Gestion de l'animation -----------------------------------------------------------------------------------
+# --- En DEV: synchroniser ce freeze intelligent avec ton apply_global_pose pour éviter les conflits entre keypoints et warp global.
 def update_pose_sequence_from_keypoints_batch(
     keypoints_tensor,
     prev_keypoints=None,
     frame_idx=0,
-    alpha=0.85,
+    alpha=0.9,
     add_motion=True,
+    motion_scale=0.4,
+    freeze_threshold=0.0015,   # 🔥 NEW
+    freeze_strength=0.5,       # 0 = full freeze, 1 = no freeze
     debug=False
 ):
     import math
@@ -2589,10 +2593,9 @@ def update_pose_sequence_from_keypoints_batch(
 
     kp = keypoints_tensor.clone()
     B, N, _ = kp.shape
-    device = kp.device
 
     # =========================================================
-    # 🔹 1. TEMPORAL SMOOTHING (stabilisé)
+    # 🔹 1. TEMPORAL SMOOTHING
     # =========================================================
     if prev_keypoints is not None:
         kp = alpha * kp + (1 - alpha) * prev_keypoints
@@ -2600,79 +2603,192 @@ def update_pose_sequence_from_keypoints_batch(
     if not add_motion:
         return kp
 
-    t = frame_idx * 0.08
+    t = frame_idx * 0.03
 
     # =========================================================
-    # 🔹 JOINT GROUPS (IMPORTANT)
+    # 🔹 2. MOTION ENERGY ESTIMATION (NEW CORE)
     # =========================================================
-    pelvis_ids  = [11, 8]              # hips
-    spine_ids   = [1, 2, 5, 8]         # torso chain
-    shoulder_ids = [5, 2]
-    head_id     = 0
-    limb_ids    = [14,15,16,17,18,19,20,21,22,23,24]
-
-    # safety mask
-    valid_ids = list(set(range(N)))
+    motion_energy = 0.0
+    if prev_keypoints is not None:
+        motion_energy = (kp - prev_keypoints).abs().mean()
 
     # =========================================================
-    # 🔹 2. BASE MOTION (pelvis driver)
+    # 🔹 3. FREEZE GATE (soft)
     # =========================================================
-    pelvis_center = kp[:, pelvis_ids].mean(1)
+    freeze_gate = 1.0
+    if motion_energy < freeze_threshold:
+        # plus le mouvement est faible, plus on freeze
+        freeze_gate = motion_energy / freeze_threshold
+        freeze_gate = torch.clamp(torch.tensor(freeze_gate), 0.0, 1.0)
 
-    sway = 0.006 * math.sin(t * 0.9)
-    drift_x = 0.002 * math.sin(t * 0.25)
-    drift_y = 0.002 * math.cos(t * 0.22)
-
-    pelvis_offset = torch.zeros_like(kp[:, :, :2])
-    pelvis_offset[:, pelvis_ids, 0] += sway + drift_x
-    pelvis_offset[:, pelvis_ids, 1] += drift_y
-
-    # propagation pelvis → full body (weak)
-    kp[..., :2] += pelvis_offset * 0.6
+        # inverse blending (freeze dominant)
+        freeze_gate = freeze_strength + (1 - freeze_strength) * freeze_gate
 
     # =========================================================
-    # 🔹 3. SPINE WAVE (NEW CORE IMPROVEMENT)
+    # 🔹 4. GROUPS
     # =========================================================
-    spine_wave = 0.004 * math.sin(t * 1.2)
+    pelvis_ids   = [11, 8]
+    spine_ids    = [1, 2, 5, 8]
+    shoulder_ids = [2, 5]
+    head_id      = 0
+    limb_ids     = list(range(min(N, 25)))
+
+    # =========================================================
+    # 🔹 5. GLOBAL MOTION (reduced by freeze)
+    # =========================================================
+    slow_sway = 0.003 * math.sin(t * 0.6)
+    drift_x   = 0.001 * math.sin(t * 0.15)
+    drift_y   = 0.001 * math.cos(t * 0.13)
+
+    global_offset = torch.zeros_like(kp[:, :, :2])
+    global_offset[..., 0] += slow_sway + drift_x
+    global_offset[..., 1] += drift_y
+
+    kp[..., :2] += global_offset * motion_scale * freeze_gate
+
+    # =========================================================
+    # 🔹 6. BREATHING (soft freeze-aware)
+    # =========================================================
+    breath = 0.004 * math.sin(t * 0.7)
+
+    kp[:, spine_ids, 1] += breath * freeze_gate
+    kp[:, shoulder_ids, 1] += breath * 0.6 * freeze_gate
+
+    # =========================================================
+    # 🔹 7. SPINE WAVE
+    # =========================================================
+    spine_wave = 0.002 * math.sin(t * 0.8)
+
+    kp[:, spine_ids, 1] += spine_wave * freeze_gate
+    kp[:, spine_ids, 0] += spine_wave * 0.2 * freeze_gate
+
+    # =========================================================
+    # 🔹 8. HEAD MOTION (inertial + freeze)
+    # =========================================================
+    head_x = 0.0025 * math.sin(t * 0.9)
+    head_y = 0.0020 * math.cos(t * 0.85)
+
+    kp[:, head_id, 0] += head_x * freeze_gate
+    kp[:, head_id, 1] += head_y * freeze_gate
+
+    kp[:, head_id] += (kp[:, 2] - kp[:, 5]) * 0.03 * freeze_gate
+
+    # =========================================================
+    # 🔹 9. LIMBS (strong freeze sensitivity)
+    # =========================================================
+    limb_noise = 0.0006 * torch.randn_like(kp[:, limb_ids, :2])
+    kp[:, limb_ids, :2] += limb_noise * freeze_gate
+
+    # =========================================================
+    # 🔹 10. MICRO STABILIZATION (reduced when frozen)
+    # =========================================================
+    kp[..., :2] += torch.randn_like(kp[..., :2]) * 0.0004 * freeze_gate
+
+    # =========================================================
+    # 🔹 11. CLAMP
+    # =========================================================
+    kp[..., :2] = torch.clamp(kp[..., :2], -1.2, 1.2)
+
+    # =========================================================
+    # 🔹 DEBUG
+    # =========================================================
+    if debug:
+        print("\n[DEBUG][FREEZE]")
+        print(f"motion_energy: {motion_energy}")
+        print(f"freeze_gate: {freeze_gate}")
+        print(f"motion_scale: {motion_scale}")
+
+    return kp
+
+def update_pose_sequence_from_keypoints_batch_stable(
+    keypoints_tensor,
+    prev_keypoints=None,
+    frame_idx=0,
+    alpha=0.9,
+    add_motion=True,
+    motion_scale=0.4,   # 🔥 NOUVEAU: contrôle global vitesse
+    debug=False
+):
+    import math
+    import torch
+
+    kp = keypoints_tensor.clone()
+    B, N, _ = kp.shape
+
+    # =========================================================
+    # 🔹 1. TEMPORAL SMOOTHING (plus fort)
+    # =========================================================
+    if prev_keypoints is not None:
+        kp = alpha * kp + (1 - alpha) * prev_keypoints
+
+    if not add_motion:
+        return kp
+
+    t = frame_idx * 0.03   # 🔥 RALENTI x3
+
+    # =========================================================
+    # 🔹 2. GROUPS
+    # =========================================================
+    pelvis_ids   = [11, 8]
+    spine_ids    = [1, 2, 5, 8]
+    shoulder_ids = [2, 5]
+    head_id      = 0
+    limb_ids     = list(range(min(N, 25)))
+
+    # =========================================================
+    # 🔹 3. GLOBAL MOTION (VERY SLOW drift)
+    # =========================================================
+    slow_sway = 0.003 * math.sin(t * 0.6)
+    drift_x   = 0.001 * math.sin(t * 0.15)
+    drift_y   = 0.001 * math.cos(t * 0.13)
+
+    global_offset = torch.zeros_like(kp[:, :, :2])
+    global_offset[..., 0] += slow_sway + drift_x
+    global_offset[..., 1] += drift_y
+
+    kp[..., :2] += global_offset * motion_scale
+
+    # =========================================================
+    # 🔹 4. BREATHING (ultra slow)
+    # =========================================================
+    breath = 0.004 * math.sin(t * 0.7)  # 🔥 beaucoup plus lent
+
+    kp[:, spine_ids, 1] += breath
+    kp[:, shoulder_ids, 1] += breath * 0.6
+
+    # =========================================================
+    # 🔹 5. SPINE WAVE (low frequency)
+    # =========================================================
+    spine_wave = 0.002 * math.sin(t * 0.8)
 
     kp[:, spine_ids, 1] += spine_wave
-    kp[:, spine_ids, 0] += spine_wave * 0.3
+    kp[:, spine_ids, 0] += spine_wave * 0.2
 
     # =========================================================
-    # 🔹 4. BREATHING (localized torso only)
+    # 🔹 6. HEAD MOTION (very slow inertia)
     # =========================================================
-    breath = 0.007 * math.sin(t * 1.1)
+    head_x = 0.0025 * math.sin(t * 0.9)
+    head_y = 0.0020 * math.cos(t * 0.85)
 
-    kp[:, shoulder_ids, 1] += breath * 0.8
-    kp[:, spine_ids, 1] += breath * 0.5
+    kp[:, head_id, 0] += head_x
+    kp[:, head_id, 1] += head_y
 
-    # =========================================================
-    # 🔹 5. HEAD MOTION (inertial lag)
-    # =========================================================
-    head_motion_x = 0.005 * math.sin(t * 1.4)
-    head_motion_y = 0.004 * math.cos(t * 1.3)
-
-    kp[:, head_id, 0] += head_motion_x
-    kp[:, head_id, 1] += head_motion_y
-
-    # head lag from shoulders (VERY important realism)
-    kp[:, head_id] += (kp[:, 5] - kp[:, 2]) * 0.08
+    # inertia head (très réduit)
+    kp[:, head_id] += (kp[:, 2] - kp[:, 5]) * 0.03
 
     # =========================================================
-    # 🔹 6. LIMB SECONDARY MOTION (passive follow-through)
+    # 🔹 7. LIMBS (quasi static)
     # =========================================================
-    limb_noise = 0.0012 * torch.randn_like(kp[:, limb_ids, :2])
+    limb_noise = 0.0006 * torch.randn_like(kp[:, limb_ids, :2])
     kp[:, limb_ids, :2] += limb_noise
 
-    kp[:, limb_ids] += (kp[:, spine_ids].mean(1).unsqueeze(1) - kp[:, limb_ids]) * 0.02
+    # =========================================================
+    # 🔹 8. MICRO STABILIZATION
+    # =========================================================
+    kp[..., :2] += torch.randn_like(kp[..., :2]) * 0.0004
 
     # =========================================================
-    # 🔹 7. MICRO NOISE (anti-freeze)
-    # =========================================================
-    kp[..., :2] += torch.randn_like(kp[..., :2]) * 0.0008
-
-    # =========================================================
-    # 🔹 8. CLAMP STABILITY
+    # 🔹 9. CLAMP
     # =========================================================
     kp[..., :2] = torch.clamp(kp[..., :2], -1.2, 1.2)
 
@@ -2681,78 +2797,9 @@ def update_pose_sequence_from_keypoints_batch(
     # =========================================================
     if debug:
         motion_strength = (kp - keypoints_tensor).abs().mean()
-        print(f"[DEBUG] motion strength: {motion_strength.item():.6f}")
-        print(f"[DEBUG] sway: {sway:.5f}, breath: {breath:.5f}")
+        print(f"[DEBUG] motion: {motion_strength.item():.6f}")
+        print(f"[DEBUG] motion_scale: {motion_scale}")
+        print(f"[DEBUG] freq t: {t:.4f}")
 
     return kp
-
-def update_pose_sequence_from_keypoints_batch_old(
-    keypoints_tensor,
-    prev_keypoints=None,
-    frame_idx=0,
-    alpha=0.7,        # lissage temporel plus fort
-    add_motion=True,
-    debug=False
-):
-
-    kp = keypoints_tensor.clone()
-    B, N, _ = kp.shape
-    device = kp.device
-
-    # =========================
-    # 🔹 1. SMOOTH TEMPOREL
-    # =========================
-    if prev_keypoints is not None:
-        kp = alpha * kp + (1 - alpha) * prev_keypoints
-
-    # =========================
-    # 🔹 2. MOTION PROCÉDURAL
-    # =========================
-    if add_motion:
-        t = frame_idx * 0.1
-
-        # Respiration (vertical torso + épaules)
-        breath = 0.009 * math.sin(t * 0.15)
-        kp[:, 2, 1] += breath
-        kp[:, 5, 1] += breath
-
-        # Balancement gauche/droite
-        sway = 0.010 * math.sin(t * 0.08)
-        #kp[:, :, 0] += sway
-        torso_ids = [0,1,2,5,8,11]
-        kp[:, torso_ids, 0] += sway
-
-        # Head motion
-        head_idx = 0
-        kp[:, head_idx, 0] += 0.006 * math.sin(t * 0.2)
-        kp[:, head_idx, 1] += 0.006 * math.cos(t * 0.18)
-
-        # Drift lent
-        drift_x = 0.002 * math.sin(t * 0.03)
-        drift_y = 0.002 * math.cos(t * 0.025)
-        #kp[:, :, 0] += drift_x
-        #kp[:, :, 1] += drift_y
-        valid_ids = [0,1,2,5,8,11,14,15,16,17,18,19,20,21,22,23,24]
-
-        kp[:, valid_ids, 0] += drift_x
-        kp[:, valid_ids, 1] += drift_y
-
-        # Micro noise (anti-freeze)
-        noise = torch.randn_like(kp[..., :2]) * 0.0015
-        kp[..., :2] += noise
-
-    # =========================
-    # 🔹 3. STABILISATION
-    # =========================
-    kp[..., :2] = torch.clamp(kp[..., :2], -1.2, 1.2)
-
-    # =========================
-    # 🔹 4. DEBUG
-    # =========================
-    if debug:
-        motion_strength = (kp - keypoints_tensor).abs().mean()
-        print(f"[DEBUG] Keypoint motion strength: {motion_strength.item():.6f}")
-
-    return kp
-
 
