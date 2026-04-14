@@ -81,7 +81,7 @@ def apply_motion_safe(latents, motion_module, threshold=1e-3):
     return motion_module(latents), True
 
 def save_input_frame(input_image, output_dir, frame_counter, pbar=None,
-                     blur_radius=0.0, contrast=1.0, saturation=1.0, apply_post=False):
+                     blur_radius=0.0, contrast=1.0, saturation=1.0, apply_post=False, prefix=None):
     try:
         from torchvision.transforms.functional import to_pil_image
 
@@ -105,7 +105,10 @@ def save_input_frame(input_image, output_dir, frame_counter, pbar=None,
             )
 
         # Save
-        img_pil.save(output_dir / f"frame_{frame_counter:05d}_00.png")
+        if prefix is None:
+            img_pil.save(output_dir / f"frame_{frame_counter:05d}_00.png")
+        else:
+            img_pil.save(output_dir / f"input_frame_{frame_counter:05d}_00.png")
         print(f"[INPUT SAVE Frame {frame_counter:03d}_00]")
 
         # Update compteur + progress bar
@@ -435,10 +438,27 @@ def get_interpolated_embeddings_s(frame_idx, frames_per_prompt, pos_list, neg_li
     return pos.to(device), neg.to(device)
 
 
-def compute_overlap(W, H, block_size, max_overlap_ratio=0.5, min_overlap=8):
-    overlap = int(block_size * max_overlap_ratio)
-    overlap = min(overlap, min(W, H) // 4)
-    overlap = max(overlap, min_overlap)
+def compute_overlap(W, H, block_size):
+    """
+    Retourne l'overlap pour le tiling de manière sécurisée.
+    - Pour block_size=48, retourne 16.
+    - Sinon, calcule un overlap par défaut à 1/3 du block_size,
+      mais jamais supérieur à 1/4 de la dimension de l'image.
+    """
+    if block_size == 48:
+        overlap = 16
+    elif block_size == 64:
+        overlap = 16
+    elif block_size == 32:
+        overlap = 16
+    else:
+        overlap = max(int(block_size / 3), 8)
+        overlap = min(overlap, min(W, H) // 4)
+
+    # ⚠ Sécuriser pour que le dernier bloc ne soit pas nul
+    if block_size - overlap <= 0:
+        overlap = max(block_size - 1, 1)
+
     return overlap
 
 # ---------------- DEBUG UTILS ----------------

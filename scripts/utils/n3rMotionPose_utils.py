@@ -1329,7 +1329,8 @@ def apply_face_warp(
     debug=False,
     debug_dir=None,
     smooth=0.85,
-    prev_grid=None
+    prev_grid=None,
+    strength=2.0
 ):
     if device is None:
         device = latents.device
@@ -1354,12 +1355,12 @@ def apply_face_warp(
     # =========================
     face_delta = torch.zeros((B, H, W, 2), device=device)
 
-    # mouvement global visage (IMPORTANT: facteur augmenté x5~10)
+    # mouvement global visage
     dx = 0.03 * torch.sin(t * 2.0)
     dy = 0.04 * torch.sin(t * 1.7)
 
-    face_delta[..., 0] += dx
-    face_delta[..., 1] += dy
+    face_delta[..., 0] += strength * dx
+    face_delta[..., 1] += strength * dy
 
     # =========================
     # 🔥 WIND MICRO MOTION (structure corrigée)
@@ -1373,8 +1374,8 @@ def apply_face_warp(
     wind1 = torch.sin(t * 1.5)
     wind2 = torch.cos(t * 1.1)
 
-    face_delta[..., 0] += mask[..., 0] * 0.02 * wind1
-    face_delta[..., 1] += mask[..., 0] * 0.015 * wind2
+    face_delta[..., 0] += strength * mask[..., 0] * 0.02 * wind1
+    face_delta[..., 1] += strength * mask[..., 0] * 0.015 * wind2
 
     if debug:
         print("FACE DELTA MEAN:", face_delta.abs().mean().item())
@@ -1397,7 +1398,7 @@ def apply_face_warp(
     # 🔥 TEMPORAL SMOOTHING
     # =========================
     if prev_grid is not None:
-        alpha = 0.7  # moins fort que 0.85 sinon ça freeze
+        alpha = 0.7
         grid_face = alpha * prev_grid + (1.0 - alpha) * grid_face
 
     # =========================
@@ -1425,90 +1426,7 @@ def apply_face_warp(
 
     return latents_out, face_delta, facial_points
 
-def apply_face_warp_v2(
-    latents,
-    pose,
-    mask_face,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device=None,
-    debug=False,
-    debug_dir=None,
-    smooth=0.85,
-    prev_grid=None
-):
-    """
-    Warp global du visage (hors bouche) avec micro-mouvements et vent.
-    Supporte le lissage temporel via prev_grid si fourni.
-    """
-    if device is None:
-        device = latents.device
-
-    B, C, H, W = latents.shape
-    latents_in = latents.clone()
-
-    # =========================
-    # Points faciaux
-    # =========================
-    facial_points = pose.estimate_facial_points_full(smooth=smooth)
-    pose.set_prev_facial_points(facial_points)
-
-    # =========================
-    # Temps
-    # =========================
-    t_micro  = torch.tensor(frame_counter / 5.0, device=device)
-    t_wind1  = torch.tensor(frame_counter / 15.0, device=device)
-    t_wind2  = torch.tensor(frame_counter / 60.0, device=device)
-
-    # =========================
-    # Déplacements micro-visage
-    # =========================
-    face_delta = torch.zeros((B,1,1,2), device=device)
-    face_delta[...,0] += 0.006 * torch.sin(t_micro)
-    face_delta[...,1] += 0.009 * torch.sin(t_micro * 1.5)
-    print("FACE DELTA MEAN:", face_delta.abs().mean().item())
-    face_delta_exp = face_delta.expand(B,H,W,2).clone()
-
-    # =========================
-    # Micro-oscillations visage (vent)
-    # =========================
-    mask_face_exp = mask_face.permute(0,2,3,1)
-    face_delta_exp[...,0] += mask_face_exp[...,0] * 0.004 * torch.sin(t_wind1)
-    face_delta_exp[...,1] += mask_face_exp[...,0] * 0.003 * torch.sin(t_wind2)
-
-    # =========================
-    # Centre visage (nez)
-    # =========================
-    face_center = pose.get_point(0)
-    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
-    face_center_px = face_center_px.view(B,1,1,2)
-
-    # =========================
-    # Warp
-    # =========================
-    grid_face = grid.clone() - face_center_px
-    grid_face = grid_face + face_delta_exp
-    grid_face = grid_face + face_center_px
-
-    # =========================
-    # Lissage temporel si prev_grid fourni
-    # =========================
-    if prev_grid is not None:
-        alpha = 0.85  # coefficient de lissage
-        grid_face = alpha * prev_grid + (1.0 - alpha) * grid_face
-
-    grid_face[...,0] = 2.0 * grid_face[...,0] / (W-1) - 1.0
-    grid_face[...,1] = 2.0 * grid_face[...,1] / (H-1) - 1.0
-
-    latents_out = F.grid_sample(latents, grid_face, align_corners=True)
-
-    if debug:
-        save_impact_map(latents_out, latents_in, debug_dir, frame_counter, prefix="face")
-        print("[DEBUG] Face warp applied")
-
-    return latents_out, face_delta_exp, facial_points
+#--------------------------------------------------------------------
 
 
 def apply_mouth_smil(
