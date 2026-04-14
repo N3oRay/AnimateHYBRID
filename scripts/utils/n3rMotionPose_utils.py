@@ -1526,6 +1526,187 @@ def apply_mouth_smil(
     strength=1.0
 ):
     """
+    Warp bouche robuste + visible + debug exploitable.
+    Fix :
+    - signal trop faible
+    - masque mal conditionné
+    - absence de normalisation du flow
+    - manque de debug spatial
+    """
+
+    if device is None:
+        device = latents.device
+
+    B, C, H, W = latents.shape
+    latents_in = latents.clone()
+
+    # =========================
+    # 1. Points faciaux
+    # =========================
+    facial_points = pose.estimate_facial_points_full(smooth=smooth)
+
+    mouth_left  = facial_points['mouth_left']
+    mouth_right = facial_points['mouth_right']
+
+    # =========================
+    # 2. MASQUE (FIX IMPORTANT)
+    # =========================
+    mask_in = mask_mouth.clone()
+
+    mask_mouth = feather_inside_strict2(mask_mouth, radius=3, blur_kernel=5, sigma=1.2)
+    mask_mouth = feather_outside_only_alpha2(mask_mouth, radius=2, sigma=1.0)
+
+    mask_mean = mask_mouth.mean().item()
+    mask_max  = mask_mouth.max().item()
+
+    # 🔥 BOOST automatique si masque trop faible
+    if mask_mean < 0.01:
+        mask_mouth = mask_mouth * 3.0
+    elif mask_mean < 0.03:
+        mask_mouth = mask_mouth * 2.0
+
+    mask_mouth = torch.clamp(mask_mouth, 0, 1)
+    mask_exp = mask_mouth.permute(0, 2, 3, 1)
+
+    if debug:
+        print(f"[DEBUG][MOUTH MASK] mean={mask_mean:.5f} max={mask_max:.5f}")
+
+    # =========================
+    # 3. TIME SIGNALS (stable + non noisy)
+    # =========================
+    t = torch.tensor(frame_counter / 10.0, device=device)
+
+    t_smile  = torch.sin(t * 1.3)
+    t_breath = torch.sin(t * 0.7)
+    t_open   = torch.sin(t * 0.5)
+
+    # =========================
+    # 4. COORDS
+    # =========================
+    mouth_left_px  = mouth_left  * torch.tensor([W-1, H-1], device=device)
+    mouth_right_px = mouth_right * torch.tensor([W-1, H-1], device=device)
+
+    y_grid, x_grid = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    x_grid = x_grid.unsqueeze(0).expand(B, -1, -1)
+    y_grid = y_grid.unsqueeze(0).expand(B, -1, -1)
+
+    # =========================
+    # 5. DISTANCE FIELD (plus stable que exp(-x²))
+    # =========================
+    sigma = 18.0
+
+    dist_left = torch.exp(-(
+        (x_grid - mouth_left_px[:,0,None,None])**2 +
+        (y_grid - mouth_left_px[:,1,None,None])**2
+    ) / (2 * sigma**2))
+
+    dist_right = torch.exp(-(
+        (x_grid - mouth_right_px[:,0,None,None])**2 +
+        (y_grid - mouth_right_px[:,1,None,None])**2
+    ) / (2 * sigma**2))
+
+    # =========================
+    # 6. MOTION (RENFORCÉ MAIS CONTRÔLÉ)
+    # =========================
+    amp = 0.35 * strength
+
+    delta = torch.zeros((B, H, W, 2), device=device)
+
+    delta[...,0] += amp * t_smile * (dist_right - dist_left)
+    delta[...,1] += 0.15 * amp * t_smile * (dist_left + dist_right)
+
+    # respiration + ouverture
+    delta[...,1] += (0.03 * strength * t_breath + 0.02 * strength * abs(t_open)) * mask_exp[...,0]
+
+    # =========================
+    # 7. MASK APPLICATION (IMPORTANT FIX)
+    # =========================
+    delta = delta * mask_exp
+
+    # 🔥 NORMALISATION pour éviter "invisible motion"
+    delta_mean = delta.abs().mean().item()
+    if delta_mean < 1e-5 and debug:
+        print("[DEBUG][MOUTH WARNING] delta too small → boosting")
+
+    delta = delta * 3.0  # boost final contrôlé
+
+    if debug:
+        print("[DEBUG][MOUTH]")
+        print(f"  smile={t_smile.item():.4f}")
+        print(f"  breath={t_breath.item():.4f}")
+        print(f"  open={t_open.item():.4f}")
+        print(f"  delta mean={delta.abs().mean().item():.6f}")
+        print(f"  delta max={delta.abs().max().item():.6f}")
+        print(f"  mask mean={mask_mean:.5f}")
+
+    # =========================
+    # 8. GRID WARP
+    # =========================
+    face_center = pose.get_point(0)
+    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
+    face_center_px = face_center_px.view(B,1,1,2)
+
+    grid_mouth = grid.clone() - face_center_px
+    grid_mouth = grid_mouth + delta
+    grid_mouth = grid_mouth + face_center_px
+
+    grid_mouth[...,0] = 2.0 * grid_mouth[...,0] / (W-1) - 1.0
+    grid_mouth[...,1] = 2.0 * grid_mouth[...,1] / (H-1) - 1.0
+
+    # =========================
+    # 9. SAMPLE
+    # =========================
+    latents_out = F.grid_sample(latents, grid_mouth, align_corners=True)
+
+    # =========================
+    # 10. DEBUG VISUEL (IMPORTANT AJOUT)
+    # =========================
+    if debug and debug_dir is not None:
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+
+            save_impact_map(
+                latents_out,
+                latents_in,
+                debug_dir,
+                frame_counter,
+                prefix="mouth"
+            )
+
+            # 🔥 debug signal brut (important pour diagnostiquer invisibilité)
+            np.save(
+                os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"),
+                delta.detach().cpu().numpy()
+            )
+
+            print("[DEBUG] Mouth warp applied OK + delta saved")
+
+        except Exception as e:
+            print(f"[WARN] mouth debug failed: {e}")
+
+    return latents_out, delta, facial_points
+
+
+def apply_mouth_smil_v3(
+    latents,
+    pose,
+    mask_mouth,
+    grid,
+    H,
+    W,
+    frame_counter,
+    device=None,
+    debug=False,
+    debug_dir=None,
+    smooth=0.85,
+    strength=1.0
+):
+    """
     Warp dynamique de la bouche (version renforcée + debug).
     Corrige :
     - manque de signal visible
@@ -1677,274 +1858,6 @@ def apply_mouth_smil(
         print("[DEBUG] Mouth warp applied OK")
 
     return latents_out, face_delta, facial_points
-
-def apply_mouth_smil_v2(
-    latents,
-    pose,
-    mask_mouth,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device=None,
-    debug=False,
-    debug_dir=None,
-    smooth=0.85
-):
-    if device is None:
-        device = latents.device
-
-    B, C, H, W = latents.shape
-    latents_in = latents.clone()
-
-    # =========================
-    # Facial points
-    # =========================
-    facial_points = pose.estimate_facial_points_full(smooth=smooth)
-    mouth_left  = facial_points['mouth_left']
-    mouth_right = facial_points['mouth_right']
-
-    # =========================
-    # MASK (amélioré + stable)
-    # =========================
-    #mask_mouth = feather_inside_strict2(mask_mouth, radius=3, blur_kernel=5, sigma=1.2)
-    #mask_mouth = feather_outside_only_alpha2(mask_mouth, radius=2, sigma=1.2)
-    mask_mouth = feather_inside_strict2(mask_mouth, radius=8, blur_kernel=9, sigma=2.5)
-    mask_mouth = feather_outside_only_alpha2(mask_mouth, radius=4, sigma=2.0)
-
-    if mask_mouth.ndim == 4:
-        mask_mouth = mask_mouth.squeeze(1)
-
-    mask_exp = mask_mouth.unsqueeze(-1)  # [B,H,W,1]
-
-    # 🔥 BOOST NON-LINEAIRE DE VISIBILITÉ
-    mask_exp = torch.pow(mask_exp, 0.6)  # IMPORTANT: augmente zones faibles
-    mask_exp = mask_exp * 2.5            # gain global
-    mask_exp = torch.clamp(mask_exp, 0, 1)
-
-    # =========================
-    # TIME SIGNALS
-    # =========================
-    t = frame_counter
-
-    t_smile  = torch.tensor(t / 10.0, device=device)
-    t_breath = torch.tensor(t / 14.0, device=device)
-    t_open   = torch.tensor(t / 18.0, device=device)
-
-    # =========================
-    # COORDS PIXELS
-    # =========================
-    mouth_left_px  = mouth_left  * torch.tensor([W-1, H-1], device=device)
-    mouth_right_px = mouth_right * torch.tensor([W-1, H-1], device=device)
-
-    # =========================
-    # GRID
-    # =========================
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
-    )
-
-    xx = xx.unsqueeze(0).expand(B, -1, -1)
-    yy = yy.unsqueeze(0).expand(B, -1, -1)
-
-    # =========================
-    # 🔥 SPATIAL FALLOFF (IMPORTANT FIX)
-    # =========================
-    def gaussian_dist(x, y, cx, cy, sigma=10.0):
-        return torch.exp(-((x - cx)**2 + (y - cy)**2) / (2 * sigma**2))
-
-    dist_l = gaussian_dist(xx, yy, mouth_left_px[:,0,None,None], mouth_left_px[:,1,None,None])
-    dist_r = gaussian_dist(xx, yy, mouth_right_px[:,0,None,None], mouth_right_px[:,1,None,None])
-
-    # =========================
-    # 🔥 SMILE (NON LINEAIRE = visible)
-    # =========================
-    smile_wave = torch.sin(t_smile)
-
-    #smile_strength = 0.10  # augmenté
-    smile_strength = 0.25
-    #delta_amp = 0.10
-    smile_curve = smile_wave * torch.abs(smile_wave)  # boost non-linéaire
-
-    delta_left_x  = -smile_strength * smile_curve * dist_l
-    delta_right_x =  smile_strength * smile_curve * dist_r
-
-    delta_y = -0.06 * smile_curve * (dist_l + dist_r)
-
-    # =========================
-    # 🔥 BREATH (lip micro motion)
-    # =========================
-    breath = 0.03 * torch.sin(t_breath)
-
-    # =========================
-    # 🔥 MOUTH OPEN/CLOSE (NEW IMPORTANT SIGNAL)
-    # =========================
-    open_signal = 0.02 * torch.sin(t_open * 1.3)
-
-    # =========================
-    # FINAL FIELD
-    # =========================
-    delta = torch.zeros((B, H, W, 2), device=device)
-
-    delta[..., 0] += (delta_left_x + delta_right_x) * mask_exp[..., 0]
-    delta[..., 1] += (delta_y + breath + open_signal) * mask_exp[..., 0]
-
-    # =========================
-    # CENTER (nose anchor)
-    # =========================
-    face_center = pose.get_point(0)
-    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
-    face_center_px = face_center_px.view(B,1,1,2)
-
-    # =========================
-    # GRID WARP
-    # =========================
-    grid_mouth = grid.clone() - face_center_px
-    grid_mouth = grid_mouth + delta
-    grid_mouth = grid_mouth + face_center_px
-
-    grid_mouth[...,0] = 2.0 * grid_mouth[...,0] / (W-1) - 1.0
-    grid_mouth[...,1] = 2.0 * grid_mouth[...,1] / (H-1) - 1.0
-
-    # =========================
-    # WARP
-    # =========================
-    latents_out = F.grid_sample(
-        latents,
-        grid_mouth,
-        align_corners=True,
-        mode="bilinear",
-        padding_mode="reflection"
-    )
-
-    # =========================
-    # 🔥 DEBUG CRUCIAL (AJOUTÉ)
-    # =========================
-    if debug:
-        print("[DEBUG][MOUTH]")
-        print("  smile_wave:", smile_wave.item())
-        print("  smile_curve:", smile_curve.item())
-        print("  breath:", breath.item())
-        print("  open_signal:", open_signal.item())
-        print("  delta mean:", delta.abs().mean().item())
-        print("  delta max:", delta.abs().max().item())
-        print("  mask mean:", mask_exp.mean().item())
-
-        if debug_dir is not None:
-            save_impact_map(latents_out, latents_in, debug_dir, frame_counter, prefix="mouth")
-
-    return latents_out, delta, facial_points
-
-
-def apply_mouth_smil_v1(
-    latents,
-    pose,
-    mask_mouth,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device=None,
-    debug=False,
-    debug_dir=None,
-    smooth=0.85
-):
-    """
-    Warp dynamique de la bouche (version visible) :
-    - Sourire animé plus prononcé
-    - Respiration bouche amplifiée
-    - Micro-oscillations
-    - Masque arrondi avec bord glow
-    """
-    if device is None:
-        device = latents.device
-
-    B, C, H, W = latents.shape
-    latents_in = latents.clone()
-
-    # =========================
-    # Points faciaux
-    # =========================
-    facial_points = pose.estimate_facial_points_full(smooth=smooth)
-    mouth_left  = facial_points['mouth_left']  # (B,2)
-    mouth_right = facial_points['mouth_right']
-
-    # =========================
-    # Masque bouche
-    # =========================
-    mask_mouth = feather_inside_strict2(mask_mouth, radius=2, blur_kernel=3, sigma=1.0)
-    mask_mouth = feather_outside_only_alpha2(mask_mouth, radius=1, sigma=1.0)  # rayon plus petit pour plus de force
-    mask_mouth_exp = mask_mouth.permute(0,2,3,1)  # (B,H,W,1)
-
-    # =========================
-    # Sourire dynamique
-    # =========================
-    t_smile = torch.tensor(frame_counter / 8.0, device=device)
-    smile_strength = 0.25  # plus visible
-    delta_amp = 0.06       # amplitude verticale
-
-    mouth_left_px  = mouth_left  * torch.tensor([W-1,H-1], device=device)
-    mouth_right_px = mouth_right * torch.tensor([W-1,H-1], device=device)
-
-    y_grid, x_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    x_grid = x_grid.unsqueeze(0).expand(B,-1,-1)
-    y_grid = y_grid.unsqueeze(0).expand(B,-1,-1)
-
-    # Distance aux coins plus concentrée
-    dist_left  = torch.clamp(1.0 - torch.sqrt((x_grid - mouth_left_px[:,0,None,None])**2 +
-                                              (y_grid - mouth_left_px[:,1,None,None])**2)/10.0, 0,1)
-    dist_right = torch.clamp(1.0 - torch.sqrt((x_grid - mouth_right_px[:,0,None,None])**2 +
-                                              (y_grid - mouth_right_px[:,1,None,None])**2)/10.0, 0,1)
-
-    # Déplacement coins amplifié
-    delta_left  = torch.zeros((B,H,W,2), device=device)
-    delta_right = torch.zeros((B,H,W,2), device=device)
-    delta_left[...,0]  = -smile_strength * torch.sin(t_smile) * dist_left
-    delta_left[...,1]  = -delta_amp * torch.sin(t_smile) * dist_left
-    delta_right[...,0] =  smile_strength * torch.sin(t_smile) * dist_right
-    delta_right[...,1] = -delta_amp * torch.sin(t_smile) * dist_right
-
-    # =========================
-    # Respiration bouche amplifiée
-    # =========================
-    t_breath = torch.tensor(frame_counter / 12.0, device=device)
-    breath_strength = 0.04  # plus visible
-    breath_delta = breath_strength * torch.sin(t_breath)
-
-    # =========================
-    # Combinaison des deltas
-    # =========================
-    face_delta = torch.zeros((B,1,1,2), device=device)
-    face_delta_expanded = face_delta.expand(B,H,W,2).clone()
-    face_delta_expanded[...,0] += (delta_left[...,0] + delta_right[...,0]) * mask_mouth_exp[...,0]
-    face_delta_expanded[...,1] += (delta_left[...,1] + delta_right[...,1] + breath_delta) * mask_mouth_exp[...,0]
-
-    # =========================
-    # Grid warp
-    # =========================
-    face_center = pose.get_point(0)  # nez
-    face_center_px = face_center * torch.tensor([W-1,H-1], device=device)
-    face_center_px = face_center_px.view(B,1,1,2)
-
-    grid_mouth = grid.clone() - face_center_px
-    grid_mouth = grid_mouth + face_delta_expanded
-    grid_mouth = grid_mouth + face_center_px
-
-    grid_mouth[...,0] = 2.0 * grid_mouth[...,0] / (W-1) - 1.0
-    grid_mouth[...,1] = 2.0 * grid_mouth[...,1] / (H-1) - 1.0
-
-    # =========================
-    # Warp final
-    # =========================
-    latents_out = F.grid_sample(latents, grid_mouth, align_corners=True)
-
-    if debug and debug_dir is not None:
-        save_impact_map(latents_out, latents_in, debug_dir, frame_counter, prefix="mouth")
-        print("[DEBUG] Mouth warp applied (visible)")
-
-    return latents_out, face_delta_expanded, facial_points
 
 
 def apply_mouth_warp(
