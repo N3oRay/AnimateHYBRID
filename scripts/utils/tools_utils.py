@@ -6,6 +6,8 @@ import hashlib
 from PIL import Image, ImageEnhance
 from torchvision.transforms import ToPILImage
 from torchvision.transforms import functional as F
+from torchvision.transforms.functional import to_pil_image
+
 from .fx_utils import apply_post_processing_adaptive
 
 LATENT_SCALE = 0.18215  # valeur globale, peut être importée si nécessaire
@@ -13,9 +15,10 @@ LATENT_SCALE = 0.18215  # valeur globale, peut être importée si nécessaire
 import json
 import torch
 from pathlib import Path
+import ffmpeg
 
 
-# ---------------- Utilitaires prompt ----------------
+# ---------------- Utilitaires prompt --------------------------------
 def encode_prompts_batch(prompts, negative_prompts, tokenizer, text_encoder,
                          device="cuda", projection=None):
     """
@@ -83,7 +86,6 @@ def apply_motion_safe(latents, motion_module, threshold=1e-3):
 def save_input_frame(input_image, output_dir, frame_counter, pbar=None,
                      blur_radius=0.0, contrast=1.0, saturation=1.0, apply_post=False, prefix=None):
     try:
-        from torchvision.transforms.functional import to_pil_image
 
         # Tensor → CPU + clamp
         img = input_image[0].detach().cpu().clamp(-1, 1)
@@ -480,7 +482,6 @@ def sanitize_latents(
     max_momentum=0.95,        # momentum maximum pour ultra stabilité
     debug=False
 ):
-    import torch
 
     # --- 1. Nettoyage NaN / Inf ---
     latents = torch.nan_to_num(latents, nan=0.0, posinf=max_val, neginf=-max_val)
@@ -533,7 +534,6 @@ def sanitize_latents_adaptive(
     eps=1e-6,
     debug=False
 ):
-    import torch
 
     latents = torch.nan_to_num(latents, nan=0.0, posinf=max_val, neginf=-max_val)
 
@@ -581,7 +581,6 @@ def sanitize_latents_hard(
     eps=1e-6,
     debug=False
 ):
-    import torch
 
     # --- 1. Nettoyage NaN / Inf (safe)
     latents = torch.nan_to_num(latents, nan=0.0, posinf=max_val, neginf=-max_val)
@@ -765,8 +764,7 @@ def ensure_4_channels(latents):
 # ---------------- Video utils ----------------
 def save_frames_as_video_from_folder(folder_path, output_path, fps=12):
     """Sauvegarde un dossier de frames PNG en vidéo mp4 via ffmpeg"""
-    import ffmpeg
-    from pathlib import Path
+
     folder_path = Path(folder_path)
     frame_files = sorted(folder_path.glob("frame_*.png"))
     if not frame_files:
