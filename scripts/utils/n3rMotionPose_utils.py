@@ -1523,7 +1523,7 @@ def apply_mouth_smil(
     debug=False,
     debug_dir=None,
     smooth=0.85,
-    strength=2.0
+    strength=2.3
 ):
 
     if device is None:
@@ -1578,140 +1578,14 @@ def apply_mouth_smil(
     if debug and debug_dir is not None:
         try:
             os.makedirs(debug_dir, exist_ok=True)
-
-            save_impact_map(
-                latents_out,
-                latents_in,
-                debug_dir,
-                frame_counter,
-                prefix="mouth"
-            )
-
-            np.save(
-                os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"),
-                delta.detach().cpu().numpy()
-            )
-
+            save_impact_map( latents_out, latents_in, debug_dir, frame_counter, prefix="mouth" )
+            np.save( os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"), delta.detach().cpu().numpy() )
             print("[DEBUG] Mouth warp applied OK + delta saved")
-
         except Exception as e:
             print(f"[WARN] mouth debug failed: {e}")
 
     return latents_out, delta, facial_points
 
-
-def apply_mouth_warp(
-    latents,
-    pose,
-    mask_mouth,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device=None,
-    debug=False,
-    debug_dir=None,
-    smooth=0.85
-):
-    """
-    Warp spécifique de la bouche :
-    - Sourire dynamique
-    - Respiration bouche
-    - Micro-oscillations
-    """
-    if device is None:
-        device = latents.device
-
-    B, C, H, W = latents.shape
-    latents_in = latents.clone()
-
-    # =========================
-    # Points faciaux
-    # =========================
-    facial_points = pose.estimate_facial_points_full(smooth=smooth)
-
-    # =========================
-    # Masque bouche
-    # =========================
-    #mouth_mask = pose.create_mouth_mask(H, W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
-    mouth_mask_exp = mask_mouth.permute(0, 2, 3, 1)  # (B,H,W,1) pour broadcast
-
-    # =========================
-    # Sourire (coins de la bouche)
-    # =========================
-    mouth_left  = facial_points['mouth_left']
-    mouth_right = facial_points['mouth_right']
-
-    # Conversion pixels
-    mouth_left_px  = mouth_left  * torch.tensor([W-1,H-1], device=device)
-    mouth_right_px = mouth_right * torch.tensor([W-1,H-1], device=device)
-
-    # Grille pixel
-    y_grid, x_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    x_grid = x_grid.unsqueeze(0).expand(B, -1, -1)
-    y_grid = y_grid.unsqueeze(0).expand(B, -1, -1)
-
-    # Distance normalisée aux coins
-    dist_left  = torch.clamp(1.0 - torch.sqrt((x_grid - mouth_left_px[:,0,None,None])**2 +
-                                              (y_grid - mouth_left_px[:,1,None,None])**2)/20.0, 0,1)
-    dist_right = torch.clamp(1.0 - torch.sqrt((x_grid - mouth_right_px[:,0,None,None])**2 +
-                                              (y_grid - mouth_right_px[:,1,None,None])**2)/20.0, 0,1)
-
-    # Déplacement coins
-    t_smile = torch.tensor(frame_counter / 8.0, device=device)
-    smile_strength = 0.12
-    delta_left  = torch.zeros((B,H,W,2), device=device)
-    delta_right = torch.zeros((B,H,W,2), device=device)
-
-    delta_left[...,0]  = -smile_strength * torch.sin(t_smile) * dist_left
-    delta_left[...,1]  = -0.03 * torch.sin(t_smile) * dist_left
-    delta_right[...,0] =  smile_strength * torch.sin(t_smile) * dist_right
-    delta_right[...,1] = -0.03 * torch.sin(t_smile) * dist_right
-
-    # =========================
-    # Respiration bouche
-    # =========================
-    t_breath = torch.tensor(frame_counter / 12.0, device=device)
-    breath_strength = 0.018
-    breath_delta = breath_strength * torch.sin(t_breath)
-
-    # =========================
-    # Combinaison des deltas
-    # =========================
-    face_delta = torch.zeros((B,1,1,2), device=device)
-    face_delta_expanded = face_delta.expand(B,H,W,2).clone()
-    face_delta_expanded[...,0] += (delta_left[...,0] + delta_right[...,0]) * mouth_mask_exp[...,0]
-    face_delta_expanded[...,1] += (delta_left[...,1] + delta_right[...,1] + breath_delta) * mouth_mask_exp[...,0]
-
-    # =========================
-    # Grid warp
-    # =========================
-    # Centre visage (pour référence, optionnel)
-    face_center = pose.get_point(0)  # nez
-    face_center_px = face_center * torch.tensor([W-1,H-1], device=device)
-    face_center_px = face_center_px.view(B,1,1,2)
-
-    grid_mouth = grid.clone() - face_center_px
-    grid_mouth = grid_mouth + face_delta_expanded
-    grid_mouth = grid_mouth + face_center_px
-
-    # Normalisation [-1,1]
-    grid_mouth[...,0] = 2.0 * grid_mouth[...,0] / (W-1) - 1.0
-    grid_mouth[...,1] = 2.0 * grid_mouth[...,1] / (H-1) - 1.0
-
-    # =========================
-    # Warp final
-    # =========================
-    latents_out = F.grid_sample(latents, grid_mouth, align_corners=True)
-
-    # =========================
-    # Debug
-    # =========================
-    if debug and debug_dir is not None:
-        save_impact_map(latents_out, latents_in, debug_dir, frame_counter, prefix="mouth")
-        print("[DEBUG] Mouth warp applied")
-
-    return latents_out, face_delta_expanded, facial_points
 #-------------------------------------------------test -----------------------------------------
 def normalize_mask(mask):
     m = mask.mean().clamp(1e-6, 0.2)
