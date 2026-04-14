@@ -344,6 +344,160 @@ class Pose:
         frame_counter: int = 0,
         expand_w=0.45,
         expand_h=0.35,
+        min_size=6,  # ↑ un peu plus robuste que 4
+        auto_boost_low_mask=True  # 🔥 nouveau
+    ):
+        """
+        Masque bouche robuste + debug avancé + correction instabilité géométrique
+        """
+
+        if device is None:
+            device = self.device
+
+        B = self.B
+        mask = torch.zeros((B, 1, H, W), device=device)
+
+        try:
+            points_dict = self.estimate_missing_facial_points()
+        except Exception as e:
+            print(f"[WARN] mouth_region: estimation failed → fallback empty ({e})")
+            return mask
+
+        required_keys = ['mouth_left', 'mouth_right', 'mouth_top', 'mouth_bottom']
+
+        if not all(k in points_dict for k in required_keys):
+            print("[WARN] mouth_region: missing keys")
+            return mask
+
+        mouth_left   = points_dict['mouth_left']
+        mouth_right  = points_dict['mouth_right']
+        mouth_top    = points_dict['mouth_top']
+        mouth_bottom = points_dict['mouth_bottom']
+
+        for b in range(B):
+
+            pts = torch.stack([
+                mouth_left[b],
+                mouth_right[b],
+                mouth_top[b],
+                mouth_bottom[b]
+            ])
+
+            if torch.isnan(pts).any():
+                print(f"[WARN] mouth_region: NaN batch {b}")
+                continue
+
+            # =========================
+            # centre & dimensions
+            # =========================
+            x_center = (mouth_left[b,0] + mouth_right[b,0]) * 0.5
+            y_center = (mouth_top[b,1] + mouth_bottom[b,1]) * 0.5
+
+            width  = torch.abs(mouth_right[b,0] - mouth_left[b,0])
+            height = torch.abs(mouth_bottom[b,1] - mouth_top[b,1])
+
+            # =========================
+            # DEBUG geometry sanity
+            # =========================
+            if debug:
+                print(f"[DEBUG][MOUTH REGION]")
+                print(f"  center: ({x_center.item():.4f}, {y_center.item():.4f})")
+                print(f"  width: {width.item():.6f} height: {height.item():.6f}")
+
+            # fallback si dégénéré
+            if width < 1e-4 or height < 1e-4:
+                width  = torch.tensor(0.06, device=device)
+                height = torch.tensor(0.06, device=device)
+
+            # =========================
+            # expansion adaptive
+            # =========================
+            width  = width  * (1 + expand_w)
+            height = height * (1 + expand_h)
+
+            # =========================
+            # pixel conversion
+            # =========================
+            x_min = int((x_center - width * 0.5) * (W - 1))
+            x_max = int((x_center + width * 0.5) * (W - 1))
+            y_min = int((y_center - height * 0.5) * (H - 1))
+            y_max = int((y_center + height * 0.5) * (H - 1))
+
+            # clamp
+            x_min = max(0, min(W - 1, x_min))
+            x_max = max(0, min(W - 1, x_max))
+            y_min = max(0, min(H - 1, y_min))
+            y_max = max(0, min(H - 1, y_max))
+
+            # =========================
+            # min size enforcement
+            # =========================
+            if (x_max - x_min) < min_size:
+                cx = (x_min + x_max) // 2
+                x_min = max(0, cx - min_size // 2)
+                x_max = min(W - 1, cx + min_size // 2)
+
+            if (y_max - y_min) < min_size:
+                cy = (y_min + y_max) // 2
+                y_min = max(0, cy - min_size // 2)
+                y_max = min(H - 1, cy + min_size // 2)
+
+            # =========================
+            # build mask
+            # =========================
+            mask[b, 0, y_min:y_max + 1, x_min:x_max + 1] = 1.0
+
+            # =========================
+            # AUTO BOOST (important pour ton log)
+            # =========================
+            if auto_boost_low_mask:
+                area = (x_max - x_min) * (y_max - y_min)
+                if area < 80:  # trop petit → ton problème actuel
+                    mask[b] *= 1.5
+
+        # =========================
+        # feather safe
+        # =========================
+        try:
+            mask = feather_outside_only_alpha(mask, radius=4, sigma=1.8)
+        except Exception as e:
+            print(f"[WARN] mouth_region: feather failed ({e})")
+
+        # =========================
+        # DEBUG VISUAL ULTRA IMPORTANT
+        # =========================
+        if debug and debug_dir is not None:
+            try:
+                os.makedirs(debug_dir, exist_ok=True)
+
+                m = mask[0, 0].detach().cpu().numpy()
+
+                print(f"[DEBUG][MOUTH MASK] mean={m.mean():.6f} max={m.max():.6f}")
+
+                img = (m * 255).astype(np.uint8)
+                img = cv2.resize(img, (W * 4, H * 4), interpolation=cv2.INTER_NEAREST)
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+                path = os.path.join(debug_dir, f"mouth_mask_{frame_counter:05d}.png")
+                cv2.imwrite(path, img)
+
+                print(f"[DEBUG] Mouth mask saved: {path}")
+
+            except Exception as e:
+                print(f"[WARN] mouth_region: debug failed ({e})")
+
+        return mask
+
+    def get_mouth_region_mini(
+        self,
+        H: int,
+        W: int,
+        device=None,
+        debug: bool = False,
+        debug_dir: str = None,
+        frame_counter: int = 0,
+        expand_w=0.45,
+        expand_h=0.35,
         min_size=4  # 🔥 taille minimale en pixels
     ):
         """
