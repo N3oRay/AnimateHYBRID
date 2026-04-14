@@ -1692,174 +1692,6 @@ def apply_mouth_smil(
     return latents_out, delta, facial_points
 
 
-def apply_mouth_smil_v3(
-    latents,
-    pose,
-    mask_mouth,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device=None,
-    debug=False,
-    debug_dir=None,
-    smooth=0.85,
-    strength=1.0
-):
-    """
-    Warp dynamique de la bouche (version renforcée + debug).
-    Corrige :
-    - manque de signal visible
-    - masquage trop agressif
-    - absence de debug exploitable
-    """
-
-    if device is None:
-        device = latents.device
-
-    B, C, H, W = latents.shape
-    latents_in = latents.clone()
-
-    # =========================
-    # Points faciaux
-    # =========================
-    facial_points = pose.estimate_facial_points_full(smooth=smooth)
-    mouth_left  = facial_points['mouth_left']
-    mouth_right = facial_points['mouth_right']
-
-    # =========================
-    # MASQUE (IMPORTANT: debug du signal réel)
-    # =========================
-    mask_raw = mask_mouth.clone()
-
-    mask_mouth = feather_inside_strict2(mask_mouth, radius=3, blur_kernel=5, sigma=1.2)
-    mask_mouth = feather_outside_only_alpha2(mask_mouth, radius=2, sigma=1.0)
-
-    mask_mean = mask_mouth.mean().item()
-
-    if debug:
-        print(f"[DEBUG][MOUTH MASK] mean={mask_mean:.6f} min={mask_mouth.min().item():.4f} max={mask_mouth.max().item():.4f}")
-
-    # si masque trop faible => on boost (sinon tout devient invisible)
-    mask_gain = 1.0
-    if mask_mean < 0.01:
-        mask_gain = 3.0
-    elif mask_mean < 0.03:
-        mask_gain = 2.0
-
-    mask_mouth = torch.clamp(mask_mouth * mask_gain, 0, 1)
-    mask_mouth_exp = mask_mouth.permute(0,2,3,1)
-
-    # =========================
-    # TEMPS
-    # =========================
-    t = frame_counter / 10.0
-    t = torch.tensor(t, device=device)
-
-    t_smile  = torch.sin(t * 1.2)
-    t_breath = torch.sin(t * 0.8)
-    t_open   = torch.sin(t * 0.4)
-
-    # =========================
-    # POSITIONS
-    # =========================
-    mouth_left_px  = mouth_left  * torch.tensor([W-1, H-1], device=device)
-    mouth_right_px = mouth_right * torch.tensor([W-1, H-1], device=device)
-
-    y_grid, x_grid = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
-    )
-
-    x_grid = x_grid.unsqueeze(0).expand(B,-1,-1)
-    y_grid = y_grid.unsqueeze(0).expand(B,-1,-1)
-
-    # =========================
-    # DISTANCE WEIGHT
-    # =========================
-    dist_left = torch.exp(-((x_grid - mouth_left_px[:,0,None,None])**2 +
-                            (y_grid - mouth_left_px[:,1,None,None])**2) / 400.0)
-
-    dist_right = torch.exp(-((x_grid - mouth_right_px[:,0,None,None])**2 +
-                             (y_grid - mouth_right_px[:,1,None,None])**2) / 400.0)
-
-    # =========================
-    # SMILE (plus fort + visible)
-    # =========================
-    smile_amp_x = 0.25 * strength
-    smile_amp_y = 0.12 * strength
-
-    delta_left = torch.zeros((B,H,W,2), device=device)
-    delta_right = torch.zeros((B,H,W,2), device=device)
-
-    delta_left[...,0]  = -smile_amp_x * t_smile * dist_left
-    delta_left[...,1]  = -smile_amp_y * t_smile * dist_left
-
-    delta_right[...,0] =  smile_amp_x * t_smile * dist_right
-    delta_right[...,1] = -smile_amp_y * t_smile * dist_right
-
-    # =========================
-    # BREATH (VISIBLE NOW)
-    # =========================
-    breath_amp = 0.03 * strength
-    breath = breath_amp * t_breath
-
-    # =========================
-    # OPEN SIGNAL (nouveau)
-    # =========================
-    open_amp = 0.02 * strength
-    mouth_open = open_amp * torch.abs(t_open)
-
-    # =========================
-    # COMBINAISON
-    # =========================
-    face_delta = torch.zeros((B,H,W,2), device=device)
-
-    face_delta[...,0] = (delta_left[...,0] + delta_right[...,0]) * mask_mouth_exp[...,0]
-    face_delta[...,1] = (delta_left[...,1] + delta_right[...,1]) * mask_mouth_exp[...,0]
-
-    # ajout vertical (respiration + ouverture)
-    face_delta[...,1] += (breath + mouth_open) * mask_mouth_exp[...,0]
-
-    # DEBUG IMPORTANT
-    if debug:
-        print(f"[DEBUG][MOUTH]")
-        print(f"  smile: {t_smile.item():.4f}")
-        print(f"  breath: {breath.item():.6f}")
-        print(f"  open: {mouth_open.item():.6f}")
-        print(f"  delta mean: {face_delta.abs().mean().item():.6f}")
-        print(f"  delta max: {face_delta.abs().max().item():.6f}")
-
-    # =========================
-    # WARP
-    # =========================
-    face_center = pose.get_point(0)
-    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
-    face_center_px = face_center_px.view(B,1,1,2)
-
-    grid_mouth = grid.clone() - face_center_px
-    grid_mouth = grid_mouth + face_delta
-    grid_mouth = grid_mouth + face_center_px
-
-    grid_mouth[...,0] = 2.0 * grid_mouth[...,0] / (W-1) - 1.0
-    grid_mouth[...,1] = 2.0 * grid_mouth[...,1] / (H-1) - 1.0
-
-    # =========================
-    # SAMPLE
-    # =========================
-    latents_out = F.grid_sample(latents, grid_mouth, align_corners=True)
-
-    # =========================
-    # DEBUG VISUEL
-    # =========================
-    if debug and debug_dir is not None:
-        save_impact_map(latents_out, latents_in, debug_dir, frame_counter, prefix="mouth")
-        print("[DEBUG] Mouth warp applied OK")
-
-    return latents_out, face_delta, facial_points
-
-
 def apply_mouth_warp(
     latents,
     pose,
@@ -2095,7 +1927,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 Global pose & stabilisation avancée
     # =========================
-    if frame_counter % 5 == 0:
+    if frame_counter % 20 == 0:
         start = time.time()
         latents_world, global_delta, grid_raw, grid_global = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
         if prev_pose is not None:
@@ -2122,7 +1954,7 @@ def apply_pose_driven_motion_ultra2(
     delta_px[...,1] *= H
     delta_px = delta_px.view(B,1,1,2)
 
-    if frame_counter % 10 == 0:
+    if frame_counter % 20 == 0:
         start = time.time()
         latents_before = latents_world.clone()
         latents_torso, delta_px = apply_torso_warp(latents_world, pose, mask_torso, grid, H, W, device=device, debug=debug, debug_dir=debug_dir)
