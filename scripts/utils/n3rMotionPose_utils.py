@@ -1523,16 +1523,8 @@ def apply_mouth_smil(
     debug=False,
     debug_dir=None,
     smooth=0.85,
-    strength=1.0
+    strength=2.0
 ):
-    """
-    Warp bouche robuste + visible + debug exploitable.
-    Fix :
-    - signal trop faible
-    - masque mal conditionné
-    - absence de normalisation du flow
-    - manque de debug spatial
-    """
 
     if device is None:
         device = latents.device
@@ -1541,111 +1533,22 @@ def apply_mouth_smil(
     latents_in = latents.clone()
 
     # =========================
-    # 1. Points faciaux
+    # 🔥 NEW: compute delta propre
     # =========================
-    facial_points = pose.estimate_facial_points_full(smooth=smooth)
-
-    mouth_left  = facial_points['mouth_left']
-    mouth_right = facial_points['mouth_right']
-
-    # =========================
-    # 2. MASQUE (FIX IMPORTANT)
-    # =========================
-    mask_in = mask_mouth.clone()
-
-    mask_mouth = feather_inside_strict2(mask_mouth, radius=3, blur_kernel=5, sigma=1.2)
-    mask_mouth = feather_outside_only_alpha2(mask_mouth, radius=2, sigma=1.0)
-
-    mask_mean = mask_mouth.mean().item()
-    mask_max  = mask_mouth.max().item()
-
-    # 🔥 BOOST automatique si masque trop faible
-    if mask_mean < 0.01:
-        mask_mouth = mask_mouth * 3.0
-    elif mask_mean < 0.03:
-        mask_mouth = mask_mouth * 2.0
-
-    mask_mouth = torch.clamp(mask_mouth, 0, 1)
-    mask_exp = mask_mouth.permute(0, 2, 3, 1)
-
-    if debug:
-        print(f"[DEBUG][MOUTH MASK] mean={mask_mean:.5f} max={mask_max:.5f}")
-
-    # =========================
-    # 3. TIME SIGNALS (stable + non noisy)
-    # =========================
-    t = torch.tensor(frame_counter / 10.0, device=device)
-
-    t_smile  = torch.sin(t * 1.3)
-    t_breath = torch.sin(t * 0.7)
-    t_open   = torch.sin(t * 0.5)
-
-    # =========================
-    # 4. COORDS
-    # =========================
-    mouth_left_px  = mouth_left  * torch.tensor([W-1, H-1], device=device)
-    mouth_right_px = mouth_right * torch.tensor([W-1, H-1], device=device)
-
-    y_grid, x_grid = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
+    delta, facial_points = Pose.compute_mouth_delta(
+        pose=pose,
+        mask_mouth=mask_mouth,
+        H=H,
+        W=W,
+        frame_counter=frame_counter,
+        device=device,
+        smooth=smooth,
+        strength=strength,
+        debug=debug
     )
 
-    x_grid = x_grid.unsqueeze(0).expand(B, -1, -1)
-    y_grid = y_grid.unsqueeze(0).expand(B, -1, -1)
-
     # =========================
-    # 5. DISTANCE FIELD (plus stable que exp(-x²))
-    # =========================
-    sigma = 18.0
-
-    dist_left = torch.exp(-(
-        (x_grid - mouth_left_px[:,0,None,None])**2 +
-        (y_grid - mouth_left_px[:,1,None,None])**2
-    ) / (2 * sigma**2))
-
-    dist_right = torch.exp(-(
-        (x_grid - mouth_right_px[:,0,None,None])**2 +
-        (y_grid - mouth_right_px[:,1,None,None])**2
-    ) / (2 * sigma**2))
-
-    # =========================
-    # 6. MOTION (RENFORCÉ MAIS CONTRÔLÉ)
-    # =========================
-    amp = 0.35 * strength
-
-    delta = torch.zeros((B, H, W, 2), device=device)
-
-    delta[...,0] += amp * t_smile * (dist_right - dist_left)
-    delta[...,1] += 0.15 * amp * t_smile * (dist_left + dist_right)
-
-    # respiration + ouverture
-    delta[...,1] += (0.03 * strength * t_breath + 0.02 * strength * abs(t_open)) * mask_exp[...,0]
-
-    # =========================
-    # 7. MASK APPLICATION (IMPORTANT FIX)
-    # =========================
-    delta = delta * mask_exp
-
-    # 🔥 NORMALISATION pour éviter "invisible motion"
-    delta_mean = delta.abs().mean().item()
-    if delta_mean < 1e-5 and debug:
-        print("[DEBUG][MOUTH WARNING] delta too small → boosting")
-
-    delta = delta * 3.0  # boost final contrôlé
-
-    if debug:
-        print("[DEBUG][MOUTH]")
-        print(f"  smile={t_smile.item():.4f}")
-        print(f"  breath={t_breath.item():.4f}")
-        print(f"  open={t_open.item():.4f}")
-        print(f"  delta mean={delta.abs().mean().item():.6f}")
-        print(f"  delta max={delta.abs().max().item():.6f}")
-        print(f"  mask mean={mask_mean:.5f}")
-
-    # =========================
-    # 8. GRID WARP
+    # 8. GRID WARP (inchangé)
     # =========================
     face_center = pose.get_point(0)
     face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
@@ -1659,12 +1562,18 @@ def apply_mouth_smil(
     grid_mouth[...,1] = 2.0 * grid_mouth[...,1] / (H-1) - 1.0
 
     # =========================
-    # 9. SAMPLE
+    # 9. SAMPLE (amélioré)
     # =========================
-    latents_out = F.grid_sample(latents, grid_mouth, align_corners=True)
+    latents_out = F.grid_sample(
+        latents,
+        grid_mouth,
+        mode='bilinear',
+        padding_mode='border',  # 🔥 important
+        align_corners=True
+    )
 
     # =========================
-    # 10. DEBUG VISUEL (IMPORTANT AJOUT)
+    # 10. DEBUG (inchangé)
     # =========================
     if debug and debug_dir is not None:
         try:
@@ -1678,7 +1587,6 @@ def apply_mouth_smil(
                 prefix="mouth"
             )
 
-            # 🔥 debug signal brut (important pour diagnostiquer invisibilité)
             np.save(
                 os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"),
                 delta.detach().cpu().numpy()
@@ -1959,15 +1867,16 @@ def apply_pose_driven_motion_ultra2(
     delta_px[...,1] *= H
     delta_px = delta_px.view(B,1,1,2)
 
-    if frame_counter % 20 == 0:
-        start = time.time()
-        latents_before = latents_world.clone()
-        latents_torso, delta_px = apply_torso_warp(latents_world, pose, mask_torso, grid, H, W, device=device, debug=debug, debug_dir=debug_dir)
-        breath_strength = 0.2 + 0.1 * torch.sin(t)
-        latents_world = latents_torso*(breath_strength*mask_torso_exp) + latents_before*(1.0 - breath_strength*mask_torso_exp)
-        timings["TORSO+BREATH"] = time.time() - start
-        if debug:
-            save_impact_map(latents, latents_base, debug_dir, frame_counter, prefix="torso_warp")
+    #if frame_counter % 2 == 0:
+    start = time.time()
+    latents_before = latents_world.clone()
+    latents_torso, delta_px = apply_torso_warp(latents_world, pose, mask_torso, grid, H, W, device=device, debug=debug, debug_dir=debug_dir)
+    breath_strength = 0.2 + 0.1 * torch.sin(t)
+    #latents_world = latents_torso*(breath_strength*mask_torso_exp) + latents_before*(1.0 - breath_strength*mask_torso_exp)
+    latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_torso*(breath_strength*mask_torso_exp)
+    timings["TORSO+BREATH"] = time.time() - start
+    if debug:
+        save_impact_map(latents_world, latents_before, debug_dir, frame_counter, prefix="torso_warp")
     # =========================
     # 🔹 BREATHING
     # =========================
@@ -2079,12 +1988,12 @@ def apply_pose_driven_motion_ultra2(
     # =========================
 
     masks = {
-        "torso": (mask_torso_exp, 0.05, calibrate_amplitude(mask_torso_exp, 0.001, 0.003)),
+        "torso": (mask_torso_exp, 0.05, calibrate_amplitude(mask_torso_exp, 0.002, 0.006)),
         "hair": (mask_hair_exp, 0.20, calibrate_amplitude(mask_hair_exp, 0.002, 0.006)),
-        "face": (mask_face_exp, 0.15, calibrate_amplitude(mask_face_exp, 0.001, 0.004)),
+        "face": (mask_face_exp, 0.15, calibrate_amplitude(mask_face_exp, 0.002, 0.006)),
         "left_eye": (mask_left_eye, 0.6, calibrate_amplitude(mask_left_eye, 0.0008, 0.0025)),
         "right_eye": (mask_right_eye, 0.6, calibrate_amplitude(mask_right_eye, 0.0008, 0.0025)),
-        "mouth": (mask_mouth_exp, 0.25, calibrate_amplitude(mask_mouth_exp, 0.0075, 0.05)),
+        "mouth": (mask_mouth_exp, 0.25, calibrate_amplitude(mask_mouth_exp, 0.01, 0.08)),
         "mouth_corners": (mask_mouth_corners, 0.2, calibrate_amplitude(mask_mouth_corners, 0.005, 0.03)),
         "decor": (mask_decor, 0.02, calibrate_amplitude(mask_decor, 0.0005, 0.0015))
     }
@@ -2115,9 +2024,10 @@ def apply_pose_driven_motion_ultra2(
         mask_exp = mask.repeat(1, C, 1, 1)
 
         # stabilisation simple et efficace
-        mask_exp = normalize_mask(mask_exp)
-        mask_exp = torch.sqrt(mask_exp)
-        MICRO_GAIN = 1.2  # 1.0–1.5 recommandé
+        #mask_exp = normalize_mask(mask_exp)
+        #mask_exp = torch.sqrt(mask_exp)
+        mask_exp = mask.repeat(1, C, 1, 1)
+        MICRO_GAIN = 3.0  # 1.0–1.5 recommandé
         latents += MICRO_GAIN * amplitude * mask_exp * torch.sin(t * speed)
 
 

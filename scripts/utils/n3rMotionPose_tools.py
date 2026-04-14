@@ -687,7 +687,7 @@ def apply_breathing_simple(
     mask_torso,
     frame_counter,
     breathing=True,
-    amplitude=1.0,
+    amplitude=1.5,
     debug=False,
     debug_dir=None,
 ):

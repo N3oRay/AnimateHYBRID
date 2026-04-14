@@ -3,7 +3,7 @@ import numpy as np
 import cv2
 import os
 from PIL import Image, ImageDraw
-from .n3rMotionPose_tools import save_debug_mask, feather_inside_strict, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, feather_outside_only_alpha
+from .n3rMotionPose_tools import save_debug_mask, feather_inside_strict, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, feather_outside_only_alpha, feather_inside_strict2, feather_outside_only_alpha2
 #---------------------------------- CLASS POSE ------------------------------------------------------
 class Pose:
     def __init__(self, keypoints: torch.Tensor):
@@ -488,6 +488,122 @@ class Pose:
 
         return mask
 
+    def compute_mouth_delta(
+        pose,
+        mask_mouth,
+        H,
+        W,
+        frame_counter,
+        device,
+        smooth=0.85,
+        strength=2.0,
+        debug=False
+    ):
+        """
+        Compute mouth motion field (NO WARP).
+        Safe for accumulation → avoids blur.
+        """
+
+        # =========================
+        # 1. Facial points
+        # =========================
+        facial_points = pose.estimate_facial_points_full(smooth=smooth)
+
+        mouth_left  = facial_points['mouth_left']
+        mouth_right = facial_points['mouth_right']
+
+        # =========================
+        # 2. MASK (stable + clean)
+        # =========================
+        mask = feather_inside_strict2(mask_mouth, radius=3, blur_kernel=5, sigma=1.2)
+        mask = feather_outside_only_alpha2(mask, radius=2, sigma=1.0)
+
+        mask_mean = mask.mean()
+
+        # auto boost léger mais contrôlé
+        boost = torch.clamp(0.04 / (mask_mean + 1e-6), 1.0, 3.0)
+        mask = torch.clamp(mask * boost, 0, 1)
+
+        mask_exp = mask.permute(0, 2, 3, 1)
+
+        # =========================
+        # 3. TIME SIGNALS (smooth)
+        # =========================
+        t = frame_counter / 10.0
+
+        t_smile  = torch.sin(torch.tensor(t * 1.2, device=device))
+        t_breath = torch.sin(torch.tensor(t * 0.6, device=device))
+        t_open   = torch.sin(torch.tensor(t * 0.4, device=device))
+
+        # =========================
+        # 4. COORD GRID
+        # =========================
+        y, x = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing='ij'
+        )
+
+        x = x[None]
+        y = y[None]
+
+        mouth_left_px  = mouth_left  * torch.tensor([W-1, H-1], device=device)
+        mouth_right_px = mouth_right * torch.tensor([W-1, H-1], device=device)
+
+        # =========================
+        # 5. DISTANCE FIELD
+        # =========================
+        sigma = 16.0
+
+        def gaussian(cx, cy):
+            return torch.exp(-(
+                (x - cx[:, None, None])**2 +
+                (y - cy[:, None, None])**2
+            ) / (2 * sigma**2))
+
+        dist_left  = gaussian(mouth_left_px[:,0],  mouth_left_px[:,1])
+        dist_right = gaussian(mouth_right_px[:,0], mouth_right_px[:,1])
+
+        # =========================
+        # 6. MOTION FIELD
+        # =========================
+        amp = 0.25 * strength
+
+        delta = torch.zeros((mask.shape[0], H, W, 2), device=device)
+
+        # smile horizontal
+        delta[..., 0] += amp * t_smile * (dist_right - dist_left)
+
+        # smile vertical léger
+        delta[..., 1] += 0.12 * amp * t_smile * (dist_left + dist_right)
+
+        # ouverture + respiration
+        delta[..., 1] += (
+            0.025 * strength * t_breath +
+            0.02  * strength * torch.abs(t_open)
+        ) * mask_exp[..., 0]
+
+        # =========================
+        # 7. APPLY MASK
+        # =========================
+        delta = delta * mask_exp
+
+        # =========================
+        # 8. NORMALISATION SAFE (ANTI BLUR)
+        # =========================
+        delta = torch.tanh(delta) * 2.0
+
+        # clamp final (important)
+        delta = torch.clamp(delta, -3.0, 3.0)
+
+        if debug:
+            print("[DEBUG][MOUTH DELTA CLEAN]")
+            print(f"  mean={delta.abs().mean().item():.6f}")
+            print(f"  max={delta.abs().max().item():.6f}")
+            print(f"  mask_mean={mask_mean.item():.5f}")
+
+        return delta, facial_points
+
     # ----------------- Torso delta -----------------
     # Attention le expand_w et le shrink_h doit être similaire pour compute_torso_delta et create_upper_body_mask
     def compute_torso_delta(
@@ -843,7 +959,7 @@ class Pose:
         frame_counter: int = 0,
         expand_w=None,
         shrink_h=None,
-        roundness=0.7
+        roundness=0.8
     ):
         """
         Masque torse PRO++ :
@@ -875,11 +991,20 @@ class Pose:
 
             # Centres anatomiques et largeur/hauteur
             shoulder_center, hip_center = (r_sh + l_sh)/2, (r_hip + l_hip)/2
-            center = (shoulder_center * 0.5 + hip_center * 0.5)
+            #center = (shoulder_center * 0.5 + hip_center * 0.5)
+            # Centre anatomique corrigé
+            center = shoulder_center * 0.65 + hip_center * 0.35 # new code
 
             width_top = torch.norm(r_sh - l_sh) * expand_w
             width_bottom = torch.norm(r_hip - l_hip) * expand_w * 0.9
-            height = torch.norm(hip_center - shoulder_center) * shrink_h
+            #height = torch.norm(hip_center - shoulder_center) * shrink_h
+
+            # Hauteur sécurisée # new code
+            base_height = torch.norm(hip_center - shoulder_center)
+            height = torch.clamp(base_height * shrink_h, min=H * 0.25)
+
+            # Légère remontée du torse
+            center[1] -= height * 0.08
 
             # Ellipse adaptative
             dx, dy = xx - center[0], yy - center[1]
@@ -887,7 +1012,8 @@ class Pose:
             width_interp = width_top * (1 - t) + width_bottom * t
             ellipse = (dx / (width_interp / 2))**2 + (dy / (height / 2))**2
 
-            mask[b,0] = torch.exp(-ellipse * 2.5)  # Gaussian falloff
+            #mask[b,0] = torch.exp(-ellipse * 2.5)  # Gaussian falloff
+            mask[b,0] = torch.exp(-ellipse * 1.5) # new code
 
         # Clamp + feather
         mask = torch.clamp(mask, 0, 1)
