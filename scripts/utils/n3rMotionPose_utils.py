@@ -2580,6 +2580,116 @@ def update_pose_sequence_from_keypoints_batch(
     keypoints_tensor,
     prev_keypoints=None,
     frame_idx=0,
+    alpha=0.85,
+    add_motion=True,
+    debug=False
+):
+    import math
+    import torch
+
+    kp = keypoints_tensor.clone()
+    B, N, _ = kp.shape
+    device = kp.device
+
+    # =========================================================
+    # 🔹 1. TEMPORAL SMOOTHING (stabilisé)
+    # =========================================================
+    if prev_keypoints is not None:
+        kp = alpha * kp + (1 - alpha) * prev_keypoints
+
+    if not add_motion:
+        return kp
+
+    t = frame_idx * 0.08
+
+    # =========================================================
+    # 🔹 JOINT GROUPS (IMPORTANT)
+    # =========================================================
+    pelvis_ids  = [11, 8]              # hips
+    spine_ids   = [1, 2, 5, 8]         # torso chain
+    shoulder_ids = [5, 2]
+    head_id     = 0
+    limb_ids    = [14,15,16,17,18,19,20,21,22,23,24]
+
+    # safety mask
+    valid_ids = list(set(range(N)))
+
+    # =========================================================
+    # 🔹 2. BASE MOTION (pelvis driver)
+    # =========================================================
+    pelvis_center = kp[:, pelvis_ids].mean(1)
+
+    sway = 0.006 * math.sin(t * 0.9)
+    drift_x = 0.002 * math.sin(t * 0.25)
+    drift_y = 0.002 * math.cos(t * 0.22)
+
+    pelvis_offset = torch.zeros_like(kp[:, :, :2])
+    pelvis_offset[:, pelvis_ids, 0] += sway + drift_x
+    pelvis_offset[:, pelvis_ids, 1] += drift_y
+
+    # propagation pelvis → full body (weak)
+    kp[..., :2] += pelvis_offset * 0.6
+
+    # =========================================================
+    # 🔹 3. SPINE WAVE (NEW CORE IMPROVEMENT)
+    # =========================================================
+    spine_wave = 0.004 * math.sin(t * 1.2)
+
+    kp[:, spine_ids, 1] += spine_wave
+    kp[:, spine_ids, 0] += spine_wave * 0.3
+
+    # =========================================================
+    # 🔹 4. BREATHING (localized torso only)
+    # =========================================================
+    breath = 0.007 * math.sin(t * 1.1)
+
+    kp[:, shoulder_ids, 1] += breath * 0.8
+    kp[:, spine_ids, 1] += breath * 0.5
+
+    # =========================================================
+    # 🔹 5. HEAD MOTION (inertial lag)
+    # =========================================================
+    head_motion_x = 0.005 * math.sin(t * 1.4)
+    head_motion_y = 0.004 * math.cos(t * 1.3)
+
+    kp[:, head_id, 0] += head_motion_x
+    kp[:, head_id, 1] += head_motion_y
+
+    # head lag from shoulders (VERY important realism)
+    kp[:, head_id] += (kp[:, 5] - kp[:, 2]) * 0.08
+
+    # =========================================================
+    # 🔹 6. LIMB SECONDARY MOTION (passive follow-through)
+    # =========================================================
+    limb_noise = 0.0012 * torch.randn_like(kp[:, limb_ids, :2])
+    kp[:, limb_ids, :2] += limb_noise
+
+    kp[:, limb_ids] += (kp[:, spine_ids].mean(1).unsqueeze(1) - kp[:, limb_ids]) * 0.02
+
+    # =========================================================
+    # 🔹 7. MICRO NOISE (anti-freeze)
+    # =========================================================
+    kp[..., :2] += torch.randn_like(kp[..., :2]) * 0.0008
+
+    # =========================================================
+    # 🔹 8. CLAMP STABILITY
+    # =========================================================
+    kp[..., :2] = torch.clamp(kp[..., :2], -1.2, 1.2)
+
+    # =========================================================
+    # 🔹 DEBUG
+    # =========================================================
+    if debug:
+        motion_strength = (kp - keypoints_tensor).abs().mean()
+        print(f"[DEBUG] motion strength: {motion_strength.item():.6f}")
+        print(f"[DEBUG] sway: {sway:.5f}, breath: {breath:.5f}")
+
+    return kp
+
+def update_pose_sequence_from_keypoints_batch_old(
+    keypoints_tensor,
+    prev_keypoints=None,
+    frame_idx=0,
     alpha=0.7,        # lissage temporel plus fort
     add_motion=True,
     debug=False
