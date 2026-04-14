@@ -681,7 +681,7 @@ def apply_breathing_mask(latents, previous_latent, frame_counter, breathing=True
     return latents
 
 
-
+#🫁 Breathing (FIX OK)
 def apply_breathing_simple(
     latents,
     mask_torso,
@@ -697,7 +697,12 @@ def apply_breathing_simple(
     B, C, H, W = latents.shape
     device = latents.device
 
-    breath = amplitude * 0.06 * math.sin(frame_counter * 0.1) * math.cos(frame_counter * 0.06)
+    phase = frame_counter * 0.1
+
+    breath = amplitude * 0.06 * (
+        0.6 * math.sin(phase + 1.0) +
+        0.4 * math.sin(phase * 0.5 + 2.0)
+    )
 
     yy, xx = torch.meshgrid(
         torch.linspace(-1, 1, H, device=device),
@@ -725,8 +730,8 @@ def apply_breathing_simple(
         # delta global (vecteur)
         global_delta = torch.stack((delta_x, delta_y), dim=-1)
 
-        print("  - delta mean px:", global_delta.abs().mean().item())
-        print("  - delta max px:", global_delta.abs().max().item())
+        print("🫁 Breathing  - delta mean px:", global_delta.abs().mean().item())
+        print("🫁 Breathing  - delta max px:", global_delta.abs().max().item())
 
         if debug_dir is not None:
             os.makedirs(debug_dir, exist_ok=True)
@@ -1132,7 +1137,6 @@ def apply_micro_boost(
     debug=False,
     debug_dir=None
 ):
-
     t = torch.tensor(frame_counter / 6.0, device=device, dtype=latents.dtype)
 
     total = torch.zeros_like(latents)
@@ -1146,10 +1150,15 @@ def apply_micro_boost(
         if torch.isnan(motion_strength):
             motion_strength = torch.tensor(0.0, device=device, dtype=latents.dtype)
 
-        motion_strength = torch.clamp(motion_strength, 0.0, 0.01)
-        motion_strength = (0.002 + motion_strength) * strength
+        # clamp stable
+        motion_strength = torch.clamp(motion_strength, 0.0, 0.05)
 
-    # -------------------- Debug header --------------------
+        # compression douce
+        motion_strength = torch.log1p(motion_strength * 20.0)
+
+        # scaling
+        motion_strength = motion_strength * strength * 2.0
+
     if debug:
         print(f"[DEBUG][MICRO_BOOST]")
         print(f"  - strength: {strength}")
@@ -1157,24 +1166,36 @@ def apply_micro_boost(
         print(f"  - frame_counter: {frame_counter}")
 
     zone_summaries = []
+    weight_sum = 0.0
 
     # -------------------- Zones --------------------
     for zone_name, (mask, phase, amp) in masks.items():
         if mask is None:
-            if debug:
-                print(f"  - {zone_name}: SKIP (mask=None)")
             continue
 
-        contrib = amp * mask * motion_strength * torch.sin(t + phase)
+        # oscillation toujours positive → évite annulation
+        osc = 0.5 + 0.5 * torch.sin(t + phase)
 
-        total += contrib
+        contrib = amp * mask * motion_strength * osc
+
+        # pondération par importance réelle du masque
+        weight = mask.mean().item() + 1e-6
+
+        total += contrib * weight
+        weight_sum += weight
 
         if debug:
             zone_summaries.append(
                 (zone_name, float(amp), float(mask.mean().item()), float(contrib.mean().item()))
             )
 
-    # -------------------- Debug summary --------------------
+    # normalisation intelligente (pas brutale)
+    if weight_sum > 0:
+        total = total / weight_sum
+
+    # 🔥 gain final (clé)
+    total = total * 3.0
+
     if debug:
         print("[DEBUG][MICRO_BOOST SUMMARY]")
         for name, amp, mmean, cmean in zone_summaries:

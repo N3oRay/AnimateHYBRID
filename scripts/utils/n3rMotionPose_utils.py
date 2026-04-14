@@ -1805,6 +1805,11 @@ def apply_mouth_warp(
 
     return latents_out, face_delta_expanded, facial_points
 #-------------------------------------------------test -----------------------------------------
+def normalize_mask(mask):
+    m = mask.mean().clamp(1e-6, 0.2)
+    mask = mask / (m + 1e-6)
+    mask = torch.clamp(mask, 0.0, 3.0)
+    return mask
     """
     Ultra PRO 2.0 motion pipeline:
     - Global Pose + Stabilisation avancée par keypoints
@@ -2085,14 +2090,37 @@ def apply_pose_driven_motion_ultra2(
     }
 
     start = time.time()
-    latents = apply_micro_boost(latents_local, frame_counter, device, masks, keypoints, prev_keypoints, strength=1.0, debug=debug)
+    total_mean = sum(m.mean() for m,_,_ in masks.values() if m is not None)
+
+    for k in masks:
+        mask, phase, amp = masks[k]
+        if mask is not None:
+            mask = normalize_mask(mask)
+
+            # boost léger des zones faibles (stable)
+            mask = torch.sqrt(mask)
+
+            masks[k] = (mask, phase, amp)
+
+    latents_mix = 0.7 * latents_local + 0.3 * latents_world
+    latents = apply_micro_boost(latents_mix, frame_counter, device, masks, keypoints, prev_keypoints, strength=1.0, debug=debug)
 
     for key, (mask, speed, amplitude) in masks.items():
         # mask: [B, 1, H, W] ou [B, H, W]
         if mask.ndim == 5:
             mask = mask.squeeze(2)  # supprime la dimension singleton inutile
         mask_exp = mask.repeat(1, C, 1, 1)  # broadcast sur les canaux
-        latents += amplitude * mask_exp * torch.sin(t * speed)
+        # BOOST DES FAIBLES ZONES
+        mask, speed, amplitude = masks[key]
+        mask_exp = mask.repeat(1, C, 1, 1)
+
+        # stabilisation simple et efficace
+        mask_exp = normalize_mask(mask_exp)
+        mask_exp = torch.sqrt(mask_exp)
+        MICRO_GAIN = 1.2  # 1.0–1.5 recommandé
+        latents += MICRO_GAIN * amplitude * mask_exp * torch.sin(t * speed)
+
+
 
     latents = apply_micro_motion(latents, frame_counter, device, masks, strength=0.05, randomize=True, debug=debug)
     timings["MICRO_BOOST"] = time.time() - start
