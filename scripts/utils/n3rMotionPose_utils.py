@@ -2576,6 +2576,19 @@ def apply_pose_driven_motion_stable(
     return latents
 
 #-------Gestion de l'animation -----------------------------------------------------------------------------------
+def should_freeze(frame_idx, frame_pause):
+    return (frame_pause is not None) and (frame_idx % frame_pause == 0)
+
+def compute_time(frame_idx, frame_pause, base_dt=0.03):
+    if frame_pause is None:
+        return frame_idx * base_dt
+
+    frozen_blocks = frame_idx // frame_pause
+    intra = frame_idx % frame_pause
+
+    # ralentissement progressif dans le bloc
+    decay = intra / frame_pause
+    return (frozen_blocks + decay * 0.3) * base_dt
 # --- En DEV: synchroniser ce freeze intelligent avec ton apply_global_pose pour éviter les conflits entre keypoints et warp global.
 def update_pose_sequence_from_keypoints_batch(
     keypoints_tensor,
@@ -2585,7 +2598,7 @@ def update_pose_sequence_from_keypoints_batch(
     add_motion=True,
     motion_scale=0.4,
     freeze_threshold=0.0015,   # 🔥 NEW
-    freeze_strength=0.5,       # 0 = full freeze, 1 = no freeze
+    freeze_strength=0.25,       # 0 = full freeze, 1 = no freeze
     debug=False
 ):
     import math
