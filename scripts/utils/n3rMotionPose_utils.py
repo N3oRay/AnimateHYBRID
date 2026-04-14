@@ -1779,6 +1779,8 @@ def apply_pose_driven_motion_ultra2(
     # 🔹 Micro boost global
     # =========================
 
+    MICRO_GAIN = 2.0   # contrôle global unique
+
     masks = {
         "torso": (mask_torso_exp, 0.05, calibrate_amplitude(mask_torso_exp, 0.002, 0.006)),
         "hair": (mask_hair_exp, 0.20, calibrate_amplitude(mask_hair_exp, 0.002, 0.006)),
@@ -1791,40 +1793,71 @@ def apply_pose_driven_motion_ultra2(
     }
 
     start = time.time()
-    total_mean = sum(m.mean() for m,_,_ in masks.values() if m is not None)
 
-    for k in masks:
-        mask, phase, amp = masks[k]
-        if mask is not None:
-            mask = normalize_mask(mask)
+    # =========================
+    # PREPROCESS MASKS (clean)
+    # =========================
+    for k, (mask, phase, amp) in masks.items():
+        if mask is None:
+            continue
 
-            # boost léger des zones faibles (stable)
-            mask = torch.sqrt(mask)
+        mask = normalize_mask(mask)
 
-            masks[k] = (mask, phase, amp)
+        # stabilisation douce (OK)
+        mask = torch.sqrt(mask.clamp(0, 1))
 
+        masks[k] = (mask, phase, amp)
+
+    # =========================
+    # BASE LATENTS MIX
+    # =========================
     latents_mix = 0.7 * latents_local + 0.3 * latents_world
-    latents = apply_micro_boost(latents_mix, frame_counter, device, masks, keypoints, prev_keypoints, strength=1.0, debug=debug)
 
+    # =========================
+    # MICRO BOOST CORE (1 seule source)
+    # =========================
+    latents = apply_micro_boost(
+        latents_mix,
+        frame_counter,
+        device,
+        masks,
+        keypoints,
+        prev_keypoints,
+        strength=1.0,
+        debug=debug
+    )
+
+    # =========================
+    # SECONDARY SINUS BOOST (optionnel mais propre)
+    # =========================
     for key, (mask, speed, amplitude) in masks.items():
-        # mask: [B, 1, H, W] ou [B, H, W]
+        if mask is None:
+            continue
+
+        # sécurité dimension
         if mask.ndim == 5:
-            mask = mask.squeeze(2)  # supprime la dimension singleton inutile
-        mask_exp = mask.repeat(1, C, 1, 1)  # broadcast sur les canaux
-        # BOOST DES FAIBLES ZONES
-        mask, speed, amplitude = masks[key]
+            mask = mask.squeeze(2)
+
         mask_exp = mask.repeat(1, C, 1, 1)
 
-        # stabilisation simple et efficace
-        #mask_exp = normalize_mask(mask_exp)
-        #mask_exp = torch.sqrt(mask_exp)
-        mask_exp = mask.repeat(1, C, 1, 1)
-        MICRO_GAIN = 3.0  # 1.0–1.5 recommandé
-        latents += MICRO_GAIN * amplitude * mask_exp * torch.sin(t * speed)
+        # UNIQUE scaling propre
+        signal = torch.sin(t * speed)
 
+        latents = latents + MICRO_GAIN * amplitude * mask_exp * signal
 
+    # =========================
+    # MICRO MOTION FINAL (very light)
+    # =========================
+    latents = apply_micro_motion(
+        latents,
+        frame_counter,
+        device,
+        masks,
+        strength=0.05,
+        randomize=True,
+        debug=debug
+    )
 
-    latents = apply_micro_motion(latents, frame_counter, device, masks, strength=0.05, randomize=True, debug=debug)
     timings["MICRO_BOOST"] = time.time() - start
 
     # =========================
