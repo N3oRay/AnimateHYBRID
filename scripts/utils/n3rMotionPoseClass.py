@@ -342,8 +342,8 @@ class Pose:
         debug: bool = False,
         debug_dir: str = None,
         frame_counter: int = 0,
-        expand_w=0.3,
-        expand_h=0.25,
+        expand_w=0.45,
+        expand_h=0.35,
         min_size=4  # 🔥 taille minimale en pixels
     ):
         """
@@ -1153,7 +1153,7 @@ class Pose:
 
         return mask
     #-----------------------------------------------------------------------------------------------------------------------------------
-    def create_mouth_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.5, expand_h=0.2):
+    def create_mouth_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.45, expand_h=0.35):
         """
         Masque dynamique pour la bouche uniquement, arrondi avec bord glow.
         expand_w / expand_h permettent d'élargir le rectangle de la bouche.
@@ -1209,7 +1209,7 @@ class Pose:
 
         return mask, mouth_points_batch
     #-----------------------------------------------------------------------------------------------------------------------------------
-    def create_mouth_corners_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.5, expand_h=0.2):
+    def create_mouth_corners_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.45, expand_h=0.35):
         """
         Masque dynamique pour les coins de la bouche uniquement (pour sourire subtil, micro-mouvements).
         Les coins sont calculés à partir du point central de la bouche.
@@ -1277,9 +1277,7 @@ class Pose:
 
         # Masque bouche
         mouth_mask = self.get_mouth_region(
-            H, W, device=self.device, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter,
-            expand_w=0.2, expand_h=0.2
-        )
+            H, W, device=self.device, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
 
         for b in range(self.B):
             # Points clés du visage (yeux, nez, oreilles)
