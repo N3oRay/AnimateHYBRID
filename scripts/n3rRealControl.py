@@ -272,7 +272,7 @@ def main(args):
                 initframe = frame_counter+transition_frames
             else:
                 initframe = frame_counter
-            save_input_frame( input_image, output_dir, initframe, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=1.0, apply_post=False )
+            save_input_frame( input_image, output_dir, initframe, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=1.0, apply_post=False, prefix=True)
 
             # --- Normalisation sécurisée des coordonnées ---
             face_coords_dict, nose_coords_dict, eye_coords_list, mouth_coords_list, ear_coords_list, nose_coords_list = prepare_face_coords( eye_coords, mouth_coords, ear_coords, nose_coords, process_coords)
