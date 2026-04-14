@@ -1056,6 +1056,386 @@ def apply_global_pose(
     debug_dir=None
 ):
     import time
+    import os
+    import torch
+    import torch.nn.functional as F
+    import torchvision
+
+    B, C, H_lat, W_lat = latents.shape
+    device = latents.device
+
+    t0 = time.time()
+
+    # =========================================================
+    # 🔹 Identity fallback
+    # =========================================================
+    if prev_pose is None:
+        yy, xx = torch.meshgrid(
+            torch.arange(H_lat, device=device),
+            torch.arange(W_lat, device=device),
+            indexing="ij"
+        )
+        grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
+        return latents, torch.zeros((B,1,1,2), device=device), grid, None
+
+    # =========================================================
+    # 🔹 Key joints
+    # =========================================================
+    joints = ["left_shoulder", "right_shoulder", "left_hip", "right_hip"]
+    idx = [pose.FACIAL_POINT_IDX[j] for j in joints]
+
+    pts = torch.stack([pose.get_point(i) for i in idx], dim=1)        # [B,4,2]
+    prev_pts = torch.stack([prev_pose.get_point(i) for i in idx], 1)
+
+    # =========================================================
+    # 🔹 Global center motion (translation)
+    # =========================================================
+    center = pts.mean(1)
+    prev_center = prev_pts.mean(1)
+    delta = center - prev_center
+
+    # =========================================================
+    # 🔹 Spine axis (NEW)
+    # =========================================================
+    spine_top = (pts[:,0] + pts[:,1]) * 0.5   # shoulders
+    spine_bottom = (pts[:,2] + pts[:,3]) * 0.5  # hips
+
+    spine_vec = spine_top - spine_bottom
+    prev_spine_vec = (prev_pts[:,0]+prev_pts[:,1])*0.5 - (prev_pts[:,2]+prev_pts[:,3])*0.5
+
+    spine_len = torch.norm(spine_vec, dim=-1, keepdim=True).clamp(1e-6)
+    prev_len = torch.norm(prev_spine_vec, dim=-1, keepdim=True).clamp(1e-6)
+
+    spine_dir = spine_vec / spine_len
+    prev_dir = prev_spine_vec / prev_len
+
+    # angle via dot/cross stable
+    dot = (spine_dir * prev_dir).sum(-1, keepdim=True).clamp(-1, 1)
+    angle = torch.acos(dot)
+
+    # signed approx
+    cross = spine_dir[...,0]*prev_dir[...,1] - spine_dir[...,1]*prev_dir[...,0]
+    angle = angle * torch.sign(cross).unsqueeze(-1)
+
+    # =========================================================
+    # 🔹 Temporal smoothing (IMPORTANT)
+    # =========================================================
+    delta = 0.8 * delta + 0.2 * getattr(pose, "_vel", torch.zeros_like(delta))
+    pose._vel = delta.detach()
+
+    # =========================================================
+    # 🔹 Pixel conversion
+    # =========================================================
+    delta_px = torch.zeros_like(delta)
+    delta_px[...,0] = delta[...,0] * W_lat
+    delta_px[...,1] = delta[...,1] * H_lat
+
+    if clamp:
+        delta_px = torch.tanh(delta_px / 4.0) * 4.0
+
+    delta_px = delta_px.view(B,1,1,2)
+
+    # =========================================================
+    # 🔹 Base grid
+    # =========================================================
+    yy, xx = torch.meshgrid(
+        torch.arange(H_lat, device=device),
+        torch.arange(W_lat, device=device),
+        indexing="ij"
+    )
+
+    grid = torch.stack((xx, yy), -1).float().unsqueeze(0).repeat(B,1,1,1)
+
+    # =========================================================
+    # 🔹 CENTER-BASED ROTATION (stable)
+    # =========================================================
+    center_px = center.clone()
+    center_px[...,0] *= W_lat
+    center_px[...,1] *= H_lat
+    center_px = center_px.view(B,1,1,2)
+
+    theta = angle * strength * 0.6
+
+    cos_t = torch.cos(theta).view(B,1,1,1)
+    sin_t = torch.sin(theta).view(B,1,1,1)
+
+    x = grid[...,0:1] - center_px[...,0:1]
+    y = grid[...,1:2] - center_px[...,1:2]
+
+    rot_x = x*cos_t - y*sin_t
+    rot_y = x*sin_t + y*cos_t
+
+    grid = torch.cat([rot_x + center_px[...,0:1],
+                      rot_y + center_px[...,1:2]], dim=-1)
+
+    # =========================================================
+    # 🔹 SPINE AXIS DEFORMATION (NEW CORE FEATURE)
+    # =========================================================
+    spine_mid = (spine_top + spine_bottom) * 0.5
+    spine_mid_px = spine_mid.clone()
+    spine_mid_px[...,0] *= W_lat
+    spine_mid_px[...,1] *= H_lat
+    spine_mid_px = spine_mid_px.view(B,1,1,2)
+
+    spine_dir_px = spine_dir.clone()
+    spine_dir_px = spine_dir_px.view(B,1,1,2)
+
+    # projection of pixel onto spine axis
+    rel = grid - spine_mid_px
+    proj = (rel * spine_dir_px).sum(-1, keepdim=True) * spine_dir_px
+
+    ortho = rel - proj
+
+    # squash/stretch VERY subtle
+    stretch = 1.0 + torch.tanh(delta_px.norm(dim=-1, keepdim=True)) * 0.03
+    squash = 1.0 - torch.tanh(delta_px.norm(dim=-1, keepdim=True)) * 0.02
+
+    grid = spine_mid_px + proj * stretch + ortho * squash
+
+    # =========================================================
+    # 🔹 FINAL MOTION
+    # =========================================================
+    global_gain = 1.6
+
+    grid = grid + delta_px * strength * global_gain
+
+    # =========================================================
+    # 🔹 Normalize for grid_sample
+    # =========================================================
+    grid_norm = grid.clone()
+    grid_norm[...,0] = 2.0 * grid_norm[...,0] / (W_lat - 1) - 1.0
+    grid_norm[...,1] = 2.0 * grid_norm[...,1] / (H_lat - 1) - 1.0
+
+    # =========================================================
+    # 🔹 Apply warp
+    # =========================================================
+    latents_out = F.grid_sample(latents, grid_norm, align_corners=True)
+
+    # =========================================================
+    # 🔹 DEBUG
+    # =========================================================
+    if debug:
+        print("\n[DEBUG][GLOBAL] =====================")
+        print(f"Time: {time.time()-t0:.4f}s")
+        print(f"Strength: {strength}")
+        print(f"Angle spine: {angle.mean().item():.5f}")
+        print(f"Delta px mean: {delta_px.abs().mean().item():.5f}")
+
+        for i, j in enumerate(joints):
+            mv = (pts[:,i]-prev_pts[:,i]) * torch.tensor([W_lat, H_lat], device=device)
+            print(f"{j}: {mv.squeeze().tolist()}")
+
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            img = latents_out[0].detach().float().cpu()
+            img = img[:3] if img.shape[0] > 3 else img
+
+            torchvision.utils.save_image(
+                (img+1)/2,
+                os.path.join(debug_dir, "global_pose_debug.png")
+            )
+
+    return latents_out, delta_px, grid, grid_norm
+
+
+def apply_global_pose_check(
+    latents,
+    pose,
+    prev_pose=None,
+    H=None,
+    W=None,
+    device="cuda",
+    strength=0.4,
+    clamp=True,
+    debug=True,
+    debug_dir=None
+):
+    import time
+    import os
+    import torch
+    import torch.nn.functional as F
+    import torchvision
+
+    B = latents.shape[0]
+    device = latents.device
+
+    t0 = time.time()
+
+    # =========================================================
+    # 🔹 Identity fallback
+    # =========================================================
+    if prev_pose is None:
+        if debug:
+            print("[DEBUG][GLOBAL] No prev_pose → identity warp")
+
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij"
+        )
+        grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
+
+        return latents, torch.zeros((B, 1, 1, 2), device=device), grid, None
+
+    # =========================================================
+    # 🔹 Key torso joints
+    # =========================================================
+    key_joints = ["left_shoulder", "right_shoulder", "left_hip", "right_hip"]
+    idx_list = [pose.FACIAL_POINT_IDX[j] for j in key_joints]
+
+    pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)
+    prev_pts = torch.stack([prev_pose.get_point(i) for i in idx_list], dim=1)
+
+    # =========================================================
+    # 🔹 Center motion (translation)
+    # =========================================================
+    center = pts.mean(dim=1)
+    prev_center = prev_pts.mean(dim=1)
+
+    delta = center - prev_center
+
+    # =========================================================
+    # 🔹 Shoulder orientation (rotation estimate)
+    # =========================================================
+    cur_vec = pts[:, 1] - pts[:, 0]
+    prev_vec = prev_pts[:, 1] - prev_pts[:, 0]
+
+    cur_angle = torch.atan2(cur_vec[:, 1], cur_vec[:, 0])
+    prev_angle = torch.atan2(prev_vec[:, 1], prev_vec[:, 0])
+
+    angle_delta = (cur_angle - prev_angle).unsqueeze(-1)
+
+    # =========================================================
+    # 🔹 Temporal smoothing (inertia model)
+    # =========================================================
+    if not hasattr(pose, "_global_velocity"):
+        pose._global_velocity = torch.zeros_like(delta)
+
+    pose._global_velocity = 0.85 * pose._global_velocity + 0.15 * delta
+    delta = pose._global_velocity
+
+    # =========================================================
+    # 🔹 Pixel conversion
+    # =========================================================
+    delta_px = delta.clone()
+    delta_px[..., 0] *= W
+    delta_px[..., 1] *= H
+
+    # clamp soft
+    if clamp:
+        delta_px = torch.tanh(delta_px / 5.0) * 5.0
+
+    delta_px = delta_px.view(B, 1, 1, 2)
+
+    # =========================================================
+    # 🔹 Scale adaptatif (distance-aware)
+    # =========================================================
+    scale_ref = torch.norm(pts[:, 0] - pts[:, 1], dim=-1, keepdim=True)
+    scale_factor = torch.clamp(scale_ref, 0.05, 0.5).view(B, 1, 1, 1)
+
+    # =========================================================
+    # 🔹 Base grid
+    # =========================================================
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing="ij"
+    )
+
+    grid_raw = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
+
+    # =========================================================
+    # 🔹 Optional rotation warp (rigid-body effect)
+    # =========================================================
+    center_px = center.clone()
+    center_px[..., 0] *= W
+    center_px[..., 1] *= H
+    center_px = center_px.view(B, 1, 1, 2)
+
+    theta = angle_delta * strength * 0.5
+
+    cos_t = torch.cos(theta).view(B, 1, 1, 1)
+    sin_t = torch.sin(theta).view(B, 1, 1, 1)
+
+    x = grid_raw[..., 0:1] - center_px[..., 0:1]
+    y = grid_raw[..., 1:2] - center_px[..., 1:2]
+
+    x_rot = x * cos_t - y * sin_t
+    y_rot = x * sin_t + y * cos_t
+
+    grid_raw = torch.cat(
+        [x_rot + center_px[..., 0:1],
+         y_rot + center_px[..., 1:2]],
+        dim=-1
+    )
+
+    # =========================================================
+    # 🔹 Final warp (NO MAGIC CONSTANTS)
+    # =========================================================
+    GLOBAL_GAIN = 1.8
+
+    grid_warp = grid_raw + delta_px * strength * GLOBAL_GAIN * scale_factor
+
+    # =========================================================
+    # 🔹 Normalize for grid_sample
+    # =========================================================
+    grid_norm = grid_warp.clone()
+    grid_norm[..., 0] = 2.0 * grid_norm[..., 0] / (W - 1) - 1.0
+    grid_norm[..., 1] = 2.0 * grid_norm[..., 1] / (H - 1) - 1.0
+
+    # =========================================================
+    # 🔹 Apply warp
+    # =========================================================
+    latents_out = F.grid_sample(latents, grid_norm, align_corners=True)
+
+    # =========================================================
+    # 🔹 DEBUG
+    # =========================================================
+    if debug:
+        print("\n[DEBUG][GLOBAL] ===============================")
+        print(f"[DEBUG][GLOBAL] Time: {time.time() - t0:.5f}s")
+        print(f"[DEBUG][GLOBAL] Strength: {strength}")
+
+        for i, j in enumerate(key_joints):
+            move_px = (pts[:, i] - prev_pts[:, i]) * torch.tensor([W, H], device=device)
+            print(f"[DEBUG][GLOBAL] {j} movement px: {move_px.squeeze().tolist()}")
+
+        print(f"[DEBUG][GLOBAL] Mean delta_px: {delta_px.abs().mean().item():.4f}")
+        print(f"[DEBUG][GLOBAL] Angle delta: {angle_delta.mean().item():.4f}")
+
+        print(f"[DEBUG][GLOBAL] grid_raw min/max: {grid_raw.min().item():.2f} / {grid_raw.max().item():.2f}")
+        print(f"[DEBUG][GLOBAL] grid_warp min/max: {grid_warp.min().item():.2f} / {grid_warp.max().item():.2f}")
+
+        # optional debug image
+        if debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+
+            img = latents_out[0].detach().float().cpu()
+            if img.shape[0] > 3:
+                img = img[:3]
+
+            torchvision.utils.save_image(
+                (img + 1.0) / 2.0,
+                os.path.join(debug_dir, "global_pose_debug.png")
+            )
+
+            print(f"[DEBUG][GLOBAL] Saved: {debug_dir}/global_pose_debug.png")
+
+    return latents_out, delta_px, grid_raw, grid_norm
+
+def apply_global_pose_warp(
+    latents,
+    pose,
+    prev_pose=None,
+    H=None,
+    W=None,
+    device="cuda",
+    strength=0.4,
+    clamp=True,
+    debug=True,
+    debug_dir=None
+):
+    import time
     import torchvision
     import os
 
@@ -1170,128 +1550,6 @@ def apply_global_pose(
             print(f"[DEBUG][GLOBAL] Saved: {debug_dir}/global_pose_debug.png")
 
     return latents_out, delta_px, grid_raw, grid_norm
-
-
-def apply_global_pose_v2(
-    latents,
-    pose,
-    prev_pose=None,
-    H=None,
-    W=None,
-    device="cuda",
-    strength=0.4,   # 🔥 IMPORTANT: boost réel
-    debug=False,
-    debug_dir=None
-):
-    B = latents.shape[0]
-
-    if prev_pose is None:
-        return latents, torch.zeros((B,1,1,2), device=device)
-
-    # -------------------- centre --------------------
-    idx = [2, 5, 8, 11]
-    pts = torch.stack([pose.get_point(i) for i in idx], dim=1)
-    prev_pts = torch.stack([prev_pose.get_point(i) for i in idx], dim=1)
-
-    center = pts.mean(dim=1)
-    prev_center = prev_pts.mean(dim=1)
-
-    # -------------------- delta --------------------
-    delta = center - prev_center
-
-    delta_px = delta.clone()
-    delta_px[..., 0] *= W
-    delta_px[..., 1] *= H
-
-    # 🔥 anti extinction du mouvement
-    delta_px = torch.tanh(delta_px / 5.0) * 5.0
-
-    delta_px = delta_px.view(B, 1, 1, 2)
-
-    # -------------------- grid --------------------
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
-    )
-
-    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
-
-    # 🔥 BOOST IMPORTANT ICI
-    grid_global = grid + delta_px * strength * 3.0
-
-    # -------------------- normalize --------------------
-    grid_global[..., 0] = 2.0 * grid_global[..., 0] / (W - 1) - 1.0
-    grid_global[..., 1] = 2.0 * grid_global[..., 1] / (H - 1) - 1.0
-
-    # -------------------- warp --------------------
-    latents_out = F.grid_sample(latents, grid_global, align_corners=True)
-
-    if debug:
-        print(f"[DEBUG] Global delta px mean: {delta_px.abs().mean().item():.4f}")
-
-    return latents_out, delta_px
-
-def apply_global_pose_v1(
-    latents,
-    pose,
-    prev_pose=None,
-    H=None,
-    W=None,
-    device="cuda",
-    strength=0.1,   # 🔥 beaucoup plus faible !
-    debug=False,
-    debug_dir=None
-):
-    B = latents.shape[0]
-
-    # -------------------- Si pas de frame précédente → rien faire --------------------
-    if prev_pose is None:
-        return latents, torch.zeros((B,1,1,2), device=device)
-
-    # -------------------- Centre actuel --------------------
-    points_idx = [2, 5, 8, 11]
-    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)
-    center = pts.mean(dim=1)
-
-    # -------------------- Centre précédent --------------------
-    prev_pts = torch.stack([prev_pose.get_point(i) for i in points_idx], dim=1)
-    prev_center = prev_pts.mean(dim=1)
-
-    # -------------------- Delta réel --------------------
-    delta = center - prev_center  # 🔥 vrai mouvement
-
-    # passage en pixels
-    delta_px = delta.clone()
-    delta_px[...,0] *= W
-    delta_px[...,1] *= H
-    delta_px = delta_px.view(B,1,1,2)
-
-    # -------------------- Clamp pour stabilité --------------------
-    delta_px = torch.clamp(delta_px, min=-10.0, max=10.0)
-
-    # -------------------- Grille --------------------
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
-    )
-
-    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
-
-    grid_global = grid + delta_px * strength
-
-    # -------------------- Normalisation --------------------
-    grid_global[...,0] = 2.0 * grid_global[...,0] / (W-1) - 1.0
-    grid_global[...,1] = 2.0 * grid_global[...,1] / (H-1) - 1.0
-
-    # -------------------- Warp --------------------
-    latents_out = F.grid_sample(latents, grid_global, align_corners=True)
-
-    if debug:
-        print(f"[DEBUG] Global delta px: {delta_px.mean().item():.4f}")
-
-    return latents_out, delta_px
 
 
 #------------------------------------------------------------------------------------------
@@ -1632,7 +1890,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 Global pose & stabilisation avancée
     # =========================
-    if frame_counter % 20 == 0:
+    if frame_counter % 1 == 0:
         start = time.time()
         latents_world, global_delta, grid_raw, grid_global = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
         if prev_pose is not None:
