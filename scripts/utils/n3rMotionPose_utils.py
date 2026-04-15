@@ -1691,7 +1691,8 @@ def apply_mouth_smil(
     debug=False,
     debug_dir=None,
     smooth=0.85,
-    strength=2.3
+    strength=2.3,
+    npy=False
 ):
 
     if device is None:
@@ -1747,7 +1748,8 @@ def apply_mouth_smil(
         try:
             os.makedirs(debug_dir, exist_ok=True)
             save_impact_map( latents_out, latents_in, debug_dir, frame_counter, prefix="mouth" )
-            np.save( os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"), delta.detach().cpu().numpy() )
+            if npy:
+                np.save( os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"), delta.detach().cpu().numpy() )
             print("[DEBUG] Mouth warp applied OK + delta saved")
         except Exception as e:
             print(f"[WARN] mouth debug failed: {e}")

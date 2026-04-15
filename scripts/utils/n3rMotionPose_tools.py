@@ -750,7 +750,7 @@ def apply_breathing_simple(
 
             vutils.save_image(
                 debug_img,
-                os.path.join(debug_dir, f"delta_{frame_counter:05d}.png"),
+                os.path.join(debug_dir, f"delta_breathing_{frame_counter:05d}.png"),
                 nrow=B
             )
 
@@ -1067,7 +1067,7 @@ def save_debug_pose_image_with_skeleton(
 #------------------------------------------- VENT                       -----------------------------------------------------------
 #----------------------------------------------------------------------------------------------------------------------------------
 
-def debug_save_mask_and_wind(mask, wind_delta, H, W, debug_dir, frame_counter, mask_prefix="torso_mask_", wind_scale=200):
+def debug_save_mask_and_wind(mask, wind_delta, H, W, debug_dir, frame_counter, mask_prefix="torso__wind_mask_", wind_scale=200):
     """
     Sauvegarde le masque et une icône vent pour debug.
 
