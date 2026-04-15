@@ -6,6 +6,49 @@ from PIL import Image, ImageDraw
 from .n3rMotionPose_tools import save_debug_mask, feather_inside_strict, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, feather_outside_only_alpha, feather_inside_strict2, feather_outside_only_alpha2
 
 
+def save_debug_mask_scale(
+    mask: torch.Tensor,
+    debug_dir: str,
+    frame_counter: int,
+    name: str = "mouth_mask",
+    scale: int = 4,
+    verbose: bool = True,
+):
+    """
+    Sauvegarde debug d'un mask [B,1,H,W] en image PNG.
+    """
+
+    try:
+
+        os.makedirs(debug_dir, exist_ok=True)
+        m = mask[0, 0].detach().cpu().numpy()
+        if verbose:
+            print(f"[DEBUG][{name.upper()} MASK] mean={m.mean():.6f} max={m.max():.6f}")
+
+        img = (np.clip(m, 0, 1) * 255).astype(np.uint8)
+
+        h, w = img.shape
+        img = cv2.resize(
+            img,
+            (w * scale, h * scale),
+            interpolation=cv2.INTER_NEAREST
+        )
+
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        path = os.path.join(debug_dir, f"{name}_{frame_counter:05d}.png")
+        cv2.imwrite(path, img)
+
+        if verbose:
+            print(f"[DEBUG] {name} saved: {path}")
+
+        return path
+
+    except Exception as e:
+        print(f"[WARN] save_debug_mask failed ({e})")
+        return None
+
+
 def ensure_2d(x):
     """
     Force shape [2] (x,y)
@@ -526,10 +569,11 @@ class Pose:
             # =========================================================
             eye_mid = None
             profile_factor = 1.0
-
-            if 'eye_left' in points_dict and 'eye_right' in points_dict:
-                el = points_dict['eye_left'][b]
-                er = points_dict['eye_right'][b]
+            # left_eye_outer - left_eye_inner - right_eye_inner -  right_eye_outer
+            if 'left_eye_outer' in points_dict and 'right_eye_outer' in points_dict:
+                print(f"[DEBUG][MOUTH] 👄 Position des yeux pris en compte")
+                el = points_dict['left_eye_outer'][b]
+                er = points_dict['right_eye_outer'][b]
 
                 eye_mid = (el + er) * 0.5
 
@@ -608,7 +652,7 @@ class Pose:
             # 🔹 DEBUG
             # =========================================================
             if debug:
-                print(f"[DEBUG][MOUTH]")
+                print(f"[DEBUG][MOUTH] 👄 ")
                 print(f" center: {center.tolist()}")
                 print(f" profile_factor: {profile_factor}")
                 print(f" width/height: {width.item():.4f} / {height.item():.4f}")
@@ -625,25 +669,7 @@ class Pose:
         # 🔥 DEBUG IMAGE (FIXED - NOW EXECUTED)
         # =========================================================
         if debug and debug_dir is not None:
-            try:
-
-                os.makedirs(debug_dir, exist_ok=True)
-
-                m = mask[0, 0].detach().cpu().numpy()
-
-                print(f"[DEBUG][MOUTH MASK] mean={m.mean():.6f} max={m.max():.6f}")
-
-                img = (m * 255).astype(np.uint8)
-                img = cv2.resize(img, (W * 4, H * 4), interpolation=cv2.INTER_NEAREST)
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-                path = os.path.join(debug_dir, f"mouth_mask_{frame_counter:05d}.png")
-                cv2.imwrite(path, img)
-
-                print(f"[DEBUG] Mouth mask saved: {path}")
-
-            except Exception as e:
-                print(f"[WARN] mouth_region debug failed ({e})")
+            save_debug_mask_scale( mask=mask, debug_dir=debug_dir, frame_counter=frame_counter, name="mouth_mask", scale=4 )
 
         return mask
     def get_mouth_region_v1(
@@ -766,7 +792,7 @@ class Pose:
             # 🔹 DEBUG
             # =========================================================
             if debug:
-                print(f"[DEBUG][MOUTH]")
+                print(f"[DEBUG][MOUTH] 👄 ")
                 print(f" center: {center.tolist()}")
                 print(f" width/height: {width.item():.4f} / {height.item():.4f}")
                 print(f" rx/ry px: {rx} / {ry}")
@@ -780,24 +806,7 @@ class Pose:
         # DEBUG VISUAL ULTRA IMPORTANT
         # =========================
         if debug and debug_dir is not None:
-            try:
-                os.makedirs(debug_dir, exist_ok=True)
-
-                m = mask[0, 0].detach().cpu().numpy()
-
-                print(f"[DEBUG][MOUTH MASK] mean={m.mean():.6f} max={m.max():.6f}")
-
-                img = (m * 255).astype(np.uint8)
-                img = cv2.resize(img, (W * 4, H * 4), interpolation=cv2.INTER_NEAREST)
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-                path = os.path.join(debug_dir, f"mouth_mask_{frame_counter:05d}.png")
-                cv2.imwrite(path, img)
-
-                print(f"[DEBUG] Mouth mask saved: {path}")
-
-            except Exception as e:
-                print(f"[WARN] mouth_region: debug failed ({e})")
+            save_debug_mask_scale( mask=mask, debug_dir=debug_dir, frame_counter=frame_counter, name="mouth_mask", scale=4 )
 
         return mask
 
@@ -1336,6 +1345,7 @@ class Pose:
         # Debug
         if debug and debug_dir is not None:
             save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="torso_mask_PRO")
+
 
         return mask
 
