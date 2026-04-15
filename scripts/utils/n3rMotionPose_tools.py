@@ -15,6 +15,7 @@ import traceback
 import torchvision.utils as vutils
 
 
+
 #from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha, smooth_noise, apply_hair_motion_3D, feather_inside_strict2, feather_outside_only_alpha2
 
 
@@ -682,7 +683,117 @@ def apply_breathing_mask(latents, previous_latent, frame_counter, breathing=True
 
 
 #🫁 Breathing (FIX OK)
+
+
+
 def apply_breathing_simple(
+    latents,
+    pose,              # 🔥 AJOUT IMPORTANT
+    mask_torso,
+    frame_counter,
+    breathing=True,
+    amplitude=1.5,
+    debug=False,
+    debug_dir=None,
+):
+    if not breathing:
+        return latents
+
+    B, C, H, W = latents.shape
+    device = latents.device
+
+    phase = frame_counter * 0.1
+
+    breath = amplitude * 0.06 * (
+        0.6 * math.sin(phase + 1.0) +
+        0.4 * math.sin(phase * 0.5 + 2.0)
+    )
+
+    # =========================================================
+    # 1. COORD GRID
+    # =========================================================
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )
+
+    xx = xx.unsqueeze(0).expand(B, H, W)
+    yy = yy.unsqueeze(0).expand(B, H, W)
+
+    mask = mask_torso.permute(0, 2, 3, 1)
+
+    # =========================================================
+    # 2. LOCAL BODY ORIENTATION
+    # =========================================================
+    dir_x = torch.zeros(B, device=device)
+    dir_y = torch.ones(B, device=device)
+
+    if pose is not None:
+        try:
+            fp = pose.estimate_facial_points_full(smooth=0.8)
+
+            if 'neck' in fp and 'nose' in fp:
+                neck = fp['neck']
+                nose = fp['nose']
+
+                body_vec = nose - neck
+                norm = torch.norm(body_vec, dim=-1, keepdim=True) + 1e-6
+                body_dir = body_vec / norm  # [B,2]
+
+                dir_x = body_dir[:, 0]
+                dir_y = body_dir[:, 1]
+
+        except Exception:
+            pass
+
+    # reshape safe (IMPORTANT)
+    dir_x = dir_x.view(B, 1, 1)
+    dir_y = dir_y.view(B, 1, 1)
+
+    # =========================================================
+    # 3. BREATHING IN LOCAL SPACE
+    # =========================================================
+    delta_x = breath * mask[..., 0] * dir_x
+    delta_y = breath * mask[..., 0] * dir_y
+
+    grid = torch.stack((xx + delta_x, yy + delta_y), dim=-1)
+
+    latents_out = F.grid_sample(latents, grid, align_corners=True)
+
+    # =========================================================
+    # 4. DEBUG
+    # =========================================================
+    if debug:
+        global_delta = torch.stack((delta_x, delta_y), dim=-1)
+
+        print("🫁 Breathing  - delta mean px:", global_delta.abs().mean().item())
+        print("🫁 Breathing  - delta max px:", global_delta.abs().max().item())
+
+        if debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+
+            delta_mag = torch.sqrt(delta_x**2 + delta_y**2)
+
+            def normalize(x):
+                x_min = x.amin(dim=(1,2), keepdim=True)
+                x_max = x.amax(dim=(1,2), keepdim=True)
+                return (x - x_min) / (x_max - x_min + 1e-8)
+
+            delta_vis = normalize(delta_mag).unsqueeze(1)
+            mask_vis = mask[..., 0].unsqueeze(1)
+
+            debug_img = torch.cat([delta_vis, mask_vis], dim=0)
+
+            vutils.save_image(
+                debug_img,
+                os.path.join(debug_dir, f"delta_breathing_{frame_counter:05d}.png"),
+                nrow=B
+            )
+
+    return latents_out
+
+def apply_breathing_simple_v2(
     latents,
     mask_torso,
     frame_counter,
@@ -756,33 +867,7 @@ def apply_breathing_simple(
 
     return latents_out
 
-def apply_breathing_simple_v1(latents, mask_torso, frame_counter, breathing=True, debug=False, debug_dir=None):
 
-    if not breathing:
-        return latents
-
-    B, C, H, W = latents.shape
-    device = latents.device
-
-    breath = 0.006 * math.sin(frame_counter * 0.1) * math.cos(frame_counter * 0.06)
-
-    yy, xx = torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device),
-        torch.linspace(-1, 1, W, device=device),
-        indexing='ij'
-    )
-
-    # 🔥 IMPORTANT
-    xx = xx.unsqueeze(0).expand(B, H, W)
-    yy = yy.unsqueeze(0).expand(B, H, W)
-
-    mask = mask_torso.permute(0,2,3,1)  # [B,H,W,1]
-
-    grid = torch.stack((xx, yy + breath * mask[...,0]), dim=-1)  # [B,H,W,2]
-
-    latents = F.grid_sample(latents, grid, align_corners=True)
-
-    return latents
 
 
 # 🔹 Applique un léger effet de respiration (scaling sinusoïdal) sur les latents
@@ -1066,8 +1151,135 @@ def save_debug_pose_image_with_skeleton(
 #----------------------------------------------------------------------------------------------------------------------------------
 #------------------------------------------- VENT                       -----------------------------------------------------------
 #----------------------------------------------------------------------------------------------------------------------------------
+def debug_save_mask_and_wind(
+    mask,
+    wind_delta,
+    H,
+    W,
+    debug_dir,
+    frame_counter,
+    mask_prefix="torso_wind_mask_",
+    wind_scale=200,
+    upscale=8,              # 🔥 upscale réel
+    draw_grid=True,
+    overlay=True
+):
 
-def debug_save_mask_and_wind(mask, wind_delta, H, W, debug_dir, frame_counter, mask_prefix="torso__wind_mask_", wind_scale=200):
+
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # =========================================================
+    # 🔹 1. NORMALIZE WIND DELTA (robuste)
+    # =========================================================
+    if isinstance(wind_delta, torch.Tensor):
+        wd = wind_delta.detach().float().cpu()
+
+        if wd.numel() == 2:
+            dx, dy = wd.view(-1)
+        else:
+            wd = wd.view(-1)
+            dx, dy = wd[-2], wd[-1]
+    else:
+        dx, dy = wind_delta
+
+    dx, dy = float(dx), float(dy)
+
+    # =========================================================
+    # 🔹 2. UPSCALE MASK (VRAI upscale)
+    # =========================================================
+    mask_up = F.interpolate(
+        mask,
+        scale_factor=upscale,
+        mode="bilinear",
+        align_corners=False
+    )
+
+    mask_np = mask_up[0, 0].detach().cpu().numpy()
+    H_up, W_up = mask_np.shape
+
+    mask_vis = (mask_np * 255).astype(np.uint8)
+    mask_color = cv2.applyColorMap(mask_vis, cv2.COLORMAP_JET)
+
+    # =========================================================
+    # 🔹 3. CANVAS DEBUG
+    # =========================================================
+    canvas = np.zeros((H_up, W_up, 3), dtype=np.uint8)
+
+    if overlay:
+        canvas = cv2.addWeighted(mask_color, 0.6, canvas, 0.4, 0)
+
+    # =========================================================
+    # 🔹 4. DESSIN VENT
+    # =========================================================
+    center = (W_up // 2, H_up // 2)
+
+    end_point = (
+        int(center[0] + dx * wind_scale),
+        int(center[1] + dy * wind_scale)
+    )
+
+    cv2.arrowedLine(
+        canvas,
+        center,
+        end_point,
+        color=(0, 255, 255),
+        thickness=3,
+        tipLength=0.25
+    )
+
+    # =========================================================
+    # 🔹 5. VECTOR FIELD (optionnel 🔥 très utile)
+    # =========================================================
+    if draw_grid:
+        step = max(20, W_up // 25)
+
+        for y in range(0, H_up, step):
+            for x in range(0, W_up, step):
+                end = (
+                    int(x + dx * wind_scale * 0.3),
+                    int(y + dy * wind_scale * 0.3)
+                )
+                cv2.arrowedLine(
+                    canvas,
+                    (x, y),
+                    end,
+                    color=(255, 255, 255),
+                    thickness=1,
+                    tipLength=0.2
+                )
+
+    # =========================================================
+    # 🔹 6. TEXTE DEBUG (🔥 très utile)
+    # =========================================================
+    cv2.putText(
+        canvas,
+        f"dx={dx:.4f} dy={dy:.4f}",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        canvas,
+        f"frame={frame_counter}",
+        (20, 75),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (200, 200, 200),
+        2
+    )
+
+    # =========================================================
+    # 🔹 7. SAVE
+    # =========================================================
+    save_path = os.path.join(debug_dir, f"{mask_prefix}{frame_counter:05d}.png")
+    cv2.imwrite(save_path, canvas)
+
+    print(f"[DEBUG] Wind+Mask saved: {save_path}")
+
+def debug_save_mask_and_wind_simple(mask, wind_delta, H, W, debug_dir, frame_counter, mask_prefix="torso_wind_mask_", wind_scale=200):
     """
     Sauvegarde le masque et une icône vent pour debug.
 
