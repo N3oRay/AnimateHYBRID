@@ -1919,8 +1919,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 Global pose & stabilisation avancée
     # =========================
-    #if frame_counter % 1 == 0:
-    if should_freeze(frame_counter, 5): # Pause traitement
+    if should_freeze(frame_counter, 1): # Pause traitement
         start = time.time()
         latents_world, global_delta, grid_raw, grid_global = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
         if prev_pose is not None:

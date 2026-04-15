@@ -1367,6 +1367,7 @@ def save_debug_pose_image_with_skeleton(
         cfg (dict, optional): peut contenir 'visual_debug' pour activer/désactiver
         prefix (str, optional): préfixe du fichier
     """
+    print("[DEBUG] skeleton pipeline triggered")
 
     if cfg is not None and cfg.get("visual_debug") is False:
         return
