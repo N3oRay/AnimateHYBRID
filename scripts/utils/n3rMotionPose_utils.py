@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_simple, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
+
 from .n3rMotionPoseClass import Pose
 import numpy as np
 import cv2
@@ -1931,13 +1932,23 @@ def apply_pose_driven_motion_ultra2(
     if should_freeze(frame_counter, 3): # Pause traitement
         start = time.time()
         latents_before = latents_world.clone()
-        latents_breath = apply_breathing_simple(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
+        latents_breath = apply_breathing_real(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
         t = torch.tensor(frame_counter/10.0, device=latents_world.device)
         breath_strength = 0.2 + 0.2 * torch.sin(t)
         latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_breath*(breath_strength*mask_torso_exp)
         timings["breathing"] = time.time() - start
         if debug:
-            print("[DEBUG] Breathing applied")
+            print("[DEBUG] Breathing applied Real")
+    else:
+        start = time.time()
+        latents_before = latents_world.clone()
+        latents_breath = apply_breathing_soft(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
+        t = torch.tensor(frame_counter/10.0, device=latents_world.device)
+        breath_strength = 0.2 + 0.2 * torch.sin(t)
+        latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_breath*(breath_strength*mask_torso_exp)
+        timings["breathing"] = time.time() - start
+        if debug:
+            print("[DEBUG] Breathing applied Soft")
 
     #================== PARTI LOCAL ========================================
 
@@ -2331,7 +2342,7 @@ def apply_pose_driven_motion_stable(
     # =========================
     start = time.time()
     latents_before = latents.clone()
-    latents_breath = apply_breathing_simple( latents, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir )
+    latents_breath = apply_breathing_real( latents, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir )
     t = torch.tensor(frame_counter / 10.0, device=latents.device)
     breath_strength = 0.2 + 0.1 * torch.sin(t)
     latents = (
