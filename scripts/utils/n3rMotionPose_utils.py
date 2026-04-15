@@ -15,6 +15,7 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 import os
+import torchvision
 import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
 import traceback
@@ -163,13 +164,13 @@ def update_keypoints_from_pose(
     # =========================
     # 🔹 NORMALISATION INPUTS
     # =========================
-    left_shoulder, right_shoulder = pair(shoulders_coords, debug=debug)
-    left_clavicle, right_clavicle = pair(clavicules_coords, debug=debug)
-    left_elbow, right_elbow = pair(elbow_coords, debug=debug)
-    left_wrist, right_wrist = pair(wrists_coords, debug=debug)
-    left_hip, right_hip = pair(hips_coords, debug=debug)
-    left_eye, right_eye = pair(eye_coords, debug=debug)
-    left_ear, right_ear = pair(ear_coords, debug=debug)
+    left_shoulder, right_shoulder  = pair(shoulders_coords, debug=debug)  # épaule_droite, épaule_gauche
+    left_clavicle, right_clavicle  = pair(clavicules_coords, debug=debug) # clavicule_droite, clavicule_gauche
+    left_elbow, right_elbow  = pair(elbow_coords, debug=debug) # coude_droit, coude_gauche
+    left_wrist, right_wrist = pair(wrists_coords, debug=debug) # poignet_gauche, poignet_droit
+    left_hip, right_hip = pair(hips_coords, debug=debug) # hanche_gauche, hanche_droite
+    left_eye, right_eye = pair(eye_coords, debug=debug) # œil_gauche, œil_droit
+    left_ear, right_ear = pair(ear_coords, debug=debug) # oreille_gauche, oreille_droite
 
     # Neck dict safe
     if isinstance(neck_coords, dict):
@@ -1055,11 +1056,6 @@ def apply_global_pose(
     debug=True,
     debug_dir=None
 ):
-    import time
-    import os
-    import torch
-    import torch.nn.functional as F
-    import torchvision
 
     B, C, H_lat, W_lat = latents.shape
     device = latents.device
@@ -1435,9 +1431,6 @@ def apply_global_pose_warp(
     debug=True,
     debug_dir=None
 ):
-    import time
-    import torchvision
-    import os
 
     B = latents.shape[0]
     device = latents.device
@@ -1685,7 +1678,6 @@ def apply_face_warp(
     return latents_out, face_delta, facial_points
 
 #--------------------------------------------------------------------
-
 
 def apply_mouth_smil(
     latents,
@@ -2591,8 +2583,6 @@ def update_pose_sequence_from_keypoints_batch(
     freeze_strength=0.25,       # 0 = full freeze, 1 = no freeze
     debug=False
 ):
-    import math
-    import torch
 
     kp = keypoints_tensor.clone()
     B, N, _ = kp.shape
@@ -2712,8 +2702,6 @@ def update_pose_sequence_from_keypoints_batch_stable(
     motion_scale=0.4,   # 🔥 NOUVEAU: contrôle global vitesse
     debug=False
 ):
-    import math
-    import torch
 
     kp = keypoints_tensor.clone()
     B, N, _ = kp.shape
