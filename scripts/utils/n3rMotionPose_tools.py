@@ -875,7 +875,6 @@ def apply_breathing_big(latents, previous_latent, frame_counter, breathing=True)
     """
     Applique une légère respiration sinusoidale sur les latents.
     """
-    import math
     if previous_latent is not None and breathing:
         # Amplitude réduite de la respiration
         breath = 0.012 * math.sin(frame_counter * 0.15)
@@ -1149,7 +1148,7 @@ def save_debug_pose_image_with_skeleton(
             frame_counter=frame_counter
         )
 #----------------------------------------------------------------------------------------------------------------------------------
-#------------------------------------------- VENT                       -----------------------------------------------------------
+#-------------------------------------------     VENT                       -------------------------------------------------------
 #----------------------------------------------------------------------------------------------------------------------------------
 def debug_save_mask_and_wind(
     mask,
