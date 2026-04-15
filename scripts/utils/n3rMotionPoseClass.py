@@ -475,14 +475,12 @@ class Pose:
         debug: bool = False,
         debug_dir: str = None,
         frame_counter: int = 0,
-        expand_w=0.40,
-        expand_h=0.30,
-        min_size=6,  # ↑ un peu plus robuste que 4
-        auto_boost_low_mask=True  # 🔥 nouveau
+        expand_w=0.55,
+        expand_h=0.35,
+        min_size=8,
+        min_area=120,                # 🔥 nouveau
+        temporal_smooth=0.8,         # 🔥 stabilité
     ):
-        """
-        Masque bouche robuste + debug avancé + correction instabilité géométrique
-        """
 
         if device is None:
             device = self.device
@@ -497,104 +495,109 @@ class Pose:
             return mask
 
         required_keys = ['mouth_left', 'mouth_right', 'mouth_top', 'mouth_bottom']
-
         if not all(k in points_dict for k in required_keys):
-            print("[WARN] mouth_region: missing keys")
             return mask
 
-        mouth_left   = points_dict['mouth_left']
-        mouth_right  = points_dict['mouth_right']
-        mouth_top    = points_dict['mouth_top']
-        mouth_bottom = points_dict['mouth_bottom']
+        ml = points_dict['mouth_left']
+        mr = points_dict['mouth_right']
+        mt = points_dict['mouth_top']
+        mb = points_dict['mouth_bottom']
+
+        # 🔥 mémoire temporelle
+        if not hasattr(self, "_mouth_state"):
+            self._mouth_state = {}
 
         for b in range(B):
 
-            pts = torch.stack([
-                mouth_left[b],
-                mouth_right[b],
-                mouth_top[b],
-                mouth_bottom[b]
-            ])
+            pts = torch.stack([ml[b], mr[b], mt[b], mb[b]])
 
             if torch.isnan(pts).any():
-                print(f"[WARN] mouth_region: NaN batch {b}")
                 continue
 
-            # =========================
-            # centre & dimensions
-            # =========================
-            x_center = (mouth_left[b,0] + mouth_right[b,0]) * 0.5
-            y_center = (mouth_top[b,1] + mouth_bottom[b,1]) * 0.5
+            # =========================================================
+            # 🔹 CENTRE
+            # =========================================================
+            cx = (ml[b,0] + mr[b,0]) * 0.5
+            cy = (mt[b,1] + mb[b,1]) * 0.5
 
-            width  = torch.abs(mouth_right[b,0] - mouth_left[b,0])
-            height = torch.abs(mouth_bottom[b,1] - mouth_top[b,1])
+            center = torch.stack([cx, cy])
 
-            # =========================
-            # DEBUG geometry sanity
-            # =========================
-            if debug:
-                print(f"[DEBUG][MOUTH REGION]")
-                print(f"  center: ({x_center.item():.4f}, {y_center.item():.4f})")
-                print(f"  width: {width.item():.6f} height: {height.item():.6f}")
+            # 🔥 temporal smoothing
+            if b in self._mouth_state:
+                prev_center = self._mouth_state[b]["center"]
+                center = temporal_smooth * prev_center + (1 - temporal_smooth) * center
 
-            # fallback si dégénéré
+            # =========================================================
+            # 🔹 DIMENSIONS
+            # =========================================================
+            width  = torch.abs(mr[b,0] - ml[b,0])
+            height = torch.abs(mb[b,1] - mt[b,1])
+
             if width < 1e-4 or height < 1e-4:
-                width  = torch.tensor(0.06, device=device)
+                width  = torch.tensor(0.08, device=device)
                 height = torch.tensor(0.06, device=device)
 
-            # =========================
-            # expansion adaptive
-            # =========================
-            width  = width  * (1 + expand_w)
-            height = height * (1 + expand_h)
+            width  *= (1 + expand_w)
+            height *= (1 + expand_h)
 
-            # =========================
-            # pixel conversion
-            # =========================
-            x_min = int((x_center - width * 0.5) * (W - 1))
-            x_max = int((x_center + width * 0.5) * (W - 1))
-            y_min = int((y_center - height * 0.5) * (H - 1))
-            y_max = int((y_center + height * 0.5) * (H - 1))
+            # =========================================================
+            # 🔥 MIN AREA (corrige ton problème réel)
+            # =========================================================
+            area = width * height
 
-            # clamp
-            x_min = max(0, min(W - 1, x_min))
-            x_max = max(0, min(W - 1, x_max))
-            y_min = max(0, min(H - 1, y_min))
-            y_max = max(0, min(H - 1, y_max))
+            if area < min_area / (H * W):
+                scale = (min_area / (H * W) / (area + 1e-6)) ** 0.5
+                width  *= scale
+                height *= scale
 
-            # =========================
-            # min size enforcement
-            # =========================
-            if (x_max - x_min) < min_size:
-                cx = (x_min + x_max) // 2
-                x_min = max(0, cx - min_size // 2)
-                x_max = min(W - 1, cx + min_size // 2)
+            # =========================================================
+            # 🔹 PIXEL SPACE
+            # =========================================================
+            cx_px = center[0] * (W - 1)
+            cy_px = center[1] * (H - 1)
 
-            if (y_max - y_min) < min_size:
-                cy = (y_min + y_max) // 2
-                y_min = max(0, cy - min_size // 2)
-                y_max = min(H - 1, cy + min_size // 2)
+            rx = max(min_size, int(width  * W * 0.5))
+            ry = max(min_size, int(height * H * 0.5))
 
-            # =========================
-            # build mask
-            # =========================
-            mask[b, 0, y_min:y_max + 1, x_min:x_max + 1] = 1.0
+            # =========================================================
+            # 🔥 ELLIPSE MASK (beaucoup plus naturel)
+            # =========================================================
+            Y, X = torch.meshgrid(
+                torch.arange(H, device=device),
+                torch.arange(W, device=device),
+                indexing="ij"
+            )
 
-            # =========================
-            # AUTO BOOST (important pour ton log)
-            # =========================
-            if auto_boost_low_mask:
-                area = (x_max - x_min) * (y_max - y_min)
-                if area < 80:  # trop petit → ton problème actuel
-                    mask[b] *= 1.5
+            dist = ((X - cx_px)**2) / (rx**2 + 1e-6) + ((Y - cy_px)**2) / (ry**2 + 1e-6)
 
-        # =========================
-        # feather safe
-        # =========================
-        try:
-            mask = feather_outside_only_alpha(mask, radius=4, sigma=1.8)
-        except Exception as e:
-            print(f"[WARN] mouth_region: feather failed ({e})")
+            ellipse = torch.exp(-dist * 2.5)  # 🔥 gaussian falloff
+
+            mask[b,0] = torch.maximum(mask[b,0], ellipse)
+
+            # =========================================================
+            # 🔹 SAVE STATE
+            # =========================================================
+            self._mouth_state[b] = {
+                "center": center.detach(),
+                "width": width.detach(),
+                "height": height.detach()
+            }
+
+            # =========================================================
+            # 🔹 DEBUG
+            # =========================================================
+            if debug:
+                print(f"[DEBUG][MOUTH]")
+                print(f" center: {center.tolist()}")
+                print(f" width/height: {width.item():.4f} / {height.item():.4f}")
+                print(f" rx/ry px: {rx} / {ry}")
+
+        # =========================================================
+        # 🔹 FINAL CLAMP
+        # =========================================================
+        mask = mask.clamp(0, 1)
+
+        return mask
 
         # =========================
         # DEBUG VISUAL ULTRA IMPORTANT
@@ -918,7 +921,8 @@ class Pose:
         self.delta = delta
         return delta
     # --------------- Mask decor ---------------------------------------------
-    def create_decor_mask( self, H: int, W: int, mask_face=None, mask_torso=None, mask_hair=None, debug: bool = False, debug_dir: str = None, frame_counter: int = 0, expand=2.2, vertical_bias=1.2, falloff_strength=2.0 ):
+    def create_decor_mask( self, H: int, W: int, mask_face=None, mask_torso=None, mask_hair=None, debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
+                          expand=2.5, vertical_bias=1.2, falloff_strength=2.0 ):
         device = self.device
         B = self.B
 
@@ -1158,125 +1162,6 @@ class Pose:
 
         return mask
 
-    def create_upper_body_mask_v2(
-        self,
-        H: int,
-        W: int,
-        debug: bool = False,
-        debug_dir: str = None,
-        frame_counter: int = 0,
-        expand_w=1.0,
-        shrink_h=0.9,
-        roundness=0.6
-    ):
-        """
-        Masque torse PRO : capsule (rectangle + ellipse), plus naturel que polygon
-        """
-        mask = torch.zeros(self.B, 1, H, W, device=self.device)
-
-        def to_px(kp):
-            return np.array([kp[0]*(W-1), kp[1]*(H-1)])
-
-        for b in range(self.B):
-            # Points clés
-            pts = np.array([
-                to_px(self.get_point(19)[b].cpu().numpy()),  # r_sh
-                to_px(self.get_point(20)[b].cpu().numpy()),  # l_sh
-                to_px(self.get_point(8)[b].cpu().numpy()),   # r_hip
-                to_px(self.get_point(11)[b].cpu().numpy())   # l_hip
-            ])
-
-            # Centre et dimensions
-            x_min, y_min = pts[:,0].min(), pts[:,1].min()
-            x_max, y_max = pts[:,0].max(), pts[:,1].max()
-            cx, cy = (x_min + x_max)/2, (y_min + y_max)/2
-            width, height = (x_max - x_min) * expand_w, (y_max - y_min) * shrink_h
-
-            # Rectangle central
-            rect_h = int(height * (1 - roundness))
-            rect_w = int(width)
-            x0, y0 = int(cx - rect_w/2), int(cy - rect_h/2)
-
-            mask_np = np.zeros((H, W), dtype=np.uint8)
-            cv2.rectangle(mask_np, (x0, y0), (x0 + rect_w, y0 + rect_h), 255, -1)
-
-            # Ellipses haut/bas
-            ellipse_h = int(height * roundness)
-            for y_center, start_angle, end_angle in [(y0, 0, 180), (y0 + rect_h, 180, 360)]:
-                cv2.ellipse(mask_np, (int(cx), int(y_center)), (rect_w//2, ellipse_h), 0, start_angle, end_angle, 255, -1)
-
-            # Morphologie pour lisser
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
-            mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel)
-
-            mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
-
-        # Feather final
-        mask = feather_inside_strict(mask, radius=5, blur_kernel=3, sigma=1.2)
-
-        # Debug
-        if debug and debug_dir is not None:
-            save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="torso_mask_")
-
-        return mask
-
-    def create_upper_body_mask_v1(self, H: int, W: int,
-                            debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
-                            expand_w=0.95, shrink_h=0.70):
-        """
-        Crée un masque polygonal flouté torse uniquement, basé sur épaules + hanches.
-        expand_w: facteur pour élargir le masque horizontalement (>1 = plus large)
-        shrink_h: facteur pour réduire le masque verticalement (<1 = plus petit)
-        """
-
-        mask = torch.zeros(self.B, 1, H, W, device=self.device)
-
-        for b in range(self.B):
-            # Récupère les keypoints : épaules et hanches
-            r_sh = self.get_point(19)[b].cpu().numpy()
-            l_sh = self.get_point(20)[b].cpu().numpy()
-            r_hip = self.get_point(8)[b].cpu().numpy()
-            l_hip = self.get_point(11)[b].cpu().numpy()
-
-            # Convertir en pixels
-            def to_px(kp):
-                return np.array([kp[0]*(W-1), kp[1]*(H-1)])
-
-            pts = np.array([
-                to_px(r_sh),
-                to_px(l_sh),
-                to_px(l_hip),
-                to_px(r_hip)
-            ], dtype=np.float32)
-
-            # 🔹 Ajuster largeur et hauteur
-            # Centre horizontal et vertical du polygone
-            cx = np.mean(pts[:,0])
-            cy = np.mean(pts[:,1])
-
-            # Appliquer le facteur
-            pts[:,0] = cx + (pts[:,0] - cx) * expand_w    # élargir horizontalement
-            pts[:,1] = cy + (pts[:,1] - cy) * shrink_h    # réduire verticalement
-
-            # Convertir en int pour cv2
-            pts = pts.astype(np.int32)
-
-            # Remplir le polygone
-            mask_np = np.zeros((H, W), dtype=np.uint8)
-            cv2.fillPoly(mask_np, [pts], 255)
-
-            # Convertir en tensor
-            mask[b,0] = torch.from_numpy(mask_np / 255.0).to(self.device)
-
-        # Appliquer feather intérieur strict
-        mask = feather_inside_strict(mask, radius=5, blur_kernel=3, sigma=1.0)
-
-        # -------------------- Debug --------------------
-        if debug and debug_dir is not None:
-            save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="skeleton_mask_")
-
-        return mask
-
     def create_hair_mask(
         self,
         H: int,
@@ -1504,118 +1389,229 @@ class Pose:
 
         return mask
     #-----------------------------------------------------------------------------------------------------------------------------------
-    def create_mouth_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.40, expand_h=0.30):
-        """
-        Masque dynamique pour la bouche uniquement, arrondi avec bord glow.
-        expand_w / expand_h permettent d'élargir le rectangle de la bouche.
-        Retourne également les points calculés de la bouche pour suivi.
-        """
-        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+    def create_mouth_mask(
+        self,
+        H: int,
+        W: int,
+        debug=False,
+        debug_dir=None,
+        frame_counter=0,
+        expand_w=0.55,
+        expand_h=0.35
+    ):
+
+        # =========================================================
+        # 🔥 1. MASK VIA NOUVELLE FONCTION (CORE)
+        # =========================================================
+        mask = self.get_mouth_region(
+            H=H,
+            W=W,
+            device=self.device,
+            debug=debug,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter,
+            expand_w=expand_w,
+            expand_h=expand_h
+        )
+
+        # =========================================================
+        # 🔹 2. EXTRACTION POINTS (pour tracking / debug)
+        # =========================================================
         mouth_points_batch = []
 
+        try:
+            points_dict = self.estimate_missing_facial_points()
+        except Exception as e:
+            print(f"[WARN] create_mouth_mask: estimation failed ({e})")
+            return mask, mouth_points_batch
+
+        required_keys = ['mouth_left', 'mouth_right', 'mouth_top', 'mouth_bottom']
+
+        if not all(k in points_dict for k in required_keys):
+            return mask, mouth_points_batch
+
+        ml = points_dict['mouth_left']
+        mr = points_dict['mouth_right']
+        mt = points_dict['mouth_top']
+        mb = points_dict['mouth_bottom']
+
         for b in range(self.B):
-            # Récupération du centre approximatif de la bouche
-            mouth_center = self.get_point('mouth')[b].cpu().numpy()
-            cx = mouth_center[0] * (W-1)
-            cy = mouth_center[1] * (H-1)
 
-            # Dimensions approximatives de la bouche
-            w_mouth = 0.06 * W * (1 + expand_w)
-            h_mouth = 0.04 * H * (1 + expand_h)
-
-            # Calcul des coins et haut/bas
-            mouth_left   = np.array([cx - w_mouth/2, cy])
-            mouth_right  = np.array([cx + w_mouth/2, cy])
-            mouth_top    = np.array([cx, cy - h_mouth/2])
-            mouth_bottom = np.array([cx, cy + h_mouth/2])
+            if torch.isnan(ml[b]).any():
+                continue
 
             mouth_points_batch.append({
-                'mouth_center': mouth_center,
-                'mouth_left': mouth_left / [W-1, H-1],
-                'mouth_right': mouth_right / [W-1, H-1],
-                'mouth_top': mouth_top / [W-1, H-1],
-                'mouth_bottom': mouth_bottom / [W-1, H-1],
+                'mouth_center': ((ml[b] + mr[b]) * 0.5).detach().cpu().numpy(),
+                'mouth_left': ml[b].detach().cpu().numpy(),
+                'mouth_right': mr[b].detach().cpu().numpy(),
+                'mouth_top': mt[b].detach().cpu().numpy(),
+                'mouth_bottom': mb[b].detach().cpu().numpy(),
             })
 
-            # Création d'un ovale pour la bouche
-            mask_np = np.zeros((H, W), dtype=np.uint8)
-            center = (int(cx), int(cy))
-            axes = (int(w_mouth/2), int(h_mouth/2))
-            cv2.ellipse(mask_np, center, axes, angle=0, startAngle=0, endAngle=360, color=255, thickness=-1)
+        # =========================================================
+        # 🔹 3. FEATHER FINAL (léger uniquement)
+        # =========================================================
+        try:
+            mask = feather_inside_strict(mask, radius=2, blur_kernel=3, sigma=0.8)
+            mask = feather_outside_only_alpha(mask, radius=3, sigma=1.2)
+        except Exception as e:
+            print(f"[WARN] create_mouth_mask: feather failed ({e})")
 
-            # Conversion en tensor et ajout au batch
-            mask[b,0] = torch.from_numpy(mask_np/255.0).to(self.device)
-
-        # Feather interne/externe pour adoucir le bord
-        mask = feather_inside_strict(mask, radius=3, blur_kernel=3, sigma=1.0)
-        mask = feather_outside_only_alpha(mask, radius=3, sigma=1.5)
-
-        # Debug
+        # =========================================================
+        # 🔹 4. DEBUG VISUEL
+        # =========================================================
         if debug and debug_dir is not None:
             os.makedirs(debug_dir, exist_ok=True)
+
+            mask_img = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
+
             save_path = os.path.join(debug_dir, f"mouth_mask_{frame_counter:05d}.png")
-            mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
             Image.fromarray(mask_img).save(save_path)
+
             print(f"[DEBUG] Mouth mask saved: {save_path}")
 
-        return mask, mouth_points_batch
+        return mask.clamp(0,1), mouth_points_batch
     #-----------------------------------------------------------------------------------------------------------------------------------
-    def create_mouth_corners_mask(self, H: int, W: int, debug=False, debug_dir=None, frame_counter=0, expand_w=0.40, expand_h=0.30):
-        """
-        Masque dynamique pour les coins de la bouche uniquement (pour sourire subtil, micro-mouvements).
-        Les coins sont calculés à partir du point central de la bouche.
+    def create_mouth_corners_mask(
+        self,
+        H: int,
+        W: int,
+        debug=False,
+        debug_dir=None,
+        frame_counter=0,
+        expand_w=0.40,
+        expand_h=0.25,
+        temporal_smooth=0.8,
+        min_size=6
+    ):
+        import torch
+        import os
+        import numpy as np
+        from PIL import Image
 
-        Args:
-            H, W: hauteur et largeur de l'image/latent
-            expand_w, expand_h: élargissement du masque horizontal/vertical
-            debug: si True, sauvegarde l'image du masque
-            debug_dir: répertoire de sauvegarde debug
-            frame_counter: numéro de frame (pour debug)
+        device = self.device
+        B = self.B
 
-        Returns:
-            mask (torch.Tensor): [B,1,H,W] masque des coins de bouche
-            corners_points_batch (list[dict]): coordonnées normalisées des coins par batch
-        """
-        mask = torch.zeros(self.B, 1, H, W, device=self.device)
+        mask = torch.zeros((B, 1, H, W), device=device)
         corners_points_batch = []
 
-        for b in range(self.B):
-            # Récupération du centre approximatif de la bouche
-            mouth_center = self.get_point('mouth')[b].cpu().numpy()
-            cx = mouth_center[0] * (W-1)
-            cy = mouth_center[1] * (H-1)
+        # =========================================================
+        # 🔹 1. POINTS RÉELS
+        # =========================================================
+        try:
+            points_dict = self.estimate_missing_facial_points()
+        except Exception as e:
+            print(f"[WARN] mouth_corners: estimation failed ({e})")
+            return mask, corners_points_batch
 
-            # Dimensions approximatives pour coins de bouche
-            w_corner = 0.03 * W * (1 + expand_w)
-            h_corner = 0.02 * H * (1 + expand_h)
+        if 'mouth_left' not in points_dict or 'mouth_right' not in points_dict:
+            return mask, corners_points_batch
 
-            # Calcul coins gauche/droite
-            mouth_left  = np.array([cx - w_corner/2, cy])
-            mouth_right = np.array([cx + w_corner/2, cy])
+        ml = points_dict['mouth_left']
+        mr = points_dict['mouth_right']
 
+        # 🔥 mémoire temporelle
+        if not hasattr(self, "_mouth_corners_state"):
+            self._mouth_corners_state = {}
+
+        # meshgrid global
+        Y, X = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij"
+        )
+
+        for b in range(B):
+
+            if torch.isnan(ml[b]).any():
+                continue
+
+            left  = ml[b]
+            right = mr[b]
+
+            # =========================================================
+            # 🔹 TEMPORAL SMOOTH
+            # =========================================================
+            if b in self._mouth_corners_state:
+                prev = self._mouth_corners_state[b]
+                left  = temporal_smooth * prev["left"]  + (1 - temporal_smooth) * left
+                right = temporal_smooth * prev["right"] + (1 - temporal_smooth) * right
+
+            # =========================================================
+            # 🔹 DIMENSIONS ADAPTIVES
+            # =========================================================
+            mouth_width = torch.abs(right[0] - left[0])
+
+            rx = max(min_size, int(mouth_width * W * 0.25 * (1 + expand_w)))
+            ry = max(min_size, int(mouth_width * H * 0.15 * (1 + expand_h)))
+
+            # =========================================================
+            # 🔹 PIXELS
+            # =========================================================
+            lx = left[0]  * (W - 1)
+            ly = left[1]  * (H - 1)
+
+            rxp = right[0] * (W - 1)
+            ryp = right[1] * (H - 1)
+
+            # =========================================================
+            # 🔥 MASQUE GAUSSIEN DOUBLE
+            # =========================================================
+            dist_left = ((X - lx)**2)/(rx**2 + 1e-6) + ((Y - ly)**2)/(ry**2 + 1e-6)
+            dist_right = ((X - rxp)**2)/(rx**2 + 1e-6) + ((Y - ryp)**2)/(ry**2 + 1e-6)
+
+            ellipse_left  = torch.exp(-dist_left * 2.5)
+            ellipse_right = torch.exp(-dist_right * 2.5)
+
+            combined = torch.maximum(ellipse_left, ellipse_right)
+
+            mask[b,0] = combined
+
+            # =========================================================
+            # 🔹 SAVE POINTS
+            # =========================================================
             corners_points_batch.append({
-                'mouth_center': mouth_center,
-                'mouth_left': mouth_left / [W-1, H-1],
-                'mouth_right': mouth_right / [W-1, H-1],
+                'mouth_left': left.detach().cpu().numpy(),
+                'mouth_right': right.detach().cpu().numpy(),
             })
 
-            # Création masque ovale pour les coins
-            mask_np = np.zeros((H, W), dtype=np.uint8)
-            cv2.ellipse(mask_np, (int(mouth_left[0]), int(mouth_left[1])), (int(w_corner/2), int(h_corner/2)), 0, 0, 360, 255, -1)
-            cv2.ellipse(mask_np, (int(mouth_right[0]), int(mouth_right[1])), (int(w_corner/2), int(h_corner/2)), 0, 0, 360, 255, -1)
+            # save state
+            self._mouth_corners_state[b] = {
+                "left": left.detach(),
+                "right": right.detach()
+            }
 
-            mask[b,0] = torch.from_numpy(mask_np/255.0).to(self.device)
+            # =========================================================
+            # 🔹 DEBUG
+            # =========================================================
+            if debug:
+                print(f"[DEBUG][MOUTH CORNERS]")
+                print(f" left: {left.tolist()}")
+                print(f" right: {right.tolist()}")
+                print(f" rx/ry: {rx}/{ry}")
 
-        # Feather interne/externe pour adoucir le bord
-        mask = feather_inside_strict(mask, radius=2, blur_kernel=3, sigma=1.0)
-        mask = feather_outside_only_alpha(mask, radius=2, sigma=1.0)
+        # =========================================================
+        # 🔹 FEATHER FINAL (léger)
+        # =========================================================
+        try:
+            mask = feather_inside_strict(mask, radius=2, blur_kernel=3, sigma=0.8)
+            mask = feather_outside_only_alpha(mask, radius=2, sigma=1.0)
+        except Exception as e:
+            print(f"[WARN] mouth_corners: feather failed ({e})")
 
-        # Debug
+        mask = mask.clamp(0,1)
+
+        # =========================================================
+        # 🔹 DEBUG IMAGE
+        # =========================================================
         if debug and debug_dir is not None:
             os.makedirs(debug_dir, exist_ok=True)
+
+            mask_img = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
+
             save_path = os.path.join(debug_dir, f"mouth_corners_mask_{frame_counter:05d}.png")
-            mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
             Image.fromarray(mask_img).save(save_path)
+
             print(f"[DEBUG] Mouth corners mask saved: {save_path}")
 
         return mask, corners_points_batch
