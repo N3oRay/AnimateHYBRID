@@ -1779,6 +1779,9 @@ def normalize_mask(mask):
     - Micro-boost per zone
     - Full debug and timings
     """
+def should_freeze(frame_idx, frame_pause):
+    return (frame_pause is not None) and (frame_idx % frame_pause == 0)
+
 def apply_pose_driven_motion_ultra2(
     latents,
     keypoints,
@@ -1890,7 +1893,8 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 Global pose & stabilisation avancée
     # =========================
-    if frame_counter % 1 == 0:
+    #if frame_counter % 1 == 0:
+    if should_freeze(frame_counter, 5): # Pause traitement
         start = time.time()
         latents_world, global_delta, grid_raw, grid_global = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
         if prev_pose is not None:
@@ -1930,15 +1934,16 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 BREATHING
     # =========================
-    start = time.time()
-    latents_before = latents_world.clone()
-    latents_breath = apply_breathing_simple(latents_world, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
-    t = torch.tensor(frame_counter/10.0, device=latents_world.device)
-    breath_strength = 0.2 + 0.2 * torch.sin(t)
-    latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_breath*(breath_strength*mask_torso_exp)
-    timings["breathing"] = time.time() - start
-    if debug:
-        print("[DEBUG] Breathing applied")
+    if should_freeze(frame_counter, 3): # Pause traitement
+        start = time.time()
+        latents_before = latents_world.clone()
+        latents_breath = apply_breathing_simple(latents_world, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
+        t = torch.tensor(frame_counter/10.0, device=latents_world.device)
+        breath_strength = 0.2 + 0.2 * torch.sin(t)
+        latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_breath*(breath_strength*mask_torso_exp)
+        timings["breathing"] = time.time() - start
+        if debug:
+            print("[DEBUG] Breathing applied")
 
     #================== PARTI LOCAL ========================================
 
@@ -1974,64 +1979,67 @@ def apply_pose_driven_motion_ultra2(
     # ===================================
     # 🔹 Mouth & micro-expressions - OK
     # ==================================
-    start = time.time()
-    latents_local, mouth_delta, _ = apply_mouth_smil(
-        latents_local, pose, mask_mouth, grid, H, W, frame_counter,
-        device=device, debug=debug, debug_dir=debug_dir, smooth=0.85
-    )
-    print("MOUTH DELTA MEAN:", mouth_delta.abs().mean().item())
+    if should_freeze(frame_counter, 3): # Pause traitement
+        start = time.time()
+        latents_local, mouth_delta, _ = apply_mouth_smil(
+            latents_local, pose, mask_mouth, grid, H, W, frame_counter,
+            device=device, debug=debug, debug_dir=debug_dir, smooth=0.85
+        )
+        print("MOUTH DELTA MEAN:", mouth_delta.abs().mean().item())
 
-    # Broadcasting correct pour la bouche
-    mask_mouth_corners_broadcast = mask_mouth_corners.repeat(1, C, 1, 1)
-    latents_local += 0.002 * (mask_mouth_corners_broadcast * torch.sin(t*2.0))
+        # Broadcasting correct pour la bouche
+        mask_mouth_corners_broadcast = mask_mouth_corners.repeat(1, C, 1, 1)
+        latents_local += 0.002 * (mask_mouth_corners_broadcast * torch.sin(t*2.0))
 
-    # Broadcasting correct pour les yeux
-    mask_left_eye_broadcast  = mask_left_eye.repeat(1, C, 1, 1)
-    mask_right_eye_broadcast = mask_right_eye.repeat(1, C, 1, 1)
+        # Broadcasting correct pour les yeux
+        mask_left_eye_broadcast  = mask_left_eye.repeat(1, C, 1, 1)
+        mask_right_eye_broadcast = mask_right_eye.repeat(1, C, 1, 1)
 
-    eye_motion = 0.1 * (mask_left_eye_broadcast  * torch.sin(t*3.0) +
-                       mask_right_eye_broadcast * torch.cos(t*3.0))
+        eye_motion = 0.1 * (mask_left_eye_broadcast  * torch.sin(t*3.0) +
+                        mask_right_eye_broadcast * torch.cos(t*3.0))
 
-    eye_motion = eye_motion * mask_face_exp
-    latents_local += eye_motion
+        eye_motion = eye_motion * mask_face_exp
+        latents_local += eye_motion
 
-    timings["MOUTH+EYES"] = time.time() - start
+        timings["MOUTH+EYES"] = time.time() - start
 
     # ==============================
     # 🔹 Hair motion cycle - OK
     # ==============================
-    if not hasattr(apply_pose_driven_motion_ultra2,"prev_hair_fields"):
-        apply_pose_driven_motion_ultra2.prev_hair_fields = [None]*B
-    start = time.time()
-    latents_before = latents_local.clone()
-    latents_hair, hair_delta = apply_hair_motion_cycle(
-        latents_local, mask_hair, grid, H, W, frame_counter, device, delta_px,
-        prev_hair_field=apply_pose_driven_motion_ultra2.prev_hair_fields[0] if B==1 else None,
-        debug=debug, debug_dir=debug_dir
-    )
-    latents_local = latents_hair * mask_hair_exp + latents_before * (1.0 - mask_hair_exp)
-    print("HAIR DELTA MEAN:", hair_delta.abs().mean().item())
-    apply_pose_driven_motion_ultra2.prev_hair_fields[0] = hair_delta
-    timings["HAIR"] = time.time() - start
+    if should_freeze(frame_counter, 6): # Pause traitement
+        if not hasattr(apply_pose_driven_motion_ultra2,"prev_hair_fields"):
+            apply_pose_driven_motion_ultra2.prev_hair_fields = [None]*B
+        start = time.time()
+        latents_before = latents_local.clone()
+        latents_hair, hair_delta = apply_hair_motion_cycle(
+            latents_local, mask_hair, grid, H, W, frame_counter, device, delta_px,
+            prev_hair_field=apply_pose_driven_motion_ultra2.prev_hair_fields[0] if B==1 else None,
+            debug=debug, debug_dir=debug_dir
+        )
+        latents_local = latents_hair * mask_hair_exp + latents_before * (1.0 - mask_hair_exp)
+        print("HAIR DELTA MEAN:", hair_delta.abs().mean().item())
+        apply_pose_driven_motion_ultra2.prev_hair_fields[0] = hair_delta
+        timings["HAIR"] = time.time() - start
 
 
     # ===========================
     # 🔹 Decor motion cycle - OK
     # ===========================
-    if not hasattr(apply_pose_driven_motion_ultra2,"prev_decor_fields"):
-        apply_pose_driven_motion_ultra2.prev_decor_fields = [None]*B
-    start = time.time()
-    latents_before = latents_local.clone()
+    if should_freeze(frame_counter, 6): # Pause traitement
+        if not hasattr(apply_pose_driven_motion_ultra2,"prev_decor_fields"):
+            apply_pose_driven_motion_ultra2.prev_decor_fields = [None]*B
+        start = time.time()
+        latents_before = latents_local.clone()
 
-    latents_decor, decor_delta = apply_hair_motion_cycle(
-        latents_local, mask_decor, grid, H, W, frame_counter, device, delta_px,
-        prev_hair_field=apply_pose_driven_motion_ultra2.prev_decor_fields[0] if B==1 else None,
-        debug=debug, debug_dir=debug_dir
-    )
-    latents_local = latents_decor * mask_decor + latents_before * (1.0 - mask_decor)
-    print("DECOR DELTA MEAN:", decor_delta.abs().mean().item())
-    apply_pose_driven_motion_ultra2.prev_decor_fields[0] = decor_delta
-    timings["DECOR"] = time.time() - start
+        latents_decor, decor_delta = apply_hair_motion_cycle(
+            latents_local, mask_decor, grid, H, W, frame_counter, device, delta_px,
+            prev_hair_field=apply_pose_driven_motion_ultra2.prev_decor_fields[0] if B==1 else None,
+            debug=debug, debug_dir=debug_dir
+        )
+        latents_local = latents_decor * mask_decor + latents_before * (1.0 - mask_decor)
+        print("DECOR DELTA MEAN:", decor_delta.abs().mean().item())
+        apply_pose_driven_motion_ultra2.prev_decor_fields[0] = decor_delta
+        timings["DECOR"] = time.time() - start
 
     # =========================
     # 🔹 Micro boost global
@@ -2074,16 +2082,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # MICRO BOOST CORE (1 seule source)
     # =========================
-    latents = apply_micro_boost(
-        latents_mix,
-        frame_counter,
-        device,
-        masks,
-        keypoints,
-        prev_keypoints,
-        strength=1.0,
-        debug=debug
-    )
+    latents = apply_micro_boost( latents_mix, frame_counter, device, masks, keypoints, prev_keypoints, strength=1.0, debug=debug )
 
     # =========================
     # SECONDARY SINUS BOOST (optionnel mais propre)
@@ -2106,15 +2105,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # MICRO MOTION FINAL (very light)
     # =========================
-    latents = apply_micro_motion(
-        latents,
-        frame_counter,
-        device,
-        masks,
-        strength=0.05,
-        randomize=True,
-        debug=debug
-    )
+    latents = apply_micro_motion( latents, frame_counter, device, masks, strength=0.05, randomize=True, debug=debug )
 
     timings["MICRO_BOOST"] = time.time() - start
 
@@ -2576,8 +2567,7 @@ def apply_pose_driven_motion_stable(
     return latents
 
 #-------Gestion de l'animation -----------------------------------------------------------------------------------
-def should_freeze(frame_idx, frame_pause):
-    return (frame_pause is not None) and (frame_idx % frame_pause == 0)
+
 
 def compute_time(frame_idx, frame_pause, base_dt=0.03):
     if frame_pause is None:
