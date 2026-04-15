@@ -866,6 +866,150 @@ class Pose:
 
         return mask
 
+
+    def compute_mouth_delta(
+        pose,
+        mask_mouth,
+        H,
+        W,
+        frame_counter,
+        device,
+        smooth=0.85,
+        strength=2.0,
+        debug=False,
+        mouth_state=None,   # 🔥 NEW (optionnel mais crucial)
+    ):
+        """
+        Compute mouth motion field (NO WARP).
+        Safe for accumulation → avoids blur.
+        """
+
+        # =========================
+        # 1. Facial points
+        # =========================
+        facial_points = pose.estimate_facial_points_full(smooth=smooth)
+
+        mouth_left  = facial_points['mouth_left']
+        mouth_right = facial_points['mouth_right']
+
+        # =========================
+        # 🔥 ALIGNEMENT AVEC get_mouth_region (profil correction)
+        # =========================
+        if mouth_state is not None and 'center' in mouth_state:
+
+            if debug:
+                print("[DEBUG][MOUTH] 🔥 using mouth_state alignment (profile-aware)")
+
+            mouth_center = mouth_state['center']  # [B,2]
+
+            # direction bouche (axe horizontal stable)
+            direction = torch.nn.functional.normalize(
+                mouth_right - mouth_left, dim=-1
+            )
+
+            width = torch.norm(mouth_right - mouth_left, dim=-1, keepdim=True)
+
+            mouth_left  = mouth_center - direction * (width * 0.5)
+            mouth_right = mouth_center + direction * (width * 0.5)
+
+        # =========================
+        # 2. MASK (stable + clean)
+        # =========================
+        mask = feather_inside_strict2(mask_mouth, radius=3, blur_kernel=5, sigma=1.2)
+        mask = feather_outside_only_alpha2(mask, radius=2, sigma=1.0)
+
+        mask_mean = mask.mean()
+
+        # auto boost léger mais contrôlé
+        boost = torch.clamp(0.04 / (mask_mean + 1e-6), 1.0, 3.0)
+        mask = torch.clamp(mask * boost, 0, 1)
+
+        mask_exp = mask.permute(0, 2, 3, 1)
+
+        # =========================
+        # 3. TIME SIGNALS (smooth)
+        # =========================
+        t = frame_counter / 10.0
+
+        t_smile  = torch.sin(torch.tensor(t * 1.2, device=device))
+        t_breath = torch.sin(torch.tensor(t * 0.6, device=device))
+        t_open   = torch.sin(torch.tensor(t * 0.4, device=device))
+
+        # =========================
+        # 4. COORD GRID
+        # =========================
+        y, x = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing='ij'
+        )
+
+        x = x[None]
+        y = y[None]
+
+        mouth_left_px  = mouth_left  * torch.tensor([W-1, H-1], device=device)
+        mouth_right_px = mouth_right * torch.tensor([W-1, H-1], device=device)
+
+        # =========================
+        # 5. DISTANCE FIELD
+        # =========================
+        sigma = 16.0
+
+        def gaussian(cx, cy):
+            return torch.exp(-(
+                (x - cx[:, None, None])**2 +
+                (y - cy[:, None, None])**2
+            ) / (2 * sigma**2))
+
+        dist_left  = gaussian(mouth_left_px[:,0],  mouth_left_px[:,1])
+        dist_right = gaussian(mouth_right_px[:,0], mouth_right_px[:,1])
+
+        # =========================
+        # 6. MOTION FIELD
+        # =========================
+        amp = 0.25 * strength
+
+        delta = torch.zeros((mask.shape[0], H, W, 2), device=device)
+
+        # smile horizontal
+        delta[..., 0] += amp * t_smile * (dist_right - dist_left)
+
+        # smile vertical léger
+        delta[..., 1] += 0.12 * amp * t_smile * (dist_left + dist_right)
+
+        # ouverture + respiration
+        delta[..., 1] += (
+            0.025 * strength * t_breath +
+            0.02  * strength * torch.abs(t_open)
+        ) * mask_exp[..., 0]
+
+        # =========================
+        # 7. APPLY MASK
+        # =========================
+        delta = delta * mask_exp
+
+        # =========================
+        # 8. NORMALISATION SAFE (ANTI BLUR)
+        # =========================
+        delta = torch.tanh(delta) * 2.0
+        delta = torch.clamp(delta, -3.0, 3.0)
+
+        # =========================
+        # DEBUG LOGS (inchangés + enrichis léger)
+        # =========================
+        if debug:
+            print("[DEBUG][MOUTH DELTA CLEAN]")
+            print(f"  mean={delta.abs().mean().item():.6f}")
+            print(f"  max={delta.abs().max().item():.6f}")
+            print(f"  mask_mean={mask_mean.item():.5f}")
+
+            if mouth_state is not None:
+                print(f"  profile_sync=ON")
+            else:
+                print(f"  profile_sync=OFF")
+
+        return delta, facial_points
+
     def compute_mouth_delta(
         pose,
         mask_mouth,
