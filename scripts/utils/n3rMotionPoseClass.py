@@ -75,6 +75,9 @@ class Pose:
         self.torce_expand_w=1.6
         self.torce_shrink_h=1.2
 
+        self.bouche_expand_h=0.30
+        self.bouche_expand_w=0.60
+
         # -----------------------------
         # Mapping global des points faciaux
         # -----------------------------
@@ -104,6 +107,12 @@ class Pose:
             'mouth_bottom': 51,  # index approximatif du bas de la bouche
         }
 
+
+    def get_bouche_expand_h(self):
+        return self.bouche_expand_h
+
+    def get_bouche_expand_w(self):
+        return self.bouche_expand_w
     # -----------------------------
     # 🔹 UPDATE HAUT DU CORPS (smooth)
     # -----------------------------
@@ -518,13 +527,15 @@ class Pose:
             debug: bool = False,
             debug_dir: str = None,
             frame_counter: int = 0,
-            expand_w=0.55,
-            expand_h=0.35,
             min_size=8,
             min_area=120,
             temporal_smooth=0.8,
             profile_strength=0.08,
         ):
+
+        # Valeurs par défaut dynamiques
+        expand_w = self.get_bouche_expand_w() # 0.60
+        expand_h = self.get_bouche_expand_h() # 0.30
 
         if device is None:
             device = self.device
@@ -683,186 +694,6 @@ class Pose:
                 name="mouth_mask",
                 scale=4
             )
-
-        return mask
-
-    def get_mouth_region_v2(
-            self,
-            H: int,
-            W: int,
-            device=None,
-            debug: bool = False,
-            debug_dir: str = None,
-            frame_counter: int = 0,
-            expand_w=0.55,
-            expand_h=0.35,
-            min_size=8,
-            min_area=120,
-            temporal_smooth=0.8,
-            profile_strength=0.08,   # 🔥 ajouté proprement
-        ):
-
-        if device is None:
-            device = self.device
-
-        B = self.B
-        mask = torch.zeros((B, 1, H, W), device=device)
-
-        try:
-            points_dict = self.estimate_missing_facial_points()
-        except Exception as e:
-            print(f"[WARN] mouth_region: estimation failed → fallback empty ({e})")
-            return mask
-
-        required_keys = ['mouth_left', 'mouth_right', 'mouth_top', 'mouth_bottom']
-        if not all(k in points_dict for k in required_keys):
-            return mask
-
-        ml = points_dict['mouth_left']
-        mr = points_dict['mouth_right']
-        mt = points_dict['mouth_top']
-        mb = points_dict['mouth_bottom']
-
-        # 🔥 mémoire temporelle
-        if not hasattr(self, "_mouth_state"):
-            self._mouth_state = {}
-
-        for b in range(B):
-
-            pts = torch.stack([ml[b], mr[b], mt[b], mb[b]])
-            if torch.isnan(pts).any():
-                continue
-
-            # =========================================================
-            # 🔹 CENTER BASE
-            # =========================================================
-            cx = (ml[b,0] + mr[b,0]) * 0.5
-            cy = (mt[b,1] + mb[b,1]) * 0.5
-            center = torch.stack([cx, cy])
-
-            # =========================================================
-            # 🔥 EYE-BASED PROFILE CORRECTION
-            # =========================================================
-            eye_mid = None
-            profile_factor = 1.0
-            # left_eye_outer - left_eye_inner - right_eye_inner -  right_eye_outer
-            if 'left_eye_outer' in points_dict and 'right_eye_outer' in points_dict:
-                print(f"[DEBUG][MOUTH] 👄 Position des 👁  pris en compte")
-                el = points_dict['left_eye_outer'][b]
-                er = points_dict['right_eye_outer'][b]
-
-                eye_mid = (el + er) * 0.5
-
-                dir_vec = center - eye_mid
-                norm = torch.norm(dir_vec) + 1e-6
-                dir_unit = dir_vec / norm
-
-                # 🔥 meilleur proxy : asymétrie relative visage
-                face_width = torch.norm(el - er) + 1e-6
-                profile_factor = torch.clamp(face_width, 0.0, 1.0)
-
-                center = center + dir_unit * profile_strength * profile_factor
-
-            if 'left_ear' in points_dict and 'right_ear' in points_dict:
-                print(f"[DEBUG][MOUTH] 👄 Position des 👂 pris en compte")
-                el = points_dict['left_ear'][b]
-                er = points_dict['right_ear'][b]
-
-                eye_mid = (el + er) * 0.5
-
-                dir_vec = center - eye_mid
-                norm = torch.norm(dir_vec) + 1e-6
-                dir_unit = dir_vec / norm
-
-                # 🔥 meilleur proxy : asymétrie relative visage
-                face_width = torch.norm(el - er) + 1e-6
-                profile_factor = torch.clamp(face_width, 0.0, 1.0)
-
-                center = center + dir_unit * profile_strength * profile_factor
-
-            # =========================================================
-            # 🔥 temporal smoothing
-            # =========================================================
-            if b in self._mouth_state:
-                prev_center = self._mouth_state[b]["center"]
-                center = temporal_smooth * prev_center + (1 - temporal_smooth) * center
-
-            # =========================================================
-            # 🔹 DIMENSIONS
-            # =========================================================
-            width  = torch.abs(mr[b,0] - ml[b,0])
-            height = torch.abs(mb[b,1] - mt[b,1])
-
-            if width < 1e-4 or height < 1e-4:
-                width  = torch.tensor(0.08, device=device)
-                height = torch.tensor(0.06, device=device)
-
-            width  *= (1 + expand_w)
-            height *= (1 + expand_h)
-
-            # =========================================================
-            # 🔥 MIN AREA
-            # =========================================================
-            area = width * height
-            if area < min_area / (H * W):
-                scale = (min_area / (H * W) / (area + 1e-6)) ** 0.5
-                width  *= scale
-                height *= scale
-
-            # =========================================================
-            # 🔹 PIXEL SPACE
-            # =========================================================
-            cx_px = center[0] * (W - 1)
-            cy_px = center[1] * (H - 1)
-
-            rx = max(min_size, int(width  * W * 0.5))
-            ry = max(min_size, int(height * H * 0.5))
-
-            # =========================================================
-            # 🔥 ELLIPSE MASK
-            # =========================================================
-            Y, X = torch.meshgrid(
-                torch.arange(H, device=device),
-                torch.arange(W, device=device),
-                indexing="ij"
-            )
-
-            dist = ((X - cx_px)**2) / (rx**2 + 1e-6) + ((Y - cy_px)**2) / (ry**2 + 1e-6)
-            ellipse = torch.exp(-dist * 2.5)
-
-            mask[b, 0] = torch.maximum(mask[b, 0], ellipse)
-
-            # =========================================================
-            # 🔹 SAVE STATE
-            # =========================================================
-            self._mouth_state[b] = {
-                "center": center.detach(),
-                "width": width.detach(),
-                "height": height.detach()
-            }
-
-            # =========================================================
-            # 🔹 DEBUG
-            # =========================================================
-            if debug:
-                print(f"[DEBUG][MOUTH] 👄 ")
-                print(f" center: {center.tolist()}")
-                print(f" profile_factor: {profile_factor}")
-                print(f" width/height: {width.item():.4f} / {height.item():.4f}")
-                print(f" rx/ry px: {rx} / {ry}")
-                if eye_mid is not None:
-                    print(f" eye_mid: {eye_mid.tolist()}")
-
-        # =========================================================
-        # 🔹 FINAL CLAMP
-        # =========================================================
-        mask = mask.clamp(0, 1)
-
-        # =========================================================
-        # 🔥 DEBUG IMAGE (FIXED - NOW EXECUTED)
-        # =========================================================
-        if debug and debug_dir is not None:
-            save_debug_mask_scale( mask=mask, debug_dir=debug_dir, frame_counter=frame_counter, name="mouth_mask", scale=4 )
 
         return mask
 
@@ -1211,101 +1042,7 @@ class Pose:
 
         return delta
 
-    def compute_torso_delta_v2(
-        self,
-        latent_h: int,
-        latent_w: int,
-        expand_w=1.0,
-        shrink_h=0.9
-    ):
-        """
-        Delta torse aligné avec le masque ovale (plus stable + plus lisible)
-        """
 
-        # =========================
-        # 🔹 Points torse
-        # =========================
-        pts = torch.stack([
-            self.get_point(19),  # r_shoulder
-            self.get_point(20),  # l_shoulder
-            self.get_point(8),   # r_hip
-            self.get_point(11)   # l_hip
-        ], dim=1)  # [B,4,2]
-
-        # =========================
-        # 🔹 Centre brut
-        # =========================
-        cx = pts[:, :, 0].mean(dim=1, keepdim=True)
-        cy = pts[:, :, 1].mean(dim=1, keepdim=True)
-
-        # =========================
-        # 🔹 Appliquer EXACTEMENT la même déformation que le masque
-        # =========================
-        pts_x = cx + (pts[:, :, 0] - cx) * expand_w
-        pts_y = cy + (pts[:, :, 1] - cy) * shrink_h
-
-        # =========================
-        # 🔹 Bounding box du torse (plus robuste que mean)
-        # =========================
-        x_min = pts_x.min(dim=1, keepdim=True)[0]
-        x_max = pts_x.max(dim=1, keepdim=True)[0]
-
-        y_min = pts_y.min(dim=1, keepdim=True)[0]
-        y_max = pts_y.max(dim=1, keepdim=True)[0]
-
-        # Centre réel du masque
-        torso_center_x = (x_min + x_max) * 0.5
-        torso_center_y = (y_min + y_max) * 0.5
-
-        torso_center = torch.cat([torso_center_x, torso_center_y], dim=1)  # [B,2]
-
-        # =========================
-        # 🔹 Delta normalisé (stable)
-        # =========================
-        delta = torso_center - 0.5
-
-        # 🔥 très important : non-linéarité douce
-        delta = torch.tanh(delta * 1.5) * 0.12
-
-        # =========================
-        # 🔹 Option PRO : inertie temporelle (🔥 gros gain qualité)
-        # =========================
-        if hasattr(self, "_prev_torso_delta"):
-            alpha = 0.85  # smooth temporel
-            delta = alpha * self._prev_torso_delta + (1 - alpha) * delta
-
-        self._prev_torso_delta = delta
-
-        # =========================
-        # 🔹 Store
-        # =========================
-        self.delta = delta
-
-        return delta
-
-    def compute_torso_delta_v1(self, latent_h: int, latent_w: int, expand_w=0.95, shrink_h=0.70):
-        pts = torch.stack([
-            self.get_point(19),  # r_shoulder
-            self.get_point(20),  # l_shoulder
-            self.get_point(8),   # r_hip
-            self.get_point(11)   # l_hip
-        ], dim=1)  # [B,4,2]
-
-        # Centre exact du polygone
-        cx = pts[:,:,0].mean(dim=1, keepdim=True)
-        cy = pts[:,:,1].mean(dim=1, keepdim=True)
-
-        # Ajuster largeur/hauteur pour matcher le masque
-        pts[:,:,0] = cx + (pts[:,:,0] - cx) * expand_w
-        pts[:,:,1] = cy + (pts[:,:,1] - cy) * shrink_h
-
-        # Delta : simple translation du centre du polygone (sans scale excessif)
-        torso_center = torch.stack([cx.squeeze(1), cy.squeeze(1)], dim=1)  # [B,2]
-        delta = torso_center - 0.5  # recentrer autour du milieu
-        delta = torch.tanh(delta * 1.0) * 0.1  # petite amplitude, stabilisation légère
-
-        self.delta = delta
-        return delta
     # --------------- Mask decor ---------------------------------------------
     def create_decor_mask( self, H: int, W: int, mask_face=None, mask_torso=None, mask_hair=None, debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
                           expand=2.5, vertical_bias=1.2, falloff_strength=2.0 ):
@@ -1783,10 +1520,11 @@ class Pose:
         debug=False,
         debug_dir=None,
         frame_counter=0,
-        expand_w=0.55,
-        expand_h=0.35
     ):
 
+        # Valeurs par défaut dynamiques
+        expand_w = self.get_bouche_expand_w()
+        expand_h = self.get_bouche_expand_h()
         # =========================================================
         # 🔥 1. MASK VIA NOUVELLE FONCTION (CORE)
         # =========================================================
@@ -1796,9 +1534,7 @@ class Pose:
             device=self.device,
             debug=debug,
             debug_dir=debug_dir,
-            frame_counter=frame_counter,
-            expand_w=expand_w,
-            expand_h=expand_h
+            frame_counter=frame_counter
         )
 
         # =========================================================
