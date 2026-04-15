@@ -1777,6 +1777,37 @@ def normalize_mask(mask):
 def should_freeze(frame_idx, frame_pause):
     return (frame_pause is not None) and (frame_idx % frame_pause == 0)
 
+def get_breathing_mode(frame_counter, freeze):
+    if freeze:
+        return "soft", 0.6
+    else:
+        return "real", 1.0
+
+
+def time_sin(frame_counter, freq=2.0, device="cuda"):
+    t = torch.tensor(frame_counter / 10.0, device=device)
+    return torch.sin(t * freq)
+
+
+def get_time(frame_counter, fps=10.0, device=None):
+    return torch.tensor(frame_counter / fps, device=device, dtype=torch.float32)
+
+
+def apply_breathing(
+    latents_world,
+    pose,
+    mask_torso_exp,
+    frame_counter,
+    breathing,
+    mode="soft",
+    debug=False,
+    debug_dir=None,
+):
+    if mode == "real":
+        return apply_breathing_real(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
+    else:
+        return apply_breathing_soft(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
+
 def apply_pose_driven_motion_ultra2(
     latents,
     keypoints,
@@ -1926,29 +1957,26 @@ def apply_pose_driven_motion_ultra2(
     timings["TORSO+BREATH"] = time.time() - start
     if debug:
         save_impact_map(latents_world, latents_before, debug_dir, frame_counter, prefix="torso_warp")
-    # =========================
+    # =====================================================================
     # 🔹 BREATHING
-    # =========================
-    if should_freeze(frame_counter, 3): # Pause traitement
-        start = time.time()
-        latents_before = latents_world.clone()
-        latents_breath = apply_breathing_real(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
-        t = torch.tensor(frame_counter/10.0, device=latents_world.device)
-        breath_strength = 0.2 + 0.2 * torch.sin(t)
-        latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_breath*(breath_strength*mask_torso_exp)
-        timings["breathing"] = time.time() - start
-        if debug:
-            print("[DEBUG] Breathing applied Real")
-    else:
-        start = time.time()
-        latents_before = latents_world.clone()
-        latents_breath = apply_breathing_soft(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
-        t = torch.tensor(frame_counter/10.0, device=latents_world.device)
-        breath_strength = 0.2 + 0.2 * torch.sin(t)
-        latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_breath*(breath_strength*mask_torso_exp)
-        timings["breathing"] = time.time() - start
-        if debug:
-            print("[DEBUG] Breathing applied Soft")
+    # =====================================================================
+    start = time.time()
+    freeze = should_freeze(frame_counter, 3)
+    mode, mode_strength = get_breathing_mode(frame_counter, freeze)
+    latents_before = latents_world
+    # breathing field (single output)
+    latents_breath = apply_breathing( latents_world, pose, mask_torso_exp, frame_counter, breathing, mode=mode, debug=debug, debug_dir=debug_dir )
+    # temporal modulation
+    t = frame_counter / 10.0
+    breath_strength = (0.2 + 0.2 * math.sin(t)) * mode_strength
+    # =========================================================
+    # ✔️ RESIDUAL INJECTION (IMPORTANT CHANGE)
+    # =========================================================
+    mask = mask_torso_exp ** 1.5   # smoother falloff
+    latents_world = latents_before + ( (latents_breath - latents_before) * mask * breath_strength )
+    timings["breathing"] = time.time() - start
+    if debug:
+        print(f"[DEBUG] Breathing applied ({mode})")
 
     #================== PARTI LOCAL ========================================
 
@@ -1994,14 +2022,21 @@ def apply_pose_driven_motion_ultra2(
 
         # Broadcasting correct pour la bouche
         mask_mouth_corners_broadcast = mask_mouth_corners.repeat(1, C, 1, 1)
-        latents_local += 0.002 * (mask_mouth_corners_broadcast * torch.sin(t*2.0))
+        #latents_local += 0.002 * (mask_mouth_corners_broadcast * torch.sin(t*2.0))
+
+        phase = time_sin(frame_counter, device=latents_local.device)
+        latents_local += 0.002 * mask_mouth_corners_broadcast * phase
 
         # Broadcasting correct pour les yeux
         mask_left_eye_broadcast  = mask_left_eye.repeat(1, C, 1, 1)
         mask_right_eye_broadcast = mask_right_eye.repeat(1, C, 1, 1)
 
-        eye_motion = 0.1 * (mask_left_eye_broadcast  * torch.sin(t*3.0) +
-                        mask_right_eye_broadcast * torch.cos(t*3.0))
+
+        t = time_sin(frame_counter, freq=3.0, device=latents_world.device)
+        eye_motion = 0.1 * (mask_left_eye_broadcast * t +
+                        mask_right_eye_broadcast * time_sin(frame_counter, freq=3.0, device=latents_world.device))
+
+        #eye_motion = 0.1 * (mask_left_eye_broadcast  * torch.sin(t*3.0) + mask_right_eye_broadcast * torch.cos(t*3.0))
 
         eye_motion = eye_motion * mask_face_exp
         latents_local += eye_motion
@@ -2103,7 +2138,8 @@ def apply_pose_driven_motion_ultra2(
         mask_exp = mask.repeat(1, C, 1, 1)
 
         # UNIQUE scaling propre
-        signal = torch.sin(t * speed)
+        t = get_time(frame_counter, device=latents.device)
+        signal = torch.sin(t * speed) * torch.exp(-0.1 * t)
 
         latents = latents + MICRO_GAIN * amplitude * mask_exp * signal
 

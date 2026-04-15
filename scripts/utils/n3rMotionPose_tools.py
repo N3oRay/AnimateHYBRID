@@ -839,7 +839,8 @@ def apply_breathing_soft(
         delta_mag = torch.sqrt(delta_x**2 + delta_y**2)
 
         print("🫁 V3 breath mean:", delta_mag.mean().item())
-        print("💓 heartbeat contrib:", heartbeat.item())
+        #print("💓 heartbeat contrib:", heartbeat.item())
+        print("💓 heartbeat contrib:", float(heartbeat))
 
         if debug_dir is not None:
             os.makedirs(debug_dir, exist_ok=True)
