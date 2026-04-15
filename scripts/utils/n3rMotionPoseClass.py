@@ -113,6 +113,54 @@ class Pose:
 
     def get_bouche_expand_w(self):
         return self.bouche_expand_w
+
+    def compute_pose_context(self, facial_points):
+        """
+        Returns global pose context for motion modules.
+        """
+
+        ctx = {}
+
+        # =========================
+        # SHOULDER AXIS
+        # =========================
+        if 'left_shoulder' in facial_points and 'right_shoulder' in facial_points:
+            ls = facial_points['left_shoulder']
+            rs = facial_points['right_shoulder']
+
+            shoulder_vec = rs - ls
+            width = torch.norm(shoulder_vec, dim=-1, keepdim=True) + 1e-6
+
+            # direction normalized
+            shoulder_dir = shoulder_vec / width
+
+            # profile indicator (0 = face, 1 = strong profile)
+            profile = torch.clamp(1.0 - width, 0.0, 1.0)
+
+            ctx["shoulder_vec"] = shoulder_vec
+            ctx["shoulder_dir"] = shoulder_dir
+            ctx["profile_factor"] = profile.squeeze(-1)
+
+        else:
+            ctx["profile_factor"] = torch.zeros_like(facial_points['nose'][..., 0])
+
+        # =========================
+        # HEAD CENTER (stabilisé)
+        # =========================
+        if 'nose' in facial_points and 'neck' in facial_points:
+            ctx["head_center"] = (facial_points['nose'] + facial_points['neck']) * 0.5
+
+        # =========================
+        # FACE WIDTH NORMALIZED
+        # =========================
+        if 'left_eye' in facial_points and 'right_eye' in facial_points:
+            le = facial_points['left_eye']
+            re = facial_points['right_eye']
+
+            eye_width = torch.norm(re - le, dim=-1, keepdim=True)
+            ctx["eye_width"] = eye_width
+
+        return ctx
     # -----------------------------
     # 🔹 UPDATE HAUT DU CORPS (smooth)
     # -----------------------------

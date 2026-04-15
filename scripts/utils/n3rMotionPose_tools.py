@@ -684,9 +684,141 @@ def apply_breathing_mask(latents, previous_latent, frame_counter, breathing=True
 
 #🫁 Breathing (FIX OK)
 
-
-
 def apply_breathing_simple(
+    latents,
+    pose,
+    mask_torso,
+    frame_counter,
+    breathing=True,
+    amplitude=1.5,
+    debug=False,
+    debug_dir=None,
+):
+    if not breathing:
+        return latents
+
+    B, C, H, W = latents.shape
+    device = latents.device
+
+    phase = frame_counter * 0.1
+
+    breath = amplitude * 0.06 * (
+        0.6 * math.sin(phase + 1.0) +
+        0.4 * math.sin(phase * 0.5 + 2.0)
+    )
+
+    # =========================================================
+    # GRID
+    # =========================================================
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing='ij'
+    )
+
+    xx = xx.unsqueeze(0).expand(B, H, W)
+    yy = yy.unsqueeze(0).expand(B, H, W)
+
+    mask = mask_torso.permute(0, 2, 3, 1)
+
+    # =========================================================
+    # BODY ORIENTATION (ROBUST + FALLBACK SAFE)
+    # =========================================================
+    dir_x = torch.zeros(B, device=device)
+    dir_y = torch.ones(B, device=device)
+
+    if pose is not None:
+        try:
+            fp = pose.estimate_facial_points_full(smooth=0.8)
+
+            ctx = None
+            if hasattr(pose, "compute_pose_context"):
+                ctx = pose.compute_pose_context(fp)
+
+            # =========================
+            # PRIORITY 1: CONTEXT (BEST)
+            # =========================
+            if ctx is not None and "shoulder_vec" in ctx:
+                vec = ctx["shoulder_vec"]  # [B,2]
+                norm = torch.norm(vec, dim=-1, keepdim=True) + 1e-6
+                body_dir = vec / norm
+
+                dir_x = body_dir[:, 0]
+                dir_y = body_dir[:, 1]
+
+            # =========================
+            # PRIORITY 2: FALLBACK (eyes/neck)
+            # =========================
+            elif "neck" in fp and "nose" in fp:
+                neck = fp["neck"]
+                nose = fp["nose"]
+
+                body_vec = nose - neck
+                norm = torch.norm(body_vec, dim=-1, keepdim=True) + 1e-6
+                body_dir = body_vec / norm
+
+                dir_x = body_dir[:, 0]
+                dir_y = body_dir[:, 1]
+
+        except Exception as e:
+            if debug:
+                print(f"[BREATH] fallback triggered: {e}")
+
+    # =========================================================
+    # SAFE RESHAPE
+    # =========================================================
+    dir_x = dir_x.view(B, 1, 1)
+    dir_y = dir_y.view(B, 1, 1)
+
+    # =========================================================
+    # BREATHING FIELD (PROFILE-AWARE)
+    # =========================================================
+    base = breath * mask[..., 0]
+
+    # 🔥 IMPORTANT: breathing should NOT fully follow direction
+    # we mix vertical + orientation instead of replacing it
+    delta_x = base * (0.25 * dir_x)
+    delta_y = base * (1.0 + 0.35 * dir_y)
+
+    grid = torch.stack((xx + delta_x, yy + delta_y), dim=-1)
+
+    latents_out = F.grid_sample(latents, grid, align_corners=True)
+
+    # =========================================================
+    # DEBUG
+    # =========================================================
+    if debug:
+        global_delta = torch.stack((delta_x, delta_y), dim=-1)
+
+        print("🫁 Breathing - mean:", global_delta.abs().mean().item())
+        print("🫁 Breathing - max:", global_delta.abs().max().item())
+
+        if debug_dir is not None:
+            os.makedirs(debug_dir, exist_ok=True)
+
+            delta_mag = torch.sqrt(delta_x**2 + delta_y**2)
+
+            def normalize(x):
+                x_min = x.amin(dim=(1,2), keepdim=True)
+                x_max = x.amax(dim=(1,2), keepdim=True)
+                return (x - x_min) / (x_max - x_min + 1e-8)
+
+            delta_vis = normalize(delta_mag).unsqueeze(1)
+            mask_vis = mask[..., 0].unsqueeze(1)
+
+            debug_img = torch.cat([delta_vis, mask_vis], dim=0)
+
+            vutils.save_image(
+                debug_img,
+                os.path.join(debug_dir, f"delta_breathing_{frame_counter:05d}.png"),
+                nrow=B
+            )
+
+    return latents_out
+
+
+
+def apply_breathing_simple_v2(
     latents,
     pose,              # 🔥 AJOUT IMPORTANT
     mask_torso,
@@ -793,85 +925,9 @@ def apply_breathing_simple(
 
     return latents_out
 
-def apply_breathing_simple_v2(
-    latents,
-    mask_torso,
-    frame_counter,
-    breathing=True,
-    amplitude=1.5,
-    debug=False,
-    debug_dir=None,
-):
-    if not breathing:
-        return latents
-
-    B, C, H, W = latents.shape
-    device = latents.device
-
-    phase = frame_counter * 0.1
-
-    breath = amplitude * 0.06 * (
-        0.6 * math.sin(phase + 1.0) +
-        0.4 * math.sin(phase * 0.5 + 2.0)
-    )
-
-    yy, xx = torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device),
-        torch.linspace(-1, 1, W, device=device),
-        indexing='ij'
-    )
-
-    xx = xx.unsqueeze(0).expand(B, H, W)
-    yy = yy.unsqueeze(0).expand(B, H, W)
-
-    mask = mask_torso.permute(0, 2, 3, 1)
-
-    # déplacement
-    delta_y = breath * mask[..., 0]
-    delta_x = torch.zeros_like(delta_y)
-
-    grid = torch.stack((xx + delta_x, yy + delta_y), dim=-1)
-
-    latents_out = F.grid_sample(latents, grid, align_corners=True)
-
-    # =========================
-    # 🔍 DEBUG DELTA
-    # =========================
-    if debug:
-        # delta global (vecteur)
-        global_delta = torch.stack((delta_x, delta_y), dim=-1)
-
-        print("🫁 Breathing  - delta mean px:", global_delta.abs().mean().item())
-        print("🫁 Breathing  - delta max px:", global_delta.abs().max().item())
-
-        if debug_dir is not None:
-            os.makedirs(debug_dir, exist_ok=True)
-
-            delta_mag = torch.sqrt(delta_x**2 + delta_y**2)
-
-            def normalize(x):
-                x_min = x.amin(dim=(1,2), keepdim=True)
-                x_max = x.amax(dim=(1,2), keepdim=True)
-                return (x - x_min) / (x_max - x_min + 1e-8)
-
-            delta_vis = normalize(delta_mag).unsqueeze(1)
-            mask_vis = mask[..., 0].unsqueeze(1)
-
-            debug_img = torch.cat([delta_vis, mask_vis], dim=0)
-
-            vutils.save_image(
-                debug_img,
-                os.path.join(debug_dir, f"delta_breathing_{frame_counter:05d}.png"),
-                nrow=B
-            )
-
-    return latents_out
-
-
-
 
 # 🔹 Applique un léger effet de respiration (scaling sinusoïdal) sur les latents
-def apply_breathing_big(latents, previous_latent, frame_counter, breathing=True):
+def apply_breathing_big_test(latents, previous_latent, frame_counter, breathing=True):
     """
     Applique une légère respiration sinusoidale sur les latents.
     """
