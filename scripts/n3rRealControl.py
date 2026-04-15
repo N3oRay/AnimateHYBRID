@@ -490,9 +490,8 @@ def main(args):
                             traceback.print_exc()
                             latents = latents_before_openpose.clone()
 
-                        # 🔹 debug image
-                        if debug_visual:
-                            save_debug_pose_image_with_skeleton( pose_tensor=pose_full, keypoints_tensor=current_keypoints, frame_counter=frame_counter, output_dir=output_dir, cfg=cfg, prefix="openpose" )
+                        # 🔹  ne pas déactiver - skeleton pipeline triggered
+                        save_debug_pose_image_with_skeleton( pose_tensor=pose_full, keypoints_tensor=current_keypoints, frame_counter=frame_counter, output_dir=output_dir, cfg=cfg, prefix="openpose" )
 
                     # ---------------- Motion module --------------------------------------------------------------------------------------------------
                     if motion_module is not None:
