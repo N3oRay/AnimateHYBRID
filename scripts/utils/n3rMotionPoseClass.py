@@ -74,8 +74,7 @@ class Pose:
         # Ajustement
         self.torce_expand_w=1.6
         self.torce_shrink_h=1.2
-
-        self.bouche_expand_h=0.30
+        self.bouche_expand_h=0.25
         self.bouche_expand_w=0.60
 
         # -----------------------------
@@ -117,48 +116,113 @@ class Pose:
     def compute_pose_context(self, facial_points):
         """
         Returns global pose context for motion modules.
+        Stable face + profile + orientation signals.
         """
 
         ctx = {}
 
-        # =========================
-        # SHOULDER AXIS
-        # =========================
+        eps = 1e-6
+
+        # =========================================================
+        # SHOULDER AXIS (base body orientation)
+        # =========================================================
         if 'left_shoulder' in facial_points and 'right_shoulder' in facial_points:
             ls = facial_points['left_shoulder']
             rs = facial_points['right_shoulder']
 
             shoulder_vec = rs - ls
-            width = torch.norm(shoulder_vec, dim=-1, keepdim=True) + 1e-6
+            shoulder_width = torch.norm(shoulder_vec, dim=-1, keepdim=True) + eps
+            shoulder_dir = shoulder_vec / shoulder_width
 
-            # direction normalized
-            shoulder_dir = shoulder_vec / width
-
-            # profile indicator (0 = face, 1 = strong profile)
-            profile = torch.clamp(1.0 - width, 0.0, 1.0)
-
+            # raw proxy: smaller width => stronger profile (normalized later)
             ctx["shoulder_vec"] = shoulder_vec
             ctx["shoulder_dir"] = shoulder_dir
-            ctx["profile_factor"] = profile.squeeze(-1)
+            ctx["shoulder_width"] = shoulder_width.squeeze(-1)
 
         else:
-            ctx["profile_factor"] = torch.zeros_like(facial_points['nose'][..., 0])
+            ctx["shoulder_dir"] = None
+            ctx["shoulder_width"] = None
 
-        # =========================
-        # HEAD CENTER (stabilisé)
-        # =========================
+        # =========================================================
+        # HEAD CENTER (stable anchor)
+        # =========================================================
         if 'nose' in facial_points and 'neck' in facial_points:
             ctx["head_center"] = (facial_points['nose'] + facial_points['neck']) * 0.5
+        else:
+            ctx["head_center"] = None
 
-        # =========================
-        # FACE WIDTH NORMALIZED
-        # =========================
+        # =========================================================
+        # FACE WIDTH (eye distance = better than shoulders for pose)
+        # =========================================================
+        eye_width = None
         if 'left_eye' in facial_points and 'right_eye' in facial_points:
             le = facial_points['left_eye']
             re = facial_points['right_eye']
-
             eye_width = torch.norm(re - le, dim=-1, keepdim=True)
             ctx["eye_width"] = eye_width
+
+        # =========================================================
+        # NOSE OFFSET (very strong profile cue)
+        # =========================================================
+        nose_offset = None
+        if 'nose' in facial_points and 'left_eye' in facial_points and 'right_eye' in facial_points:
+            nose = facial_points['nose']
+            le = facial_points['left_eye']
+            re = facial_points['right_eye']
+
+            eye_mid = (le + re) * 0.5
+            nose_offset = torch.norm(nose - eye_mid, dim=-1, keepdim=True)
+            ctx["nose_offset"] = nose_offset
+
+        # =========================================================
+        # PROFILE FACTOR (robust fusion)
+        # =========================================================
+        profile_terms = []
+
+        # 1. shoulder compression
+        if ctx.get("shoulder_width") is not None:
+            # inverse normalized (tune range empirically)
+            p_shoulder = torch.exp(-ctx["shoulder_width"])
+            profile_terms.append(p_shoulder)
+
+        # 2. nose deviation (strong signal for profile)
+        if nose_offset is not None:
+            p_nose = torch.tanh(nose_offset * 3.0)
+            profile_terms.append(p_nose)
+
+        # 3. eye width consistency (fallback face openness)
+        if eye_width is not None:
+            p_eye = torch.exp(-eye_width)
+            profile_terms.append(p_eye)
+
+        if len(profile_terms) > 0:
+            profile = sum(profile_terms) / len(profile_terms)
+            profile = torch.clamp(profile, 0.0, 1.0)
+        else:
+            profile = torch.zeros_like(facial_points['nose'][..., 0])
+
+        ctx["profile_factor"] = profile
+
+        # =========================================================
+        # FACE ORIENTATION VECTOR (useful for breathing + mouth)
+        # =========================================================
+        if ('left_eye' in facial_points and
+            'right_eye' in facial_points and
+            'nose' in facial_points):
+
+            le = facial_points['left_eye']
+            re = facial_points['right_eye']
+            nose = facial_points['nose']
+
+            eye_vec = re - le
+            eye_mid = (le + re) * 0.5
+
+            face_vec = nose - eye_mid
+            face_norm = torch.norm(face_vec, dim=-1, keepdim=True) + eps
+
+            ctx["face_dir"] = face_vec / face_norm
+        else:
+            ctx["face_dir"] = None
 
         return ctx
     # -----------------------------
@@ -386,94 +450,6 @@ class Pose:
         # MEMORY UPDATE
         # =========================
         self.set_prev_facial_points(points)
-
-        return points
-
-    def estimate_facial_points_simple(self, smooth=0.8):
-        """
-        Version complète + temporelle + stable
-        """
-        points = {}
-
-        nose = self.keypoints[:, 0, :2]
-        right_eye = self.keypoints[:, 14, :2] if self.keypoints.shape[1] > 14 else None
-        left_eye  = self.keypoints[:, 15, :2] if self.keypoints.shape[1] > 15 else None
-
-        if right_eye is not None and left_eye is not None:
-            eye_dist = (left_eye[:, 0] - right_eye[:, 0]).abs().unsqueeze(1)
-        else:
-            eye_dist = torch.full((self.B,1), 0.12, device=self.device)
-
-        # -------------------- Base structure --------------------
-        mouth_center = nose + torch.cat([torch.zeros_like(eye_dist), eye_dist * 1.0], dim=1)
-
-        mouth_left   = mouth_center + torch.cat([-0.3 * eye_dist, torch.zeros_like(eye_dist)], dim=1)
-        mouth_right  = mouth_center + torch.cat([ 0.3 * eye_dist, torch.zeros_like(eye_dist)], dim=1)
-        mouth_top    = mouth_center + torch.cat([torch.zeros_like(eye_dist), -0.15 * eye_dist], dim=1)
-        mouth_bottom = mouth_center + torch.cat([torch.zeros_like(eye_dist),  0.15 * eye_dist], dim=1)
-
-        points.update({
-            "mouth_center": mouth_center,
-            "mouth_left": mouth_left,
-            "mouth_right": mouth_right,
-            "mouth_top": mouth_top,
-            "mouth_bottom": mouth_bottom,
-        })
-
-        # -------------------- YEUX enrichis --------------------
-        if right_eye is not None and left_eye is not None:
-            eye_vec = left_eye - right_eye
-
-            points["eye_center"] = (left_eye + right_eye) / 2
-
-            points["right_eye_inner"] = right_eye + 0.2 * eye_vec
-            points["right_eye_outer"] = right_eye - 0.3 * eye_vec
-
-            points["left_eye_inner"] = left_eye - 0.2 * eye_vec
-            points["left_eye_outer"] = left_eye + 0.3 * eye_vec
-
-        # =========================
-        # 🔥 SMOOTH TEMPOREL AUTO
-        # =========================
-        prev = self.get_prev_facial_points()
-
-        if prev is not None:
-            for k in points:
-                if k in prev:
-                    points[k] = smooth * prev[k] + (1 - smooth) * points[k]
-
-        # =========================
-        # 🔥 UPDATE MÉMOIRE
-        # =========================
-        self.set_prev_facial_points(points)
-
-        return points
-
-
-    def estimate_facial_points(self, prev_points=None, smooth=0.8):
-        points = {}
-        nose = self.keypoints[:,0,:2]
-        right_eye = self.keypoints[:,14,:2] if self.keypoints.shape[1] > 14 else None
-        left_eye = self.keypoints[:,15,:2] if self.keypoints.shape[1] > 15 else None
-
-        # Distance relative yeux-nez
-        eye_dist = (left_eye[:,0]-right_eye[:,0]).abs() if right_eye is not None else 0.12
-        eye_dist = eye_dist.unsqueeze(1)
-
-        mouth_center = nose + torch.tensor([0.0, eye_dist.mean()*1.0], device=self.device)
-
-        mouth_left  = mouth_center + torch.tensor([-0.3,0.0], device=self.device) * eye_dist
-        mouth_right = mouth_center + torch.tensor([0.3,0.0], device=self.device) * eye_dist
-        mouth_top   = mouth_center + torch.tensor([0.0,-0.15], device=self.device) * eye_dist
-        mouth_bottom= mouth_center + torch.tensor([0.0,0.15], device=self.device) * eye_dist
-
-        points['mouth_center'], points['mouth_left'], points['mouth_right'] = mouth_center, mouth_left, mouth_right
-        points['mouth_top'], points['mouth_bottom'] = mouth_top, mouth_bottom
-
-        # Lissage si points précédents fournis
-        if prev_points is not None:
-            for k in points:
-                points[k] = smooth*prev_points[k] + (1-smooth)*points[k]
 
         return points
 
