@@ -8,6 +8,8 @@ from PIL import Image, ImageFilter
 import torch.nn.functional as F
 from pathlib import Path
 from torchvision.transforms.functional import to_pil_image
+import matplotlib.pyplot as plt
+import mediapipe as mp
 
 
 def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
@@ -44,12 +46,8 @@ def get_hips_coords_safe(image_pil, H=None, W=None):
         print(f"[Hips detection ERROR] {e}")
         return None
 
-
-
-
 def get_hips_coords_pixels(image_pil, H=None, W=None):
-    import numpy as np
-    import mediapipe as mp
+
 
     img_width, img_height = image_pil.size
     if W is None: W = img_width
@@ -1293,7 +1291,6 @@ def apply_pro_net_volumetrique(
     latents_out = latents_3D.clamp(-1.0, 1.0)
 
     if debug:
-        import matplotlib.pyplot as plt
         plt.figure(figsize=(12,4))
         plt.subplot(1,3,1); plt.imshow(latents_prot[0,0].detach().cpu(), cmap='gray'); plt.title("ProNet")
         plt.subplot(1,3,2); plt.imshow(smooth[0,0].detach().cpu(), cmap='gray'); plt.title("Low-Freq (Anime)")
@@ -1848,6 +1845,115 @@ def apply_pro_net_with_eyes(
     sanitize_fn,
     iris_radius_ratio=0.04,
     mask_blur_kernel=13,
+    shade_strength=0.04,
+    light_strength=0.025,
+    blend_strength=0.6,         # 🔥 nouveau
+    preserve_detail=0.5         # 🔥 nouveau
+):
+
+    import torch.nn.functional as F
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # =========================================================
+    # 🔹 1. ProNet (base)
+    # =========================================================
+    with torch.no_grad():
+        latents_prot = apply_n3r_pro_net(
+            latents,
+            model=n3r_pro_net,
+            strength=n3r_pro_strength,
+            sanitize_fn=sanitize_fn
+        ).to(dtype)
+
+    if not eye_coords:
+        return latents_prot
+
+    # =========================================================
+    # 🔹 2. Iris mask (soft ellipse)
+    # =========================================================
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    iris_mask = torch.zeros((1,1,H,W), device=device, dtype=dtype)
+
+    for x, y in eye_coords:
+        rx = max(1, int(W * iris_radius_ratio))
+        ry = max(1, int(H * iris_radius_ratio))
+
+        dist = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
+        iris_mask[0,0] += (dist <= 1).float()
+
+    iris_mask = iris_mask.clamp(0,1)
+
+    if mask_blur_kernel > 1:
+        iris_mask = F.avg_pool2d(
+            iris_mask,
+            kernel_size=mask_blur_kernel,
+            stride=1,
+            padding=mask_blur_kernel // 2
+        ).clamp(0,1)
+
+    # =========================================================
+    # 🔹 3. Base smooth (low freq)
+    # =========================================================
+    smooth = F.avg_pool2d(latents_prot, 5, stride=1, padding=2)
+
+    # =========================================================
+    # 🔹 4. Volume (shadow + light)
+    # =========================================================
+    shadow = (smooth - latents_prot) * shade_strength
+    light  = torch.relu(latents_prot - smooth) * light_strength
+
+    iris_effect = shadow + light
+
+    # =========================================================
+    # 🔹 5. 🔥 NON-LINEAR COMPRESSION (clé)
+    # évite saturation / écrasement
+    # =========================================================
+    iris_effect = torch.tanh(iris_effect * 2.0) * 0.5
+
+    # =========================================================
+    # 🔹 6. 🔥 DETAIL PRESERVATION
+    # garde les hautes fréquences originales
+    # =========================================================
+    high_freq = latents_prot - smooth
+    iris_effect = iris_effect * (1.0 - preserve_detail) + high_freq * preserve_detail * 0.3
+
+    # =========================================================
+    # 🔹 7. 🔥 BLEND ADAPTATIF (AU LIEU DE ADD)
+    # =========================================================
+    blend_mask = iris_mask * blend_strength
+
+    latents_out = (
+        latents_prot * (1.0 - blend_mask) +
+        (latents_prot + iris_effect) * blend_mask
+    )
+
+    # =========================================================
+    # 🔹 8. 🔥 SOFT GATING (évite zones plates)
+    # =========================================================
+    contrast = torch.abs(high_freq)
+    gate = torch.sigmoid(contrast * 10.0)
+
+    latents_out = latents_prot * (1 - gate) + latents_out * gate
+
+    print("👁 Fusion iris perceptuelle (soft blend, no crushing)")
+
+    return latents_out.clamp(-1.0, 1.0)
+
+def apply_pro_net_with_eyes_boost(
+    latents,
+    eye_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    iris_radius_ratio=0.04,
+    mask_blur_kernel=13,
     shade_strength=0.04,   # profondeur (ombres)
     light_strength=0.025   # lumière douce
 ):
@@ -1919,262 +2025,31 @@ def apply_pro_net_with_eyes(
 
     return latents_out.clamp(-1.0, 1.0)
 
-def apply_pro_net_with_eyes_sd(
+
+
+#---------- Mask bouche -------
+def apply_pro_net_with_mouth(
     latents,
-    eye_coords,
+    mouth_coords,
     n3r_pro_net,
     n3r_pro_strength,
     sanitize_fn,
-    iris_radius_ratio=0.03,   # très ciblé iris
-    mask_blur_kernel=13,       # très doux (clé anti contour)
-    eye_strength=0.015          # ultra subtil
+    detail_strength=0.35,
+    blur_kernel=5,
+    mouth_radius_ratio=0.08,
+    mask_blur_kernel=5,
+    blend_strength=0.5,        # 🔥 nouveau
+    preserve_motion=0.6        # 🔥 nouveau
 ):
-    """
-    Version clean :
-    - aucun sharp
-    - aucun bruit amplifié
-    - aucun contour paupière
-    - effet naturel (quasi invisible)
-    """
+
+    import torch.nn.functional as F
 
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
 
-    # 1️⃣ ProNet (léger)
-    with torch.no_grad():
-        latents_prot = apply_n3r_pro_net(
-            latents,
-            model=n3r_pro_net,
-            strength=n3r_pro_strength,
-            sanitize_fn=sanitize_fn
-        ).to(dtype)
-
-    if not eye_coords:
-        return latents_prot
-
-    # 2️⃣ Masque iris (simple + propre)
-    Y, X = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
-    )
-
-    iris_mask = torch.zeros((1,1,H,W), device=device, dtype=dtype)
-
-    for x, y in eye_coords:
-        rx = max(1, int(W * iris_radius_ratio))
-        ry = max(1, int(H * iris_radius_ratio))
-
-        dist = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
-        iris_mask[0,0] += (dist <= 1).float()
-
-    iris_mask = iris_mask.clamp(0,1)
-
-    # 3️⃣ Flou large → supprime totalement les contours durs
-    if mask_blur_kernel > 1:
-        iris_mask = F.avg_pool2d(
-            iris_mask,
-            kernel_size=mask_blur_kernel,
-            stride=1,
-            padding=mask_blur_kernel // 2
-        ).clamp(0,1)
-
-    print("👁 HDR détails appliqué sur iris avec contours adoucis")
-
-    # 4️⃣ Blend ultra doux (pas de détails artificiels)
-    latents_out = latents_prot + (latents_prot - latents) * eye_strength * iris_mask
-
-    return latents_out.clamp(-1.0, 1.0)
-
-def apply_pro_net_with_eyes_power(
-    latents,
-    eye_coords,
-    n3r_pro_net,
-    n3r_pro_strength,
-    sanitize_fn,
-    detail_strength=0.03,       # très doux
-    blur_kernel=4,
-    iris_radius_ratio=0.03,     # cible encore plus précis iris
-    mask_blur_kernel=9,         # flou large pour éviter contours durs
-    contrast=1.0                # léger contraste
-):
-    """
-    Amplification douce de l’iris seulement.
-    Contours de l’œil / paupière adoucis au maximum.
-    """
-
-    B, C, H, W = latents.shape
-    device, dtype = latents.device, latents.dtype
-
-    # 1️⃣ ProNet inference
-    with torch.no_grad():
-        latents_prot = apply_n3r_pro_net(
-            latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn
-        ).to(dtype)
-
-    if not eye_coords:
-        return latents_prot
-
-    # 2️⃣ Masque iris vectorisé
-    Y, X = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
-    )
-    iris_mask = torch.zeros((1,1,H,W), device=device, dtype=dtype)
-    for x, y in eye_coords:
-        rx = max(1, int(W * iris_radius_ratio))
-        ry = max(1, int(H * iris_radius_ratio))
-        dist2 = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
-        iris_mask[0,0] += (dist2 <= 1).float()
-    iris_mask = iris_mask.clamp(0,1)
-
-    # 3️⃣ Flou important pour fusion douce (1D separable)
-    if mask_blur_kernel > 1:
-        sigma = mask_blur_kernel / 3
-        ax = torch.arange(-mask_blur_kernel//2 + 1., mask_blur_kernel//2 + 1., device=device, dtype=dtype)
-        gauss_1d = torch.exp(-(ax**2)/(2*sigma**2))
-        gauss_1d /= gauss_1d.sum()
-        kx = gauss_1d.view(1,1,1,mask_blur_kernel)
-        ky = gauss_1d.view(1,1,mask_blur_kernel,1)
-        pad_x = (kx.shape[-1]-1)//2
-        pad_y = (ky.shape[-2]-1)//2
-        iris_mask = F.conv2d(F.conv2d(iris_mask, kx, padding=(0,pad_x)),
-                             ky, padding=(pad_y,0)).clamp(0,1)
-
-    # 4️⃣ High-frequency details blur
-    if blur_kernel > 1:
-        sigma = blur_kernel / 3
-        ax = torch.arange(-blur_kernel//2+1., blur_kernel//2+1., device=device, dtype=dtype)
-        g1d = torch.exp(-(ax**2)/(2*sigma**2))
-        g1d /= g1d.sum()
-        kx = g1d.view(1,1,1,blur_kernel).repeat(C,1,1,1)
-        ky = g1d.view(1,1,blur_kernel,1).repeat(C,1,1,1)
-        pad_x = (kx.shape[-1]-1)//2
-        pad_y = (ky.shape[-2]-1)//2
-        blurred = F.conv2d(F.conv2d(latents_prot, kx, padding=(0,pad_x), groups=C),
-                           ky, padding=(pad_y,0), groups=C)
-        if blurred.shape != latents_prot.shape:
-            blurred = F.interpolate(blurred, size=latents_prot.shape[-2:], mode='bilinear', align_corners=False)
-    else:
-        blurred = latents_prot
-
-    details = latents_prot - blurred
-
-    # 5️⃣ Amplification douce et contraste léger
-    detail_map = torch.tanh(details * detail_strength) * iris_mask
-    enhanced = latents_prot + detail_map
-    iris_enhanced = (enhanced - enhanced.mean()) * contrast + enhanced.mean()
-    latents_out = latents_prot * (1 - iris_mask) + iris_enhanced * iris_mask
-
-    print("👁 HDR détails appliqué sur iris avec contours adoucis")
-
-    # 6️⃣ Clamp final
-    return latents_out.clamp(-1.0,1.0)
-
-def apply_pro_net_with_eyes_glow(
-    latents,
-    eye_coords,
-    n3r_pro_net,
-    n3r_pro_strength,
-    sanitize_fn,
-    detail_strength=0.05,       # intensité HDR plus douce
-    blur_kernel=3,              # kernel plus petit pour moins de calcul
-    iris_radius_ratio=0.05,     # cible l’iris
-    mask_blur_kernel=5          # flou pour contours doux
-):
-    """
-    ProNet optimisé + amplification douce des détails de l’iris.
-    Moins lumineux et moins “HDR sharp” pour rester proche de l'input.
-    """
-
-    B, C, H, W = latents.shape
-    device, dtype = latents.device, latents.dtype
-
-    # 1️⃣ Appliquer ProNet standard (inference)
-    with torch.no_grad():
-        latents_prot = apply_n3r_pro_net(
-            latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn
-        ).to(dtype)
-
-    # 2️⃣ Si pas d’yeux → fallback
-    if not eye_coords:
-        return latents_prot
-
-    # 3️⃣ Création masque IRIS vectorisé
-    Y, X = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
-    )
-    iris_mask = torch.zeros((1, 1, H, W), device=device, dtype=dtype)
-
-    for x, y in eye_coords:
-        rx = int(W * iris_radius_ratio)
-        ry = int(H * iris_radius_ratio)
-        dist = ((X - x)**2) / (rx**2 + 1e-6) + ((Y - y)**2) / (ry**2 + 1e-6)
-        iris_mask[0, 0] += (dist <= 1).float()
-    iris_mask = iris_mask.clamp(0, 1)
-
-    # 4️⃣ Flouter le masque rapidement avec conv separable
-    if mask_blur_kernel > 1:
-        sigma = mask_blur_kernel / 3
-        ax = torch.arange(-mask_blur_kernel // 2 + 1., mask_blur_kernel // 2 + 1., device=device, dtype=dtype)
-        gauss_1d = torch.exp(-(ax**2) / (2 * sigma**2))
-        gauss_1d = gauss_1d / gauss_1d.sum()
-        kernel_x = gauss_1d.view(1, 1, 1, mask_blur_kernel)
-        kernel_y = gauss_1d.view(1, 1, mask_blur_kernel, 1)
-        iris_mask = F.conv2d(F.conv2d(iris_mask, kernel_x, padding=(0, mask_blur_kernel // 2)),
-                             kernel_y, padding=(mask_blur_kernel // 2, 0))
-        iris_mask = iris_mask.clamp(0, 1)
-
-    # 5️⃣ Blur rapide pour high-frequency
-    if blur_kernel > 1:
-        sigma = blur_kernel / 3
-        ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device, dtype=dtype)
-        gauss_1d = torch.exp(-(ax**2) / (2 * sigma**2))
-        gauss_1d = gauss_1d / gauss_1d.sum()
-        kernel_x = gauss_1d.view(1, 1, 1, blur_kernel).repeat(C, 1, 1, 1)
-        kernel_y = gauss_1d.view(1, 1, blur_kernel, 1).repeat(C, 1, 1, 1)
-        blurred = F.conv2d(F.conv2d(latents_prot, kernel_x, padding=(0, blur_kernel // 2), groups=C),
-                           kernel_y, padding=(blur_kernel // 2, 0), groups=C)
-    else:
-        blurred = latents_prot
-
-    details = latents_prot - blurred
-
-    # 6️⃣ Amplification douce adaptative
-    detail_strength_map = detail_strength * iris_mask
-    enhanced = latents_prot + torch.tanh(details * detail_strength_map)
-
-    # 7️⃣ Fusion douce
-    latents_out = latents_prot * (1 - iris_mask) + enhanced * iris_mask
-
-    print("👁 HDR détails appliqué sur iris avec contours adoucis")
-
-    # 8️⃣ Clamp final pour sécurité
-    return torch.clamp(latents_out, -1.0, 1.0)
-
-def apply_pro_net_with_eyes_boost(
-    latents,
-    eye_coords,
-    n3r_pro_net,
-    n3r_pro_strength,
-    sanitize_fn,
-    detail_strength=0.05,       # intensité HDR
-    blur_kernel=5,              # kernel pour détails
-    iris_radius_ratio=0.05,     # plus petit = cible mieux iris
-    mask_blur_kernel=7          # flou du masque pour adoucir les contours
-):
-    """
-    ProNet optimisé + amplification HDR des détails sur l’iris (pas glow)
-    avec fusion douce pour éviter halo sur les contours.
-    """
-
-    B, C, H, W = latents.shape
-    device, dtype = latents.device, latents.dtype
-
-    # 1️⃣ Appliquer ProNet standard
+    # =========================================================
+    # 🔹 1. ProNet
+    # =========================================================
     latents_prot = apply_n3r_pro_net(
         latents,
         model=n3r_pro_net,
@@ -2182,65 +2057,90 @@ def apply_pro_net_with_eyes_boost(
         sanitize_fn=sanitize_fn
     ).to(dtype)
 
-    # 2️⃣ Si pas d’yeux → fallback
-    if not eye_coords:
+    if not mouth_coords:
         return latents_prot
 
-    # 3️⃣ Création masque IRIS
-    iris_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+    # =========================================================
+    # 🔹 2. Masque bouche (ellipse)
+    # =========================================================
+    mouth_mask = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
+
     Y, X = torch.meshgrid(
         torch.arange(H, device=device),
         torch.arange(W, device=device),
         indexing='ij'
     )
 
-    for x, y in eye_coords:
-        rx = int(W * iris_radius_ratio)
-        ry = int(H * iris_radius_ratio)
-        dist = ((X - x)**2) / (rx**2 + 1e-6) + ((Y - y)**2) / (ry**2 + 1e-6)
-        iris_mask[0, 0] += (dist <= 1).float()
+    for x, y in mouth_coords:
+        rx = int(W * mouth_radius_ratio)
+        ry = int(H * mouth_radius_ratio)
 
-    iris_mask = iris_mask.clamp(0, 1)
+        dist = ((X - x)**2)/(rx**2 + 1e-6) + ((Y - y)**2)/(ry**2 + 1e-6)
+        mouth_mask[0,0] += (dist <= 1).float()
 
-    # 4️⃣ Flouter le masque pour adoucir les contours
+    mouth_mask = mouth_mask.clamp(0,1)
+
+    # blur mask
     if mask_blur_kernel > 1:
-        sigma = mask_blur_kernel / 3
-        ax = torch.arange(-mask_blur_kernel // 2 + 1., mask_blur_kernel // 2 + 1., device=device, dtype=dtype)
-        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-        mask_kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
-        mask_kernel_2d = mask_kernel_2d / mask_kernel_2d.sum()
-        mask_kernel = mask_kernel_2d.view(1, 1, mask_blur_kernel, mask_blur_kernel)
-        iris_mask = F.conv2d(iris_mask, mask_kernel, padding=mask_blur_kernel // 2)
-        iris_mask = iris_mask.clamp(0, 1)
+        mouth_mask = F.avg_pool2d(
+            mouth_mask,
+            kernel_size=mask_blur_kernel,
+            stride=1,
+            padding=mask_blur_kernel // 2
+        ).clamp(0,1)
 
-    # 5️⃣ Blur pour récupérer les détails (high-frequency)
-    sigma = blur_kernel / 3
-    ax = torch.arange(-blur_kernel // 2 + 1., blur_kernel // 2 + 1., device=device, dtype=dtype)
-    xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-    kernel_2d = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
-    kernel_2d = kernel_2d / kernel_2d.sum()
-    kernel = kernel_2d.view(1, 1, blur_kernel, blur_kernel).repeat(C, 1, 1, 1).to(dtype)
-    blurred = F.conv2d(latents_prot, kernel, padding=blur_kernel // 2, groups=C)
+    # =========================================================
+    # 🔹 3. Low / High freq split
+    # =========================================================
+    blurred = F.avg_pool2d(latents_prot, blur_kernel, stride=1, padding=blur_kernel // 2)
     details = latents_prot - blurred
 
-    # 6️⃣ Amplification HDR adaptative selon le masque flou
-    detail_strength_map = detail_strength * iris_mask
-    #enhanced = latents_prot + details * detail_strength_map
-    enhanced = latents_prot + torch.tanh(details * detail_strength_map)
+    # =========================================================
+    # 🔹 4. 🔥 NON-LINEAR DETAIL COMPRESSION
+    # évite effet "over sharpen"
+    # =========================================================
+    details = torch.tanh(details * 2.5) * 0.5
 
-    # 7️⃣ Fusion douce
-    latents_out = latents_prot * (1 - iris_mask) + enhanced * iris_mask
+    # =========================================================
+    # 🔹 5. 🔥 MOTION PRESERVATION
+    # protège les zones en mouvement
+    # =========================================================
+    motion_map = torch.abs(details)
+    motion_gate = torch.sigmoid(motion_map * 12.0)
 
-    # 8️⃣ Clamp final pour sécurité
+    # =========================================================
+    # 🔹 6. HDR effect (soft)
+    # =========================================================
+    enhanced = latents_prot + details * detail_strength
+
+    # =========================================================
+    # 🔹 7. 🔥 ADAPTIVE BLEND (clé)
+    # =========================================================
+    blend_mask = mouth_mask * blend_strength
+
+    latents_blend = (
+        latents_prot * (1 - blend_mask) +
+        enhanced * blend_mask
+    )
+
+    # =========================================================
+    # 🔹 8. 🔥 GATING FINAL (anti écrasement animation)
+    # =========================================================
+    latents_out = (
+        latents_prot * (1 - motion_gate * preserve_motion) +
+        latents_blend * (motion_gate * preserve_motion)
+    )
+
+    # =========================================================
+    # 🔹 9. Clamp
+    # =========================================================
     latents_out = torch.clamp(latents_out, -1.0, 1.0)
 
-    print("👁 HDR détails appliqué sur iris avec contours adoucis")
+    print("👄 Fusion bouche HDR (soft + motion preserved)")
 
     return latents_out
 
-#---------- Mask bouche:
-#----------
-def apply_pro_net_with_mouth(
+def apply_pro_net_with_mouth_boost(
     latents,
     mouth_coords,
     n3r_pro_net,
@@ -2631,7 +2531,7 @@ def get_coords(image):
 # --------------------------------------------------
 # 🔥 Création mask yeux (latents)
 # --------------------------------------------------
-import torch
+
 import matplotlib.pyplot as plt
 
 
@@ -4752,7 +4652,6 @@ def adjust_color_temperature_simple(image, target_temp=7800, reference_temp=6500
 
 
 def soft_tone_map(img):
-    import numpy as np
 
     arr = np.array(img).astype(np.float32) / 255.0
 
@@ -4763,7 +4662,6 @@ def soft_tone_map(img):
     return Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
 
 def soft_tone_map_unreal(img, exposure=1.0):
-    import numpy as np
 
     arr = np.array(img).astype(np.float32) / 255.0
 
@@ -4778,17 +4676,6 @@ def soft_tone_map_unreal(img, exposure=1.0):
 
     return Image.fromarray((np.clip(mapped, 0, 1) * 255).astype(np.uint8))
 
-
-def soft_tone_map_v1(img):
-    arr = np.array(img).astype(np.float32) / 255.0
-
-    # 🔥 compression plus douce (log-like)
-    arr = np.log1p(arr * 1.5) / np.log1p(1.5)
-
-    # 🔥 léger adoucissement des contrastes
-    arr = np.power(arr, 0.95)
-
-    return Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
 
 def soft_tone_map1(img):
     arr = np.array(img).astype(np.float32) / 255.0
@@ -4953,41 +4840,6 @@ def apply_n3r_pro_net1(latents, model=None, strength=0.3, sanitize_fn=None):
         print(f"[N3RProNet ERROR] {e}")
         return latents
 
-
-def apply_n3r_pro_net_v1(latents, model=None, strength=0.3, sanitize_fn=None, frame_idx=None, total_frames=None):
-    if model is None or strength <= 0:
-        return latents
-
-    try:
-        model_dtype = next(model.parameters()).dtype
-        model_device = next(model.parameters()).device
-        latents = latents.to(dtype=model_dtype, device=model_device)
-        latents = ensure_4_channels(latents)
-
-        if frame_idx is not None and total_frames is not None:
-            adaptive_strength = strength * (0.3 + 0.7 * 0.5 * (1 - math.cos(math.pi * frame_idx / total_frames)))
-        else:
-            adaptive_strength = strength
-
-        refined = model(latents)
-
-        # 🔹 Normalisation du delta pour éviter saturation
-        delta = refined - latents
-        max_delta = delta.abs().amax(dim=(1,2,3), keepdim=True).clamp(min=1e-5)
-        delta = delta / max_delta
-        latents = latents + adaptive_strength * delta
-
-        # 🔹 Clamp léger pour stabilité
-        latents = latents / latents.abs().amax(dim=(1,2,3), keepdim=True).clamp(min=1.0)
-
-        if sanitize_fn:
-            latents = sanitize_fn(latents)
-
-        return latents
-
-    except Exception as e:
-        print(f"[N3RProNet ERROR] {e}")
-        return latents
 
 
 
