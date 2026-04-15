@@ -41,7 +41,7 @@ from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose,
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, gaussian_blur
 
-from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch, update_keypoints_from_pose
+from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch, update_keypoints_from_pose
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -60,8 +60,8 @@ def main(args):
     device = args.device if torch.cuda.is_available() else "cpu"
     dtype = torch.float16
     # Configurable depuis ton fichier cfg
-    use_mini_gpu = cfg.get("use_mini_gpu", True)
-    verbose, psave = cfg.get("verbose", False), cfg.get("psave", False)
+    use_mini_gpu = cfg.get("use_mini_gpu", True) # debug_visual
+    verbose, psave, debug_visual = cfg.get("verbose", False), cfg.get("psave", False), cfg.get("debug_visual", False)
     latent_injection = float(cfg.get("latent_injection", 0.75))
     latent_injection = min(max(latent_injection, 0.5), 0.9)  # plage sûre
     final_latent_scale = cfg.get("final_latent_scale", 1/8) # 1/8 speed, 1/4 moyen, 1/2 low
@@ -178,7 +178,7 @@ def main(args):
                 anim_data = json.load(f)
 
             print(f"✅ JSON chargé : {json_file}")
-            pose_sequence = convert_json_to_pose_sequence( anim_data, H=cfg["H"], W=cfg["W"], device=device, dtype=dtype, debug=True, output_dir=output_dir)
+            pose_sequence = convert_json_to_pose_sequence( anim_data, H=cfg["H"], W=cfg["W"], device=device, dtype=dtype, debug=debug_visual, output_dir=output_dir)
 
             if pose_sequence is None:
                 print("❌ Aucun pose_sequence → OpenPose désactivé")
@@ -235,7 +235,7 @@ def main(args):
             start_pose = input_image.to(device=device, dtype=dtype) # start_pose = tensor 4D BCHW directement
             # Pose sequence
             if use_openpose and pose_sequence is None:
-                pose_sequence = generate_pose_sequence(base_pose=start_pose, num_frames=total_frames, device=device, dtype=dtype, debug=True)
+                pose_sequence = generate_pose_sequence(base_pose=start_pose, num_frames=total_frames, device=device, dtype=dtype, debug=verbose)
             # 🔥 Détection yeux (une seule fois par image)
             input_pil = tensor_to_pil(input_image)  # à créer si tu ne l'as pas
 
@@ -286,7 +286,7 @@ def main(args):
                                         eye_coords=eye_coords_list, mouth_coords=mouth_coords_list, ear_coords=ear_coords_list,       # liste de tuples
                                         nose_coords=nose_coords_list, device=device, latent_scale=LATENT_SCALE,
                                         creative_mode=None, # cinematic # dream # anime  #glitch # soft # distortion hybrid ********
-                                        frame_idx=frame_counter, total_frames=total_frames, debug=True, debug_dir=output_dir
+                                        frame_idx=frame_counter, total_frames=total_frames, debug=verbose, debug_dir=output_dir
                                         )
 
             current_latent_single = torch.nn.functional.interpolate(
@@ -456,7 +456,7 @@ def main(args):
                                 tile_fn_partial = partial( controlnet_tile_fn, frame_counter=frame_counter, unet=unet, controlnet=controlnet, scheduler=scheduler, cf_embeds=cf_embeds, current_guidance_scale=current_guidance_scale, controlnet_scale=controlnet_scale, device=device, target_dtype=target_dtype, )
 
                                 # 🔹 Appel de apply_openpose_tilewise
-                                latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=True, debug_dir=output_dir,frame_idx=frame_counter)
+                                latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=verbose, debug_dir=output_dir,frame_idx=frame_counter)
 
                             else:
                                 # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION -------------------------------------------------------
@@ -470,7 +470,7 @@ def main(args):
                                 current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints,
                                                                                               prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
 
-                                # 🔹 Appliquer le mouvement du haut du corps / OpenPose - apply_pose_driven_motion_stable or apply_pose_driven_motion or apply_pose_driven_motion_ultra2
+                                # 🔹 Appliquer le mouvement du haut du corps / OpenPose - apply_pose_driven_motion_stable or apply_pose_driven_motion_ultra2
                                 latents = apply_pose_driven_motion_ultra2(
                                     latents=latents, keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
                                     breathing=True, debug=True, debug_dir=output_dir
@@ -491,7 +491,8 @@ def main(args):
                             latents = latents_before_openpose.clone()
 
                         # 🔹 debug image
-                        save_debug_pose_image_with_skeleton( pose_tensor=pose_full, keypoints_tensor=current_keypoints, frame_counter=frame_counter, output_dir=output_dir, cfg=cfg, prefix="openpose" )
+                        if debug_visual:
+                            save_debug_pose_image_with_skeleton( pose_tensor=pose_full, keypoints_tensor=current_keypoints, frame_counter=frame_counter, output_dir=output_dir, cfg=cfg, prefix="openpose" )
 
                     # ---------------- Motion module --------------------------------------------------------------------------------------------------
                     if motion_module is not None:
@@ -552,11 +553,12 @@ def main(args):
     # Libération à la fin
     release_mediapipe_models()
     video_path = output_dir / f"video_{timestamp}.mp4"
-    skeleton_path = output_dir / f"skeleton_{timestamp}.mp4"
     save_frames_as_video_from_folder(folder_path=output_dir, out_path=video_path, pattern="frame_*.png", fps=fps, upscale_factor=upscale_factor)
     print(f"🎬 Vidéo générée : {video_path}")
-    save_frames_as_video_from_folder(folder_path=output_dir, out_path=skeleton_path, pattern="skeleton_*.png", fps=fps, upscale_factor=upscale_factor)
-    print(f"🎬 Vidéo générée : {skeleton_path}")
+    if debug_visual:
+        skeleton_path = output_dir / f"skeleton_{timestamp}.mp4"
+        save_frames_as_video_from_folder(folder_path=output_dir, out_path=skeleton_path, pattern="skeleton_*.png", fps=fps, upscale_factor=upscale_factor)
+        print(f"🎬 Vidéo générée : {skeleton_path}")
 
 # ---------------- ENTRY ----------------
 if __name__=="__main__":
