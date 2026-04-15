@@ -7,7 +7,6 @@ import numpy as np
 from PIL import Image, ImageFilter
 import torch.nn.functional as F
 from pathlib import Path
-
 from torchvision.transforms.functional import to_pil_image
 
 
@@ -1202,8 +1201,7 @@ def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=
     return latents_out
 
 
-import torch
-import torch.nn.functional as F
+
 import matplotlib.pyplot as plt
 #----------- Rendu HD ------------------------------
 # version optimized
@@ -1229,9 +1227,6 @@ def apply_pro_net_volumetrique(
     - lumière douce (jamais cramée)
     - iris propre (pas de sharp)
     """
-
-    import torch
-    import torch.nn.functional as F
 
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
@@ -1328,9 +1323,6 @@ def apply_pro_net_volumetrique_high(
     Amplification 3D douce pour latents : relief, volumes et glow subtil sur iris.
     """
 
-    import torch
-    import torch.nn.functional as F
-
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
 
@@ -1423,8 +1415,6 @@ def apply_pro_net_volumetrique_natural(
     Effet léger, contours doux, détails iris subtils.
     """
 
-    import torch
-    import torch.nn.functional as F
 
     if not coords_v:
         with torch.no_grad():
@@ -1511,9 +1501,6 @@ def apply_pro_net_volumetrique_clean(
     """
     ProNet volumétrique HD optimisé + glow iris doux + gamma/contrast
     """
-
-    import torch
-    import torch.nn.functional as F
 
     if not coords_v:
         with torch.no_grad():
@@ -1607,9 +1594,6 @@ def apply_pro_net_volumetrique_ice(
     ProNet volumétrique HD optimisé + glow iris doux
     """
 
-    import torch
-    import torch.nn.functional as F
-
     if not coords_v:
         with torch.no_grad():
             return apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
@@ -1692,9 +1676,6 @@ def apply_pro_net_volumetrique_glow(
     """
     ProNet volumétrique HD + glow iris avec contours adoucis mais plus net
     """
-
-    import torch
-    import torch.nn.functional as F
 
     if not coords_v:
         return apply_n3r_pro_net(latents, model=n3r_pro_net, strength=n3r_pro_strength, sanitize_fn=sanitize_fn)
@@ -1878,9 +1859,6 @@ def apply_pro_net_with_eyes(
     - iris lisse et propre
     """
 
-    import torch
-    import torch.nn.functional as F
-
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
 
@@ -1959,9 +1937,6 @@ def apply_pro_net_with_eyes_sd(
     - effet naturel (quasi invisible)
     """
 
-    import torch
-    import torch.nn.functional as F
-
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
 
@@ -2027,9 +2002,6 @@ def apply_pro_net_with_eyes_power(
     Amplification douce de l’iris seulement.
     Contours de l’œil / paupière adoucis au maximum.
     """
-
-    import torch
-    import torch.nn.functional as F
 
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
@@ -2116,9 +2088,6 @@ def apply_pro_net_with_eyes_glow(
     Moins lumineux et moins “HDR sharp” pour rester proche de l'input.
     """
 
-    import torch
-    import torch.nn.functional as F
-
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
 
@@ -2201,9 +2170,6 @@ def apply_pro_net_with_eyes_boost(
     ProNet optimisé + amplification HDR des détails sur l’iris (pas glow)
     avec fusion douce pour éviter halo sur les contours.
     """
-
-    import torch
-    import torch.nn.functional as F
 
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
@@ -2289,9 +2255,6 @@ def apply_pro_net_with_mouth(
     ProNet optimisé + amplification HDR des détails sur la bouche
     avec fusion douce pour éviter halo sur les contours.
     """
-
-    import torch
-    import torch.nn.functional as F
 
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
@@ -2799,9 +2762,6 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     gamma_boost=1.03,                  # légèrement plus de punch naturel
     scale=4
 ):
-    import torch
-    import torch.nn.functional as F
-    from torchvision.transforms.functional import to_pil_image
 
     vae.eval()  # pas besoin de caster tout le VAE
     B, C, H, W = latents.shape
@@ -2915,9 +2875,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural_test(
     sharpen_edges_strength=0.02,
     gamma_boost=1.03                  # légèrement plus de punch naturel
 ):
-    import torch
-    import torch.nn.functional as F
-    from torchvision.transforms.functional import to_pil_image
+
 
     vae.eval()
     B, C, H, W = latents.shape
@@ -3038,9 +2996,6 @@ def decode_latents_ultrasafe_blockwise_ultranatural_optimized(
     sharpen_edges_strength=0.02,
     gamma_boost=1.03
 ):
-    import torch
-    import torch.nn.functional as F
-    from torchvision.transforms.functional import to_pil_image
 
     vae = vae.to(device=device, dtype=torch.float32)
     vae.eval()
@@ -3161,9 +3116,6 @@ def decode_latents_ultrasafe_blockwise_ultranatural_stable(
     sharpen_edges_strength=0.02,
     gamma_boost=1.03                  # légèrement plus de punch naturel
 ):
-    import torch
-    import torch.nn.functional as F
-    from torchvision.transforms.functional import to_pil_image
 
     vae = vae.to(device=device, dtype=torch.float32)
     vae.eval()
@@ -3287,9 +3239,6 @@ def decode_latents_ultrasafe_blockwise_natural(
     sharpen_edges_strength=0.02,
     gamma_boost=1.10                  # 12% plus de punch naturel
 ):
-    import torch
-    import torch.nn.functional as F
-    from torchvision.transforms.functional import to_pil_image
 
     vae = vae.to(device=device, dtype=torch.float32)
     vae.eval()
@@ -3399,9 +3348,6 @@ def decode_latents_ultrasafe_blockwise_sharp(
     sharpen_strength=0.04,
     sharpen_edges_strength=0.05
 ):
-    import torch
-    import torch.nn.functional as F
-    from torchvision.transforms.functional import to_pil_image
 
     vae = vae.to(device=device, dtype=torch.float32)
     vae.eval()
@@ -3529,9 +3475,6 @@ def decode_latents_ultrasafe_blockwise_plastique(
     sharpen_strength=0.04,
     sharpen_edges_strength=0.05
 ):
-    import torch
-    import torch.nn.functional as F
-    from torchvision.transforms.functional import to_pil_image
 
     vae = vae.to(device=device, dtype=torch.float32)
     vae.eval()
@@ -3647,8 +3590,6 @@ def decode_latents_ultrasafe_blockwise_pro(
     latent_scale_boost=1.0,
     use_hann=True
 ):
-    import torch
-    from torchvision.transforms.functional import to_pil_image
 
     vae = vae.to(device=device, dtype=torch.float32)
     vae.eval()
@@ -3719,8 +3660,6 @@ def decode_latents_ultrasafe_blockwise(latents, vae,
     Décodage ultra-safe par blocs des latents en image PIL.
     Paramètres conservés uniquement : block_size, overlap, device, frame_counter, latent_scale_boost
     """
-    import torch
-    from torchvision.transforms.functional import to_pil_image
 
     vae = vae.to(device=device, dtype=torch.float32)
     vae.eval()
