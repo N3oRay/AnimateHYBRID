@@ -6,7 +6,7 @@ import time
 from diffusers import ControlNetModel
 import math
 import torch.nn.functional as F
-from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body
+from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body, reconstruct_hips
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
@@ -150,6 +150,9 @@ def normalize_coord(coord):
 
     return None
 
+
+
+
 def update_keypoints_from_pose(
     current_keypoints,
     nose_coords,
@@ -184,6 +187,7 @@ def update_keypoints_from_pose(
     left_elbow, right_elbow = pair(elbow_coords, debug=debug)
     left_wrist, right_wrist = pair(wrists_coords, debug=debug)
     left_hip, right_hip = pair(hips_coords, debug=debug)
+    left_hip, right_hip, hips_reconstructed = reconstruct_hips( left_hip, right_hip, left_shoulder, right_shoulder, image_size, image_size, debug=debug )
     left_eye, right_eye = pair(eye_coords, debug=debug)
     left_ear, right_ear  = pair(ear_coords, debug=debug)
 

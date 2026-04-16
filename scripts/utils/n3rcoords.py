@@ -528,3 +528,75 @@ def generate_pose_sequence_keypoints(
 
     return seq
 
+
+import numpy as np
+
+import numpy as np
+
+def reconstruct_hips(
+    left_hip,
+    right_hip,
+    left_shoulder,
+    right_shoulder,
+    image_size=(1280, 896),
+    hip_drop_ratio=0.65,     # ↓ hauteur dépend largeur épaules
+    hip_width_ratio=1.20,    # ↔ hanches plus larges
+    debug=False
+):
+    """
+    Stable proportional hip reconstruction:
+    - hip height ∝ shoulder width
+    - hip width  ∝ shoulder width
+    """
+
+    H, W = image_size
+
+    def valid(c):
+        if c is None:
+            return False
+        x, y = c
+        return np.isfinite(x) and np.isfinite(y)
+
+    hips_reconstructed = False
+
+    # =========================================================
+    # 1. fallback condition
+    # =========================================================
+    if (not valid(left_hip)) or (not valid(right_hip)):
+
+        if valid(left_shoulder) and valid(right_shoulder):
+
+            ls = np.array(left_shoulder, dtype=np.float32)
+            rs = np.array(right_shoulder, dtype=np.float32)
+
+            shoulder_center = (ls + rs) * 0.5
+            shoulder_vec = rs - ls
+
+            shoulder_width = np.linalg.norm(shoulder_vec)
+            if shoulder_width < 1e-6:
+                shoulder_width = W * 0.1
+
+            x_axis = shoulder_vec / shoulder_width
+
+            # =================================================
+            # 2. HEIGHT = function of shoulder width
+            # =================================================
+            hip_drop = shoulder_width * hip_drop_ratio
+
+            hip_center = shoulder_center + np.array([0, hip_drop], dtype=np.float32)
+
+            # =================================================
+            # 3. WIDTH = function of shoulder width
+            # =================================================
+            half_width = shoulder_width * hip_width_ratio * 0.5
+
+            left_hip  = hip_center - x_axis * half_width
+            right_hip = hip_center + x_axis * half_width
+
+            hips_reconstructed = True
+
+            if debug:
+                print("🦿 [HIP RECONSTRUCTION] proportional model applied")
+
+    return left_hip, right_hip, hips_reconstructed
+
