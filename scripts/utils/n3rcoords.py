@@ -3,6 +3,7 @@
 import torch
 import numpy as np
 from .n3rMotionPoseClass import Pose
+import math
 
 def lerp(a, b, t):
     return a * (1 - t) + b * t
@@ -406,8 +407,6 @@ def animate_upper_body(
     return keypoints
 
 
-import torch
-import math
 
 def generate_pose_sequence_keypoints(
     base_keypoints,
@@ -529,9 +528,7 @@ def generate_pose_sequence_keypoints(
     return seq
 
 
-import numpy as np
 
-import numpy as np
 
 def reconstruct_hips(
     left_hip,
