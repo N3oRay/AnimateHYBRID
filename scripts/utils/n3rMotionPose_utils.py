@@ -2439,67 +2439,66 @@ def compute_time(frame_idx, frame_pause, base_dt=0.03):
     return (frozen_blocks + decay * 0.3) * base_dt
 # --- En DEV: synchroniser ce freeze intelligent avec ton apply_global_pose pour éviter les conflits entre keypoints et warp global.
 def update_sequence_from_keypoints_batch(
-    sequence,                  # 🔥 NEW (liste de keypoints)
+    sequence,
     frame_idx,
     prev_keypoints=None,
     alpha=0.9,
     freeze_threshold=0.0015,
     freeze_strength=0.25,
-    micro_jitter=0.0005,
+    micro_jitter=0.0003,
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)
 ):
-    """
-    Version PRO :
-    - utilise directement la sequence animée
-    - applique seulement stabilisation + freeze + micro motion
-    """
-
-    kp = sequence[frame_idx].clone()
-    B, N, _ = kp.shape
+    kp_raw = sequence[frame_idx].clone()
+    B, N, _ = kp_raw.shape
 
     # =========================================================
-    # 🔹 1. TEMPORAL SMOOTHING
+    # 🔹 1. MOTION ENERGY (PURE)
     # =========================================================
     if prev_keypoints is not None:
-        kp = alpha * kp + (1 - alpha) * prev_keypoints
+        motion_energy = (kp_raw - prev_keypoints).abs().mean()
+    else:
+        motion_energy = torch.tensor(1.0, device=kp_raw.device)
 
     # =========================================================
-    # 🔹 2. MOTION ENERGY
+    # 🔹 2. FREEZE GATE (stable)
     # =========================================================
-    motion_energy = torch.tensor(1.0, device=kp.device)
-
-    if prev_keypoints is not None:
-        motion_energy = (kp - prev_keypoints).abs().mean()
-
-    # =========================================================
-    # 🔹 3. FREEZE GATE
-    # =========================================================
-    freeze_gate = torch.tensor(1.0, device=kp.device)
-
     if motion_energy < freeze_threshold:
         freeze_gate = motion_energy / freeze_threshold
         freeze_gate = torch.clamp(freeze_gate, 0.0, 1.0)
         freeze_gate = freeze_strength + (1 - freeze_strength) * freeze_gate
+    else:
+        freeze_gate = torch.tensor(1.0, device=kp_raw.device)
 
     # =========================================================
-    # 🔹 4. MICRO JITTER (ULTRA LIGHT)
+    # 🔹 3. TEMPORAL SMOOTHING (only here)
     # =========================================================
-    jitter = torch.randn_like(kp[..., :2]) * micro_jitter
+    kp = kp_raw
+    if prev_keypoints is not None:
+        kp = alpha * kp + (1 - alpha) * prev_keypoints
+
+    # =========================================================
+    # 🔹 4. MICRO JITTER (LIMITED SCOPE)
+    # =========================================================
+    # uniquement torso + head (sinon explosion visuelle)
+    jitter = torch.zeros_like(kp[..., :2])
+
+    head_ids = [0,1,14,15,16,17,18]
+    limb_ids = list(range(min(N, 25)))
+
+    jitter[:, head_ids, :] = torch.randn_like(kp[:, head_ids, :2]) * micro_jitter
+
     kp[..., :2] += jitter * freeze_gate
 
     # =========================================================
-    # 🔹 5. LIMB DAMPING (important)
+    # 🔹 5. VERY LIGHT STABILIZATION (NO FEEDBACK LOOP)
     # =========================================================
-    limb_ids = list(range(min(N, 25)))
-
     if prev_keypoints is not None:
-        delta = kp[:, limb_ids, :2] - prev_keypoints[:, limb_ids, :2]
-        kp[:, limb_ids, :2] -= delta * (1 - freeze_gate)
+        kp[..., :2] = kp[..., :2] * 0.98 + prev_keypoints[..., :2] * 0.02
 
     # =========================================================
-    # 🔹 6. CLAMP (NORMALIZED SPACE)
+    # 🔹 6. CLAMP
     # =========================================================
     kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
 
@@ -2512,9 +2511,6 @@ def update_sequence_from_keypoints_batch(
         print(f"motion_energy: {motion_energy.item():.6f}")
         print(f"freeze_gate: {freeze_gate.item():.4f}")
 
-        # =========================
-    # 🔹 DEBUG
-    # =========================
     if debug and debug_dir is not None:
         debug_draw_openpose_skeleton(
             keypoints_tensor=kp,
