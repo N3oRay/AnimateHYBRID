@@ -2425,7 +2425,10 @@ def apply_pose_driven_motion_stable(
     return latents
 
 #-------Gestion de l'animation -----------------------------------------------------------------------------------
-
+def to_float(x):
+    if torch.is_tensor(x):
+        return x.item()
+    return float(x)
 
 def compute_time(frame_idx, frame_pause, base_dt=0.03):
     if frame_pause is None:
@@ -2439,6 +2442,93 @@ def compute_time(frame_idx, frame_pause, base_dt=0.03):
     return (frozen_blocks + decay * 0.3) * base_dt
 # --- En DEV: synchroniser ce freeze intelligent avec ton apply_global_pose pour éviter les conflits entre keypoints et warp global.
 """
+Motion Graph v5 – Cinematic Rig System”
+spine inertiel
+head lock caméra optionnel
+breathing séparé propre
+full skeleton graph (pas seulement bras)
+compatible diffusion latents (anti-blur garanti)
+"""
+
+def update_motion_state(
+    kp,
+    new_state,
+    body_anchor_ids=(8, 11),   # bassin / hanches
+    head_ids=(0, 1, 2, 3, 4),
+    anchor_smooth=0.15,
+    velocity_smooth=0.7,
+):
+    """
+    Stable motion state updater for AnimateDiff / OpenPose keypoints.
+
+    Returns:
+        updated_state (dict)
+        kp_corrected (tensor)
+    """
+
+    B, N, _ = kp.shape
+
+    # =========================================================
+    # 1. INIT STATE
+    # =========================================================
+    if new_state is None:
+        new_state = {
+            "kp_prev": kp.clone(),
+            "velocity": torch.zeros_like(kp[..., :2]),
+            "anchor": kp[:, list(body_anchor_ids), :2].mean(dim=1, keepdim=True)
+        }
+
+        return kp, new_state
+
+    kp_prev = new_state["kp_prev"]
+
+    # =========================================================
+    # 2. VELOCITY (RAW)
+    # =========================================================
+    velocity = kp[..., :2] - kp_prev[..., :2]
+
+    if new_state["velocity"] is None:
+        new_state["velocity"] = velocity.clone()
+
+    # smooth velocity (CRITICAL for stability)
+    velocity = (
+        velocity * (1 - velocity_smooth)
+        + new_state["velocity"] * velocity_smooth
+    )
+
+    new_state["velocity"] = velocity.clone()
+
+    # =========================================================
+    # 3. ANCHOR (BODY CENTER DRIFT CONTROL)
+    # =========================================================
+    current_anchor = kp[:, list(body_anchor_ids), :2].mean(dim=1, keepdim=True)
+
+    if new_state["anchor"] is None:
+        new_state["anchor"] = current_anchor.clone()
+
+    drift = current_anchor - new_state["anchor"]
+
+    # smooth anchor update (prevents jitter)
+    new_state["anchor"] = (
+        new_state["anchor"] * (1 - anchor_smooth)
+        + current_anchor * anchor_smooth
+    )
+
+    # APPLY DRIFT CORRECTION (KEY FIX)
+    kp[..., :2] -= drift
+
+    # =========================================================
+    # 4. HEAD LOCK (optional cinematic stability)
+    # =========================================================
+    kp[:, list(head_ids), :2] = kp_prev[:, list(head_ids), :2]
+
+    # =========================================================
+    # 5. UPDATE STATE MEMORY
+    # =========================================================
+    new_state["kp_prev"] = kp.clone()
+
+    return kp, new_state
+"""
 alpha_base = 0.92          # un peu plus inertie
 freeze_threshold = 0.0022  # freeze plus actif
 freeze_strength = 0.30     # freeze utile mais pas bloquant
@@ -2446,125 +2536,92 @@ micro_jitter = 0.00012     # encore plus subtil
 time_scale = 0.45          # ralentit légèrement plus
 max_velocity = 0.008       # 🔥 clé principale (cinematic cap)
 """
-def update_sequence_from_keypoints_batch_test(
+def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
+    prev_state=None,
     prev_keypoints=None,
     alpha_base=0.90,
     freeze_threshold=0.0025,
-    freeze_strength=0.20,
-    micro_jitter=0.00015,
-    time_scale=0.50,
-    max_velocity=0.012,
+    freeze_strength=0.15,
+    micro_jitter=0.00025,
+    time_scale=0.5,          # 🔥 contrôle vitesse globale
+    max_velocity=0.009,       # 🔥 clamp px/frame (IMPORTANT)
+    camera_lock=0.97,
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)
 ):
-    kp_raw = sequence[frame_idx].clone()
-    B, N, _ = kp_raw.shape  # N = 25
+    """
+    Motion warper for AnimateDiff / ControlNet pipeline.
+    Handles:
+    - time interpolation
+    - calls motion state engine
+    - optional camera stabilization hook
+    """
+
+    B, N, _ = sequence[0].shape
+    device = sequence[0].device
 
     # =========================================================
-    # 0. TIME INTERPOLATION
+    # 1. TIME WARP (smooth playback control)
     # =========================================================
     scaled_idx = frame_idx * time_scale
     i0 = int(scaled_idx)
     i1 = min(i0 + 1, len(sequence) - 1)
     t = scaled_idx - i0
 
-    kp = (1 - t) * sequence[i0] + t * sequence[i1]
+    kp_raw = (1 - t) * sequence[i0] + t * sequence[i1]
 
     # =========================================================
-    # 1. MOTION ANALYSIS
+    # 2. CAMERA LOCK PRE-FILTER (anti drift global)
     # =========================================================
-    if prev_keypoints is not None:
-        delta = kp[..., :2] - prev_keypoints[..., :2]
-        motion_energy = delta.abs().mean()
-        vel = torch.norm(delta, dim=-1, keepdim=True)
+    if prev_state is not None and prev_state.get("anchor") is not None:
+        anchor = prev_state["anchor"]
     else:
-        motion_energy = torch.tensor(1.0, device=kp.device)
-        vel = torch.zeros((B, N, 1), device=kp.device)
+        anchor = kp_raw[:, 8:12, :2].mean(dim=1, keepdim=True)
+
+    # soft normalization toward center stability
+    kp_raw[..., :2] = kp_raw[..., :2] * camera_lock + anchor * (1 - camera_lock)
 
     # =========================================================
-    # 2. FREEZE GATE
+    # 3. CALL MOTION STATE ENGINE (CORE)
     # =========================================================
-    if motion_energy < freeze_threshold:
-        freeze_gate = motion_energy / freeze_threshold
-        freeze_gate = freeze_strength + (1 - freeze_strength) * freeze_gate
-    else:
-        freeze_gate = torch.ones_like(motion_energy)
-
-    freeze_gate = torch.clamp(freeze_gate, 0.0, 1.0)
+    kp, new_state = update_motion_state(
+        kp_raw,
+        prev_state
+    )
 
     # =========================================================
-    # 3. VELOCITY CLAMP
+    # 4. VELOCITY LIMIT (GLOBAL SAFETY NET)
     # =========================================================
-    if prev_keypoints is not None:
-        direction = delta / (vel + 1e-6)
-        clamped_vel = torch.clamp(vel, 0.0, max_velocity)
-        kp[..., :2] = prev_keypoints[..., :2] + direction * clamped_vel
+    if new_state["kp_prev"] is not None:
+        delta = kp[..., :2] - new_state["kp_prev"][..., :2]
+
+        speed = torch.norm(delta, dim=-1, keepdim=True)
+        scale = torch.clamp(max_velocity / (speed + 1e-6), max=1.0)
+
+        kp[..., :2] = new_state["kp_prev"][..., :2] + delta * scale
 
     # =========================================================
-    # 4. MUSCLE MODEL (FIXED SHAPE)
-    # =========================================================
-    muscle_map = torch.ones((B, N, 1), device=kp.device)
-
-    # OpenPose 25 keypoints mapping
-    shoulder_ids = [2, 5]
-    elbow_ids = [3, 6]
-    wrist_ids = [4, 7]
-    hip_ids = [8, 11]
-
-    # contraction strengths (lower = stiffer)
-    muscle_map[:, shoulder_ids] *= 0.35
-    muscle_map[:, elbow_ids] *= 0.55
-    muscle_map[:, wrist_ids] *= 0.75
-    muscle_map[:, hip_ids] *= 0.25
-
-    if prev_keypoints is not None:
-        kp_delta = kp[..., :2] - prev_keypoints[..., :2]
-
-        # ✅ FIX: correct broadcasting [B, N, 2] * [B, N, 1]
-        kp[..., :2] = prev_keypoints[..., :2] + kp_delta * muscle_map
-
-    # =========================================================
-    # 5. TEMPORAL SMOOTHING
-    # =========================================================
-    alpha = alpha_base * freeze_gate
-
-    if prev_keypoints is not None:
-        kp = alpha * kp + (1 - alpha) * prev_keypoints
-
-    # =========================================================
-    # 6. MICRO MOTION
-    # =========================================================
-    if prev_keypoints is not None and freeze_gate < 0.7:
-        noise = torch.randn_like(kp[..., :2]) * micro_jitter
-        kp[..., :2] += noise * (1.0 - freeze_gate)
-
-    # =========================================================
-    # 7. FINAL STABILIZATION
-    # =========================================================
-    if prev_keypoints is not None:
-        kp[..., :2] = prev_keypoints[..., :2] + torch.clamp(
-            kp[..., :2] - prev_keypoints[..., :2],
-            -max_velocity,
-            max_velocity
-        )
-
-    # =========================================================
-    # 8. CLAMP
+    # 5. FINAL SAFETY CLAMP
     # =========================================================
     kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
 
     # =========================================================
-    # 9. DEBUG (KEEP EXACT FORMAT REQUESTED)
+    # 6. DEBUG
     # =========================================================
     if debug:
-        print("\n[DEBUG][SEQ PRO]")
+        motion = (kp[..., :2] - new_state["kp_prev"][..., :2]).abs().mean() if new_state["kp_prev"] is not None else 0.0
+
+        print("\n[DEBUG][MOTION WARPER]")
         print(f"frame: {frame_idx}")
-        print(f"motion_energy: {motion_energy.item():.6f}")
-        print(f"freeze_gate: {freeze_gate.item():.4f}")
-        print(f"alpha: {alpha:.4f}")
+        print(f"scaled_idx: {scaled_idx:.3f}")
+        print(f"camera_lock: {camera_lock}")
+        print(f"motion_mean: {motion:.6f}")
+
+        if new_state.get("anchor") is not None:
+            print(f"anchor: {new_state['anchor'].mean().item():.4f}")
 
         if debug_dir is not None:
             debug_draw_openpose_skeleton(
@@ -2576,16 +2633,17 @@ def update_sequence_from_keypoints_batch_test(
 
     return kp
 
-def update_sequence_from_keypoints_batch(
+
+def update_sequence_from_keypoints_batch_stable(
     sequence,
     frame_idx,
     prev_keypoints=None,
     alpha_base=0.90,
     freeze_threshold=0.0025,
-    freeze_strength=0.20,
+    freeze_strength=0.15,
     micro_jitter=0.00025,
-    time_scale=0.50,          # 🔥 contrôle vitesse globale
-    max_velocity=0.012,       # 🔥 clamp px/frame (IMPORTANT)
+    time_scale=1.00,          # 🔥 contrôle vitesse globale
+    max_velocity=0.009,       # 🔥 clamp px/frame (IMPORTANT)
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)
@@ -2640,6 +2698,37 @@ def update_sequence_from_keypoints_batch(
         scale = torch.clamp(max_velocity / (speed + 1e-6), max=1.0)
 
         kp[..., :2] = prev_keypoints[..., :2] + delta * scale
+
+    # =========================================================
+    # 8. KINETIC CHAIN PROPAGATION (PRO+)
+    # =========================================================
+    if prev_keypoints is not None:
+
+        def propagate(parent, child, stiffness=0.15, delay=0.6):
+            parent_vel = kp[:, parent, :2] - prev_keypoints[:, parent, :2]
+            child_vel = kp[:, child, :2] - prev_keypoints[:, child, :2]
+
+            # propagation retardée
+            propagated = parent_vel * delay
+
+            # mélange physique
+            new_child_vel = (
+                child_vel * (1 - stiffness) +
+                propagated * stiffness
+            )
+
+            kp[:, child, :2] = prev_keypoints[:, child, :2] + new_child_vel
+
+        # 🔹 chaîne bras
+        propagate(2, 3, stiffness=0.25, delay=0.7)  # shoulder → elbow
+        propagate(3, 4, stiffness=0.35, delay=0.8)  # elbow → wrist
+
+        propagate(5, 6, stiffness=0.25, delay=0.7)
+        propagate(6, 7, stiffness=0.35, delay=0.8)
+
+        # 🔹 chaîne corps
+        propagate(1, 8, stiffness=0.2, delay=0.6)   # neck → hip
+        propagate(1, 11, stiffness=0.2, delay=0.6)
 
     # =========================================================
     # 6. MICRO MOTION (ONLY WHEN FROZEN)
