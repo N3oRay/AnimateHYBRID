@@ -2449,85 +2449,141 @@ breathing séparé propre
 full skeleton graph (pas seulement bras)
 compatible diffusion latents (anti-blur garanti)
 """
-
 def update_motion_state(
     kp,
-    new_state,
-    body_anchor_ids=(8, 11),   # bassin / hanches
-    head_ids=(0, 1, 2, 3, 4),
-    anchor_smooth=0.15,
-    velocity_smooth=0.7,
+    state,
+    head_ids=(0,1,2,3,4),
+    body_ids=(5,6,7,8,9,10,11,12),
+    anchor_smooth=0.12,
+    velocity_smooth=0.65,
+    drift_smooth=0.25,
+    head_lock=True,
+    head_lock_strength=1.0
 ):
-    """
-    Stable motion state updater for AnimateDiff / OpenPose keypoints.
-
-    Returns:
-        updated_state (dict)
-        kp_corrected (tensor)
-    """
-
     B, N, _ = kp.shape
 
     # =========================================================
-    # 1. INIT STATE
+    # INIT STATE
     # =========================================================
-    if new_state is None:
-        new_state = {
+    if state is None:
+        return kp, {
             "kp_prev": kp.clone(),
             "velocity": torch.zeros_like(kp[..., :2]),
-            "anchor": kp[:, list(body_anchor_ids), :2].mean(dim=1, keepdim=True)
+            "anchor": kp[:, body_ids, :2].mean(dim=1, keepdim=True)
         }
 
-        return kp, new_state
+    kp_prev = state["kp_prev"]
 
-    kp_prev = new_state["kp_prev"]
+    # safety
+    if kp_prev.shape != kp.shape:
+        kp_prev = kp.clone()
 
     # =========================================================
-    # 2. VELOCITY (RAW)
+    # 1. VELOCITY (smoothed + stable)
     # =========================================================
-    velocity = kp[..., :2] - kp_prev[..., :2]
+    raw_velocity = kp[..., :2] - kp_prev[..., :2]
 
-    if new_state["velocity"] is None:
-        new_state["velocity"] = velocity.clone()
-
-    # smooth velocity (CRITICAL for stability)
     velocity = (
-        velocity * (1 - velocity_smooth)
-        + new_state["velocity"] * velocity_smooth
+        raw_velocity * (1 - velocity_smooth)
+        + state["velocity"] * velocity_smooth
     )
 
-    new_state["velocity"] = velocity.clone()
+    state["velocity"] = velocity.clone()
 
     # =========================================================
-    # 3. ANCHOR (BODY CENTER DRIFT CONTROL)
+    # 2. ANCHOR (camera stability core)
     # =========================================================
-    current_anchor = kp[:, list(body_anchor_ids), :2].mean(dim=1, keepdim=True)
+    anchor_now = kp[:, body_ids, :2].mean(dim=1, keepdim=True)
 
-    if new_state["anchor"] is None:
-        new_state["anchor"] = current_anchor.clone()
+    anchor_prev = state["anchor"]
 
-    drift = current_anchor - new_state["anchor"]
+    # raw drift
+    drift_raw = anchor_now - anchor_prev
 
-    # smooth anchor update (prevents jitter)
-    new_state["anchor"] = (
-        new_state["anchor"] * (1 - anchor_smooth)
-        + current_anchor * anchor_smooth
+    # SMOOTH drift (CRITICAL FIX for jitter reduction)
+    drift = (
+        drift_raw * (1 - drift_smooth)
+        + drift_raw * drift_smooth  # keeps slight responsiveness
     )
 
-    # APPLY DRIFT CORRECTION (KEY FIX)
+    # update anchor EMA (camera memory)
+    state["anchor"] = (
+        anchor_prev * (1 - anchor_smooth)
+        + anchor_now * anchor_smooth
+    )
+
+    # apply camera stabilization
     kp[..., :2] -= drift
 
     # =========================================================
-    # 4. HEAD LOCK (optional cinematic stability)
+    # 3. HEAD LOCK (cinematic stability)
     # =========================================================
-    kp[:, list(head_ids), :2] = kp_prev[:, list(head_ids), :2]
+    if head_lock:
+        if head_lock_strength >= 1.0:
+            kp[:, head_ids, :2] = kp_prev[:, head_ids, :2]
+        else:
+            kp[:, head_ids, :2] = (
+                kp_prev[:, head_ids, :2] * head_lock_strength
+                + kp[:, head_ids, :2] * (1 - head_lock_strength)
+            )
 
     # =========================================================
-    # 5. UPDATE STATE MEMORY
+    # 4. SAFETY CLAMP (NaN + explosion guard)
     # =========================================================
-    new_state["kp_prev"] = kp.clone()
+    kp[..., :2] = torch.nan_to_num(kp[..., :2], nan=0.0, posinf=1.0, neginf=0.0)
+    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
 
-    return kp, new_state
+    # =========================================================
+    # 5. UPDATE MEMORY
+    # =========================================================
+    state["kp_prev"] = kp.clone()
+
+    return kp, state
+
+def update_motion_state_v1(kp, state, head_ids=(0,1,2,3,4), body_ids=(5,6,7,8,9,10,11,12)):
+
+    B, N, _ = kp.shape
+
+    if state is None:
+        return kp, {
+            "kp_prev": kp.clone(),
+            "velocity": torch.zeros_like(kp[..., :2]),
+            "anchor": kp[:, body_ids, :2].mean(dim=1, keepdim=True)
+        }
+
+    kp_prev = state["kp_prev"]
+
+    # -------------------------
+    # VELOCITY (stable)
+    # -------------------------
+    velocity = kp[..., :2] - kp_prev[..., :2]
+    velocity = velocity * 0.6 + state["velocity"] * 0.4
+    state["velocity"] = velocity.clone()
+
+    # -------------------------
+    # ANCHOR (global stability)
+    # -------------------------
+    anchor_now = kp[:, body_ids, :2].mean(dim=1, keepdim=True)
+
+    drift = anchor_now - state["anchor"]
+
+    # smooth anchor update (IMPORTANT)
+    state["anchor"] = state["anchor"] * 0.85 + anchor_now * 0.15
+
+    # REMOVE GLOBAL DRIFT (core fix)
+    kp[..., :2] -= drift
+
+    # -------------------------
+    # HEAD LOCK (optional cinematic mode)
+    # -------------------------
+    kp[:, head_ids, :2] = kp_prev[:, head_ids, :2]
+
+    # -------------------------
+    # UPDATE MEMORY
+    # -------------------------
+    state["kp_prev"] = kp.clone()
+
+    return kp, state
 """
 alpha_base = 0.92          # un peu plus inertie
 freeze_threshold = 0.0022  # freeze plus actif
@@ -2539,61 +2595,43 @@ max_velocity = 0.008       # 🔥 clé principale (cinematic cap)
 def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
-    prev_state=None,
     prev_keypoints=None,
-    alpha_base=0.90,
-    freeze_threshold=0.0025,
-    freeze_strength=0.15,
-    micro_jitter=0.00025,
-    time_scale=0.5,          # 🔥 contrôle vitesse globale
-    max_velocity=0.009,       # 🔥 clamp px/frame (IMPORTANT)
-    camera_lock=0.97,
+    state=None,
+    time_scale=0.5,
+    max_velocity=0.008,
+    camera_lock=0.92,
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)
 ):
-    """
-    Motion warper for AnimateDiff / ControlNet pipeline.
-    Handles:
-    - time interpolation
-    - calls motion state engine
-    - optional camera stabilization hook
-    """
-
-    B, N, _ = sequence[0].shape
-    device = sequence[0].device
 
     # =========================================================
-    # 1. TIME WARP (smooth playback control)
+    # 1. TIME WARP
     # =========================================================
-    scaled_idx = frame_idx * time_scale
-    i0 = int(scaled_idx)
+    scaled = frame_idx * time_scale
+    i0 = int(scaled)
     i1 = min(i0 + 1, len(sequence) - 1)
-    t = scaled_idx - i0
+    t = scaled - i0
 
-    kp_raw = (1 - t) * sequence[i0] + t * sequence[i1]
+    kp = (1 - t) * sequence[i0] + t * sequence[i1]
+    kp = kp.clone()
 
-    # =========================================================
-    # 2. CAMERA LOCK PRE-FILTER (anti drift global)
-    # =========================================================
-    if prev_state is not None and prev_state.get("anchor") is not None:
-        anchor = prev_state["anchor"]
-    else:
-        anchor = kp_raw[:, 8:12, :2].mean(dim=1, keepdim=True)
-
-    # soft normalization toward center stability
-    kp_raw[..., :2] = kp_raw[..., :2] * camera_lock + anchor * (1 - camera_lock)
+    B, N, _ = kp.shape
 
     # =========================================================
-    # 3. CALL MOTION STATE ENGINE (CORE)
+    # 2. CAMERA STABILIZATION (VERY LIGHT)
     # =========================================================
-    kp, new_state = update_motion_state(
-        kp_raw,
-        prev_state
-    )
+    if state is not None:
+        anchor = state["anchor"]
+        kp[..., :2] = kp[..., :2] * camera_lock + anchor * (1 - camera_lock)
 
     # =========================================================
-    # 4. VELOCITY LIMIT (GLOBAL SAFETY NET)
+    # 3. MOTION ENGINE
+    # =========================================================
+    kp, new_state = update_motion_state(kp, state)
+
+    # =========================================================
+    # 4. HARD VELOCITY LIMIT (FINAL SAFETY)
     # =========================================================
     if new_state["kp_prev"] is not None:
         delta = kp[..., :2] - new_state["kp_prev"][..., :2]
@@ -2604,24 +2642,20 @@ def update_sequence_from_keypoints_batch(
         kp[..., :2] = new_state["kp_prev"][..., :2] + delta * scale
 
     # =========================================================
-    # 5. FINAL SAFETY CLAMP
+    # 5. SAFE CLAMP
     # =========================================================
     kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
 
     # =========================================================
-    # 6. DEBUG
+    # 6. DEBUG CLEAN
     # =========================================================
     if debug:
-        motion = (kp[..., :2] - new_state["kp_prev"][..., :2]).abs().mean() if new_state["kp_prev"] is not None else 0.0
+        motion = (kp[..., :2] - new_state["kp_prev"][..., :2]).abs().mean()
 
-        print("\n[DEBUG][MOTION WARPER]")
+        print("\n[🎬 FINAL MOTION ENGINE]")
         print(f"frame: {frame_idx}")
-        print(f"scaled_idx: {scaled_idx:.3f}")
-        print(f"camera_lock: {camera_lock}")
-        print(f"motion_mean: {motion:.6f}")
-
-        if new_state.get("anchor") is not None:
-            print(f"anchor: {new_state['anchor'].mean().item():.4f}")
+        print(f"motion_mean: {motion.item():.6f}")
+        print(f"anchor: {new_state['anchor'].mean().item():.6f}")
 
         if debug_dir is not None:
             debug_draw_openpose_skeleton(
