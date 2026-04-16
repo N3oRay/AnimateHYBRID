@@ -2438,6 +2438,144 @@ def compute_time(frame_idx, frame_pause, base_dt=0.03):
     decay = intra / frame_pause
     return (frozen_blocks + decay * 0.3) * base_dt
 # --- En DEV: synchroniser ce freeze intelligent avec ton apply_global_pose pour éviter les conflits entre keypoints et warp global.
+"""
+alpha_base = 0.92          # un peu plus inertie
+freeze_threshold = 0.0022  # freeze plus actif
+freeze_strength = 0.30     # freeze utile mais pas bloquant
+micro_jitter = 0.00012     # encore plus subtil
+time_scale = 0.45          # ralentit légèrement plus
+max_velocity = 0.008       # 🔥 clé principale (cinematic cap)
+"""
+def update_sequence_from_keypoints_batch_test(
+    sequence,
+    frame_idx,
+    prev_keypoints=None,
+    alpha_base=0.90,
+    freeze_threshold=0.0025,
+    freeze_strength=0.20,
+    micro_jitter=0.00015,
+    time_scale=0.50,
+    max_velocity=0.012,
+    debug=False,
+    debug_dir=None,
+    image_size=(1280, 896)
+):
+    kp_raw = sequence[frame_idx].clone()
+    B, N, _ = kp_raw.shape  # N = 25
+
+    # =========================================================
+    # 0. TIME INTERPOLATION
+    # =========================================================
+    scaled_idx = frame_idx * time_scale
+    i0 = int(scaled_idx)
+    i1 = min(i0 + 1, len(sequence) - 1)
+    t = scaled_idx - i0
+
+    kp = (1 - t) * sequence[i0] + t * sequence[i1]
+
+    # =========================================================
+    # 1. MOTION ANALYSIS
+    # =========================================================
+    if prev_keypoints is not None:
+        delta = kp[..., :2] - prev_keypoints[..., :2]
+        motion_energy = delta.abs().mean()
+        vel = torch.norm(delta, dim=-1, keepdim=True)
+    else:
+        motion_energy = torch.tensor(1.0, device=kp.device)
+        vel = torch.zeros((B, N, 1), device=kp.device)
+
+    # =========================================================
+    # 2. FREEZE GATE
+    # =========================================================
+    if motion_energy < freeze_threshold:
+        freeze_gate = motion_energy / freeze_threshold
+        freeze_gate = freeze_strength + (1 - freeze_strength) * freeze_gate
+    else:
+        freeze_gate = torch.ones_like(motion_energy)
+
+    freeze_gate = torch.clamp(freeze_gate, 0.0, 1.0)
+
+    # =========================================================
+    # 3. VELOCITY CLAMP
+    # =========================================================
+    if prev_keypoints is not None:
+        direction = delta / (vel + 1e-6)
+        clamped_vel = torch.clamp(vel, 0.0, max_velocity)
+        kp[..., :2] = prev_keypoints[..., :2] + direction * clamped_vel
+
+    # =========================================================
+    # 4. MUSCLE MODEL (FIXED SHAPE)
+    # =========================================================
+    muscle_map = torch.ones((B, N, 1), device=kp.device)
+
+    # OpenPose 25 keypoints mapping
+    shoulder_ids = [2, 5]
+    elbow_ids = [3, 6]
+    wrist_ids = [4, 7]
+    hip_ids = [8, 11]
+
+    # contraction strengths (lower = stiffer)
+    muscle_map[:, shoulder_ids] *= 0.35
+    muscle_map[:, elbow_ids] *= 0.55
+    muscle_map[:, wrist_ids] *= 0.75
+    muscle_map[:, hip_ids] *= 0.25
+
+    if prev_keypoints is not None:
+        kp_delta = kp[..., :2] - prev_keypoints[..., :2]
+
+        # ✅ FIX: correct broadcasting [B, N, 2] * [B, N, 1]
+        kp[..., :2] = prev_keypoints[..., :2] + kp_delta * muscle_map
+
+    # =========================================================
+    # 5. TEMPORAL SMOOTHING
+    # =========================================================
+    alpha = alpha_base * freeze_gate
+
+    if prev_keypoints is not None:
+        kp = alpha * kp + (1 - alpha) * prev_keypoints
+
+    # =========================================================
+    # 6. MICRO MOTION
+    # =========================================================
+    if prev_keypoints is not None and freeze_gate < 0.7:
+        noise = torch.randn_like(kp[..., :2]) * micro_jitter
+        kp[..., :2] += noise * (1.0 - freeze_gate)
+
+    # =========================================================
+    # 7. FINAL STABILIZATION
+    # =========================================================
+    if prev_keypoints is not None:
+        kp[..., :2] = prev_keypoints[..., :2] + torch.clamp(
+            kp[..., :2] - prev_keypoints[..., :2],
+            -max_velocity,
+            max_velocity
+        )
+
+    # =========================================================
+    # 8. CLAMP
+    # =========================================================
+    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
+
+    # =========================================================
+    # 9. DEBUG (KEEP EXACT FORMAT REQUESTED)
+    # =========================================================
+    if debug:
+        print("\n[DEBUG][SEQ PRO]")
+        print(f"frame: {frame_idx}")
+        print(f"motion_energy: {motion_energy.item():.6f}")
+        print(f"freeze_gate: {freeze_gate.item():.4f}")
+        print(f"alpha: {alpha:.4f}")
+
+        if debug_dir is not None:
+            debug_draw_openpose_skeleton(
+                keypoints_tensor=kp,
+                debug_dir=debug_dir,
+                frame_counter=frame_idx,
+                image_size=image_size
+            )
+
+    return kp
+
 def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
