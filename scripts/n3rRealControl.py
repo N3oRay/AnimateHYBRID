@@ -459,18 +459,19 @@ def main(args):
                                 latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=verbose, debug_dir=output_dir,frame_idx=frame_counter)
 
                             else:
+                                image_size=(H, W)
                                 # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION ---------------------------
-                                current_keypoints = extract_keypoints_from_pose( debug=True, debug_dir=output_dir, frame_counter=frame_counter)
+                                current_keypoints = extract_keypoints_from_pose( debug=True, debug_dir=output_dir, frame_counter=frame_counter, image_size=image_size)
                                 # 🔹 Update des keypoints avec Mediapipe
 
-                                current_keypoints = update_keypoints_from_pose(current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, image_size=(1280, 896), device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
+                                current_keypoints = update_keypoints_from_pose(current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, image_size=image_size, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
 
-                                sequence = generate_pose_sequence_keypoints(base_keypoints=current_keypoints, num_frames=total_frames, fps=fps, breathing_strength=0.5, sway_strength=0.5, device=device, debug=verbose)
+                                sequence = generate_pose_sequence_keypoints(base_keypoints=current_keypoints, num_frames=total_frames, fps=fps, breathing_strength=0.4, sway_strength=0.4, device=device, debug=verbose)
 
                                 # Mettre à jour les keypoints éventuellement modifiés
                                 if sequence is not None:
                                     # utilisation sequence
-                                    current_keypoints = update_sequence_from_keypoints_batch(sequence=sequence, frame_idx=frame_counter, prev_keypoints=prev_keypoints, alpha=0.9, freeze_threshold=0.0015, freeze_strength=0.25, micro_jitter=0.0005, debug=True, debug_dir=output_dir)
+                                    current_keypoints = update_sequence_from_keypoints_batch(sequence=sequence, frame_idx=frame_counter, prev_keypoints=prev_keypoints, alpha=0.9, freeze_threshold=0.0015, freeze_strength=0.25, micro_jitter=0.0005, debug=True, debug_dir=output_dir, image_size=image_size)
                                 else:
                                     # utilisation uniquement des keypoints_tensor
                                     current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints,
