@@ -169,42 +169,32 @@ def feather_outside_only_alpha(mask, radius=5, sigma=2.0):
 
     return torch.clamp(out, 0, 1)
 
-def debug_draw_openpose_skeleton( keypoints_tensor, debug_dir, frame_counter, pose_full_image=None, image_size=None):
-    """
-    OpenPose debug renderer (HEADLESS COMPATIBLE)
-
-    - pose_full_image: optional tensor [B,3,H,W]
-    - image_size: fallback (H,W)
-    """
-
+def debug_draw_openpose_skeleton(
+    keypoints_tensor,
+    debug_dir,
+    frame_counter,
+    pose_full_image=None,
+    image_size=None
+):
     os.makedirs(debug_dir, exist_ok=True)
 
     # =========================
-    # 🔹 RESOLVE IMAGE SIZE
+    # SIZE RESOLUTION
     # =========================
     if pose_full_image is not None:
         B, C, H, W = pose_full_image.shape
     elif image_size is not None:
         H, W = image_size
-        B = keypoints_tensor.shape[0]
     else:
-        raise ValueError(
-            "debug_draw_openpose_skeleton requires either pose_full_image or image_size"
-        )
+        raise ValueError("Need pose_full_image or image_size")
 
-    # =========================
-    # 🔹 KEYPOINTS
-    # =========================
     keypoints = keypoints_tensor[0].detach().cpu().numpy()
 
-    pose_img = np.zeros((H, W, 4), dtype=np.uint8)
+    pose_img = np.zeros((H, W, 3), dtype=np.uint8)  # ❗ RGB ONLY (important)
 
     def to_pixel(x, y):
         return int(x * W), int(y * H)
 
-    # =========================
-    # 🎨 COLORS
-    # =========================
     COLORS = {
         "head": (255, 0, 255),
         "eyes": (0, 0, 255),
@@ -218,13 +208,16 @@ def debug_draw_openpose_skeleton( keypoints_tensor, debug_dir, frame_counter, po
     }
 
     # =========================
-    # 🔹 POINTS
+    # POINTS
     # =========================
     for i, (x, y, conf) in enumerate(keypoints):
         if conf < 0.05:
             continue
 
         px, py = to_pixel(x, y)
+
+        x1, x2 = max(px-3, 0), min(px+3, W)
+        y1, y2 = max(py-3, 0), min(py+3, H)
 
         if i in [14,15]:
             color = COLORS["eyes"]
@@ -245,23 +238,10 @@ def debug_draw_openpose_skeleton( keypoints_tensor, debug_dir, frame_counter, po
         else:
             color = COLORS["default"]
 
-        alpha = int(conf * 255)
-        pose_img[py-3:py+3, px-3:px+3, :3] = color
-        pose_img[py-3:py+3, px-3:px+3, 3] = alpha
-
-        cv2.putText(
-            pose_img,
-            f"{px},{py}",
-            (px+5, py-5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            color + (alpha,),
-            1,
-            cv2.LINE_AA
-        )
+        cv2.circle(pose_img, (px, py), 3, color, -1)
 
     # =========================
-    # 🔹 SKELETON
+    # SKELETON
     # =========================
     skeleton = [
         (0,1),(1,19),(19,2),(2,3),(3,4),
@@ -298,141 +278,12 @@ def debug_draw_openpose_skeleton( keypoints_tensor, debug_dir, frame_counter, po
             color = COLORS["default"]
 
         thickness = 3 if i in [1,8,11] else 2
-        cv2.line(pose_img, p1, p2, color + (255,), thickness)
+        cv2.line(pose_img, p1, p2, color, thickness)
 
-    # =========================
-    # 💾 SAVE
-    # =========================
     save_path = f"{debug_dir}/skeleton_{frame_counter:05d}.png"
     cv2.imwrite(save_path, pose_img)
 
     print(f"[DEBUG] Skeleton saved: {save_path}")
-
-
-def debug_draw_openpose_skeleton_v2(
-    pose_full_image=None,
-    keypoints_tensor=None,
-    debug_dir=None,
-    frame_counter=0,
-    image_size=None,   # 🔥 fallback explicite
-):
-    """
-    Draw OpenPose skeleton (OPTIONAL image input)
-
-    - pose_full_image: optional [B,3,H,W]
-    - image_size: fallback (H,W)
-    """
-
-    if debug_dir is None or keypoints_tensor is None:
-        return
-
-    os.makedirs(debug_dir, exist_ok=True)
-
-    # =========================
-    # 🔹 RESOLVE SIZE
-    # =========================
-    if pose_full_image is not None:
-        B, C, H, W = pose_full_image.shape
-    elif image_size is not None:
-        H, W = image_size
-        B = keypoints_tensor.shape[0]
-    else:
-        raise ValueError(
-            "Either pose_full_image or image_size must be provided"
-        )
-
-    # =========================
-    # 🔹 KEYPOINTS
-    # =========================
-    keypoints = keypoints_tensor[0].detach().cpu().numpy()
-
-    pose_img = np.zeros((H, W, 4), dtype=np.uint8)
-
-    def to_pixel(x, y):
-        return int(x * W), int(y * H)
-
-    # =========================
-    # 🎨 COLORS
-    # =========================
-    COLORS = {
-        "head": (255, 0, 255, 255),
-        "eyes": (0, 0, 255, 255),
-        "nose": (128, 0, 128, 255),
-        "arms": (0, 255, 0, 255),
-        "torso": (255, 0, 0, 255),
-        "legs": (0, 255, 255, 255),
-        "default": (200, 200, 200, 255)
-    }
-
-    # =========================
-    # 🔹 DRAW POINTS
-    # =========================
-    for i, (x, y, conf) in enumerate(keypoints):
-        if conf < 0.1:
-            continue
-
-        px, py = to_pixel(x, y)
-
-        if i in [14,15]:
-            color = COLORS["eyes"]
-        elif i == 0:
-            color = COLORS["nose"]
-        elif i in [16,17]:
-            color = COLORS["head"]
-        elif i in [2,3,4,5,6,7,19,20]:
-            color = COLORS["arms"]
-        elif i in [1,8,11,21,22,23,24]:
-            color = COLORS["torso"]
-        elif i in [9,10,12,13]:
-            color = COLORS["legs"]
-        elif i == 18:
-            color = COLORS["head"]
-        else:
-            color = COLORS["default"]
-
-        cv2.circle(pose_img, (px, py), 6, color, -1)
-
-    # =========================
-    # 🔹 SKELETON
-    # =========================
-    skeleton = [
-        (0,1), (1,19),(19,2),(2,3),(3,4),
-        (1,20),(20,5),(5,6),(6,7),
-        (1,8),(1,11),
-        (14,0),(15,0),(16,15),(17,14),
-        (8,9),(9,10),(11,12),(12,13),
-        (21,22),(21,23),(21,24)
-    ]
-
-    for i, j in skeleton:
-        xi, yi, ci = keypoints[i]
-        xj, yj, cj = keypoints[j]
-
-        if ci < 0.1 or cj < 0.1:
-            continue
-
-        p1 = to_pixel(xi, yi)
-        p2 = to_pixel(xj, yj)
-
-        if i in [2,3,4,5,6,7,19,20]:
-            color = COLORS["arms"]
-        elif i in [1,8,11,21,22,23,24]:
-            color = COLORS["torso"]
-        elif i in [9,10,12,13]:
-            color = COLORS["legs"]
-        else:
-            color = COLORS["default"]
-
-        cv2.line(pose_img, p1, p2, color, 2)
-
-    # =========================
-    # 💾 SAVE
-    # =========================
-    save_path = f"{debug_dir}/skeleton_{frame_counter:05d}.png"
-    cv2.imwrite(save_path, pose_img)
-
-    print(f"[DEBUG] Skeleton saved: {save_path}")
-
 
 
 

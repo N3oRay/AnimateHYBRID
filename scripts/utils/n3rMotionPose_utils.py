@@ -2561,7 +2561,9 @@ def update_sequence_from_keypoints_batch(
     freeze_threshold=0.0015,
     freeze_strength=0.25,
     micro_jitter=0.0005,
-    debug=False
+    debug=False,
+    debug_dir=None,
+    image_size=(1280, 896)
 ):
     """
     Version PRO :
@@ -2624,6 +2626,17 @@ def update_sequence_from_keypoints_batch(
         print(f"frame: {frame_idx}")
         print(f"motion_energy: {motion_energy.item():.6f}")
         print(f"freeze_gate: {freeze_gate.item():.4f}")
+
+        # =========================
+    # 🔹 DEBUG
+    # =========================
+    if debug and debug_dir is not None:
+        debug_draw_openpose_skeleton(
+            keypoints_tensor=kp,
+            debug_dir=debug_dir,
+            frame_counter=frame_idx,
+            image_size=image_size
+        )
 
     return kp
 
