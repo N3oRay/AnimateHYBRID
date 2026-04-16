@@ -10,6 +10,8 @@ from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
+#n3rPoseModule.py
+from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state
 
 from .n3rMotionPoseClass import Pose
 import numpy as np
@@ -2441,149 +2443,10 @@ def compute_time(frame_idx, frame_pause, base_dt=0.03):
     decay = intra / frame_pause
     return (frozen_blocks + decay * 0.3) * base_dt
 # --- En DEV: synchroniser ce freeze intelligent avec ton apply_global_pose pour éviter les conflits entre keypoints et warp global.
-"""
-Motion Graph v5 – Cinematic Rig System”
-spine inertiel
-head lock caméra optionnel
-breathing séparé propre
-full skeleton graph (pas seulement bras)
-compatible diffusion latents (anti-blur garanti)
-"""
-def update_motion_state(
-    kp,
-    state,
-    head_ids=(0,1,2,3,4),
-    body_ids=(5,6,7,8,9,10,11,12),
-    anchor_smooth=0.12,
-    velocity_smooth=0.65,
-    drift_smooth=0.25,
-    head_lock=True,
-    head_lock_strength=1.0
-):
-    B, N, _ = kp.shape
 
-    # =========================================================
-    # INIT STATE
-    # =========================================================
-    if state is None:
-        return kp, {
-            "kp_prev": kp.clone(),
-            "velocity": torch.zeros_like(kp[..., :2]),
-            "anchor": kp[:, body_ids, :2].mean(dim=1, keepdim=True)
-        }
 
-    kp_prev = state["kp_prev"]
 
-    # safety
-    if kp_prev.shape != kp.shape:
-        kp_prev = kp.clone()
 
-    # =========================================================
-    # 1. VELOCITY (smoothed + stable)
-    # =========================================================
-    raw_velocity = kp[..., :2] - kp_prev[..., :2]
-
-    velocity = (
-        raw_velocity * (1 - velocity_smooth)
-        + state["velocity"] * velocity_smooth
-    )
-
-    state["velocity"] = velocity.clone()
-
-    # =========================================================
-    # 2. ANCHOR (camera stability core)
-    # =========================================================
-    anchor_now = kp[:, body_ids, :2].mean(dim=1, keepdim=True)
-
-    anchor_prev = state["anchor"]
-
-    # raw drift
-    drift_raw = anchor_now - anchor_prev
-
-    # SMOOTH drift (CRITICAL FIX for jitter reduction)
-    drift = (
-        drift_raw * (1 - drift_smooth)
-        + drift_raw * drift_smooth  # keeps slight responsiveness
-    )
-
-    # update anchor EMA (camera memory)
-    state["anchor"] = (
-        anchor_prev * (1 - anchor_smooth)
-        + anchor_now * anchor_smooth
-    )
-
-    # apply camera stabilization
-    kp[..., :2] -= drift
-
-    # =========================================================
-    # 3. HEAD LOCK (cinematic stability)
-    # =========================================================
-    if head_lock:
-        if head_lock_strength >= 1.0:
-            kp[:, head_ids, :2] = kp_prev[:, head_ids, :2]
-        else:
-            kp[:, head_ids, :2] = (
-                kp_prev[:, head_ids, :2] * head_lock_strength
-                + kp[:, head_ids, :2] * (1 - head_lock_strength)
-            )
-
-    # =========================================================
-    # 4. SAFETY CLAMP (NaN + explosion guard)
-    # =========================================================
-    kp[..., :2] = torch.nan_to_num(kp[..., :2], nan=0.0, posinf=1.0, neginf=0.0)
-    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
-
-    # =========================================================
-    # 5. UPDATE MEMORY
-    # =========================================================
-    state["kp_prev"] = kp.clone()
-
-    return kp, state
-
-def update_motion_state_v1(kp, state, head_ids=(0,1,2,3,4), body_ids=(5,6,7,8,9,10,11,12)):
-
-    B, N, _ = kp.shape
-
-    if state is None:
-        return kp, {
-            "kp_prev": kp.clone(),
-            "velocity": torch.zeros_like(kp[..., :2]),
-            "anchor": kp[:, body_ids, :2].mean(dim=1, keepdim=True)
-        }
-
-    kp_prev = state["kp_prev"]
-
-    # -------------------------
-    # VELOCITY (stable)
-    # -------------------------
-    velocity = kp[..., :2] - kp_prev[..., :2]
-    velocity = velocity * 0.6 + state["velocity"] * 0.4
-    state["velocity"] = velocity.clone()
-
-    # -------------------------
-    # ANCHOR (global stability)
-    # -------------------------
-    anchor_now = kp[:, body_ids, :2].mean(dim=1, keepdim=True)
-
-    drift = anchor_now - state["anchor"]
-
-    # smooth anchor update (IMPORTANT)
-    state["anchor"] = state["anchor"] * 0.85 + anchor_now * 0.15
-
-    # REMOVE GLOBAL DRIFT (core fix)
-    kp[..., :2] -= drift
-
-    # -------------------------
-    # HEAD LOCK (optional cinematic mode)
-    # -------------------------
-    kp[:, head_ids, :2] = kp_prev[:, head_ids, :2]
-
-    # -------------------------
-    # UPDATE MEMORY
-    # -------------------------
-    state["kp_prev"] = kp.clone()
-
-    return kp, state
 """
 alpha_base = 0.92          # un peu plus inertie
 freeze_threshold = 0.0022  # freeze plus actif
@@ -2626,9 +2489,14 @@ def update_sequence_from_keypoints_batch(
         kp[..., :2] = kp[..., :2] * camera_lock + anchor * (1 - camera_lock)
 
     # =========================================================
-    # 3. MOTION ENGINE
+    # 3. MOTION ENGINE or CINMATIC
     # =========================================================
-    kp, new_state = update_motion_state(kp, state)
+    if frame_idx > 10:
+        kp, new_state = cinematic_motion_graph_v3( kp, state)
+        cinematic=True
+    else:
+        kp, new_state = update_motion_state(kp, state)
+        cinematic=False
 
     # =========================================================
     # 4. HARD VELOCITY LIMIT (FINAL SAFETY)
@@ -2655,7 +2523,8 @@ def update_sequence_from_keypoints_batch(
         print("\n[🎬 FINAL MOTION ENGINE]")
         print(f"frame: {frame_idx}")
         print(f"motion_mean: {motion.item():.6f}")
-        print(f"anchor: {new_state['anchor'].mean().item():.6f}")
+        if cinematic == False:
+            print(f"anchor: {new_state['anchor'].mean().item():.6f}")
 
         if debug_dir is not None:
             debug_draw_openpose_skeleton(
