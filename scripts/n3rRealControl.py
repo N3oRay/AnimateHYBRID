@@ -471,7 +471,8 @@ def main(args):
                                 # Mettre à jour les keypoints éventuellement modifiés
                                 if sequence is not None:
                                     # utilisation sequence
-                                    current_keypoints = update_sequence_from_keypoints_batch(sequence=sequence, frame_idx=frame_counter, prev_keypoints=prev_keypoints, alpha=0.9, freeze_threshold=0.0015, freeze_strength=0.25, micro_jitter=0.0005, debug=True, debug_dir=output_dir, image_size=image_size)
+                                    # update_sequence_from_keypoints_batch( sequence, frame_idx, prev_keypoints=None, alpha_base=0.90, freeze_threshold=0.0025, freeze_strength=0.20, micro_jitter=0.00025, time_scale=0.55,          # 🔥 contrôle vitesse globale max_velocity=0.015,       # 🔥 clamp px/frame (IMPORTANT) debug=False, debug_dir=None, image_size=(1280, 896) )
+                                    current_keypoints = update_sequence_from_keypoints_batch(sequence=sequence, frame_idx=frame_counter, prev_keypoints=prev_keypoints, alpha_base=0.9, freeze_threshold=0.0015, freeze_strength=0.25, micro_jitter=0.0005, debug=True, debug_dir=output_dir, image_size=image_size)
                                 else:
                                     # utilisation uniquement des keypoints_tensor
                                     current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints,
