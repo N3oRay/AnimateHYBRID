@@ -234,7 +234,7 @@ def main(args):
             # ---------------- Pose sequence ---------------------------------------------
             start_pose = input_image.to(device=device, dtype=dtype) # start_pose = tensor 4D BCHW directement
             # Pose sequence
-            if use_openpose and pose_sequence is None:
+            if open_pose_dev and pose_sequence is None:
                 pose_sequence = generate_pose_sequence(base_pose=start_pose, num_frames=total_frames, device=device, dtype=dtype, debug=verbose)
             # 🔥 Détection yeux (une seule fois par image)
             input_pil = tensor_to_pil(input_image)  # à créer si tu ne l'as pas
@@ -434,18 +434,18 @@ def main(args):
                     # 🔹 Si motion_module est None, injecter un léger bruit temporel
                     if use_openpose:
                         try:
-                            # 🔥 dtype cible réel (UNet)
-                            target_dtype = next(unet.parameters()).dtype
-                            # ------------------- Load pose frame -------------------
-                            pose_full = pose_sequence[frame_counter % pose_sequence.shape[0]]
-                            # Format BCHW et channels fix  → channels fix → normalize [-1,1] → device + dtype
-                            pose_full = prepare_pose_tensor(pose_full=pose_full, device=device, target_dtype=target_dtype)
                             # ------------------- Backup latents -------------------
                             latents_before_openpose = latents.clone()
-                            debug_latents("Latents avant OpenPose", latents)
-
                             # ------------------- Tile-wise OpenPose -------------------
                             if open_pose_dev: # Open Pose simple 6 points - PROTO
+                                # 🔥 dtype cible réel (UNet)
+                                target_dtype = next(unet.parameters()).dtype
+                                # ------------------- Load pose frame -------------------
+                                pose_full = pose_sequence[frame_counter % pose_sequence.shape[0]]
+                                # Format BCHW et channels fix  → channels fix → normalize [-1,1] → device + dtype
+                                pose_full = prepare_pose_tensor(pose_full=pose_full, device=device, target_dtype=target_dtype)
+
+                                debug_latents("Latents avant OpenPose", latents)
                                 # 🔹 BUILD LATENT-SPACE POSE (CRUCIAL) =====
                                 latent_h, latent_w = latents.shape[2], latents.shape[3]
                                 pose_latent_full = F.interpolate( pose_full, size=(latent_h, latent_w), mode='bilinear', align_corners=False ).to(device=device, dtype=target_dtype)
@@ -460,10 +460,10 @@ def main(args):
 
                             else:
                                 # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION -------------------------------------------------------
-                                current_keypoints = extract_keypoints_from_pose( pose_full, debug=True, debug_dir=output_dir, frame_counter=frame_counter)
+                                current_keypoints = extract_keypoints_from_pose( debug=True, debug_dir=output_dir, frame_counter=frame_counter)
                                 # 🔹 Update des keypoints avec Mediapipe
 
-                                current_keypoints = update_keypoints_from_pose( pose_full, current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
+                                current_keypoints = update_keypoints_from_pose(current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, image_size=(1280, 896), device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
 
                                 sequence = generate_pose_sequence_keypoints(base_keypoints=current_keypoints, num_frames=total_frames, fps=fps, breathing_strength=0.5, sway_strength=0.5, device=device, debug=verbose)
 
@@ -493,9 +493,10 @@ def main(args):
                             print("[ERROR] ControlNet OpenPose failed:")
                             traceback.print_exc()
                             latents = latents_before_openpose.clone()
-
                         # 🔹  ne pas déactiver - skeleton pipeline triggered
-                        save_debug_pose_image_with_skeleton( pose_tensor=pose_full, keypoints_tensor=current_keypoints, frame_counter=frame_counter, output_dir=output_dir, cfg=cfg, prefix="openpose" )
+                        if open_pose_dev:
+                            save_debug_pose_image_with_skeleton( pose_tensor=pose_full, keypoints_tensor=current_keypoints, frame_counter=frame_counter, output_dir=output_dir, cfg=cfg, prefix="openpose" )
+
 
                     # ---------------- Motion module --------------------------------------------------------------------------------------------------
                     if motion_module is not None:
