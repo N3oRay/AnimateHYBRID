@@ -26,111 +26,219 @@ from torchvision.utils import save_image
 #------extract_keypoints_from_pose
 
 def extract_keypoints_from_pose(
-    pose_full_image,
+    pose_full_image=None,
     device="cuda",
     debug=False,
     debug_dir=None,
-    frame_counter=None
+    frame_counter=None,
+    image_size=(1280, 896)  # H, W fallback si pas d'image
 ):
     """
-    FR:
-    Extraction MANUELLE des keypoints (format COCO 18 points).
-    Les coordonnées sont normalisées entre [0,1] dans l'espace IMAGE.
+    Extraction MANUELLE des keypoints (COCO-like).
+    Coordonnées normalisées [0,1].
 
-    EN:
-    MANUAL keypoints extraction (COCO 18 format).
-    Coordinates are normalized in [0,1] in IMAGE space.
-
-    Output:
-        keypoints_tensor: [B, 18, 3]  (x, y, confidence)
+    pose_full_image est optionnel et utilisé UNIQUEMENT pour le debug visuel.
     """
 
-    B, C, H, W = pose_full_image.shape  # H=height, W=width
+    # =========================================================
+    # 🔹 SIZE HANDLING (IMPORTANT)
+    # =========================================================
+    if pose_full_image is not None:
+        B, C, H, W = pose_full_image.shape
+    else:
+        H, W = image_size
+        B = 1  # fallback batch
 
-    # ---------------------------
-    # 🔥 KEYPOINTS MANUELS / MANUAL KEYPOINTS
-    # ---------------------------
-    # FR:
-    # x = pixel_x / image_width
-    # y = pixel_y / image_height
-    # IMPORTANT: utiliser la taille de l'image originale (pose_full), PAS le latent
-
-    # EN:
-    # x = pixel_x / image_width
-    # y = pixel_y / image_height
-    # IMPORTANT: use original image size (pose_full), NOT latent size
-
+    # =========================================================
+    # 🔥 KEYPOINTS TEMPLATE
+    # =========================================================
     keypoints_template = [
-        [422/896, 408/1280, 1.0],  # 0 nose / nez 👃 Nose detected: (422, 408)
-        [418/896, 490/1280, 1.0],  # 1 neck / cou 🦵 Neck detected: {'center': (418, 490)}
+        [422/W, 408/H, 1.0],
+        [418/W, 490/H, 1.0],
+        [562/W, 506/H, 1.0],
+        [627/W, 896/H, 1.0],
+        [488/W, 1040/H, 1.0],
 
-        [562/896, 506/1280, 1.0],  # 2 right_shoulder / épaule droite 🦾 Clavicules detected: [(275, 519), (562, 506)]
-        [627/896, 896/1280, 1.0],  # 3 right_elbow / coude droit 🦾 Elbows detected/estimated: [[179, 896], [627, 896]]
-        [488/896, 1040/1280, 1.0], # 4 right_wrist / poignet droit ✋ Wrists detected: fallback
+        [275/W, 519/H, 1.0],
+        [197/W, 944/H, 1.0],
+        [431/W, 1087/H, 1.0],
 
-        [275/896, 519/1280, 1.0],  # 5 left_shoulder / épaule gauche 🦾 Clavicules detected: [(275, 519), (562, 506)]
-        [197/896, 944/1280, 1.0],  # 6 left_elbow / coude gauche 🦾 Elbows detected/estimated: [[179, 896], [627, 896]]
-        [431/896, 1087/1280, 1.0], # 7 left_wrist / poignet gauche ✋ Wrists detected: fallback
+        [308/W, 1129/H, 1.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
 
-        [308/896, 1129/1280, 1.0], # 8 right_hip / hanche droite 🦿📍 Hips detected: left=(564, 1102), right=(308, 1129)
-        [0.0, 0.0, 0.0],           # 9 right_knee (absent)
-        [0.0, 0.0, 0.0],           # 10 right_ankle (absent)
+        [564/W, 1102/H, 1.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
 
-        [564/896, 1102/1280, 1.0], # 11 left_hip / hanche gauche 🦿📍 Hips detected: left=(564, 1102), right=(308, 1129)
-        [0.0, 0.0, 0.0],           # 12 left_knee (absent)
-        [0.0, 0.0, 0.0],           # 13 left_ankle (absent)
+        [492/W, 355/H, 1.0],
+        [374/W, 323/H, 1.0],
+        [529/W, 349/H, 1.0],
+        [308/W, 282/H, 1.0],
+        [406/W, 446/H, 1.0],
 
-        [492/896, 355/1280, 1.0],  # 14 right_eye / œil droit 👁 Eyes detected: [(492, 355), (375, 323)]
-        [374/896, 323/1280, 1.0],  # 15 left_eye / œil gauche 👁 Eyes detected: [(326, 379), (359, 490)]
-        [529/896, 349/1280, 1.0],  # 16 right_ear / oreille droite 👂 Ears detected: [(308, 282), (529, 349)]
-        [308/896, 282/1280, 1.0],  # 17 left_ear / oreille gauche
-        [406/896, 446/1280, 1.0],  # 18 mouth / bouche 👄 Mouth detected: [(405, 446)]
-        [562/896, 506/1280, 1.0],  # 19 right_clavicle 🦾 Clavicules detected: [(275, 519), (562, 506)]
-        [275/896, 519/1280, 1.0],  # 20 left_clavicle 🦾 Clavicules detected: [(275, 519), (562, 506)]
+        [562/W, 506/H, 1.0],
+        [275/W, 519/H, 1.0],
 
-        # Nouveaux points du cou
-        [387/896, 480/1280, 1.0],  # 21 chin / menton
-        [307/896, 282/1280, 1.0],  # 22 left_side_neck / gauche cou
-        [529/896, 349/1280, 1.0],  # 23 right_side_neck / droite cou
-        [422/896, 428/1280, 1.0],  # 24 anchor / point d'ancrage cou
+        [387/W, 480/H, 1.0],
+        [307/W, 282/H, 1.0],
+        [529/W, 349/H, 1.0],
+        [422/W, 428/H, 1.0],
     ]
 
-    #48–54 : lèvres supérieures (coin gauche → coin droit)
-    #54–60 : lèvres inférieures (coin droit → coin gauche)
-    #60–67 : contour interne de la bouche (pour l’ouverture, micro-mouvements)
-
-    # ---------------------------
-    # 🔹 Conversion numpy → tensor
-    # ---------------------------
+    # =========================================================
+    # 🔹 TENSOR BUILD
+    # =========================================================
     keypoints_np = np.array(keypoints_template, dtype=np.float32)
-
-    # FR: sécurité pour éviter valeurs hors [0,1]
-    # EN: safety clamp to keep values in [0,1]
     keypoints_np = np.clip(keypoints_np, 0.0, 1.0)
 
-    # FR: duplication pour batch
-    # EN: repeat for batch
-    keypoints_np = np.expand_dims(keypoints_np, axis=0)  # [1,18,3]
-    keypoints_np = np.repeat(keypoints_np, B, axis=0)    # [B,18,3]
+    keypoints_np = np.expand_dims(keypoints_np, axis=0)
+    keypoints_np = np.repeat(keypoints_np, B, axis=0)
 
     keypoints_tensor = torch.from_numpy(keypoints_np).to(device)
 
-    # ---------------------------
-    # 🔹 DEBUG VISUEL / VISUAL DEBUG
-    # ---------------------------
+    # =========================================================
+    # 🔹 DEBUG (OPTIONAL SAFE)
+    # =========================================================
     if debug and debug_dir is not None and frame_counter is not None:
-        # Affichage des points en debug
-        debug_draw_openpose_skeleton(
-            pose_full_image=pose_full_image,
-            keypoints_tensor=keypoints_tensor,
-            debug_dir=debug_dir,
-            frame_counter=frame_counter
-        )
+        if pose_full_image is not None:
+            debug_draw_openpose_skeleton(
+                pose_full_image=pose_full_image,
+                keypoints_tensor=keypoints_tensor,
+                debug_dir=debug_dir,
+                frame_counter=frame_counter
+            )
+        else:
+            # fallback debug sans image
+            print(f"[DEBUG] keypoints frame {frame_counter} (no image provided)")
 
     return keypoints_tensor
 
 
 def update_keypoints_from_pose(
+    current_keypoints,
+    nose_coords,
+    neck_coords,
+    shoulders_coords,
+    clavicules_coords,
+    elbow_coords,
+    wrists_coords,
+    hips_coords,
+    eye_coords,
+    ear_coords,
+    mouth_coords,
+    image_size=(1280, 896),
+    device="cuda",
+    frame_counter=0,
+    debug=False,
+    debug_dir=None
+):
+    """
+    ONLY ACTIVE ON FRAME 0
+
+    - Frame 0 : initialise / overwrite keypoints
+    - Frame > 0 : no-op (returns unchanged keypoints)
+    """
+
+    # =========================================================
+    # 🔥 FRAME GATE (IMPORTANT)
+    # =========================================================
+    if frame_counter is not None and frame_counter != 0:
+        return current_keypoints
+
+    H, W = image_size
+
+    # =========================
+    # 🔹 INIT KEYPOINTS
+    # =========================
+    keypoints_np = current_keypoints.clone().detach().cpu().numpy()[0]
+
+    # =========================
+    # 🔹 NORMALISATION INPUTS
+    # =========================
+    left_shoulder, right_shoulder = pair(shoulders_coords, debug=debug)
+    left_clavicle, right_clavicle = pair(clavicules_coords, debug=debug)
+    left_elbow, right_elbow = pair(elbow_coords, debug=debug)
+    left_wrist, right_wrist = pair(wrists_coords, debug=debug)
+    left_hip, right_hip = pair(hips_coords, debug=debug)
+    left_eye, right_eye = pair(eye_coords, debug=debug)
+    left_ear, right_ear = pair(ear_coords, debug=debug)
+
+    # Neck dict safe
+    if isinstance(neck_coords, dict):
+        neck_map = {
+            "neck": neck_coords.get("center"),
+            "chin": neck_coords.get("chin"),
+            "left_side_neck": neck_coords.get("left"),
+            "right_side_neck": neck_coords.get("right"),
+            "anchor": neck_coords.get("anchor"),
+        }
+    else:
+        neck_map = {"neck": neck_coords}
+
+    # =========================
+    # 🔹 MAPPING CENTRALISÉ
+    # =========================
+    updates = {
+        0: ("nose", nose_coords),
+        1: ("neck", norm(neck_map.get("neck"))),
+
+        2: ("right_shoulder", right_shoulder),
+        3: ("right_elbow", right_elbow),
+        4: ("right_wrist", right_wrist),
+
+        5: ("left_shoulder", left_shoulder),
+        6: ("left_elbow", left_elbow),
+        7: ("left_wrist", left_wrist),
+
+        8: ("right_hip", right_hip),
+        11: ("left_hip", left_hip),
+
+        14: ("right_eye", right_eye),
+        15: ("left_eye", left_eye),
+        16: ("right_ear", right_ear),
+        17: ("left_ear", left_ear),
+
+        18: ("mouth", mouth_coords),
+
+        19: ("right_clavicle", right_clavicle),
+        20: ("left_clavicle", left_clavicle),
+
+        21: ("chin", neck_map.get("chin")),
+        22: ("left_side_neck", neck_map.get("left_side_neck")),
+        23: ("right_side_neck", neck_map.get("right_side_neck")),
+        24: ("anchor", neck_map.get("anchor")),
+    }
+
+    # =========================
+    # 🔹 APPLY UPDATES
+    # =========================
+    for idx, (label, coord) in updates.items():
+        safe_update(idx, coord, keypoints_np, W=W, H=H, label=label, debug=debug)
+
+    # =========================
+    # 🔹 BACK TO TENSOR
+    # =========================
+    keypoints_np = np.expand_dims(keypoints_np, axis=0)
+    keypoints_np = np.repeat(keypoints_np, current_keypoints.shape[0], axis=0)
+
+    keypoints_tensor = torch.from_numpy(keypoints_np).to(device)
+
+    # =========================
+    # 🔹 DEBUG
+    # =========================
+    if debug and debug_dir is not None and frame_counter == 0:
+        debug_draw_openpose_skeleton(
+            keypoints_tensor=keypoints_tensor,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter,
+            image_size=image_size
+        )
+
+    return keypoints_tensor
+
+
+def update_keypoints_from_pose_v1(
     pose_full_image,
     current_keypoints,
     nose_coords,
