@@ -459,7 +459,7 @@ def main(args):
                                 latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=verbose, debug_dir=output_dir,frame_idx=frame_counter)
 
                             else:
-                                # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION -------------------------------------------------------
+                                # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION ---------------------------
                                 current_keypoints = extract_keypoints_from_pose( debug=True, debug_dir=output_dir, frame_counter=frame_counter)
                                 # 🔹 Update des keypoints avec Mediapipe
 
