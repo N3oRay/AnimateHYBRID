@@ -362,25 +362,12 @@ def animate_upper_body(
     inputs: dict,
     mapping: dict = None,
     mode: str = "smooth",
-    strength: float = 0.35
+    strength: float = 0.35,
+    debug: bool = True  # <-- nouveau paramètre pour activer/désactiver les logs
 ):
     """
     Met à jour les keypoints du haut du corps à partir des inputs détectés.
-
-    Parameters
-    ----------
-    state : Pose
-        Objet Pose contenant les keypoints actuels et mémoire.
-    inputs : dict
-        Coordonnées détectées { 'nose': [x,y], 'neck': [x,y], ... }
-    mapping : dict
-        Optionnel. Mapping nom_points -> indices dans state.FACIAL_POINT_IDX
-        Si None, mapping interne est utilisé.
-    mode : str
-        'smooth' -> interpolation entre ancien et nouveau
-        'instant' -> update direct
-    strength : float
-        Poids de l'interpolation si mode='smooth' (0=ancien, 1=nouveau)
+    Affiche les positions avant/après si debug=True.
     """
 
     if mapping is None:
@@ -394,12 +381,11 @@ def animate_upper_body(
     # -----------------------------
     for name, idx in mapping.items():
         if name in inputs:
-            new_coord = inputs[name]  # tensor sur le même device que keypoints
+            new_coord = inputs[name]  # tensor ou list
             if not isinstance(new_coord, torch.Tensor):
-                # convertit au tensor si nécessaire
                 new_coord = torch.tensor(new_coord, device=keypoints.device, dtype=keypoints.dtype)
 
-            old_coord = keypoints[0, idx, :2]
+            old_coord = keypoints[0, idx, :2].clone()
 
             if mode == "smooth":
                 keypoints[0, idx, :2] = old_coord * (1 - strength) + new_coord * strength
@@ -408,6 +394,9 @@ def animate_upper_body(
             else:
                 raise ValueError(f"Mode '{mode}' non supporté, choisir 'smooth' ou 'instant'")
 
+            if debug:
+                print(f"[DEBUG] {name}: old={old_coord.cpu().numpy()} → new={keypoints[0, idx, :2].cpu().numpy()}")
+
     # -----------------------------
     # Mise à jour interne
     # -----------------------------
@@ -415,3 +404,127 @@ def animate_upper_body(
     state.keypoints = keypoints.clone()
 
     return keypoints
+
+
+import torch
+import math
+
+def generate_pose_sequence_keypoints(
+    base_keypoints,
+    num_frames=16,
+    fps=10.0,
+    breathing_strength=1.0,
+    sway_strength=0.5,
+    device="cuda",
+    debug=False
+):
+
+    B, K, _ = base_keypoints.shape
+    base_keypoints = base_keypoints.to(device)
+
+    seq = []
+
+    IDX = {
+        "nose": 0,
+        "neck": 1,
+        "r_shoulder": 2,
+        "l_shoulder": 5,
+        "r_clav": 19,
+        "l_clav": 20,
+        "r_eye": 14,
+        "l_eye": 15,
+        "mouth": 18,
+    }
+
+    for f in range(num_frames):
+
+        # =========================================================
+        # 🔒 FRAME 0 = ANCHOR (CRUCIAL)
+        # =========================================================
+        if f == 0:
+            kp = base_keypoints.clone()
+
+            # sécurité
+            kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
+            seq.append(kp)
+            continue  # 🔥 skip tout le reste
+
+        # =========================================================
+        # 🔹 TEMPS
+        # =========================================================
+        t = f / fps
+        phase = 2 * math.pi * (f / num_frames)
+
+        kp = base_keypoints.clone()
+
+        # =========================================================
+        # 🫁 BREATHING
+        # =========================================================
+        breath = breathing_strength * (
+            0.6 * math.sin(phase) +
+            0.4 * math.sin(phase * 0.5 + 1.3)
+        )
+        breath *= 0.015
+
+        kp[:, IDX["neck"], 1] -= breath * 0.6
+        kp[:, IDX["r_shoulder"], 1] -= breath
+        kp[:, IDX["l_shoulder"], 1] -= breath
+
+        kp[:, IDX["r_shoulder"], 0] += breath * 0.4
+        kp[:, IDX["l_shoulder"], 0] -= breath * 0.4
+
+        # clavicle lag
+        lag = math.sin(phase - 0.4) * 0.01
+        kp[:, IDX["r_clav"], 1] -= lag
+        kp[:, IDX["l_clav"], 1] -= lag
+
+        # =========================================================
+        # 💓 HEARTBEAT
+        # =========================================================
+        heartbeat = 0.002 * math.sin(t * 6.0)
+        kp[:, IDX["neck"], 1] += heartbeat
+        kp[:, IDX["nose"], 1] += heartbeat * 0.5
+
+        # =========================================================
+        # ⚖️ SWAY
+        # =========================================================
+        sway_x = sway_strength * 0.01 * math.sin(phase * 0.7)
+        sway_y = sway_strength * 0.005 * math.cos(phase * 0.5)
+
+        kp[:, :, 0] += sway_x
+        kp[:, :, 1] += sway_y
+
+        # =========================================================
+        # ⚠️ ASYMMETRY
+        # =========================================================
+        asym = 0.003 * math.sin(phase * 1.3 + 2.0)
+
+        kp[:, IDX["r_shoulder"], 1] += asym
+        kp[:, IDX["l_shoulder"], 1] -= asym
+
+        # =========================================================
+        # 👁 FACE SYNC
+        # =========================================================
+        face_phase = math.sin(phase * 1.2)
+
+        kp[:, IDX["nose"], 1] += face_phase * 0.002
+        kp[:, IDX["mouth"], 1] += face_phase * 0.003
+
+        kp[:, IDX["r_eye"], 0] += 0.001 * math.sin(t * 3.0)
+        kp[:, IDX["l_eye"], 0] -= 0.001 * math.sin(t * 3.0)
+
+        # =========================================================
+        # 🔒 CLAMP
+        # =========================================================
+        kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
+        kp[..., 2] = base_keypoints[..., 2]
+
+        seq.append(kp)
+
+    if debug:
+        print(f"[PoseSeq KP] frames: {num_frames}")
+        print("[PoseSeq KP] frame0 == base:",
+              torch.allclose(seq[0], base_keypoints))
+
+    return seq
+

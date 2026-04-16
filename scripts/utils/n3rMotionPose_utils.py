@@ -2445,6 +2445,82 @@ def compute_time(frame_idx, frame_pause, base_dt=0.03):
     decay = intra / frame_pause
     return (frozen_blocks + decay * 0.3) * base_dt
 # --- En DEV: synchroniser ce freeze intelligent avec ton apply_global_pose pour éviter les conflits entre keypoints et warp global.
+def update_sequence_from_keypoints_batch(
+    sequence,                  # 🔥 NEW (liste de keypoints)
+    frame_idx,
+    prev_keypoints=None,
+    alpha=0.9,
+    freeze_threshold=0.0015,
+    freeze_strength=0.25,
+    micro_jitter=0.0005,
+    debug=False
+):
+    """
+    Version PRO :
+    - utilise directement la sequence animée
+    - applique seulement stabilisation + freeze + micro motion
+    """
+
+    kp = sequence[frame_idx].clone()
+    B, N, _ = kp.shape
+
+    # =========================================================
+    # 🔹 1. TEMPORAL SMOOTHING
+    # =========================================================
+    if prev_keypoints is not None:
+        kp = alpha * kp + (1 - alpha) * prev_keypoints
+
+    # =========================================================
+    # 🔹 2. MOTION ENERGY
+    # =========================================================
+    motion_energy = torch.tensor(1.0, device=kp.device)
+
+    if prev_keypoints is not None:
+        motion_energy = (kp - prev_keypoints).abs().mean()
+
+    # =========================================================
+    # 🔹 3. FREEZE GATE
+    # =========================================================
+    freeze_gate = torch.tensor(1.0, device=kp.device)
+
+    if motion_energy < freeze_threshold:
+        freeze_gate = motion_energy / freeze_threshold
+        freeze_gate = torch.clamp(freeze_gate, 0.0, 1.0)
+        freeze_gate = freeze_strength + (1 - freeze_strength) * freeze_gate
+
+    # =========================================================
+    # 🔹 4. MICRO JITTER (ULTRA LIGHT)
+    # =========================================================
+    jitter = torch.randn_like(kp[..., :2]) * micro_jitter
+    kp[..., :2] += jitter * freeze_gate
+
+    # =========================================================
+    # 🔹 5. LIMB DAMPING (important)
+    # =========================================================
+    limb_ids = list(range(min(N, 25)))
+
+    if prev_keypoints is not None:
+        delta = kp[:, limb_ids, :2] - prev_keypoints[:, limb_ids, :2]
+        kp[:, limb_ids, :2] -= delta * (1 - freeze_gate)
+
+    # =========================================================
+    # 🔹 6. CLAMP (NORMALIZED SPACE)
+    # =========================================================
+    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
+
+    # =========================================================
+    # 🔹 DEBUG
+    # =========================================================
+    if debug:
+        print("\n[DEBUG][SEQ POST]")
+        print(f"frame: {frame_idx}")
+        print(f"motion_energy: {motion_energy.item():.6f}")
+        print(f"freeze_gate: {freeze_gate.item():.4f}")
+
+    return kp
+
+
+
 def update_pose_sequence_from_keypoints_batch(
     keypoints_tensor,
     prev_keypoints=None,
