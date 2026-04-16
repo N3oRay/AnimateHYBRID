@@ -2531,11 +2531,46 @@ micro_jitter = 0.00012     # encore plus subtil
 time_scale = 0.45          # ralentit légèrement plus
 max_velocity = 0.008       # 🔥 clé principale (cinematic cap)
 """
+
+MOTION_PROFILES = {
+    "stable": {
+        "time_scale": 0.4,
+        "camera_lock": 0.95,
+        "max_velocity": 0.004,
+        "rotation_gain": 1.0,
+        "cinematic_start": 25
+    },
+
+    "cinematic": {
+        "time_scale": 0.5,
+        "camera_lock": 0.92,
+        "max_velocity": 0.008,
+        "rotation_gain": 1.2,
+        "cinematic_start": 20
+    },
+
+    "dynamic": {
+        "time_scale": 0.7,
+        "camera_lock": 0.88,
+        "max_velocity": 0.012,
+        "rotation_gain": 1.35,
+        "cinematic_start": 10
+    },
+
+    "locked": {
+        "time_scale": 0.3,
+        "camera_lock": 0.98,
+        "max_velocity": 0.002,
+        "rotation_gain": 0.8,
+        "cinematic_start": 9999
+    }
+}
 def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
     prev_keypoints=None,
     state=None,
+    profile="cinematic",   # 👈 NEW profile = "cinematic" if face_detected else "stable" or profile = "dynamic" if motion_mean > threshold else "cinematic"
     time_scale=0.5,
     max_velocity=0.008,
     camera_lock=0.92,
@@ -2544,6 +2579,16 @@ def update_sequence_from_keypoints_batch(
     image_size=(1280, 896)
 ):
 
+    # =========================================================
+    # 0. MOTION profil
+    # =========================================================
+    p = MOTION_PROFILES[profile]
+
+    time_scale = p["time_scale"]
+    camera_lock = p["camera_lock"]
+    max_velocity = p["max_velocity"]
+    rotation_gain = p["rotation_gain"]
+    cinematic_start = p["cinematic_start"]
     # =========================================================
     # 1. TIME WARP (SAFE)
     # =========================================================
@@ -2587,12 +2632,24 @@ def update_sequence_from_keypoints_batch(
     # =========================================================
     # 5. MOTION ENGINE
     # =========================================================
-    if frame_idx > 20:
+    if frame_idx > cinematic_start:
         kp, new_state = cinematic_motion_graph_v3(kp, state)
         cinematic = True
     else:
         kp, new_state = update_motion_state(kp, state)
         cinematic = False
+
+    # =========================================================
+    # 5. MOTION ENGINE +
+    # =========================================================
+
+    if prev_kp is not None:
+        upper_ids = [5,6,7,8,9,10,11,12]
+
+        kp[:, upper_ids, :2] = (
+            prev_kp[:, upper_ids, :2] +
+            (kp[:, upper_ids, :2] - prev_kp[:, upper_ids, :2]) * rotation_gain
+        )
 
     # =========================================================
     # 6. HARD VELOCITY LIMIT (FIXED)
@@ -2624,14 +2681,14 @@ def update_sequence_from_keypoints_batch(
 
         if not cinematic and "anchor" in new_state:
             print(f"anchor: {new_state['anchor'].mean().item():.6f}")
-
-        if debug_dir is not None:
-            debug_draw_openpose_skeleton(
-                keypoints_tensor=kp,
-                debug_dir=debug_dir,
-                frame_counter=frame_idx,
-                image_size=image_size
-            )
+        if frame_counter % 2 == 0:
+            if debug_dir is not None:
+                debug_draw_openpose_skeleton(
+                    keypoints_tensor=kp,
+                    debug_dir=debug_dir,
+                    frame_counter=frame_idx,
+                    image_size=image_size
+                )
 
     return kp
 
