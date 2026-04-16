@@ -25,7 +25,7 @@ from transformers import CLIPTokenizerFast, CLIPTextModel
 from scripts.utils.logging_utils import debug_latents
 from scripts.utils.lora_utils import apply_lora_smart
 from scripts.utils.vae_config import load_vae
-from scripts.utils.n3rcoords import prepare_pose_tensor, process_coords, prepare_face_coords, has_valid_coords
+from scripts.utils.n3rcoords import prepare_pose_tensor, process_coords, prepare_face_coords, has_valid_coords, generate_pose_sequence_keypoints
 from scripts.utils.n3rModelUtils import generate_n3r_coords, process_n3r_latents, fuse_with_memory, inject_external, fuse_n3r_latents_adaptive_new
 from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet, get_dynamic_latent_injection, save_input_frame, apply_motion_safe, encode_prompts_batch
 from scripts.utils.config_loader import load_config
@@ -41,7 +41,7 @@ from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose,
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, gaussian_blur
 
-from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch, update_keypoints_from_pose
+from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch, update_keypoints_from_pose, update_sequence_from_keypoints_batch
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -465,10 +465,14 @@ def main(args):
 
                                 current_keypoints = update_keypoints_from_pose( pose_full, current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
 
+                                sequence = generate_pose_sequence_keypoints(base_keypoints=current_keypoints, num_frames=total_frames, fps=fps, breathing_strength=0.5, sway_strength=0.5, device=device, debug=verbose)
+
                                 # Mettre à jour les keypoints éventuellement modifiés
-                                #if frame_counter % 2 == 0:
-                                current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints,
-                                                                                              prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
+                                if sequence is not None:
+                                    current_keypoints = update_sequence_from_keypoints_batch(sequence=sequence, frame_idx=frame_counter, prev_keypoints=prev_keypoints, alpha=0.9, freeze_threshold=0.0015, freeze_strength=0.25, micro_jitter=0.0005, debug=True)
+                                else:
+                                    current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints,
+                                                                                                prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
 
                                 # 🔹 Appliquer le mouvement du haut du corps / OpenPose - apply_pose_driven_motion_stable or apply_pose_driven_motion_ultra2
                                 latents = apply_pose_driven_motion_ultra2(
