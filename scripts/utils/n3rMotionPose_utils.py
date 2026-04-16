@@ -118,6 +118,38 @@ def extract_keypoints_from_pose(
     return keypoints_tensor
 
 
+def normalize_coord(coord):
+    """
+    Convert any coord format → (x, y) or None
+    """
+
+    if coord is None:
+        return None
+
+    # dict → essayer de récupérer center
+    if isinstance(coord, dict):
+        if "center" in coord:
+            return normalize_coord(coord["center"])
+        return None
+
+    # list / tuple
+    if isinstance(coord, (list, tuple)):
+        # cas [x, y]
+        if len(coord) == 2 and all(isinstance(v, (int, float)) for v in coord):
+            return coord
+
+        # cas [[x, y]]
+        if len(coord) == 1:
+            return normalize_coord(coord[0])
+
+        # cas [[x1,y1],[x2,y2]] → prendre le centre
+        if len(coord) == 2 and all(isinstance(v, (list, tuple)) for v in coord):
+            x = (coord[0][0] + coord[1][0]) * 0.5
+            y = (coord[0][1] + coord[1][1]) * 0.5
+            return (x, y)
+
+    return None
+
 def update_keypoints_from_pose(
     current_keypoints,
     nose_coords,
@@ -137,28 +169,16 @@ def update_keypoints_from_pose(
     debug_dir=None
 ):
     """
-    ONLY ACTIVE ON FRAME 0
-
-    - Frame 0 : initialise / overwrite keypoints
-    - Frame > 0 : no-op (returns unchanged keypoints)
+    Robust keypoint injection with fallback + reconstruction
     """
-
-    # =========================================================
-    # 🔥 FRAME GATE (IMPORTANT)
-    # =========================================================
-    if frame_counter is not None and frame_counter != 0:
-        return current_keypoints
 
     H, W = image_size
 
-    # =========================
-    # 🔹 INIT KEYPOINTS
-    # =========================
     keypoints_np = current_keypoints.clone().detach().cpu().numpy()[0]
 
-    # =========================
-    # 🔹 NORMALISATION INPUTS
-    # =========================
+    # =========================================================
+    # 🔹 SAFE NORMALIZATION
+    # =========================================================
     left_shoulder, right_shoulder = pair(shoulders_coords, debug=debug)
     left_clavicle, right_clavicle = pair(clavicules_coords, debug=debug)
     left_elbow, right_elbow = pair(elbow_coords, debug=debug)
@@ -167,7 +187,27 @@ def update_keypoints_from_pose(
     left_eye, right_eye = pair(eye_coords, debug=debug)
     left_ear, right_ear  = pair(ear_coords, debug=debug)
 
-    # Neck dict safe
+    # =========================================================
+    # 🔥 HIP RECONSTRUCTION (CRITICAL)
+    # =========================================================
+    if (left_hip is None or right_hip is None or
+        left_hip == (0,0) or right_hip == (0,0)):
+
+        if left_shoulder and right_shoulder:
+            cx = (left_shoulder[0] + right_shoulder[0]) * 0.5
+            cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
+
+            offset_y = H * 0.18
+
+            left_hip  = (cx - 40, cy + offset_y)
+            right_hip = (cx + 40, cy + offset_y)
+
+            if debug:
+                print("🦿 HIP RECONSTRUCTED")
+
+    # =========================================================
+    # 🔹 NECK SAFE
+    # =========================================================
     if isinstance(neck_coords, dict):
         neck_map = {
             "neck": neck_coords.get("center"),
@@ -179,12 +219,48 @@ def update_keypoints_from_pose(
     else:
         neck_map = {"neck": neck_coords}
 
-    # =========================
-    # 🔹 MAPPING CENTRALISÉ
-    # =========================
+    # =========================================================
+    # 🔹 VALIDATION FUNCTION
+    # =========================================================
+    def is_valid(coord):
+        if coord is None:
+            return False
+        coord = normalize_coord(coord)
+
+        if debug and coord is None:
+            print(f"[WARN] {label} coord dropped (invalid format)")
+        if coord is None:
+            return False
+
+        x, y = coord
+        if x is None or y is None:
+            return False
+        if not np.isfinite(x) or not np.isfinite(y):
+            return False
+        if x <= 0 or y <= 0:
+            return False
+        if x > W or y > H:
+            return False
+        return True
+
+    # =========================================================
+    # 🔹 SAFE UPDATE WRAPPER
+    # =========================================================
+    def safe_apply(idx, coord, label):
+        coord = normalize_coord(coord)
+
+        if is_valid(coord):
+            safe_update(idx, coord, keypoints_np, W=W, H=H, label=label, debug=debug)
+        else:
+            if debug:
+                print(f"[SKIP] {label} invalid → keep previous")
+
+    # =========================================================
+    # 🔹 APPLY UPDATES
+    # =========================================================
     updates = {
         0: ("nose", nose_coords),
-        1: ("neck", norm(neck_map.get("neck"))),
+        1: ("neck", neck_map.get("neck")),
 
         2: ("right_shoulder", right_shoulder),
         3: ("right_elbow", right_elbow),
@@ -196,7 +272,6 @@ def update_keypoints_from_pose(
 
         8: ("right_hip", right_hip),
         11: ("left_hip", left_hip),
-
 
         14: ("right_eye", right_eye),
         15: ("left_eye", left_eye),
@@ -215,24 +290,21 @@ def update_keypoints_from_pose(
         24: ("anchor", neck_map.get("anchor")),
     }
 
-    # =========================
-    # 🔹 APPLY UPDATES
-    # =========================
     for idx, (label, coord) in updates.items():
-        safe_update(idx, coord, keypoints_np, W=W, H=H, label=label, debug=debug)
+        safe_apply(idx, coord, label)
 
-    # =========================
+    # =========================================================
     # 🔹 BACK TO TENSOR
-    # =========================
+    # =========================================================
     keypoints_np = np.expand_dims(keypoints_np, axis=0)
     keypoints_np = np.repeat(keypoints_np, current_keypoints.shape[0], axis=0)
 
     keypoints_tensor = torch.from_numpy(keypoints_np).to(device)
 
-    # =========================
+    # =========================================================
     # 🔹 DEBUG
-    # =========================
-    if debug and debug_dir is not None and frame_counter == 0:
+    # =========================================================
+    if debug and debug_dir is not None:
         debug_draw_openpose_skeleton(
             keypoints_tensor=keypoints_tensor,
             debug_dir=debug_dir,
@@ -2469,61 +2541,84 @@ def update_sequence_from_keypoints_batch(
 ):
 
     # =========================================================
-    # 1. TIME WARP
+    # 1. TIME WARP (SAFE)
     # =========================================================
     scaled = frame_idx * time_scale
-    i0 = int(scaled)
+
+    i0 = max(0, min(int(scaled), len(sequence) - 1))
     i1 = min(i0 + 1, len(sequence) - 1)
+
     t = scaled - i0
 
     kp = (1 - t) * sequence[i0] + t * sequence[i1]
     kp = kp.clone()
 
+    kp = torch.nan_to_num(kp, nan=0.0)
+
     B, N, _ = kp.shape
 
     # =========================================================
-    # 2. CAMERA STABILIZATION (VERY LIGHT)
+    # 2. AUTO RESET (CRITICAL)
     # =========================================================
-    if state is not None:
-        anchor = state["anchor"]
-        kp[..., :2] = kp[..., :2] * camera_lock + anchor * (1 - camera_lock)
+    if state is not None and "kp_prev" in state:
+        drift = torch.norm(kp - state["kp_prev"], dim=-1).mean()
+
+        if drift > 0.2:
+            state = None
 
     # =========================================================
-    # 3. MOTION ENGINE or CINMATIC
+    # 3. CAMERA STABILIZATION (SAFE)
+    # =========================================================
+    if state is not None and "anchor" in state:
+        anchor = state["anchor"]
+
+        if torch.isfinite(anchor).all():
+            kp[..., :2] = kp[..., :2] * camera_lock + anchor * (1 - camera_lock)
+
+    # =========================================================
+    # 4. SAVE PREV FOR VELOCITY
+    # =========================================================
+    prev_kp = state["kp_prev"] if state is not None else None
+
+    # =========================================================
+    # 5. MOTION ENGINE
     # =========================================================
     if frame_idx > 10:
-        kp, new_state = cinematic_motion_graph_v3( kp, state)
-        cinematic=True
+        kp, new_state = cinematic_motion_graph_v3(kp, state)
+        cinematic = True
     else:
         kp, new_state = update_motion_state(kp, state)
-        cinematic=False
+        cinematic = False
 
     # =========================================================
-    # 4. HARD VELOCITY LIMIT (FINAL SAFETY)
+    # 6. HARD VELOCITY LIMIT (FIXED)
     # =========================================================
-    if new_state["kp_prev"] is not None:
-        delta = kp[..., :2] - new_state["kp_prev"][..., :2]
+    if prev_kp is not None:
+        delta = kp[..., :2] - prev_kp[..., :2]
 
         speed = torch.norm(delta, dim=-1, keepdim=True)
         scale = torch.clamp(max_velocity / (speed + 1e-6), max=1.0)
 
-        kp[..., :2] = new_state["kp_prev"][..., :2] + delta * scale
+        kp[..., :2] = prev_kp[..., :2] + delta * scale
 
     # =========================================================
-    # 5. SAFE CLAMP
+    # 7. SAFE CLAMP
     # =========================================================
     kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
 
     # =========================================================
-    # 6. DEBUG CLEAN
+    # 8. DEBUG
     # =========================================================
     if debug:
-        motion = (kp[..., :2] - new_state["kp_prev"][..., :2]).abs().mean()
+        motion = 0.0
+        if prev_kp is not None:
+            motion = (kp[..., :2] - prev_kp[..., :2]).abs().mean()
 
         print("\n[🎬 FINAL MOTION ENGINE]")
         print(f"frame: {frame_idx}")
-        print(f"motion_mean: {motion.item():.6f}")
-        if cinematic == False:
+        print(f"motion_mean: {float(motion):.6f}")
+
+        if not cinematic and "anchor" in new_state:
             print(f"anchor: {new_state['anchor'].mean().item():.6f}")
 
         if debug_dir is not None:
