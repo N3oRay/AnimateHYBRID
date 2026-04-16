@@ -2442,19 +2442,30 @@ def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
     prev_keypoints=None,
-    alpha=0.9,
-    freeze_threshold=0.0015,
-    freeze_strength=0.25,
-    micro_jitter=0.0003,
+    alpha_base=0.90,
+    freeze_threshold=0.0025,
+    freeze_strength=0.20,
+    micro_jitter=0.00025,
+    time_scale=0.50,          # 🔥 contrôle vitesse globale
+    max_velocity=0.012,       # 🔥 clamp px/frame (IMPORTANT)
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)
 ):
-    kp_raw = sequence[frame_idx].clone()
+
+    # =========================================================
+    # 1. TIME WARP (interpolation propre)
+    # =========================================================
+    scaled_idx = frame_idx * time_scale
+    i0 = int(scaled_idx)
+    i1 = min(i0 + 1, len(sequence) - 1)
+    t = scaled_idx - i0
+
+    kp_raw = (1 - t) * sequence[i0] + t * sequence[i1]
     B, N, _ = kp_raw.shape
 
     # =========================================================
-    # 🔹 1. MOTION ENERGY (PURE)
+    # 2. MOTION ENERGY (RAW ONLY)
     # =========================================================
     if prev_keypoints is not None:
         motion_energy = (kp_raw - prev_keypoints).abs().mean()
@@ -2462,62 +2473,72 @@ def update_sequence_from_keypoints_batch(
         motion_energy = torch.tensor(1.0, device=kp_raw.device)
 
     # =========================================================
-    # 🔹 2. FREEZE GATE (stable)
+    # 3. FREEZE GATE
     # =========================================================
+    freeze_gate = torch.ones_like(motion_energy)
+
     if motion_energy < freeze_threshold:
         freeze_gate = motion_energy / freeze_threshold
-        freeze_gate = torch.clamp(freeze_gate, 0.0, 1.0)
         freeze_gate = freeze_strength + (1 - freeze_strength) * freeze_gate
-    else:
-        freeze_gate = torch.tensor(1.0, device=kp_raw.device)
+
+    freeze_gate = torch.clamp(freeze_gate, 0.0, 1.0)
 
     # =========================================================
-    # 🔹 3. TEMPORAL SMOOTHING (only here)
+    # 4. ADAPTIVE SMOOTHING (IMPORTANT)
     # =========================================================
+    alpha = alpha_base + (1.0 - alpha_base) * freeze_gate
+
     kp = kp_raw
     if prev_keypoints is not None:
         kp = alpha * kp + (1 - alpha) * prev_keypoints
 
     # =========================================================
-    # 🔹 4. MICRO JITTER (LIMITED SCOPE)
-    # =========================================================
-    # uniquement torso + head (sinon explosion visuelle)
-    jitter = torch.zeros_like(kp[..., :2])
-
-    head_ids = [0,1,14,15,16,17,18]
-    limb_ids = list(range(min(N, 25)))
-
-    jitter[:, head_ids, :] = torch.randn_like(kp[:, head_ids, :2]) * micro_jitter
-
-    kp[..., :2] += jitter * freeze_gate
-
-    # =========================================================
-    # 🔹 5. VERY LIGHT STABILIZATION (NO FEEDBACK LOOP)
+    # 5. VELOCITY CLAMP (CRITICAL FIX)
     # =========================================================
     if prev_keypoints is not None:
-        kp[..., :2] = kp[..., :2] * 0.98 + prev_keypoints[..., :2] * 0.02
+        delta = kp[..., :2] - prev_keypoints[..., :2]
+
+        speed = torch.norm(delta, dim=-1, keepdim=True)
+        scale = torch.clamp(max_velocity / (speed + 1e-6), max=1.0)
+
+        kp[..., :2] = prev_keypoints[..., :2] + delta * scale
 
     # =========================================================
-    # 🔹 6. CLAMP
+    # 6. MICRO MOTION (ONLY WHEN FROZEN)
+    # =========================================================
+    if freeze_gate < 0.6:
+        jitter = torch.randn_like(kp[..., :2]) * micro_jitter
+        kp[..., :2] += jitter * (1.0 - freeze_gate)
+
+    # =========================================================
+    # 7. FINAL DAMPING (VERY SOFT)
+    # =========================================================
+    if prev_keypoints is not None:
+        delta = kp[..., :2] - prev_keypoints[..., :2]
+        kp[..., :2] -= delta * (1 - freeze_gate) * 0.25
+
+    # =========================================================
+    # 8. CLAMP SAFE SPACE
     # =========================================================
     kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
 
     # =========================================================
-    # 🔹 DEBUG
+    # 9. DEBUG
     # =========================================================
     if debug:
-        print("\n[DEBUG][SEQ POST]")
+        print("\n[DEBUG][SEQ PRO]")
         print(f"frame: {frame_idx}")
         print(f"motion_energy: {motion_energy.item():.6f}")
         print(f"freeze_gate: {freeze_gate.item():.4f}")
+        print(f"alpha: {alpha:.4f}")
 
-    if debug and debug_dir is not None:
-        debug_draw_openpose_skeleton(
-            keypoints_tensor=kp,
-            debug_dir=debug_dir,
-            frame_counter=frame_idx,
-            image_size=image_size
-        )
+        if debug_dir is not None:
+            debug_draw_openpose_skeleton(
+                keypoints_tensor=kp,
+                debug_dir=debug_dir,
+                frame_counter=frame_idx,
+                image_size=image_size
+            )
 
     return kp
 
