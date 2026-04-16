@@ -2587,7 +2587,7 @@ def update_sequence_from_keypoints_batch(
     # =========================================================
     # 5. MOTION ENGINE
     # =========================================================
-    if frame_idx > 10:
+    if frame_idx > 20:
         kp, new_state = cinematic_motion_graph_v3(kp, state)
         cinematic = True
     else:

@@ -3,6 +3,7 @@
 #cinematic_motion_graph_v3, update_motion_state
 
 import torch
+import torch.nn.functional as F
 
 """
 Motion Graph v5 – Cinematic Rig System”
@@ -27,7 +28,67 @@ compatible batch inference
 stable sur longues séquences (200+ frames)
 """
 
-def compute_torso_rotation_delta(kp, prev_vec=None):
+
+
+def compute_torso_rotation_delta(kp, prev_vec=None, eps=1e-6):
+    """
+    Stable torso rotation estimation with robustness to missing hips.
+    """
+
+    l_sh = kp[:, 5, :2]
+    r_sh = kp[:, 6, :2]
+    l_hp = kp[:, 11, :2]
+    r_hp = kp[:, 12, :2]
+
+    # =========================================================
+    # 1. BUILD VECTORS
+    # =========================================================
+    shoulder_vec = r_sh - l_sh
+    hip_vec = r_hp - l_hp
+
+    # fallback if hips are garbage (VERY IMPORTANT)
+    hip_valid = torch.isfinite(hip_vec).all(dim=-1, keepdim=True)
+    shoulder_valid = torch.isfinite(shoulder_vec).all(dim=-1, keepdim=True)
+
+    torso_vec = torch.where(
+        hip_valid,
+        (shoulder_vec + hip_vec) * 0.5,
+        shoulder_vec
+    )
+
+    # =========================================================
+    # 2. NORMALIZE SAFELY
+    # =========================================================
+    norm = torch.norm(torso_vec, dim=-1, keepdim=True)
+    torso_vec = torso_vec / (norm + eps)
+
+    # =========================================================
+    # 3. INIT CASE
+    # =========================================================
+    if prev_vec is None:
+        return torch.zeros((kp.shape[0], 1, 1), device=kp.device), torso_vec
+
+    prev_vec = F.normalize(prev_vec, dim=-1)
+
+    # =========================================================
+    # 4. ANGLE BETWEEN VECTORS
+    # =========================================================
+    cross = torso_vec[..., 0] * prev_vec[..., 1] - torso_vec[..., 1] * prev_vec[..., 0]
+    dot = (torso_vec * prev_vec).sum(dim=-1)
+
+    angle = torch.atan2(cross, dot)
+
+    # =========================================================
+    # 5. SAFETY CLAMP (VERY IMPORTANT)
+    # =========================================================
+    angle = torch.nan_to_num(angle, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # optional: clamp extreme jumps (stability boost)
+    angle = torch.clamp(angle, -1.2, 1.2)
+
+    return angle.unsqueeze(-1).unsqueeze(-1), torso_vec
+
+def compute_torso_rotation_delta_v1(kp, prev_vec=None):
     l_sh = kp[:, 5, :2]
     r_sh = kp[:, 6, :2]
     l_hp = kp[:, 11, :2]
