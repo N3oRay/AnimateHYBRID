@@ -71,8 +71,9 @@ def extract_keypoints_from_pose(
         [0.0, 0.0, 0.0],
         [0.0, 0.0, 0.0],
 
-        [492/W, 355/H, 1.0],
         [374/W, 323/H, 1.0],
+        [492/W, 355/H, 1.0],
+
         [529/W, 349/H, 1.0],
         [308/W, 282/H, 1.0],
         [406/W, 446/H, 1.0],
@@ -162,7 +163,7 @@ def update_keypoints_from_pose(
     left_wrist, right_wrist = pair(wrists_coords, debug=debug)
     left_hip, right_hip = pair(hips_coords, debug=debug)
     left_eye, right_eye = pair(eye_coords, debug=debug)
-    left_ear, right_ear = pair(ear_coords, debug=debug)
+    left_ear, right_ear  = pair(ear_coords, debug=debug)
 
     # Neck dict safe
     if isinstance(neck_coords, dict):
@@ -194,8 +195,10 @@ def update_keypoints_from_pose(
         8: ("right_hip", right_hip),
         11: ("left_hip", left_hip),
 
+
         14: ("right_eye", right_eye),
         15: ("left_eye", left_eye),
+
         16: ("right_ear", right_ear),
         17: ("left_ear", left_ear),
 
@@ -233,124 +236,6 @@ def update_keypoints_from_pose(
             debug_dir=debug_dir,
             frame_counter=frame_counter,
             image_size=image_size
-        )
-
-    return keypoints_tensor
-
-
-def update_keypoints_from_pose_v1(
-    pose_full_image,
-    current_keypoints,
-    nose_coords,
-    neck_coords,
-    shoulders_coords,
-    clavicules_coords,
-    elbow_coords,
-    wrists_coords,
-    hips_coords,
-    eye_coords,
-    ear_coords,
-    mouth_coords,
-    device="cuda",
-    strength=0.35,
-    debug=False,
-    debug_dir=None,
-    frame_counter=None
-):
-    """
-    Version factorisée PRO :
-    - Mapping centralisé
-    - Safe update générique
-    """
-
-    B, C, H, W = pose_full_image.shape
-
-    # =========================
-    # 🔹 INIT KEYPOINTS
-    # =========================
-    keypoints_np = current_keypoints.clone().cpu().numpy()[0]
-
-    # =========================
-    # 🔹 NORMALISATION INPUTS
-    # =========================
-    left_shoulder, right_shoulder  = pair(shoulders_coords, debug=debug)  # épaule_droite, épaule_gauche
-    left_clavicle, right_clavicle  = pair(clavicules_coords, debug=debug) # clavicule_droite, clavicule_gauche
-    left_elbow, right_elbow  = pair(elbow_coords, debug=debug) # coude_droit, coude_gauche
-    left_wrist, right_wrist = pair(wrists_coords, debug=debug) # poignet_gauche, poignet_droit
-    left_hip, right_hip = pair(hips_coords, debug=debug) # hanche_gauche, hanche_droite
-    left_eye, right_eye = pair(eye_coords, debug=debug) # œil_gauche, œil_droit
-    left_ear, right_ear = pair(ear_coords, debug=debug) # oreille_gauche, oreille_droite
-
-    # Neck dict safe
-    if isinstance(neck_coords, dict):
-        neck_map = {
-            "neck": neck_coords.get("center"),
-            "chin": neck_coords.get("chin"),
-            "left_side_neck": neck_coords.get("left"),
-            "right_side_neck": neck_coords.get("right"),
-            "anchor": neck_coords.get("anchor"),
-        }
-    else:
-        neck_map = {"neck": neck_coords}
-
-    # =========================
-    # 🔹 MAPPING CENTRALISÉ 🔥
-    # =========================
-
-    updates = {
-        0: ("nose", nose_coords),
-        1: ("neck", norm(neck_map.get("neck"))),
-
-        2: ("right_shoulder", right_shoulder),
-        3: ("right_elbow", right_elbow),
-        4: ("right_wrist", right_wrist),
-
-        5: ("left_shoulder", left_shoulder),
-        6: ("left_elbow", left_elbow),
-        7: ("left_wrist", left_wrist),
-
-        8: ("right_hip", right_hip),
-        11: ("left_hip", left_hip),
-
-        14: ("right_eye", right_eye),
-        15: ("left_eye", left_eye),
-        16: ("right_ear", right_ear),
-        17: ("left_ear", left_ear),
-
-        18: ("mouth", mouth_coords),
-
-        19: ("right_clavicle", right_clavicle),
-        20: ("left_clavicle", left_clavicle),
-
-        21: ("chin", neck_map.get("chin")),
-        22: ("left_side_neck", neck_map.get("left_side_neck")),
-        23: ("right_side_neck", neck_map.get("right_side_neck")),
-        24: ("anchor", neck_map.get("anchor")),
-    }
-
-    # =========================
-    # 🔹 APPLY UPDATES
-    # =========================
-    for idx, (label, coord) in updates.items():
-        safe_update(idx, coord, keypoints_np, W, H, label, debug=debug)
-
-
-    # ========= Valeur initial================
-    # 🔹 TO TENSOR
-    # =========================
-    keypoints_np = np.expand_dims(keypoints_np, axis=0)
-    keypoints_np = np.repeat(keypoints_np, B, axis=0)
-    keypoints_tensor = torch.from_numpy(keypoints_np).to(device)
-
-    # =========================
-    # 🔹 DEBUG
-    # =========================
-    if debug and debug_dir is not None and frame_counter is not None:
-        debug_draw_openpose_skeleton(
-            pose_full_image=pose_full_image,
-            keypoints_tensor=keypoints_tensor,
-            debug_dir=debug_dir,
-            frame_counter=frame_counter
         )
 
     return keypoints_tensor
