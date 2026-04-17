@@ -11,7 +11,7 @@ from .n3rControlNet import create_canny_control, control_to_latent, match_latent
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
 #n3rPoseModule.py
-from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v4
+from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v6, cinematic_motion_graph_v7, cinematic_motion_graph_v8, actor_system_v9
 
 from .n3rMotionPoseClass import Pose
 import numpy as np
@@ -2539,7 +2539,8 @@ MOTION_PROFILES = {
         "camera_lock": 0.95,
         "max_velocity": 0.004,
         "rotation_gain": 1.0,
-        "cinematic_start": 25
+        "cinematic_start": 25,
+        "actor_model": "v7"
     },
 
     "cinematic": {
@@ -2547,14 +2548,17 @@ MOTION_PROFILES = {
         "camera_lock": 0.7,
         "max_velocity": 0.03,
         "rotation_gain": 1.2,
-        "cinematic_start": 20
+        "cinematic_start": 20,
+        "actor_model": "v8"
     },
+
     "warp": {
         "time_scale": 0.5,
         "camera_lock": 0.92,
         "max_velocity": 0.008,
         "rotation_gain": 1.2,
-        "cinematic_start": 10
+        "cinematic_start": 10,
+        "actor_model": "v7"
     },
 
     "dynamic": {
@@ -2562,7 +2566,8 @@ MOTION_PROFILES = {
         "camera_lock": 0.88,
         "max_velocity": 0.012,
         "rotation_gain": 1.35,
-        "cinematic_start": 10
+        "cinematic_start": 10,
+        "actor_model": "v8"
     },
 
     "locked": {
@@ -2570,25 +2575,104 @@ MOTION_PROFILES = {
         "camera_lock": 0.98,
         "max_velocity": 0.002,
         "rotation_gain": 0.8,
-        "cinematic_start": 9999
+        "cinematic_start": 9999,
+        "actor_model": "v7"
+    },
+
+    # 🔥 NEW PURE ACTING MODE
+    "acting": {
+        "time_scale": 0.55,
+        "camera_lock": 0.75,
+        "max_velocity": 0.02,
+        "rotation_gain": 1.3,
+        "cinematic_start": 15,
+        "actor_model": "v9"
     }
 }
+
+
+def resolve_actor_model(frame_idx):
+    if frame_idx <= 0:
+        return "base"
+
+    if frame_idx <= 5:
+        return "v6"
+
+    if frame_idx <= 10:
+        return "v7"
+
+    if frame_idx <= 15:
+        return "v8"
+
+    return "v9"
+
+def apply_actor_model(kp, state, model, frame_idx, debug=True):
+
+    rmodel = resolve_actor_model(frame_idx)
+
+    # =========================================================
+    # DEBUG HEADER
+    # =========================================================
+    if debug:
+        print("\n[🎬 ACTOR PIPELINE] *********************************************************************")
+        print(f"frame_idx: {frame_idx} -> model: {rmodel}")
+
+    # =========================================================
+    # V6 - base cinematic motion
+    # =========================================================
+    if rmodel == "v6":
+        if debug:
+            print("[V6] cinematic_motion_graph_v6 *******************************************************")
+        return cinematic_motion_graph_v6(kp, state, debug=debug)
+
+    # =========================================================
+    # V7 - cinema physics
+    # =========================================================
+    elif rmodel == "v7":
+        if debug:
+            print("[V7] cinematic_motion_graph_v7 (physics layer) ***************************************")
+        return cinematic_motion_graph_v7(kp, state, debug=debug)
+
+    # =========================================================
+    # V8 - acting system
+    # =========================================================
+    elif rmodel == "v8":
+        if debug:
+            print("[V8] cinematic_motion_graph_v8 (acting layer)*****************************************")
+        return cinematic_motion_graph_v8(kp, state, debug=debug)
+
+    # =========================================================
+    # V9 - full actor system (face + gaze + emotion)
+    # =========================================================
+    elif rmodel == "v9":
+        if debug:
+            print("[V9] actor_system_v9 (full actor system)**********************************************")
+        return actor_system_v9(kp, state, debug=debug)
+
+    # =========================================================
+    # fallback
+    # =========================================================
+    else:
+        if debug:
+            print("[BASE] update_motion_state ***********************************************************")
+        return update_motion_state(kp, state)
+
 def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
     prev_keypoints=None,
     state=None,
-    profile="cinematic",   # 👈 NEW profile = "cinematic" if face_detected else "stable" or profile = "dynamic" if motion_mean > threshold else "cinematic"
+    profile="cinematic",
     time_scale=0.5,
     max_velocity=0.008,
-    camera_lock=0.7, # 0.92
+    camera_lock=0.7,
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)
 ):
 
     # =========================================================
-    # 0. MOTION profil
+    # 0. PROFILE
     # =========================================================
     p = MOTION_PROFILES[profile]
 
@@ -2597,9 +2681,10 @@ def update_sequence_from_keypoints_batch(
     max_velocity = p["max_velocity"]
     rotation_gain = p["rotation_gain"]
     cinematic_start = p["cinematic_start"]
+    actor_model = p.get("actor_model", "v7")
 
     # =========================================================
-    # 1. TIME WARP (SAFE)
+    # 1. TIME WARP
     # =========================================================
     scaled = frame_idx * time_scale
 
@@ -2609,23 +2694,24 @@ def update_sequence_from_keypoints_batch(
     t = scaled - i0
 
     kp = (1 - t) * sequence[i0] + t * sequence[i1]
-    kp = kp.clone()
-
-    kp = torch.nan_to_num(kp, nan=0.0)
+    kp = torch.nan_to_num(kp.clone(), nan=0.0)
 
     B, N, _ = kp.shape
 
     # =========================================================
-    # 2. AUTO RESET (CRITICAL)
+    # 2. AUTO RESET
     # =========================================================
     if state is not None and "kp_prev" in state:
         drift = torch.norm(kp - state["kp_prev"], dim=-1).mean()
 
         if drift > 0.2:
-            state = None
+            state = {
+                "kp_prev": kp.clone(),
+                "anchor": state.get("anchor", kp.mean(dim=1))
+            }
 
     # =========================================================
-    # 3. CAMERA STABILIZATION (SAFE)
+    # 3. CAMERA STABILIZATION
     # =========================================================
     if state is not None and "anchor" in state:
         anchor = state["anchor"]
@@ -2634,26 +2720,36 @@ def update_sequence_from_keypoints_batch(
             kp[..., :2] = kp[..., :2] * camera_lock + anchor * (1 - camera_lock)
 
     # =========================================================
-    # 4. SAVE PREV FOR VELOCITY
+    # 4. PREV
     # =========================================================
     prev_kp = state["kp_prev"] if state is not None else None
 
     # =========================================================
-    # 5. MOTION ENGINE
+    # 5. MOTION GRAPH ROUTING (V7 / V8 / V9)
     # =========================================================
-    if frame_idx > cinematic_start and profile == "cinematic":
-        kp, new_state = cinematic_motion_graph_v4(kp, state, debug=debug)
+    kp, new_state = apply_actor_model(kp, state, actor_model, frame_idx, debug=debug)
 
-    elif frame_idx > cinematic_start and profile == "warp":
-        kp, new_state = cinematic_motion_graph_v3(kp, state, debug=debug)
-
-    else:
-        kp, new_state = update_motion_state(kp, state)
-
+    # =========================================================
+    # 6. DEBUG POST GRAPH
+    # =========================================================
     if prev_kp is not None:
-        print("[DEBUG][DELTA PRE ROT]", (kp - prev_kp).abs().mean().item())
+        print("[DEBUG][POST GRAPH DELTA]", (kp[..., :2] - prev_kp[..., :2]).abs().mean().item())
+
     # =========================================================
-    # 6. ROTATION / ARTICULATION (IMPORTANT: BEFORE CLAMP)
+    # 7. PHYSICS LIMIT
+    # =========================================================
+    if prev_kp is not None:
+        delta = kp[..., :2] - prev_kp[..., :2]
+        speed = torch.norm(delta, dim=-1, keepdim=True)
+
+        speed = torch.where(speed < 1e-6, torch.ones_like(speed), speed)
+
+        scale = torch.clamp(max_velocity / speed, 0.0, 1.0)
+
+        kp[..., :2] = prev_kp[..., :2] + delta * scale
+
+    # =========================================================
+    # 8. ROTATION (POST PHYSICS)
     # =========================================================
     if prev_kp is not None:
         upper_ids = [5,6,7,8,9,10,11,12]
@@ -2663,43 +2759,30 @@ def update_sequence_from_keypoints_batch(
             (kp[:, upper_ids, :2] - prev_kp[:, upper_ids, :2]) * rotation_gain
         )
 
-
-
     # =========================================================
-    # 7. HARD VELOCITY LIMIT (FINAL PHYSICS STEP)
-    # =========================================================
-    if prev_kp is not None:
-        delta = kp[..., :2] - prev_kp[..., :2]
-
-        speed = torch.norm(delta, dim=-1, keepdim=True)
-        scale = torch.clamp(max_velocity / (speed + 1e-6), max=1.0)
-
-        kp[..., :2] = prev_kp[..., :2] + delta * scale
-
-    # =========================================================
-    # 8. DEBUG
+    # 9. DEBUG
     # =========================================================
     if debug:
         motion = 0.0
         if prev_kp is not None:
             motion = (kp[..., :2] - prev_kp[..., :2]).abs().mean()
 
-        print("\n[🎬 FINAL MOTION ENGINE]")
+        print("\n[🎬 MOTION ENGINE V6/V7/V8/V9]")
         print(f"frame: {frame_idx}")
+        print(f"profile: {profile}")
+        print(f"actor_model: {actor_model}")
         print(f"motion_mean: {float(motion):.6f}")
-        print("[DEBUG][SPACE CHECK]")
-        print("kp min/max:", kp.min().item(), kp.max().item())
 
         if (profile in ["cinematic", "warp"]) and new_state is not None and "anchor" in new_state:
             print(f"anchor: {new_state['anchor'].mean().item():.6f}")
-        if frame_idx % 2 == 0:
-            if debug_dir is not None:
-                debug_draw_openpose_skeleton(
-                    keypoints_tensor=kp,
-                    debug_dir=debug_dir,
-                    frame_counter=frame_idx,
-                    image_size=image_size
-                )
+
+        if frame_idx % 2 == 0 and debug_dir is not None:
+            debug_draw_openpose_skeleton(
+                keypoints_tensor=kp,
+                debug_dir=debug_dir,
+                frame_counter=frame_idx,
+                image_size=image_size
+            )
 
     return kp
 
