@@ -10,7 +10,7 @@ from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
-#n3rPoseModule.py
+
 from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v6, cinematic_motion_graph_v7, cinematic_motion_graph_v8, actor_system_v9
 
 from .n3rMotionPoseClass import Pose
@@ -2612,6 +2612,29 @@ def resolve_actor_model(frame_idx: int) -> str:
     return model
 
 
+MOTION_MODEL_SCHEDULE = [
+    (0,  "locked"),
+    (5,  "stable"),
+    (10, "warp"),
+    (20, "cinematic"),
+    (35, "dynamic"),
+]
+
+
+def resolve_motion_model(frame_idx: int) -> str:
+    """
+    Motion system:
+    controls physics behavior over time (camera + velocity + warp).
+    """
+    model = "dynamic"
+
+    for threshold, name in MOTION_MODEL_SCHEDULE:
+        if frame_idx >= threshold:
+            model = name
+
+    return model
+
+
 # =========================================================
 # ACTOR FUNCTION MAP (EXTENSIBLE SYSTEM)
 # =========================================================
@@ -2638,26 +2661,21 @@ ACTOR_LABELS = {
 # MAIN ENTRY
 # =========================================================
 
-def apply_actor_model(kp, state, frame_idx, debug=True):
+def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
 
     rmodel = resolve_actor_model(frame_idx)
 
     fn = ACTOR_PIPELINE.get(rmodel, update_motion_state)
     label = ACTOR_LABELS.get(rmodel, "[UNKNOWN MODEL]")
 
-    # =========================================================
-    # DEBUG HEADER (clean + readable)
-    # =========================================================
     if debug:
         print("\n[🎬 ACTOR PIPELINE] =====================================")
         print(f"frame_idx : {frame_idx}")
         print(f"model     : {rmodel}")
+        print(f"profile   : {profile}")
         print(f"layer     : {label}")
         print("========================================================")
 
-    # =========================================================
-    # EXECUTION
-    # =========================================================
     try:
         result = fn(kp, state, debug=debug)
 
@@ -2666,24 +2684,25 @@ def apply_actor_model(kp, state, frame_idx, debug=True):
         print(f"error: {e}")
         return update_motion_state(kp, state)
 
-    # =========================================================
-    # DEBUG FOOTER (lightweight but useful)
-    # =========================================================
-    if debug and isinstance(result, tuple):
+    if isinstance(result, tuple):
         kp_out, new_state = result
 
         if state is not None and "kp_prev" in state:
             delta = (kp_out[..., :2] - state["kp_prev"][..., :2]).abs().mean().item()
             print(f"[DEBUG] motion_delta_mean: {delta:.6f}")
 
+        return kp_out, new_state
+
     return result
+
+
 
 def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
     prev_keypoints=None,
     state=None,
-    profile="cinematic",
+    profile=None, # motion_model
     time_scale=0.5,
     max_velocity=0.008,
     camera_lock=0.7,
@@ -2692,10 +2711,17 @@ def update_sequence_from_keypoints_batch(
     image_size=(1280, 896)
 ):
 
+
+
     # =========================================================
     # 0. PROFILE
     # =========================================================
-    p = MOTION_PROFILES[profile]
+    if profile is not None:
+        motion_model = profile # manual override
+    else:
+        motion_model = resolve_motion_model(frame_idx)
+
+    p = MOTION_PROFILES[motion_model]
 
     time_scale = p["time_scale"]
     camera_lock = p["camera_lock"]
@@ -2748,7 +2774,7 @@ def update_sequence_from_keypoints_batch(
     # =========================================================
     # 5. MOTION GRAPH ROUTING (V7 / V8 / V9)
     # =========================================================
-    kp, new_state = apply_actor_model(kp, state, frame_idx=frame_idx)
+    kp, new_state = apply_actor_model(kp, state, frame_idx=frame_idx, profile=motion_model)
 
     # =========================================================
     # 6. DEBUG POST GRAPH
@@ -2790,10 +2816,10 @@ def update_sequence_from_keypoints_batch(
 
         print("\n[🎬 MOTION ENGINE V6/V7/V8/V9]")
         print(f"frame: {frame_idx}")
-        print(f"profile: {profile}")
+        print(f"Motion model: {motion_model}")
         print(f"motion_mean: {float(motion):.6f}")
 
-        if (profile in ["cinematic", "warp"]) and new_state is not None and "anchor" in new_state:
+        if (motion_model in ["cinematic", "warp"]) and new_state is not None and "anchor" in new_state:
             print(f"anchor: {new_state['anchor'].mean().item():.6f}")
 
         if frame_idx % 2 == 0 and debug_dir is not None:

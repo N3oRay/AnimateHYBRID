@@ -1,5 +1,4 @@
 #n3rPoseModule.py
-
 #cinematic_motion_graph_v3, update_motion_state
 
 import torch
@@ -109,9 +108,7 @@ def compute_torso_rotation_delta(kp, prev_vec=None, eps=1e-6):
 
     return angle.unsqueeze(-1).unsqueeze(-1), torso_vec
 
-
-
-
+#---------------------------------------------------------------------
 
 def update_motion_state(
     kp,

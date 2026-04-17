@@ -15,10 +15,6 @@ import traceback
 import torchvision.utils as vutils
 
 
-
-#from .n3rMotionPose_tools import gaussian_blur_tensor, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, feather_outside_only_alpha, smooth_noise, apply_hair_motion_3D, feather_inside_strict2, feather_outside_only_alpha2
-
-
 def feather_outside_only_alpha2(mask: torch.Tensor, radius: int = 2, sigma: float = 1.0):
     """
     Adoucit uniquement l'extérieur d'un masque (feathering glow externe)
@@ -732,27 +728,8 @@ def apply_breathing_soft(
     # =========================================================
     if debug:
         delta_mag = torch.sqrt(delta_x**2 + delta_y**2)
-
-        print("🫁 V3 breath mean:", delta_mag.mean().item())
-        #print("💓 heartbeat contrib:", heartbeat.item())
+        print("🫁 Soft breath mean:", delta_mag.mean().item())
         print("💓 heartbeat contrib:", float(heartbeat))
-
-        if debug_dir is not None:
-            os.makedirs(debug_dir, exist_ok=True)
-
-            def norm(x):
-                x_min = x.amin(dim=(1,2), keepdim=True)
-                x_max = x.amax(dim=(1,2), keepdim=True)
-                return (x - x_min) / (x_max - x_min + 1e-8)
-
-            vis = norm(delta_mag).unsqueeze(1)
-            m = mask[..., 0].unsqueeze(1)
-
-            vutils.save_image(
-                torch.cat([vis, m], dim=0),
-                os.path.join(debug_dir, f"breathing_v3_{frame_counter:05d}.png"),
-                nrow=B
-            )
 
     return latents_out
 
@@ -870,26 +847,8 @@ def apply_breathing_real(
     # =========================================================
     if debug:
         delta_mag = torch.sqrt(delta_x**2 + delta_y**2)
-
-        print("🫁 V2 Breathing mean:", delta_mag.mean().item())
-        print("🫁 V2 Breathing max:", delta_mag.max().item())
-
-        if debug_dir is not None:
-            os.makedirs(debug_dir, exist_ok=True)
-
-            def normalize(x):
-                x_min = x.amin(dim=(1,2), keepdim=True)
-                x_max = x.amax(dim=(1,2), keepdim=True)
-                return (x - x_min) / (x_max - x_min + 1e-8)
-
-            vis = normalize(delta_mag).unsqueeze(1)
-            mask_vis = mask[..., 0].unsqueeze(1)
-
-            vutils.save_image(
-                torch.cat([vis, mask_vis], dim=0),
-                os.path.join(debug_dir, f"breathing_v2_{frame_counter:05d}.png"),
-                nrow=B
-            )
+        print("🫁 Real Breathing mean:", delta_mag.mean().item())
+        print("🫁 Real Breathing max:", delta_mag.max().item())
 
     return latents_out
 
@@ -999,30 +958,8 @@ def apply_breathing_simple_anime(
     # =========================================================
     if debug:
         global_delta = torch.stack((delta_x, delta_y), dim=-1)
-
-        print("🫁 Breathing - mean:", global_delta.abs().mean().item())
-        print("🫁 Breathing - max:", global_delta.abs().max().item())
-
-        if debug_dir is not None:
-            os.makedirs(debug_dir, exist_ok=True)
-
-            delta_mag = torch.sqrt(delta_x**2 + delta_y**2)
-
-            def normalize(x):
-                x_min = x.amin(dim=(1,2), keepdim=True)
-                x_max = x.amax(dim=(1,2), keepdim=True)
-                return (x - x_min) / (x_max - x_min + 1e-8)
-
-            delta_vis = normalize(delta_mag).unsqueeze(1)
-            mask_vis = mask[..., 0].unsqueeze(1)
-
-            debug_img = torch.cat([delta_vis, mask_vis], dim=0)
-
-            vutils.save_image(
-                debug_img,
-                os.path.join(debug_dir, f"delta_breathing_{frame_counter:05d}.png"),
-                nrow=B
-            )
+        print("🫁 Simple Breathing - mean:", global_delta.abs().mean().item())
+        print("🫁 Simple Breathing - max:", global_delta.abs().max().item())
 
     return latents_out
 
@@ -1062,6 +999,8 @@ def save_impact_map(latents, latents_in, debug_dir, frame_counter, prefix="drive
         frame_counter (int): Index de la frame pour le nom de fichier
         prefix (str): Préfixe pour différencier le type d'impact map
     """
+    if frame_counter % 2 == 0:
+        return
     if debug_dir is None:
         return
 
@@ -1946,16 +1885,16 @@ def apply_hair_motion_vent(
     # 🔹 Debug
     if debug:
         print(f"[DEBUG] Hair motion Vent applied with strength={strength:.2f}")
-
-    if debug and debug_dir is not None:
-        debug_save_mask_and_wind(
-            mask=mask_hair,
-            wind_delta=wind_delta,
-            H=H,
-            W=W,
-            debug_dir=debug_dir,
-            frame_counter=frame_counter
-        )
+    if frame_counter % 2 == 0:
+        if debug and debug_dir is not None:
+            debug_save_mask_and_wind(
+                mask=mask_hair,
+                wind_delta=wind_delta,
+                H=H,
+                W=W,
+                debug_dir=debug_dir,
+                frame_counter=frame_counter
+            )
 
     return latents_out, hair_delta_field
 #------------ version cinema -----------------
@@ -2055,14 +1994,15 @@ def apply_hair_motion_cinema(
     if debug:
         print(f"[DEBUG] Hair motion cinema applied | strength={strength:.2f}")
 
-    if debug and debug_dir is not None:
-        debug_save_mask_and_wind(
-            mask=mask_hair,
-            wind_delta=wind_delta,
-            H=H,
-            W=W,
-            debug_dir=debug_dir,
-            frame_counter=frame_counter
-        )
+    if frame_counter % 2 == 0:
+        if debug and debug_dir is not None:
+            debug_save_mask_and_wind(
+                mask=mask_hair,
+                wind_delta=wind_delta,
+                H=H,
+                W=W,
+                debug_dir=debug_dir,
+                frame_counter=frame_counter
+            )
 
     return latents_out, hair_delta_field
