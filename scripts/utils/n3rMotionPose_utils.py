@@ -2545,7 +2545,7 @@ MOTION_PROFILES = {
     "cinematic": {
         "time_scale": 0.5,
         "camera_lock": 0.7,
-        "max_velocity": 0.008,
+        "max_velocity": 0.03,
         "rotation_gain": 1.2,
         "cinematic_start": 20
     },
@@ -2643,20 +2643,18 @@ def update_sequence_from_keypoints_batch(
     # =========================================================
     if frame_idx > cinematic_start and profile == "cinematic":
         kp, new_state = cinematic_motion_graph_v4(kp, state, debug=debug)
-        cinematic = True
 
     elif frame_idx > cinematic_start and profile == "warp":
         kp, new_state = cinematic_motion_graph_v3(kp, state, debug=debug)
-        cinematic = True
 
     else:
         kp, new_state = update_motion_state(kp, state)
-        cinematic = False
 
+    if prev_kp is not None:
+        print("[DEBUG][DELTA PRE ROT]", (kp - prev_kp).abs().mean().item())
     # =========================================================
-    # 5. MOTION ENGINE +
+    # 6. ROTATION / ARTICULATION (IMPORTANT: BEFORE CLAMP)
     # =========================================================
-
     if prev_kp is not None:
         upper_ids = [5,6,7,8,9,10,11,12]
 
@@ -2665,8 +2663,10 @@ def update_sequence_from_keypoints_batch(
             (kp[:, upper_ids, :2] - prev_kp[:, upper_ids, :2]) * rotation_gain
         )
 
+
+
     # =========================================================
-    # 6. HARD VELOCITY LIMIT (FIXED)
+    # 7. HARD VELOCITY LIMIT (FINAL PHYSICS STEP)
     # =========================================================
     if prev_kp is not None:
         delta = kp[..., :2] - prev_kp[..., :2]
@@ -2675,11 +2675,6 @@ def update_sequence_from_keypoints_batch(
         scale = torch.clamp(max_velocity / (speed + 1e-6), max=1.0)
 
         kp[..., :2] = prev_kp[..., :2] + delta * scale
-
-    # =========================================================
-    # 7. SAFE CLAMP
-    # =========================================================
-    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
 
     # =========================================================
     # 8. DEBUG
@@ -2692,8 +2687,10 @@ def update_sequence_from_keypoints_batch(
         print("\n[🎬 FINAL MOTION ENGINE]")
         print(f"frame: {frame_idx}")
         print(f"motion_mean: {float(motion):.6f}")
+        print("[DEBUG][SPACE CHECK]")
+        print("kp min/max:", kp.min().item(), kp.max().item())
 
-        if not cinematic and "anchor" in new_state:
+        if (profile in ["cinematic", "warp"]) and new_state is not None and "anchor" in new_state:
             print(f"anchor: {new_state['anchor'].mean().item():.6f}")
         if frame_idx % 2 == 0:
             if debug_dir is not None:
@@ -2962,6 +2959,8 @@ def update_pose_sequence_from_keypoints_batch(
         print(f"motion_energy: {motion_energy}")
         print(f"freeze_gate: {freeze_gate}")
         print(f"motion_scale: {motion_scale}")
+        print("[DEBUG][SPACE CHECK]")
+        print("kp min/max:", kp.min().item(), kp.max().item())
 
     return kp
 
