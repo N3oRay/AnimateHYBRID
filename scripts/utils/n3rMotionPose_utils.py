@@ -2539,8 +2539,7 @@ MOTION_PROFILES = {
         "camera_lock": 0.95,
         "max_velocity": 0.004,
         "rotation_gain": 1.0,
-        "cinematic_start": 25,
-        "actor_model": "v7"
+        "cinematic_start": 25
     },
 
     "cinematic": {
@@ -2548,8 +2547,7 @@ MOTION_PROFILES = {
         "camera_lock": 0.7,
         "max_velocity": 0.03,
         "rotation_gain": 1.2,
-        "cinematic_start": 20,
-        "actor_model": "v8"
+        "cinematic_start": 20
     },
 
     "warp": {
@@ -2557,8 +2555,7 @@ MOTION_PROFILES = {
         "camera_lock": 0.92,
         "max_velocity": 0.008,
         "rotation_gain": 1.2,
-        "cinematic_start": 10,
-        "actor_model": "v7"
+        "cinematic_start": 10
     },
 
     "dynamic": {
@@ -2566,8 +2563,7 @@ MOTION_PROFILES = {
         "camera_lock": 0.88,
         "max_velocity": 0.012,
         "rotation_gain": 1.35,
-        "cinematic_start": 10,
-        "actor_model": "v8"
+        "cinematic_start": 10
     },
 
     "locked": {
@@ -2575,87 +2571,112 @@ MOTION_PROFILES = {
         "camera_lock": 0.98,
         "max_velocity": 0.002,
         "rotation_gain": 0.8,
-        "cinematic_start": 9999,
-        "actor_model": "v7"
+        "cinematic_start": 9999
     },
 
-    # 🔥 NEW PURE ACTING MODE
+    # optional hint only (NOT authoritative)
     "acting": {
         "time_scale": 0.55,
         "camera_lock": 0.75,
         "max_velocity": 0.02,
         "rotation_gain": 1.3,
-        "cinematic_start": 15,
-        "actor_model": "v9"
+        "cinematic_start": 15
     }
 }
 
 
-def resolve_actor_model(frame_idx):
-    if frame_idx <= 0:
-        return "base"
+# =========================================================
+# ACTOR MODEL RESOLUTION (DIRECTOR SYSTEM)
+# =========================================================
 
-    if frame_idx <= 5:
-        return "v6"
+ACTOR_MODEL_SCHEDULE = [
+    (0,  "base"),
+    (1,  "v6"),
+    (6,  "v7"),
+    (11, "v8"),
+    (16, "v9"),
+]
 
-    if frame_idx <= 10:
-        return "v7"
 
-    if frame_idx <= 15:
-        return "v8"
+def resolve_actor_model(frame_idx: int) -> str:
+    """
+    Director timeline system:
+    progressive acting complexity over time.
+    """
+    model = "v9"
 
-    return "v9"
+    for threshold, name in ACTOR_MODEL_SCHEDULE:
+        if frame_idx >= threshold:
+            model = name
 
-def apply_actor_model(kp, state, model, frame_idx, debug=True):
+    return model
+
+
+# =========================================================
+# ACTOR FUNCTION MAP (EXTENSIBLE SYSTEM)
+# =========================================================
+
+ACTOR_PIPELINE = {
+    "base": update_motion_state,
+    "v6": cinematic_motion_graph_v6,
+    "v7": cinematic_motion_graph_v7,
+    "v8": cinematic_motion_graph_v8,
+    "v9": actor_system_v9,
+}
+
+
+ACTOR_LABELS = {
+    "base": "[BASE MOTION]",
+    "v6": "[V6 CINEMATIC]",
+    "v7": "[V7 PHYSICS LAYER]",
+    "v8": "[V8 ACTING SYSTEM]",
+    "v9": "[V9 FULL ACTOR SYSTEM]",
+}
+
+
+# =========================================================
+# MAIN ENTRY
+# =========================================================
+
+def apply_actor_model(kp, state, frame_idx, debug=True):
 
     rmodel = resolve_actor_model(frame_idx)
 
+    fn = ACTOR_PIPELINE.get(rmodel, update_motion_state)
+    label = ACTOR_LABELS.get(rmodel, "[UNKNOWN MODEL]")
+
     # =========================================================
-    # DEBUG HEADER
+    # DEBUG HEADER (clean + readable)
     # =========================================================
     if debug:
-        print("\n[🎬 ACTOR PIPELINE] *********************************************************************")
-        print(f"frame_idx: {frame_idx} -> model: {rmodel}")
+        print("\n[🎬 ACTOR PIPELINE] =====================================")
+        print(f"frame_idx : {frame_idx}")
+        print(f"model     : {rmodel}")
+        print(f"layer     : {label}")
+        print("========================================================")
 
     # =========================================================
-    # V6 - base cinematic motion
+    # EXECUTION
     # =========================================================
-    if rmodel == "v6":
-        if debug:
-            print("[V6] cinematic_motion_graph_v6 *******************************************************")
-        return cinematic_motion_graph_v6(kp, state, debug=debug)
+    try:
+        result = fn(kp, state, debug=debug)
 
-    # =========================================================
-    # V7 - cinema physics
-    # =========================================================
-    elif rmodel == "v7":
-        if debug:
-            print("[V7] cinematic_motion_graph_v7 (physics layer) ***************************************")
-        return cinematic_motion_graph_v7(kp, state, debug=debug)
-
-    # =========================================================
-    # V8 - acting system
-    # =========================================================
-    elif rmodel == "v8":
-        if debug:
-            print("[V8] cinematic_motion_graph_v8 (acting layer)*****************************************")
-        return cinematic_motion_graph_v8(kp, state, debug=debug)
-
-    # =========================================================
-    # V9 - full actor system (face + gaze + emotion)
-    # =========================================================
-    elif rmodel == "v9":
-        if debug:
-            print("[V9] actor_system_v9 (full actor system)**********************************************")
-        return actor_system_v9(kp, state, debug=debug)
-
-    # =========================================================
-    # fallback
-    # =========================================================
-    else:
-        if debug:
-            print("[BASE] update_motion_state ***********************************************************")
+    except Exception as e:
+        print(f"[⚠️ ACTOR ERROR] model={rmodel} -> fallback base motion")
+        print(f"error: {e}")
         return update_motion_state(kp, state)
+
+    # =========================================================
+    # DEBUG FOOTER (lightweight but useful)
+    # =========================================================
+    if debug and isinstance(result, tuple):
+        kp_out, new_state = result
+
+        if state is not None and "kp_prev" in state:
+            delta = (kp_out[..., :2] - state["kp_prev"][..., :2]).abs().mean().item()
+            print(f"[DEBUG] motion_delta_mean: {delta:.6f}")
+
+    return result
 
 def update_sequence_from_keypoints_batch(
     sequence,
@@ -2681,7 +2702,7 @@ def update_sequence_from_keypoints_batch(
     max_velocity = p["max_velocity"]
     rotation_gain = p["rotation_gain"]
     cinematic_start = p["cinematic_start"]
-    actor_model = p.get("actor_model", "v7")
+
 
     # =========================================================
     # 1. TIME WARP
@@ -2727,7 +2748,7 @@ def update_sequence_from_keypoints_batch(
     # =========================================================
     # 5. MOTION GRAPH ROUTING (V7 / V8 / V9)
     # =========================================================
-    kp, new_state = apply_actor_model(kp, state, actor_model, frame_idx, debug=debug)
+    kp, new_state = apply_actor_model(kp, state, frame_idx=frame_idx)
 
     # =========================================================
     # 6. DEBUG POST GRAPH
@@ -2770,7 +2791,6 @@ def update_sequence_from_keypoints_batch(
         print("\n[🎬 MOTION ENGINE V6/V7/V8/V9]")
         print(f"frame: {frame_idx}")
         print(f"profile: {profile}")
-        print(f"actor_model: {actor_model}")
         print(f"motion_mean: {float(motion):.6f}")
 
         if (profile in ["cinematic", "warp"]) and new_state is not None and "anchor" in new_state:
