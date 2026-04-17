@@ -3,7 +3,7 @@
 # Prompt / Input → N3RModelOptimized → MotionModule → UNet → LoRA → VAE → Image / Vidéo
 #Avec use_mini_gpu et generate_latents_mini_gpu_320 → ~2,1 Go VRAM ✅ Avec use_n3r_model et N3RModelOptimized → ~3,6 Go VRAM
 # Image input ↓ OpenPose → skeleton (frame t) ↓ ControlNet (condition pose) ↓ UNet (avec pos/neg embeds) ↓ Latents 4D (animés) ↓ N3RProNet (détails + iris + sharpen) ↓ Decode blockwise ↓ Frames animées
-#use_n3r_model: True # Amélioration de la qualité use_n3r_pro_net: False # Augmentation des détails à mettre au point use_mini_gpu: False # Génération rapide use_openpose: False # Pas encore au point
+#use_n3r_model: True # Amélioration de la qualité use_n3r_pro_net: False # Augmentation des détails à mettre au point use_mini_gpu: False
 # ----------------------------------------------------------------------------------------
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
@@ -75,6 +75,7 @@ def main(args):
     frames_per_prompt = cfg.get("frames_per_prompt", 20)  # nombre de frames par prompt
     contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.15), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
     H, W = cfg.get("H", 512), cfg.get("W", 512)
+    image_size=(H, W) # taille original de l'image'
     block_size = cfg.get("block_size", 64)  # block_size auto selon résolution 64
     overlap = compute_overlap(cfg["W"], cfg["H"], block_size) #overlap = 32 #32
     print(f"Dimention : overlap :", overlap)
@@ -459,7 +460,7 @@ def main(args):
                                 latents = apply_openpose_tilewise_safe( latents, pose_latent_full, tile_fn_partial, block_size=block_size, overlap=overlap, device=device, debug=verbose, debug_dir=output_dir,frame_idx=frame_counter)
 
                             else:
-                                image_size=(H, W)
+
                                 # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION ---------------------------
                                 current_keypoints = extract_keypoints_from_pose( debug=True, debug_dir=output_dir, frame_counter=frame_counter, image_size=image_size)
                                 # 🔹 Update des keypoints avec Mediapipe
@@ -471,10 +472,11 @@ def main(args):
                                 # Mettre à jour les keypoints éventuellement modifiés
                                 if sequence is not None:
                                     # utilisation sequence
-                                    # update_sequence_from_keypoints_batch( sequence, frame_idx, prev_keypoints=None, alpha_base=0.90, freeze_threshold=0.0025, freeze_strength=0.20, micro_jitter=0.00025, time_scale=0.55,          # 🔥 contrôle vitesse globale max_velocity=0.015,       # 🔥 clamp px/frame (IMPORTANT) debug=False, debug_dir=None, image_size=(1280, 896) )
-                                    current_keypoints = update_sequence_from_keypoints_batch(sequence=sequence, frame_idx=frame_counter, prev_keypoints=prev_keypoints, alpha_base=0.9, freeze_threshold=0.0015, freeze_strength=0.25, micro_jitter=0.0005, debug=True, debug_dir=output_dir, image_size=image_size)
+                                    print("[INFO] *********** SEQUENCE: update_sequence_from_keypoints_batch")
+                                    current_keypoints = update_sequence_from_keypoints_batch(sequence=sequence, frame_idx=frame_counter, prev_keypoints=prev_keypoints, debug=True, debug_dir=output_dir, image_size=image_size)
                                 else:
                                     # utilisation uniquement des keypoints_tensor
+                                    print("[INFO] *********** SEQUENCE NONE: update_pose_sequence_from_keypoints_batch")
                                     current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints,
                                                                                                 prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
 
