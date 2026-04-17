@@ -11,7 +11,7 @@ from .n3rControlNet import create_canny_control, control_to_latent, match_latent
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
 #n3rPoseModule.py
-from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state
+from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v4
 
 from .n3rMotionPoseClass import Pose
 import numpy as np
@@ -2001,7 +2001,8 @@ def apply_pose_driven_motion_ultra2(
                 diff = torch.clamp(diff, -3.0, 3.0)
                 latents_world += diff.mean() * 0.001
         timings["GLOBAL"] = time.time() - start
-        if debug:
+
+        if debug and frame_counter % 4 == 0:
             print("[DEBUG] GLOBAL WARP REPORT")
             print("  - delta mean px:", global_delta.abs().mean().item())
             print("  - delta max px:", global_delta.abs().max().item())
@@ -2543,10 +2544,17 @@ MOTION_PROFILES = {
 
     "cinematic": {
         "time_scale": 0.5,
-        "camera_lock": 0.92,
+        "camera_lock": 0.7,
         "max_velocity": 0.008,
         "rotation_gain": 1.2,
         "cinematic_start": 20
+    },
+    "warp": {
+        "time_scale": 0.5,
+        "camera_lock": 0.92,
+        "max_velocity": 0.008,
+        "rotation_gain": 1.2,
+        "cinematic_start": 10
     },
 
     "dynamic": {
@@ -2573,7 +2581,7 @@ def update_sequence_from_keypoints_batch(
     profile="cinematic",   # 👈 NEW profile = "cinematic" if face_detected else "stable" or profile = "dynamic" if motion_mean > threshold else "cinematic"
     time_scale=0.5,
     max_velocity=0.008,
-    camera_lock=0.92,
+    camera_lock=0.7, # 0.92
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)
@@ -2589,6 +2597,7 @@ def update_sequence_from_keypoints_batch(
     max_velocity = p["max_velocity"]
     rotation_gain = p["rotation_gain"]
     cinematic_start = p["cinematic_start"]
+
     # =========================================================
     # 1. TIME WARP (SAFE)
     # =========================================================
@@ -2632,9 +2641,14 @@ def update_sequence_from_keypoints_batch(
     # =========================================================
     # 5. MOTION ENGINE
     # =========================================================
-    if frame_idx > cinematic_start:
-        kp, new_state = cinematic_motion_graph_v3(kp, state)
+    if frame_idx > cinematic_start and profile == "cinematic":
+        kp, new_state = cinematic_motion_graph_v4(kp, state, debug=debug)
         cinematic = True
+
+    elif frame_idx > cinematic_start and profile == "warp":
+        kp, new_state = cinematic_motion_graph_v3(kp, state, debug=debug)
+        cinematic = True
+
     else:
         kp, new_state = update_motion_state(kp, state)
         cinematic = False
@@ -2681,7 +2695,7 @@ def update_sequence_from_keypoints_batch(
 
         if not cinematic and "anchor" in new_state:
             print(f"anchor: {new_state['anchor'].mean().item():.6f}")
-        if frame_counter % 2 == 0:
+        if frame_idx % 2 == 0:
             if debug_dir is not None:
                 debug_draw_openpose_skeleton(
                     keypoints_tensor=kp,

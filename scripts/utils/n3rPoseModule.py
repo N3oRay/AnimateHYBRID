@@ -5,6 +5,7 @@
 import torch
 import torch.nn.functional as F
 
+
 """
 Motion Graph v5 – Cinematic Rig System”
 spine inertiel
@@ -29,49 +30,70 @@ stable sur longues séquences (200+ frames)
 """
 
 
-
 def compute_torso_rotation_delta(kp, prev_vec=None, eps=1e-6):
     """
     Stable torso rotation estimation with robustness to missing hips.
+    Returns:
+        angle: (B, 1, 1)
+        torso_vec: (B, 2)
     """
 
+    # =========================================================
+    # 1. EXTRACT KEYPOINTS
+    # =========================================================
     l_sh = kp[:, 5, :2]
     r_sh = kp[:, 6, :2]
     l_hp = kp[:, 11, :2]
     r_hp = kp[:, 12, :2]
 
     # =========================================================
-    # 1. BUILD VECTORS
+    # 2. BUILD VECTORS
     # =========================================================
     shoulder_vec = r_sh - l_sh
     hip_vec = r_hp - l_hp
 
-    # fallback if hips are garbage (VERY IMPORTANT)
-    hip_valid = torch.isfinite(hip_vec).all(dim=-1, keepdim=True)
-    shoulder_valid = torch.isfinite(shoulder_vec).all(dim=-1, keepdim=True)
+    # robust validity check (not just finite)
+    def is_valid(v):
+        return (
+            torch.isfinite(v).all(dim=-1, keepdim=True) &
+            (torch.norm(v, dim=-1, keepdim=True) > 1e-4)
+        )
 
-    torso_vec = torch.where(
-        hip_valid,
-        (shoulder_vec + hip_vec) * 0.5,
-        shoulder_vec
-    )
+    shoulder_ok = is_valid(shoulder_vec)
+    hip_ok = is_valid(hip_vec)
 
     # =========================================================
-    # 2. NORMALIZE SAFELY
+    # 3. SMART FUSION (IMPORTANT)
+    # =========================================================
+    # cases:
+    # - both valid → average
+    # - only shoulder → fallback
+    # - only hip → rare but handle
+    # - none → zero (safe)
+    torso_vec = torch.zeros_like(shoulder_vec)
+
+    both = shoulder_ok & hip_ok
+    torso_vec = torch.where(both, (shoulder_vec + hip_vec) * 0.5, torso_vec)
+    torso_vec = torch.where(shoulder_ok & ~hip_ok, shoulder_vec, torso_vec)
+    torso_vec = torch.where(~shoulder_ok & hip_ok, hip_vec, torso_vec)
+
+    # =========================================================
+    # 4. NORMALIZE SAFELY
     # =========================================================
     norm = torch.norm(torso_vec, dim=-1, keepdim=True)
     torso_vec = torso_vec / (norm + eps)
 
     # =========================================================
-    # 3. INIT CASE
+    # 5. INIT CASE
     # =========================================================
     if prev_vec is None:
-        return torch.zeros((kp.shape[0], 1, 1), device=kp.device), torso_vec
+        zero_angle = torch.zeros((kp.shape[0], 1, 1), device=kp.device)
+        return zero_angle, torso_vec
 
     prev_vec = F.normalize(prev_vec, dim=-1)
 
     # =========================================================
-    # 4. ANGLE BETWEEN VECTORS
+    # 6. ANGLE COMPUTATION
     # =========================================================
     cross = torso_vec[..., 0] * prev_vec[..., 1] - torso_vec[..., 1] * prev_vec[..., 0]
     dot = (torso_vec * prev_vec).sum(dim=-1)
@@ -79,39 +101,18 @@ def compute_torso_rotation_delta(kp, prev_vec=None, eps=1e-6):
     angle = torch.atan2(cross, dot)
 
     # =========================================================
-    # 5. SAFETY CLAMP (VERY IMPORTANT)
+    # 7. STABILITY SAFETY
     # =========================================================
     angle = torch.nan_to_num(angle, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # optional: clamp extreme jumps (stability boost)
-    angle = torch.clamp(angle, -1.2, 1.2)
+    # clamp violent jumps (important for video stability)
+    angle = torch.clamp(angle, -1.0, 1.0)
 
     return angle.unsqueeze(-1).unsqueeze(-1), torso_vec
 
-def compute_torso_rotation_delta_v1(kp, prev_vec=None):
-    l_sh = kp[:, 5, :2]
-    r_sh = kp[:, 6, :2]
-    l_hp = kp[:, 11, :2]
-    r_hp = kp[:, 12, :2]
 
-    shoulder_vec = r_sh - l_sh
-    hip_vec = r_hp - l_hp
 
-    torso_vec = (shoulder_vec + hip_vec) * 0.5
 
-    # normalize
-    torso_vec = torch.nn.functional.normalize(torso_vec, dim=-1)
-
-    if prev_vec is None:
-        return torch.zeros_like(torso_vec[..., :1]), torso_vec
-
-    # angle between vectors (cross + dot)
-    cross = torso_vec[..., 0]*prev_vec[..., 1] - torso_vec[..., 1]*prev_vec[..., 0]
-    dot = (torso_vec * prev_vec).sum(dim=-1)
-
-    angle = torch.atan2(cross, dot)
-
-    return angle.unsqueeze(-1).unsqueeze(-1), torso_vec
 
 def update_motion_state(
     kp,
@@ -229,15 +230,22 @@ def compute_torso_rotation(kp, body_ids=(5,6,7,8,9,10,11,12)):
     return angle
 
 
-def rotate_points_around_pivot(points, pivot, angle):
+def rotate_points_around_pivot(points, pivot, angle, name="ROT"):
     """
-    2D rotation (stable, batch-safe)
+    2D rotation (stable, batch-safe) + debug
     """
+
     s = torch.sin(angle)
     c = torch.cos(angle)
 
+    print(f"[{name}] angle: {angle}")
+    print(f"[{name}] pivot: {pivot}")
+    print(f"[{name}] points shape: {points.shape}")
+
     # translate
     p = points - pivot
+
+    print(f"[{name}] pre-translate sample: {p[0] if p.ndim > 1 else p}")
 
     x = p[..., 0]
     y = p[..., 1]
@@ -245,7 +253,188 @@ def rotate_points_around_pivot(points, pivot, angle):
     x_new = x * c - y * s
     y_new = x * s + y * c
 
-    return torch.stack([x_new, y_new], dim=-1) + pivot
+    out = torch.stack([x_new, y_new], dim=-1) + pivot
+
+    print(f"[{name}] post-rotate sample: {out[0] if out.ndim > 1 else out}")
+
+    return out
+
+# ---------------------------------------------------------
+# utils debug
+# ---------------------------------------------------------
+def _dbg(debug, *args):
+    if debug:
+        print(*args)
+
+
+# ---------------------------------------------------------
+# SAFE ROTATION
+# ---------------------------------------------------------
+def compute_torso_rotation_delta_v2(kp, prev_vec=None, eps=1e-6):
+    l_sh = kp[:, 5, :2]
+    r_sh = kp[:, 6, :2]
+    l_hp = kp[:, 11, :2]
+    r_hp = kp[:, 12, :2]
+
+    shoulder_vec = r_sh - l_sh
+    hip_vec = r_hp - l_hp
+
+    hip_valid = torch.isfinite(hip_vec).all(dim=-1, keepdim=True)
+
+    torso_vec = torch.where(
+        hip_valid,
+        0.7 * shoulder_vec + 0.3 * hip_vec,
+        shoulder_vec
+    )
+
+    norm = torch.norm(torso_vec, dim=-1, keepdim=True)
+    torso_vec = torso_vec / (norm + eps)
+
+    if prev_vec is None:
+        return torch.zeros((kp.shape[0], 1, 1), device=kp.device), torso_vec
+
+    prev_vec = F.normalize(prev_vec, dim=-1)
+
+    cross = torso_vec[..., 0] * prev_vec[..., 1] - torso_vec[..., 1] * prev_vec[..., 0]
+    dot = (torso_vec * prev_vec).sum(dim=-1)
+
+    angle = torch.atan2(cross, dot)
+
+    # ↓↓↓ important: soft clamp, pas hard clamp brutal
+    angle = torch.tanh(angle) * 0.9
+
+    angle = torch.nan_to_num(angle, 0.0)
+
+    return angle.unsqueeze(-1).unsqueeze(-1), torso_vec
+
+
+# ---------------------------------------------------------
+# MAIN MOTION GRAPH (FIXED)
+# ---------------------------------------------------------
+def cinematic_motion_graph_v4(
+    kp,
+    state,
+    head_ids=(0,1,2,3,4),
+    rotation_strength=1.2,
+    rotation_smooth=0.35,
+    head_lock=True,
+    debug=False
+):
+    B, N, _ = kp.shape
+
+    # =========================================================
+    # INIT
+    # =========================================================
+    if state is None:
+        return kp, {
+            "kp_prev": kp.clone(),
+            "angle": torch.zeros((B, 1, 1), device=kp.device),
+            "torso_vec_prev": None
+        }
+
+    kp_prev = state["kp_prev"]
+
+    # =========================================================
+    # 1. TORSO ROTATION ONLY
+    # =========================================================
+    angle_raw, torso_vec = compute_torso_rotation_delta(
+        kp,
+        state.get("torso_vec_prev")
+    )
+
+    state["torso_vec_prev"] = torso_vec
+
+    # smooth angle
+    angle = (
+        state["angle"] * (1 - rotation_smooth)
+        + angle_raw * rotation_smooth
+    )
+    state["angle"] = angle
+
+    # =========================================================
+    # 2. MOTION INTENSITY (minimal, no warp influence)
+    # =========================================================
+    motion = torch.norm(kp[..., :2] - kp_prev[..., :2], dim=-1)
+    motion = motion.mean(dim=1, keepdim=True).unsqueeze(-1)
+
+    motion_gain = torch.clamp(motion * 5.0, 0.0, 1.0)
+    dynamic_strength = rotation_strength * (1.0 + motion_gain)
+
+    # =========================================================
+    # 3. PIVOT (stable pelvis center)
+    # =========================================================
+    l_hp = kp[:, 11, :2]
+    r_hp = kp[:, 12, :2]
+
+    valid_hips = torch.isfinite(l_hp).all(dim=-1, keepdim=True) & \
+                 torch.isfinite(r_hp).all(dim=-1, keepdim=True)
+
+    shoulder_center = kp[:, [5, 6], :2].mean(dim=1, keepdim=True)
+    fake_hip = shoulder_center + torch.tensor([0.0, 0.12], device=kp.device)
+
+    l_hp = torch.where(valid_hips, l_hp, fake_hip)
+    r_hp = torch.where(valid_hips, r_hp, fake_hip)
+
+    pivot = (l_hp + r_hp) * 0.5
+
+    # fallback safety
+    invalid = (pivot.abs().sum(dim=-1, keepdim=True) < 1e-6)
+    pivot = torch.where(invalid, shoulder_center, pivot)
+
+    # =========================================================
+    # 4. APPLY PURE ROTATION (NO WARP BLENDING)
+    # =========================================================
+
+    upper_ids = [5, 6, 7, 8, 9, 10]
+
+    kp_rot = kp.clone()
+
+    pivot_batched = pivot.view(-1, 1, 2)
+
+    rotated = rotate_points_around_pivot(
+        kp[:, upper_ids, :2],
+        pivot_batched,
+        angle * dynamic_strength
+    )
+
+    print("[ROT DEBUG] max delta:",
+        (rotated - kp[:, upper_ids, :2]).abs().max().item())
+
+    kp_rot[:, upper_ids, :2] = rotated
+
+    kp = kp_rot.contiguous()
+
+    # =========================================================
+    # 5. HEAD LOCK (soft stability)
+    # =========================================================
+    if head_lock:
+        kp[:, head_ids, :2] = (
+            kp_prev[:, head_ids, :2] * 0.92
+            + kp[:, head_ids, :2] * 0.08
+        )
+
+    # =========================================================
+    # 6. STABILITY CLEAN
+    # =========================================================
+    kp[..., :2] = torch.nan_to_num(kp[..., :2], nan=0.0)
+    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
+
+    # =========================================================
+    # 7. UPDATE STATE
+    # =========================================================
+    state["kp_prev"] = kp.clone()
+
+    # =========================================================
+    # DEBUG
+    # =========================================================
+    if debug:
+        print("\n[🎬 NOWARP CINEMATIC]")
+        print(f"angle_raw: {angle_raw.mean().item():.6f}")
+        print(f"angle: {angle.mean().item():.6f}")
+        print(f"motion: {motion.mean().item():.6f}")
+        print(f"pivot: {pivot[0,0].tolist()}")
+
+    return kp, state
 
 
 def cinematic_motion_graph_v3(
@@ -255,7 +444,8 @@ def cinematic_motion_graph_v3(
     body_ids=(5,6,7,8,9,10,11,12),
     rotation_strength=0.35,
     rotation_smooth=0.15,
-    head_lock=True
+    head_lock=True,
+    debug=False
 ):
     B, N, _ = kp.shape
 
@@ -306,10 +496,8 @@ def cinematic_motion_graph_v3(
         (r_hp.sum(dim=-1) == 0)
     ).view(B, 1, 1)
 
-    if hips_missing.any():
-        l_sh = kp[:, 5, :2]
-        r_sh = kp[:, 6, :2]
-
+    l_sh = kp[:, 5, :2]
+    r_sh = kp[:, 6, :2]
     shoulder_center = (l_sh + r_sh) * 0.5
 
     # approx torso length
@@ -380,83 +568,27 @@ def cinematic_motion_graph_v3(
     # =========================================================
     state["kp_prev"] = kp.clone()
 
-    return kp, state
+    if debug:
+        angle_deg = angle.mean().item() * 57.2958
+        raw_deg = angle_raw.mean().item() * 57.2958
 
+        motion_val = motion.mean().item()
+        strength_val = dynamic_strength.mean().item()
 
-def cinematic_motion_graph_v1(
-    kp,
-    state,
-    head_ids=(0,1,2,3,4),
-    body_ids=(5,6,7,8,9,10,11,12),
-    rotation_strength=0.35,
-    rotation_smooth=0.15,
-    head_lock=True
-):
-    B, N, _ = kp.shape
+        pivot_mean = pivot.mean(dim=1)[0]
 
-    # =========================================================
-    # INIT STATE
-    # =========================================================
-    if state is None:
-        return kp, {
-            "kp_prev": kp.clone(),
-            "angle": torch.zeros((B, 1, 1), device=kp.device)
-        }
+        print("\n[🎯 TORSO ROTATION DEBUG]")
+        print(f"angle_raw_deg: {raw_deg:.3f}")
+        print(f"angle_smooth_deg: {angle_deg:.3f}")
+        print(f"motion: {motion_val:.6f}")
+        print(f"rotation_strength: {strength_val:.4f}")
 
-    kp_prev = state["kp_prev"]
+        print(f"pivot: ({pivot_mean[0].item():.3f}, {pivot_mean[1].item():.3f})")
 
-    # =========================================================
-    # 1. TORSO ROTATION ESTIMATION
-    # =========================================================
-    angle_raw, torso_vec = compute_torso_rotation_delta( kp, state.get("torso_vec_prev") )
-
-    state["torso_vec_prev"] = torso_vec
-
-    angle_raw = angle_raw.unsqueeze(-1).unsqueeze(-1)
-
-    # smooth rotation (CRITICAL for stability)
-    angle = (
-        state["angle"] * (1 - rotation_smooth)
-        + angle_raw * rotation_smooth
-    )
-
-    state["angle"] = angle
-
-    # =========================================================
-    # 2. PIVOT = pelvis center
-    # =========================================================
-    pivot = kp[:, [11, 12], :2].mean(dim=1, keepdim=True)
-
-    # =========================================================
-    # 3. APPLY ROTATION ONLY TO UPPER BODY
-    # =========================================================
-    upper_ids = [5,6,7,8,9,10]
-
-    kp_rot = kp.clone()
-
-    kp_rot[:, upper_ids, :2] = rotate_points_around_pivot(
-        kp[:, upper_ids, :2],
-        pivot,
-        angle * rotation_strength
-    )
-
-    kp = kp_rot
-
-    # =========================================================
-    # 4. HEAD LOCK (optional cinematic realism)
-    # =========================================================
-    if head_lock:
-        kp[:, head_ids, :2] = kp_prev[:, head_ids, :2]
-
-    # =========================================================
-    # 5. STABILITY CLAMP (important)
-    # =========================================================
-    kp[..., :2] = torch.nan_to_num(kp[..., :2], nan=0.0)
-    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
-
-    # =========================================================
-    # 6. UPDATE MEMORY
-    # =========================================================
-    state["kp_prev"] = kp.clone()
+        # stabilité du vecteur torso
+        if state.get("torso_vec_prev") is not None:
+            vec = torso_vec[0]
+            print(f"torso_vec: ({vec[0].item():.3f}, {vec[1].item():.3f})")
 
     return kp, state
+
