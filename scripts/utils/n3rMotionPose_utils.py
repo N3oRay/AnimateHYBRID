@@ -2307,7 +2307,7 @@ def update_sequence_from_keypoints_batch(
     prev_keypoints=None,
     state=None,
     profile=None,
-    time_scale=0.5,
+    time_scale=0.3,
     max_velocity=0.05,
     camera_lock=0.5,
     debug=False,
