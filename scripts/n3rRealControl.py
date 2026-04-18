@@ -41,7 +41,7 @@ from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose,
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, gaussian_blur
 
-from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_sequence_from_keypoints_batch, update_keypoints_from_pose, update_sequence_from_keypoints_batch
+from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_from_keypoints_batch, update_keypoints_from_pose, update_sequence_from_keypoints_batch
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -373,6 +373,7 @@ def main(args):
             # ---------------- Frames principales ----------------
             prev_keypoints = None # motion Open Pose
             current_keypoints = None # init None
+            state = None
             for f in range(num_fraps_per_image):
                 if stop_generation:
                     break
@@ -473,12 +474,12 @@ def main(args):
                                 if sequence is not None:
                                     # utilisation sequence
                                     print("[INFO] *********** SEQUENCE: update_sequence_from_keypoints_batch")
-                                    current_keypoints = update_sequence_from_keypoints_batch(sequence=sequence, frame_idx=frame_counter, prev_keypoints=prev_keypoints, debug=True, debug_dir=output_dir, image_size=image_size)
+                                    current_keypoints, state =  update_sequence_from_keypoints_batch(sequence=sequence, frame_idx=frame_counter, prev_keypoints=prev_keypoints, state=state, debug=True, debug_dir=output_dir, image_size=image_size)
                                 else:
                                     # utilisation uniquement des keypoints_tensor
-                                    print("[INFO] *********** SEQUENCE NONE: update_pose_sequence_from_keypoints_batch")
-                                    current_keypoints = update_pose_sequence_from_keypoints_batch( keypoints_tensor=current_keypoints,
-                                                                                                prev_keypoints=prev_keypoints, frame_idx=frame_counter, alpha=0.5, add_motion=True, debug=True )
+                                    print("[INFO] *********** SEQUENCE NONE: update_pose_from_keypoints_batch")
+                                    current_keypoints, state = update_pose_from_keypoints_batch( keypoints_tensor=current_keypoints,
+                                                                                                state=state, frame_idx=frame_counter, debug=True )
 
                                 # 🔹 Appliquer le mouvement du haut du corps / OpenPose - apply_pose_driven_motion_stable or apply_pose_driven_motion_ultra2
                                 latents = apply_pose_driven_motion_ultra2(
