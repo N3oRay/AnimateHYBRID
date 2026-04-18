@@ -80,6 +80,7 @@ class Pose:
         # -----------------------------
         # Mapping global des points faciaux
         # -----------------------------
+
         self.FACIAL_POINT_IDX = {
             'nose': 0,
             'neck': 1,
@@ -90,7 +91,11 @@ class Pose:
             'left_elbow': 6,
             'left_wrist': 7,
             'right_hip': 8,
+            'right_knee': 9, # 9	genou droit (right knee)
+            'right_ankle': 10, # 10	cheville droite (right ankle)
             'left_hip': 11,
+            'left_knee': 12, # 12	genou gauche (left knee)
+            'left_ankle': 13, # 13	cheville gauche (left ankle)
             'right_eye': 14,
             'left_eye': 15,
             'right_ear': 16,

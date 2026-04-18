@@ -4,6 +4,149 @@
 import torch
 import torch.nn.functional as F
 
+# =========================================================
+# ACTOR FUNCTION MAP (EXTENSIBLE SYSTEM)
+# =========================================================
+
+def update_motion_state(
+    kp,
+    state,
+    head_ids=(0,1,2,3,4),
+    body_ids=(5,6,7,8,9,10,11,12),
+    anchor_smooth=0.12,
+    velocity_smooth=0.65,
+    drift_smooth=0.25,
+    head_lock=True,
+    head_lock_strength=1.0,
+    debug=None
+):
+    B, N, _ = kp.shape
+
+    # =========================================================
+    # INIT STATE
+    # =========================================================
+    if state is None:
+        return kp, {
+            "kp_prev": kp.clone(),
+            "velocity": torch.zeros_like(kp[..., :2]),
+            "anchor": kp[:, body_ids, :2].mean(dim=1, keepdim=True)
+        }
+
+    kp_prev = state["kp_prev"]
+
+    # safety
+    if kp_prev.shape != kp.shape:
+        kp_prev = kp.clone()
+
+    # =========================================================
+    # 1. VELOCITY (smoothed + stable)
+    # =========================================================
+    raw_velocity = kp[..., :2] - kp_prev[..., :2]
+
+    velocity = (
+        raw_velocity * (1 - velocity_smooth)
+        + state["velocity"] * velocity_smooth
+    )
+
+    state["velocity"] = velocity.clone()
+
+    # =========================================================
+    # 2. ANCHOR (camera stability core)
+    # =========================================================
+    anchor_now = kp[:, body_ids, :2].mean(dim=1, keepdim=True)
+
+    anchor_prev = state["anchor"]
+
+    # raw drift
+    drift_raw = anchor_now - anchor_prev
+
+    # SMOOTH drift (CRITICAL FIX for jitter reduction)
+    drift = (
+        drift_raw * (1 - drift_smooth)
+        + drift_raw * drift_smooth  # keeps slight responsiveness
+    )
+
+    # update anchor EMA (camera memory)
+    state["anchor"] = (
+        anchor_prev * (1 - anchor_smooth)
+        + anchor_now * anchor_smooth
+    )
+
+    # apply camera stabilization
+    kp[..., :2] -= drift
+
+    # =========================================================
+    # 3. HEAD LOCK (cinematic stability)
+    # =========================================================
+    if head_lock:
+        if head_lock_strength >= 1.0:
+            kp[:, head_ids, :2] = kp_prev[:, head_ids, :2]
+        else:
+            kp[:, head_ids, :2] = (
+                kp_prev[:, head_ids, :2] * head_lock_strength
+                + kp[:, head_ids, :2] * (1 - head_lock_strength)
+            )
+
+    # =========================================================
+    # 4. SAFETY CLAMP (NaN + explosion guard)
+    # =========================================================
+    kp[..., :2] = torch.nan_to_num(kp[..., :2], nan=0.0, posinf=1.0, neginf=0.0)
+    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
+
+    # =========================================================
+    # 5. UPDATE MEMORY
+    # =========================================================
+    state["kp_prev"] = kp.clone()
+
+    return kp, state
+
+ACTOR_LABELS = {
+    "base": "[BASE MOTION]",
+    "v6": "[V6 CINEMATIC]",
+    "v7": "[V7 PHYSICS LAYER]",
+    "v8": "[V8 ACTING SYSTEM]",
+    "v9": "[V9 FULL ACTOR SYSTEM]",
+}
+
+
+ACTOR_MODEL_SCHEDULE = [
+    (0,  "base"),
+    (1,  "v6"),
+    (6,  "v7"),
+    (11, "v8"),
+    (16, "v9"),
+]
+
+
+
+
+# =========================================================
+# ACTOR MODEL RESOLUTION (DIRECTOR SYSTEM)
+# =========================================================
+
+MOTION_MODEL_SCHEDULE = [
+    (0,  "locked"),
+    (5,  "stable"),
+    (10, "warp"),
+    (20, "cinematic"),
+    (35, "dynamic"),
+]
+
+def resolve_motion_model(frame_idx: int) -> str:
+    """
+    Motion system:
+    controls physics behavior over time (camera + velocity + warp).
+    """
+    model = "dynamic"
+
+    for threshold, name in MOTION_MODEL_SCHEDULE:
+        if frame_idx >= threshold:
+            model = name
+
+    return model
+
+
+
 """
 Motion Graph v5 – Cinematic Rig System”
 spine inertiel
@@ -110,96 +253,7 @@ def compute_torso_rotation_delta(kp, prev_vec=None, eps=1e-6):
 
 #---------------------------------------------------------------------
 
-def update_motion_state(
-    kp,
-    state,
-    head_ids=(0,1,2,3,4),
-    body_ids=(5,6,7,8,9,10,11,12),
-    anchor_smooth=0.12,
-    velocity_smooth=0.65,
-    drift_smooth=0.25,
-    head_lock=True,
-    head_lock_strength=1.0
-):
-    B, N, _ = kp.shape
 
-    # =========================================================
-    # INIT STATE
-    # =========================================================
-    if state is None:
-        return kp, {
-            "kp_prev": kp.clone(),
-            "velocity": torch.zeros_like(kp[..., :2]),
-            "anchor": kp[:, body_ids, :2].mean(dim=1, keepdim=True)
-        }
-
-    kp_prev = state["kp_prev"]
-
-    # safety
-    if kp_prev.shape != kp.shape:
-        kp_prev = kp.clone()
-
-    # =========================================================
-    # 1. VELOCITY (smoothed + stable)
-    # =========================================================
-    raw_velocity = kp[..., :2] - kp_prev[..., :2]
-
-    velocity = (
-        raw_velocity * (1 - velocity_smooth)
-        + state["velocity"] * velocity_smooth
-    )
-
-    state["velocity"] = velocity.clone()
-
-    # =========================================================
-    # 2. ANCHOR (camera stability core)
-    # =========================================================
-    anchor_now = kp[:, body_ids, :2].mean(dim=1, keepdim=True)
-
-    anchor_prev = state["anchor"]
-
-    # raw drift
-    drift_raw = anchor_now - anchor_prev
-
-    # SMOOTH drift (CRITICAL FIX for jitter reduction)
-    drift = (
-        drift_raw * (1 - drift_smooth)
-        + drift_raw * drift_smooth  # keeps slight responsiveness
-    )
-
-    # update anchor EMA (camera memory)
-    state["anchor"] = (
-        anchor_prev * (1 - anchor_smooth)
-        + anchor_now * anchor_smooth
-    )
-
-    # apply camera stabilization
-    kp[..., :2] -= drift
-
-    # =========================================================
-    # 3. HEAD LOCK (cinematic stability)
-    # =========================================================
-    if head_lock:
-        if head_lock_strength >= 1.0:
-            kp[:, head_ids, :2] = kp_prev[:, head_ids, :2]
-        else:
-            kp[:, head_ids, :2] = (
-                kp_prev[:, head_ids, :2] * head_lock_strength
-                + kp[:, head_ids, :2] * (1 - head_lock_strength)
-            )
-
-    # =========================================================
-    # 4. SAFETY CLAMP (NaN + explosion guard)
-    # =========================================================
-    kp[..., :2] = torch.nan_to_num(kp[..., :2], nan=0.0, posinf=1.0, neginf=0.0)
-    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
-
-    # =========================================================
-    # 5. UPDATE MEMORY
-    # =========================================================
-    state["kp_prev"] = kp.clone()
-
-    return kp, state
 
 def compute_torso_rotation(kp, body_ids=(5,6,7,8,9,10,11,12)):
     """
@@ -226,22 +280,22 @@ def compute_torso_rotation(kp, body_ids=(5,6,7,8,9,10,11,12)):
     return angle
 
 
-def rotate_points_around_pivot(points, pivot, angle, name="ROT"):
+def rotate_points_around_pivot(points, pivot, angle, name="ROT", debug=None):
     """
     2D rotation (stable, batch-safe) + debug
     """
 
     s = torch.sin(angle)
     c = torch.cos(angle)
-
-    print(f"[{name}] angle: {angle}")
-    print(f"[{name}] pivot: {pivot}")
-    print(f"[{name}] points shape: {points.shape}")
+    if debug:
+        print(f"[{name}] angle: {angle}")
+        print(f"[{name}] pivot: {pivot}")
+        print(f"[{name}] points shape: {points.shape}")
 
     # translate
     p = points - pivot
-
-    print(f"[{name}] pre-translate sample: {p[0] if p.ndim > 1 else p}")
+    if debug:
+        print(f"[{name}] pre-translate sample: {p[0] if p.ndim > 1 else p}")
 
     x = p[..., 0]
     y = p[..., 1]
@@ -250,8 +304,8 @@ def rotate_points_around_pivot(points, pivot, angle, name="ROT"):
     y_new = x * s + y * c
 
     out = torch.stack([x_new, y_new], dim=-1) + pivot
-
-    print(f"[{name}] post-rotate sample: {out[0] if out.ndim > 1 else out}")
+    if debug:
+        print(f"[{name}] post-rotate sample: {out[0] if out.ndim > 1 else out}")
 
     return out
 
@@ -590,18 +644,14 @@ def cinematic_motion_graph_v7(
     head_ids=(0,1,2,3,4),
     upper_ids=(5,6,7,8,9,10),
     hip_ids=(11,12),
-
     rotation_strength=1.4,
     motion_sensitivity=7.0,
-
     # physics params
     angular_damping=0.88,
     angular_inertia=0.92,
     spring_strength=0.18,
-
     head_lag=0.75,
     max_deg=28.0,
-
     debug=False
 ):
     B, N, _ = kp.shape
@@ -1020,4 +1070,137 @@ def cinematic_motion_graph_v3(
             print(f"torso_vec: ({vec[0].item():.3f}, {vec[1].item():.3f})")
 
     return kp, state
+
+
+def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
+
+    import inspect
+    import torch
+
+    # =========================
+    # SAFE MODEL RESOLUTION
+    # =========================
+    try:
+        rmodel = resolve_actor_model(frame_idx)
+    except Exception as e:
+        if debug:
+            print(f"[⚠ resolve_actor_model failed] {e}")
+        rmodel = "v7"
+
+    fn = ACTOR_PIPELINE.get(rmodel, update_motion_state)
+    label = ACTOR_LABELS.get(rmodel, "[UNKNOWN MODEL]")
+
+    # =========================
+    # DEBUG HEADER
+    # =========================
+    if debug:
+        print("\n[🎬 ACTOR PIPELINE] =====================================")
+        print(f"frame_idx : {frame_idx}")
+        print(f"model     : {rmodel}")
+        print(f"profile   : {profile}")
+        print(f"layer     : {label}")
+        print("========================================================")
+
+    # =========================
+    # SAFE STATE INIT
+    # =========================
+    if state is None:
+        state = {}
+
+    kp_prev = state.get("kp_prev", kp.clone())
+
+    state.setdefault("kp_prev", kp_prev)
+
+    # FIX: velocity always valid shape (B,N,2)
+    state.setdefault(
+        "velocity",
+        torch.zeros_like(kp[..., :2])
+    )
+
+    # =========================
+    # SAFE ARG INSPECTION
+    # (évite crash frame_idx / debug / velocity mismatch)
+    # =========================
+    try:
+        sig = inspect.signature(fn)
+        kwargs = {}
+
+        if "frame_idx" in sig.parameters:
+            kwargs["frame_idx"] = frame_idx
+        if "debug" in sig.parameters:
+            kwargs["debug"] = debug
+        if "profile" in sig.parameters:
+            kwargs["profile"] = profile
+
+        result = fn(kp, state, **kwargs)
+
+    except TypeError as e:
+        if debug:
+            print(f"[⚠ ACTOR SIGNATURE MISMATCH] {e}")
+            print("[↩ fallback update_motion_state]")
+        result = update_motion_state(kp, state)
+
+    except Exception as e:
+        if debug:
+            print(f"[⚠ ACTOR ERROR] model={rmodel} -> fallback base motion")
+            print(f"error: {e}")
+        result = update_motion_state(kp, state)
+
+    # =========================
+    # NORMALIZE OUTPUT
+    # =========================
+    if isinstance(result, tuple):
+        kp_out, new_state = result
+    else:
+        kp_out, new_state = result, state
+
+    if new_state is None:
+        new_state = {}
+
+    # =========================
+    # SAFE STATE UPDATE (IMPORTANT FIX)
+    # =========================
+    new_state["kp_prev"] = kp_out.clone()
+
+    # FIX: avoid velocity/angle crash in downstream v6/v7
+    if "velocity" not in new_state:
+        new_state["velocity"] = torch.zeros_like(kp_out[..., :2])
+
+    if "angle" not in new_state:
+        new_state["angle"] = 0.0
+
+    # =========================
+    # DEBUG MOTION
+    # =========================
+    if kp_prev is not None:
+        delta = (kp_out[..., :2] - kp_prev[..., :2]).abs().mean().item()
+        print(f"[DEBUG] motion_delta_mean: {delta:.6f}")
+
+    return kp_out, new_state
+
+
+
+
+
+def resolve_actor_model(frame_idx: int) -> str:
+    """
+    Director timeline system:
+    progressive acting complexity over time.
+    """
+    model = "v9"
+
+    for threshold, name in ACTOR_MODEL_SCHEDULE:
+        if frame_idx >= threshold:
+            model = name
+
+    return model
+
+
+ACTOR_PIPELINE = {
+    "base": update_motion_state,
+    "v6": cinematic_motion_graph_v6,
+    "v7": cinematic_motion_graph_v7,
+    "v8": cinematic_motion_graph_v8,
+    "v9": actor_system_v9,
+}
 

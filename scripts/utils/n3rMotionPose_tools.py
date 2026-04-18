@@ -165,6 +165,8 @@ def feather_outside_only_alpha(mask, radius=5, sigma=2.0):
 
     return torch.clamp(out, 0, 1)
 
+
+
 def debug_draw_openpose_skeleton(
     keypoints_tensor,
     debug_dir,
@@ -191,13 +193,27 @@ def debug_draw_openpose_skeleton(
     def to_pixel(x, y):
         return int(x * W), int(y * H)
 
+    """
+    'right_shoulder': 2,
+            'right_elbow': 3,
+            'right_wrist': 4,
+            'left_shoulder': 5,
+            'left_elbow': 6,
+            'left_wrist': 7,
+    'mouth_left': 48,    # coin gauche des lèvres supérieures
+            'mouth_right': 49,   # coin droit des lèvres supérieures
+            'mouth_top': 50,     # index approximatif du haut de la bouche (à ajuster selon ton keypoints)
+            'mouth_bottom': 51,  # index approximatif du bas de la bouche
+    """
+
     COLORS = {
-        "head": (255, 0, 255),
-        "eyes": (0, 0, 255),
+        "head": (255, 0, 255),  # 'nose': 0, 'right_ear': 16, 'left_ear': 17, 'mouth': 18,
+        "eyes": (0, 0, 255),    # 'right_eye': 14, 'left_eye': 15,
         "nose": (128, 0, 128),
         "arms_r": (0, 200, 0),
         "arms_l": (0, 255, 0),
-        "torso": (255, 0, 0),
+        "torso": (255, 0, 0),  # 'neck': 1,  'chin': 21, 'left_side_neck': 22, 'right_side_neck': 23, 'anchor_neck': 24,
+        "hip": (255, 64, 64), #'right_hip': 8, 'left_hip': 11,
         "legs_r": (0, 255, 255),
         "legs_l": (0, 200, 255),
         "default": (200, 200, 200)
@@ -225,8 +241,10 @@ def debug_draw_openpose_skeleton(
             color = COLORS["arms_r"]
         elif i in [5,6,7,20]:
             color = COLORS["arms_l"]
-        elif i in [1,8,11,21,22,23,24]:
+        elif i in [1,21,22,23,24]:
             color = COLORS["torso"]
+        elif i in [8,11]:
+            color = COLORS["hip"]
         elif i in [9,10]:
             color = COLORS["legs_r"]
         elif i in [12,13]:
@@ -262,8 +280,10 @@ def debug_draw_openpose_skeleton(
             color = COLORS["arms_r"]
         elif i in [5,6,7,20]:
             color = COLORS["arms_l"]
-        elif i in [1,8,11,21,22,23,24]:
+        elif i in [1,21,22,23,24]:
             color = COLORS["torso"]
+        elif i in [8,11]:
+            color = COLORS["hip"]
         elif i in [9,10]:
             color = COLORS["legs_r"]
         elif i in [12,13]:

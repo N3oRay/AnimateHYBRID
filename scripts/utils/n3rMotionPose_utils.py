@@ -11,7 +11,7 @@ from .n3rControlNet import create_canny_control, control_to_latent, match_latent
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
 
-from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v6, cinematic_motion_graph_v7, cinematic_motion_graph_v8, actor_system_v9
+from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v6, cinematic_motion_graph_v7, cinematic_motion_graph_v8, actor_system_v9, apply_actor_model, resolve_motion_model
 
 from .n3rMotionPoseClass import Pose
 import numpy as np
@@ -188,6 +188,7 @@ def update_keypoints_from_pose(
     left_wrist, right_wrist = pair(wrists_coords, debug=debug)
     left_hip, right_hip = pair(hips_coords, debug=debug)
     left_hip, right_hip, hips_reconstructed = reconstruct_hips( left_hip, right_hip, left_shoulder, right_shoulder, image_size, image_size, debug=debug )
+
     left_eye, right_eye = pair(eye_coords, debug=debug)
     left_ear, right_ear  = pair(ear_coords, debug=debug)
 
@@ -202,9 +203,17 @@ def update_keypoints_from_pose(
             cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
 
             offset_y = H * 0.18
+            offset_y2 = H * 0.24
+            offset_y3 = H * 0.30
 
-            left_hip  = (cx - 40, cy + offset_y)
-            right_hip = (cx + 40, cy + offset_y)
+            left_hip  = (cx - 50, cy + offset_y)
+            right_hip = (cx + 50, cy + offset_y)
+
+            left_knee  = (cx - 65, cy + offset_y2)
+            right_knee = (cx + 65, cy + offset_y2)
+
+            left_ankle = (cx - 80, cy + offset_y3)
+            right_ankle = (cx + 80, cy + offset_y3)
 
             if debug:
                 print("🦿 HIP RECONSTRUCTED")
@@ -262,6 +271,7 @@ def update_keypoints_from_pose(
     # =========================================================
     # 🔹 APPLY UPDATES
     # =========================================================
+
     updates = {
         0: ("nose", nose_coords),
         1: ("neck", neck_map.get("neck")),
@@ -275,7 +285,12 @@ def update_keypoints_from_pose(
         7: ("left_wrist", left_wrist),
 
         8: ("right_hip", right_hip),
+        9: ("right_knee", right_knee),
+        10: ("right_ankle", right_ankle),
+
         11: ("left_hip", left_hip),
+        12: ("left_knee", left_knee),
+        13: ("left_ankle", left_ankle),
 
         14: ("right_eye", right_eye),
         15: ("left_eye", left_eye),
@@ -1283,7 +1298,7 @@ def apply_global_pose(
     # 🔹 DEBUG
     # =========================================================
     if debug:
-        print("\n[DEBUG][GLOBAL] =====================")
+        print("\n[DEBUG][GLOBAL] ======= apply_global_pose ==============")
         print(f"Time: {time.time()-t0:.4f}s")
         print(f"Strength: {strength}")
         print(f"Angle spine: {angle.mean().item():.5f}")
@@ -1304,317 +1319,6 @@ def apply_global_pose(
             )
 
     return latents_out, delta_px, grid, grid_norm
-
-
-def apply_global_pose_check(
-    latents,
-    pose,
-    prev_pose=None,
-    H=None,
-    W=None,
-    device="cuda",
-    strength=0.4,
-    clamp=True,
-    debug=True,
-    debug_dir=None
-):
-    import time
-    import os
-    import torch
-    import torch.nn.functional as F
-    import torchvision
-
-    B = latents.shape[0]
-    device = latents.device
-
-    t0 = time.time()
-
-    # =========================================================
-    # 🔹 Identity fallback
-    # =========================================================
-    if prev_pose is None:
-        if debug:
-            print("[DEBUG][GLOBAL] No prev_pose → identity warp")
-
-        yy, xx = torch.meshgrid(
-            torch.arange(H, device=device),
-            torch.arange(W, device=device),
-            indexing="ij"
-        )
-        grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
-
-        return latents, torch.zeros((B, 1, 1, 2), device=device), grid, None
-
-    # =========================================================
-    # 🔹 Key torso joints
-    # =========================================================
-    key_joints = ["left_shoulder", "right_shoulder", "left_hip", "right_hip"]
-    idx_list = [pose.FACIAL_POINT_IDX[j] for j in key_joints]
-
-    pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)
-    prev_pts = torch.stack([prev_pose.get_point(i) for i in idx_list], dim=1)
-
-    # =========================================================
-    # 🔹 Center motion (translation)
-    # =========================================================
-    center = pts.mean(dim=1)
-    prev_center = prev_pts.mean(dim=1)
-
-    delta = center - prev_center
-
-    # =========================================================
-    # 🔹 Shoulder orientation (rotation estimate)
-    # =========================================================
-    cur_vec = pts[:, 1] - pts[:, 0]
-    prev_vec = prev_pts[:, 1] - prev_pts[:, 0]
-
-    cur_angle = torch.atan2(cur_vec[:, 1], cur_vec[:, 0])
-    prev_angle = torch.atan2(prev_vec[:, 1], prev_vec[:, 0])
-
-    angle_delta = (cur_angle - prev_angle).unsqueeze(-1)
-
-    # =========================================================
-    # 🔹 Temporal smoothing (inertia model)
-    # =========================================================
-    if not hasattr(pose, "_global_velocity"):
-        pose._global_velocity = torch.zeros_like(delta)
-
-    pose._global_velocity = 0.85 * pose._global_velocity + 0.15 * delta
-    delta = pose._global_velocity
-
-    # =========================================================
-    # 🔹 Pixel conversion
-    # =========================================================
-    delta_px = delta.clone()
-    delta_px[..., 0] *= W
-    delta_px[..., 1] *= H
-
-    # clamp soft
-    if clamp:
-        delta_px = torch.tanh(delta_px / 5.0) * 5.0
-
-    delta_px = delta_px.view(B, 1, 1, 2)
-
-    # =========================================================
-    # 🔹 Scale adaptatif (distance-aware)
-    # =========================================================
-    scale_ref = torch.norm(pts[:, 0] - pts[:, 1], dim=-1, keepdim=True)
-    scale_factor = torch.clamp(scale_ref, 0.05, 0.5).view(B, 1, 1, 1)
-
-    # =========================================================
-    # 🔹 Base grid
-    # =========================================================
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing="ij"
-    )
-
-    grid_raw = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
-
-    # =========================================================
-    # 🔹 Optional rotation warp (rigid-body effect)
-    # =========================================================
-    center_px = center.clone()
-    center_px[..., 0] *= W
-    center_px[..., 1] *= H
-    center_px = center_px.view(B, 1, 1, 2)
-
-    theta = angle_delta * strength * 0.5
-
-    cos_t = torch.cos(theta).view(B, 1, 1, 1)
-    sin_t = torch.sin(theta).view(B, 1, 1, 1)
-
-    x = grid_raw[..., 0:1] - center_px[..., 0:1]
-    y = grid_raw[..., 1:2] - center_px[..., 1:2]
-
-    x_rot = x * cos_t - y * sin_t
-    y_rot = x * sin_t + y * cos_t
-
-    grid_raw = torch.cat(
-        [x_rot + center_px[..., 0:1],
-         y_rot + center_px[..., 1:2]],
-        dim=-1
-    )
-
-    # =========================================================
-    # 🔹 Final warp (NO MAGIC CONSTANTS)
-    # =========================================================
-    GLOBAL_GAIN = 1.8
-
-    grid_warp = grid_raw + delta_px * strength * GLOBAL_GAIN * scale_factor
-
-    # =========================================================
-    # 🔹 Normalize for grid_sample
-    # =========================================================
-    grid_norm = grid_warp.clone()
-    grid_norm[..., 0] = 2.0 * grid_norm[..., 0] / (W - 1) - 1.0
-    grid_norm[..., 1] = 2.0 * grid_norm[..., 1] / (H - 1) - 1.0
-
-    # =========================================================
-    # 🔹 Apply warp
-    # =========================================================
-    latents_out = F.grid_sample(latents, grid_norm, align_corners=True)
-
-    # =========================================================
-    # 🔹 DEBUG
-    # =========================================================
-    if debug:
-        print("\n[DEBUG][GLOBAL] ===============================")
-        print(f"[DEBUG][GLOBAL] Time: {time.time() - t0:.5f}s")
-        print(f"[DEBUG][GLOBAL] Strength: {strength}")
-
-        for i, j in enumerate(key_joints):
-            move_px = (pts[:, i] - prev_pts[:, i]) * torch.tensor([W, H], device=device)
-            print(f"[DEBUG][GLOBAL] {j} movement px: {move_px.squeeze().tolist()}")
-
-        print(f"[DEBUG][GLOBAL] Mean delta_px: {delta_px.abs().mean().item():.4f}")
-        print(f"[DEBUG][GLOBAL] Angle delta: {angle_delta.mean().item():.4f}")
-
-        print(f"[DEBUG][GLOBAL] grid_raw min/max: {grid_raw.min().item():.2f} / {grid_raw.max().item():.2f}")
-        print(f"[DEBUG][GLOBAL] grid_warp min/max: {grid_warp.min().item():.2f} / {grid_warp.max().item():.2f}")
-
-        # optional debug image
-        if debug_dir is not None:
-            os.makedirs(debug_dir, exist_ok=True)
-
-            img = latents_out[0].detach().float().cpu()
-            if img.shape[0] > 3:
-                img = img[:3]
-
-            torchvision.utils.save_image(
-                (img + 1.0) / 2.0,
-                os.path.join(debug_dir, "global_pose_debug.png")
-            )
-
-            print(f"[DEBUG][GLOBAL] Saved: {debug_dir}/global_pose_debug.png")
-
-    return latents_out, delta_px, grid_raw, grid_norm
-
-def apply_global_pose_warp(
-    latents,
-    pose,
-    prev_pose=None,
-    H=None,
-    W=None,
-    device="cuda",
-    strength=0.4,
-    clamp=True,
-    debug=True,
-    debug_dir=None
-):
-
-    B = latents.shape[0]
-    device = latents.device
-
-    t0 = time.time()
-
-    # =========================================================
-    # 🔹 No previous pose → no motion
-    # =========================================================
-    if prev_pose is None:
-        if debug:
-            print("[DEBUG][GLOBAL] No prev_pose → identity warp")
-
-        yy, xx = torch.meshgrid(
-            torch.arange(H, device=device),
-            torch.arange(W, device=device),
-            indexing='ij'
-        )
-        grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
-
-        return latents, torch.zeros((B,1,1,2), device=device), grid, None
-
-    # =========================================================
-    # 🔹 Torso joints
-    # =========================================================
-    key_joints = ["left_shoulder","right_shoulder","left_hip","right_hip"]
-    idx_list = [pose.FACIAL_POINT_IDX[j] for j in key_joints]
-
-    pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)
-    prev_pts = torch.stack([prev_pose.get_point(i) for i in idx_list], dim=1)
-
-    center = pts.mean(dim=1)
-    prev_center = prev_pts.mean(dim=1)
-
-    delta = center - prev_center
-
-    # pixels
-    delta_px = delta.clone()
-    delta_px[..., 0] *= W
-    delta_px[..., 1] *= H
-
-    if clamp:
-        delta_px = torch.tanh(delta_px / 5.0) * 5.0
-
-    delta_px = delta_px.view(B,1,1,2)
-
-    # =========================================================
-    # 🔹 Grid (RAW)
-    # =========================================================
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing='ij'
-    )
-
-    grid_raw = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
-
-    # =========================================================
-    # 🔹 Warp
-    # =========================================================
-    grid_warp = grid_raw + delta_px * strength * 3.0
-
-    # =========================================================
-    # 🔹 Normalize for grid_sample
-    # =========================================================
-    grid_norm = grid_warp.clone()
-    grid_norm[..., 0] = 2.0 * grid_norm[..., 0] / (W - 1) - 1.0
-    grid_norm[..., 1] = 2.0 * grid_norm[..., 1] / (H - 1) - 1.0
-
-    # =========================================================
-    # 🔹 Apply warp
-    # =========================================================
-    latents_out = F.grid_sample(latents, grid_norm, align_corners=True)
-
-    # =========================================================
-    # 🔹 DEBUG
-    # =========================================================
-    if debug:
-
-        print("\n[DEBUG][GLOBAL] ===============================")
-        print(f"[DEBUG][GLOBAL] Time: {time.time() - t0:.5f}s")
-        print(f"[DEBUG][GLOBAL] Strength: {strength}")
-
-        # --- joint motion ---
-        for i, j in enumerate(key_joints):
-            move_px = (pts[:, i, :] - prev_pts[:, i, :]) * torch.tensor([W, H], device=device)
-            print(f"[DEBUG][GLOBAL] {j} movement (px): {move_px.squeeze().tolist()}")
-
-        print(f"[DEBUG][GLOBAL] Mean delta_px: {delta_px.abs().mean().item():.4f}")
-
-        # --- sanity checks ---
-        print(f"[DEBUG][GLOBAL] grid_raw min/max: {grid_raw.min().item():.2f} / {grid_raw.max().item():.2f}")
-        print(f"[DEBUG][GLOBAL] grid_warp min/max: {grid_warp.min().item():.2f} / {grid_warp.max().item():.2f}")
-
-        # =====================================================
-        # 🔹 optional debug image
-        # =====================================================
-        if debug_dir is not None:
-            os.makedirs(debug_dir, exist_ok=True)
-
-            img = latents_out[0].detach().float().cpu()
-            if img.shape[0] > 3:
-                img = img[:3]
-
-            torchvision.utils.save_image(
-                (img + 1.0) / 2.0,
-                os.path.join(debug_dir, "global_pose_debug.png")
-            )
-
-            print(f"[DEBUG][GLOBAL] Saved: {debug_dir}/global_pose_debug.png")
-
-    return latents_out, delta_px, grid_raw, grid_norm
 
 
 #------------------------------------------------------------------------------------------
@@ -2585,252 +2289,268 @@ MOTION_PROFILES = {
 }
 
 
-# =========================================================
-# ACTOR MODEL RESOLUTION (DIRECTOR SYSTEM)
-# =========================================================
-
-ACTOR_MODEL_SCHEDULE = [
-    (0,  "base"),
-    (1,  "v6"),
-    (6,  "v7"),
-    (11, "v8"),
-    (16, "v9"),
-]
-
-
-def resolve_actor_model(frame_idx: int) -> str:
-    """
-    Director timeline system:
-    progressive acting complexity over time.
-    """
-    model = "v9"
-
-    for threshold, name in ACTOR_MODEL_SCHEDULE:
-        if frame_idx >= threshold:
-            model = name
-
-    return model
-
-
-MOTION_MODEL_SCHEDULE = [
-    (0,  "locked"),
-    (5,  "stable"),
-    (10, "warp"),
-    (20, "cinematic"),
-    (35, "dynamic"),
-]
-
-
-def resolve_motion_model(frame_idx: int) -> str:
-    """
-    Motion system:
-    controls physics behavior over time (camera + velocity + warp).
-    """
-    model = "dynamic"
-
-    for threshold, name in MOTION_MODEL_SCHEDULE:
-        if frame_idx >= threshold:
-            model = name
-
-    return model
-
-
-# =========================================================
-# ACTOR FUNCTION MAP (EXTENSIBLE SYSTEM)
-# =========================================================
-
-ACTOR_PIPELINE = {
-    "base": update_motion_state,
-    "v6": cinematic_motion_graph_v6,
-    "v7": cinematic_motion_graph_v7,
-    "v8": cinematic_motion_graph_v8,
-    "v9": actor_system_v9,
-}
-
-
-ACTOR_LABELS = {
-    "base": "[BASE MOTION]",
-    "v6": "[V6 CINEMATIC]",
-    "v7": "[V7 PHYSICS LAYER]",
-    "v8": "[V8 ACTING SYSTEM]",
-    "v9": "[V9 FULL ACTOR SYSTEM]",
-}
-
 
 # =========================================================
 # MAIN ENTRY
 # =========================================================
 
-def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
-
-    rmodel = resolve_actor_model(frame_idx)
-
-    fn = ACTOR_PIPELINE.get(rmodel, update_motion_state)
-    label = ACTOR_LABELS.get(rmodel, "[UNKNOWN MODEL]")
-
-    if debug:
-        print("\n[🎬 ACTOR PIPELINE] =====================================")
-        print(f"frame_idx : {frame_idx}")
-        print(f"model     : {rmodel}")
-        print(f"profile   : {profile}")
-        print(f"layer     : {label}")
-        print("========================================================")
-
-    try:
-        result = fn(kp, state, debug=debug)
-
-    except Exception as e:
-        print(f"[⚠️ ACTOR ERROR] model={rmodel} -> fallback base motion")
-        print(f"error: {e}")
-        return update_motion_state(kp, state)
-
-    if isinstance(result, tuple):
-        kp_out, new_state = result
-
-        if state is not None and "kp_prev" in state:
-            delta = (kp_out[..., :2] - state["kp_prev"][..., :2]).abs().mean().item()
-            print(f"[DEBUG] motion_delta_mean: {delta:.6f}")
-
-        return kp_out, new_state
-
-    return result
-
-
+def ensure_kp3(kp):
+    # kp: (B,N,2) or (B,N,3)
+    if kp.shape[-1] == 2:
+        conf = torch.ones_like(kp[..., :1])
+        kp = torch.cat([kp, conf], dim=-1)
+    return kp
 
 def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
     prev_keypoints=None,
     state=None,
-    profile=None, # motion_model
+    profile=None,
     time_scale=0.5,
-    max_velocity=0.008,
-    camera_lock=0.7,
+    max_velocity=0.05,
+    camera_lock=0.5,
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)
 ):
 
+    # =========================================================
+    # 0. STATE SAFE INIT
+    # =========================================================
+    if state is None:
+        state = {}
 
+    def safe_kp(kp):
+        if kp is None:
+            return None
+
+        if not torch.is_tensor(kp):
+            return None
+
+        kp = kp.clone()
+        kp = torch.nan_to_num(kp, nan=0.0)
+
+        # force (B,N,2)
+        if kp.dim() == 3:
+            kp = kp[..., :2]
+
+        return kp
 
     # =========================================================
-    # 0. PROFILE
+    # REF KP SAFE
     # =========================================================
-    if profile is not None:
-        motion_model = profile # manual override
+    ref_kp = safe_kp(prev_keypoints)
+
+    if ref_kp is None and len(sequence) > 0:
+        ref_kp = safe_kp(sequence[0])
+
+    if ref_kp is not None:
+        B, N, _ = ref_kp.shape
+
+        state.setdefault("kp_prev", ref_kp.clone())
+        state.setdefault("velocity", torch.zeros((B, N, 2), device=ref_kp.device))
+
+        # 🔹 angular_vel init propre
+        state.setdefault("angular_vel", torch.zeros((B, N, 2), device=ref_kp.device))
+
+        # ✅ FIX CRASH ICI: anchor toujours (B,1,2)
+        state.setdefault(
+            "anchor",
+            ref_kp[..., :2].mean(dim=1, keepdim=True)
+        )
     else:
-        motion_model = resolve_motion_model(frame_idx)
+        state.setdefault("kp_prev", None)
+        state.setdefault("velocity", None)
+        state.setdefault("angular_vel", None)  # si pas de ref_kp, None
+        state.setdefault("anchor", torch.zeros((1,1,2)))
 
-    p = MOTION_PROFILES[motion_model]
+    state.setdefault("angle", 0.0)
+    state.setdefault("rotation", 0.0)
+    state.setdefault("initialized", True)
 
-    time_scale = p["time_scale"]
-    camera_lock = p["camera_lock"]
-    max_velocity = p["max_velocity"]
-    rotation_gain = p["rotation_gain"]
-    cinematic_start = p["cinematic_start"]
+    # =========================================================
+    # 1. PROFILE SAFE
+    # =========================================================
+    motion_model = profile or resolve_motion_model(frame_idx)
+
+    p = MOTION_PROFILES.get(motion_model, {})
+
+    time_scale = p.get("time_scale", time_scale)
+    camera_lock = p.get("camera_lock", camera_lock)
+    max_velocity = p.get("max_velocity", max_velocity)
+    rotation_gain = p.get("rotation_gain", 1.0)
 
 
     # =========================================================
-    # 1. TIME WARP
+    # 2. TIME WARP
     # =========================================================
     scaled = frame_idx * time_scale
-
     i0 = max(0, min(int(scaled), len(sequence) - 1))
     i1 = min(i0 + 1, len(sequence) - 1)
-
     t = scaled - i0
 
     kp = (1 - t) * sequence[i0] + t * sequence[i1]
-    kp = torch.nan_to_num(kp.clone(), nan=0.0)
+    kp = torch.nan_to_num(kp, nan=0.0)
+
+    if kp.dim() == 3:
+        kp = kp[..., :2]
 
     B, N, _ = kp.shape
 
     # =========================================================
-    # 2. AUTO RESET
+    # DRIFT SAFE
     # =========================================================
-    if state is not None and "kp_prev" in state:
-        drift = torch.norm(kp - state["kp_prev"], dim=-1).mean()
+    kp_prev = state.get("kp_prev", None)
 
-        if drift > 0.2:
-            state = {
-                "kp_prev": kp.clone(),
-                "anchor": state.get("anchor", kp.mean(dim=1))
-            }
+    if kp_prev is not None and torch.is_tensor(kp_prev):
 
-    # =========================================================
-    # 3. CAMERA STABILIZATION
-    # =========================================================
-    if state is not None and "anchor" in state:
-        anchor = state["anchor"]
+        kp_prev = kp_prev[..., :2]
 
-        if torch.isfinite(anchor).all():
-            kp[..., :2] = kp[..., :2] * camera_lock + anchor * (1 - camera_lock)
+        minN = min(kp_prev.shape[1], kp.shape[1])
+
+        kp_xy = kp[:, :minN, :]
+        kp_prev_xy = kp_prev[:, :minN, :]
+
+        drift = torch.norm(kp_xy - kp_prev_xy, dim=-1).mean()
+    else:
+        drift = torch.tensor(0.0, device=kp.device)
+
 
     # =========================================================
-    # 4. PREV
+    # CAMERA STABILIZATION
     # =========================================================
-    prev_kp = state["kp_prev"] if state is not None else None
+    anchor = state.get("anchor", None)
+
+    if anchor is not None and torch.is_tensor(anchor):
+
+        if anchor.dim() == 2:
+            anchor = anchor.unsqueeze(1)  # (B,1,2)
+
+        anchor_xy = anchor[..., :2]
+
+        kp[..., :2] = kp[..., :2] * camera_lock + anchor_xy * (1 - camera_lock)
+
 
     # =========================================================
-    # 5. MOTION GRAPH ROUTING (V7 / V8 / V9)
+    # 6. ACTOR MODEL SAFE CALL
     # =========================================================
-    kp, new_state = apply_actor_model(kp, state, frame_idx=frame_idx, profile=motion_model)
+    try:
+        kp, new_state = apply_actor_model(
+            kp, state, frame_idx=frame_idx, profile=motion_model
+        )
+    except Exception as e:
+        print(f"[⚠ ACTOR FALLBACK] {e}")
+        new_state = state
 
     # =========================================================
-    # 6. DEBUG POST GRAPH
+    # 7. DEBUG POST GRAPH
     # =========================================================
-    if prev_kp is not None:
-        print("[DEBUG][POST GRAPH DELTA]", (kp[..., :2] - prev_kp[..., :2]).abs().mean().item())
+    if kp_prev is not None:
+        print("[DEBUG][POST GRAPH DELTA]",
+              (kp[..., :2] - kp_prev[..., :2]).abs().mean().item())
 
     # =========================================================
-    # 7. PHYSICS LIMIT
+    # 8. ROTATION SAFE
     # =========================================================
-    if prev_kp is not None:
-        delta = kp[..., :2] - prev_kp[..., :2]
+    if kp_prev is not None:
+        center = kp[..., :2].mean(dim=1, keepdim=True)
+
+        angle = 0.08 * math.sin(frame_idx * 0.05)
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+
+        rot = torch.tensor(
+            [[cos_a, -sin_a],
+             [sin_a,  cos_a]],
+            device=kp.device,
+            dtype=kp.dtype
+        )
+
+        kp_before = kp.clone()
+        xy = kp[..., :2] - center
+
+        kp[..., :2] = torch.einsum('bnc,cd->bnd', xy, rot) + center
+
+        delta_rot = kp[..., :2] - kp_before[..., :2]
+        dist_before = torch.norm(kp_before[..., :2] - center, dim=-1)
+
+        print("\n[DEBUG ROTATION]")
+        print(f"angle (rad): {angle:.6f}")
+        print(f"angle (deg): {angle * 57.2958:.2f}")
+        print(f"center mean: {center.mean().item():.6f}")
+        print(f"delta_rot mean: {delta_rot.abs().mean().item():.6f}")
+        print(f"delta_rot max: {delta_rot.abs().max().item():.6f}")
+        print(f"radius mean: {dist_before.mean().item():.6f}")
+
+    # =========================================================
+    # 9. PHYSICS LIMIT
+    # =========================================================
+    if kp_prev is not None:
+        delta = kp[..., :2] - kp_prev[..., :2]
         speed = torch.norm(delta, dim=-1, keepdim=True)
 
         speed = torch.where(speed < 1e-6, torch.ones_like(speed), speed)
 
-        scale = torch.clamp(max_velocity / speed, 0.0, 1.0)
+        scale = torch.clamp(max_velocity / speed, 0.1, 1.0)
 
-        kp[..., :2] = prev_kp[..., :2] + delta * scale
+        kp[..., :2] = kp_prev[..., :2] + delta * scale
+
+        print("\n[DEBUG PHYSICS LIMIT ***********************]")
+        print(f"delta mean: {delta.abs().mean().item():.6f}")
+        print(f"speed mean: {speed.mean().item():.6f}")
+        print(f"scale mean: {scale.mean().item():.6f}")
+        print(f"scale min/max: {scale.min().item():.6f}/{scale.max().item():.6f}")
 
     # =========================================================
-    # 8. ROTATION (POST PHYSICS)
+    # 10. POST ROTATION GAIN
     # =========================================================
-    if prev_kp is not None:
-        upper_ids = [5,6,7,8,9,10,11,12]
+
+    if kp_prev is not None:
+        # 'right_shoulder': 2, 'right_elbow': 3, 'right_wrist': 4,'left_shoulder': 5, 'left_elbow': 6, 'left_wrist': 7, 'right_hip': 8, 'left_hip': 11,
+        #upper_ids = [5,6,7,8,9,10,11,12]
+        upper_ids = [2,3,4,5,6,7,8,11]
+
+        upper_ids = [i for i in upper_ids if i < kp.shape[1]]
+
+        rotation_gain = min(rotation_gain, 0.7)
 
         kp[:, upper_ids, :2] = (
-            prev_kp[:, upper_ids, :2] +
-            (kp[:, upper_ids, :2] - prev_kp[:, upper_ids, :2]) * rotation_gain
+            kp_prev[:, upper_ids, :2] +
+            (kp[:, upper_ids, :2] - kp_prev[:, upper_ids, :2]) * rotation_gain
         )
 
     # =========================================================
-    # 9. DEBUG
+    # 11. DEBUG FINAL
     # =========================================================
     if debug:
         motion = 0.0
-        if prev_kp is not None:
-            motion = (kp[..., :2] - prev_kp[..., :2]).abs().mean()
+        if kp_prev is not None:
+            motion = (kp[..., :2] - kp_prev[..., :2]).abs().mean()
 
         print("\n[🎬 MOTION ENGINE V6/V7/V8/V9]")
         print(f"frame: {frame_idx}")
         print(f"Motion model: {motion_model}")
         print(f"motion_mean: {float(motion):.6f}")
 
-        if (motion_model in ["cinematic", "warp"]) and new_state is not None and "anchor" in new_state:
-            print(f"anchor: {new_state['anchor'].mean().item():.6f}")
-
         if frame_idx % 2 == 0 and debug_dir is not None:
             debug_draw_openpose_skeleton(
-                keypoints_tensor=kp,
+                keypoints_tensor=ensure_kp3(kp),
                 debug_dir=debug_dir,
                 frame_counter=frame_idx,
                 image_size=image_size
             )
 
-    return kp
+    # =========================================================
+    # 12. STATE UPDATE SAFE
+    # =========================================================
+    new_state = new_state or {}
+
+    new_state["kp_prev"] = kp.clone()
+
+    if "anchor" not in new_state or new_state["anchor"] is None:
+        new_state["anchor"] = kp.mean(dim=1)
+
+    return kp, new_state
 
 
 def update_sequence_from_keypoints_batch_stable(
@@ -2970,128 +2690,76 @@ def update_sequence_from_keypoints_batch_stable(
 
 
 
-def update_pose_sequence_from_keypoints_batch(
+def update_pose_from_keypoints_batch(
     keypoints_tensor,
-    prev_keypoints=None,
+    state=None,
     frame_idx=0,
-    alpha=0.9,
-    add_motion=True,
-    motion_scale=0.4,
-    freeze_threshold=0.0015,   # 🔥 NEW
-    freeze_strength=0.25,       # 0 = full freeze, 1 = no freeze
+    smooth=0.8,
+    motion_scale=0.01,
     debug=False
 ):
-
     kp = keypoints_tensor.clone()
     B, N, _ = kp.shape
 
     # =========================================================
-    # 🔹 1. TEMPORAL SMOOTHING
+    # INIT STATE
     # =========================================================
-    if prev_keypoints is not None:
-        kp = alpha * kp + (1 - alpha) * prev_keypoints
+    if state is None:
+        state = {
+            "kp_prev": kp.clone(),
+            "anchor": kp.mean(dim=1)
+        }
 
-    if not add_motion:
-        return kp
-
-    t = frame_idx * 0.03
-
-    # =========================================================
-    # 🔹 2. MOTION ENERGY ESTIMATION (NEW CORE)
-    # =========================================================
-    motion_energy = 0.0
-    if prev_keypoints is not None:
-        motion_energy = (kp - prev_keypoints).abs().mean()
+    prev_kp = state["kp_prev"]
+    anchor  = state["anchor"]
 
     # =========================================================
-    # 🔹 3. FREEZE GATE (soft)
+    # 1. TEMPORAL SMOOTHING (inertia)
     # =========================================================
-    freeze_gate = 1.0
-    if motion_energy < freeze_threshold:
-        # plus le mouvement est faible, plus on freeze
-        freeze_gate = motion_energy / freeze_threshold
-        freeze_gate = torch.clamp(torch.tensor(freeze_gate), 0.0, 1.0)
-
-        # inverse blending (freeze dominant)
-        freeze_gate = freeze_strength + (1 - freeze_strength) * freeze_gate
+    kp = smooth * kp + (1 - smooth) * prev_kp
 
     # =========================================================
-    # 🔹 4. GROUPS
+    # 2. GLOBAL STABILIZATION (anti drift)
     # =========================================================
-    pelvis_ids   = [11, 8]
-    spine_ids    = [1, 2, 5, 8]
-    shoulder_ids = [2, 5]
-    head_id      = 0
-    limb_ids     = list(range(min(N, 25)))
+    kp[..., :2] = 0.7 * kp[..., :2] + 0.3 * anchor.unsqueeze(1)
 
     # =========================================================
-    # 🔹 5. GLOBAL MOTION (reduced by freeze)
+    # 3. LIGHT NATURAL MOTION
     # =========================================================
-    slow_sway = 0.003 * math.sin(t * 0.6)
-    drift_x   = 0.001 * math.sin(t * 0.15)
-    drift_y   = 0.001 * math.cos(t * 0.13)
+    t = frame_idx * 0.05
 
-    global_offset = torch.zeros_like(kp[:, :, :2])
-    global_offset[..., 0] += slow_sway + drift_x
-    global_offset[..., 1] += drift_y
+    offset_x = motion_scale * torch.sin(torch.tensor(t, device=kp.device))
+    offset_y = motion_scale * torch.cos(torch.tensor(t * 0.7, device=kp.device))
 
-    kp[..., :2] += global_offset * motion_scale * freeze_gate
+    kp[..., 0] += offset_x
+    kp[..., 1] += offset_y
 
     # =========================================================
-    # 🔹 6. BREATHING (soft freeze-aware)
+    # 4. MICRO JITTER (very subtle)
     # =========================================================
-    breath = 0.004 * math.sin(t * 0.7)
-
-    kp[:, spine_ids, 1] += breath * freeze_gate
-    kp[:, shoulder_ids, 1] += breath * 0.6 * freeze_gate
+    kp[..., :2] += 0.001 * torch.randn_like(kp[..., :2])
 
     # =========================================================
-    # 🔹 7. SPINE WAVE
-    # =========================================================
-    spine_wave = 0.002 * math.sin(t * 0.8)
-
-    kp[:, spine_ids, 1] += spine_wave * freeze_gate
-    kp[:, spine_ids, 0] += spine_wave * 0.2 * freeze_gate
-
-    # =========================================================
-    # 🔹 8. HEAD MOTION (inertial + freeze)
-    # =========================================================
-    head_x = 0.0025 * math.sin(t * 0.9)
-    head_y = 0.0020 * math.cos(t * 0.85)
-
-    kp[:, head_id, 0] += head_x * freeze_gate
-    kp[:, head_id, 1] += head_y * freeze_gate
-
-    kp[:, head_id] += (kp[:, 2] - kp[:, 5]) * 0.03 * freeze_gate
-
-    # =========================================================
-    # 🔹 9. LIMBS (strong freeze sensitivity)
-    # =========================================================
-    limb_noise = 0.0006 * torch.randn_like(kp[:, limb_ids, :2])
-    kp[:, limb_ids, :2] += limb_noise * freeze_gate
-
-    # =========================================================
-    # 🔹 10. MICRO STABILIZATION (reduced when frozen)
-    # =========================================================
-    kp[..., :2] += torch.randn_like(kp[..., :2]) * 0.0004 * freeze_gate
-
-    # =========================================================
-    # 🔹 11. CLAMP
+    # 5. CLAMP (safety)
     # =========================================================
     kp[..., :2] = torch.clamp(kp[..., :2], -1.2, 1.2)
 
     # =========================================================
-    # 🔹 DEBUG
+    # UPDATE STATE
+    # =========================================================
+    state["kp_prev"] = kp.clone()
+    state["anchor"]  = kp.mean(dim=1)
+
+    # =========================================================
+    # DEBUG
     # =========================================================
     if debug:
-        print("\n[DEBUG][FREEZE]")
-        print(f"motion_energy: {motion_energy}")
-        print(f"freeze_gate: {freeze_gate}")
-        print(f"motion_scale: {motion_scale}")
-        print("[DEBUG][SPACE CHECK]")
-        print("kp min/max:", kp.min().item(), kp.max().item())
+        motion = (kp - prev_kp).abs().mean()
+        print("\n[DEBUG SIMPLE]")
+        print(f"motion: {motion.item():.6f}")
+        print(f"anchor: {state['anchor'].mean().item():.6f}")
 
-    return kp
+    return kp, state
 
 def update_pose_sequence_from_keypoints_batch_stable(
     keypoints_tensor,
