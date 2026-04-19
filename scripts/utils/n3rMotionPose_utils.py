@@ -58,6 +58,11 @@ def compensate_latent_shift(
     shift_x = float(shift[0,0])
     shift_y = float(shift[0,1])
 
+    compensation_gain = 10.0  # ou 5-20 selon pipeline
+
+    shift_x *= compensation_gain
+    shift_y *= compensation_gain
+
     # =========================================================
     # 2. Convert to latent pixels
     # =========================================================
@@ -1252,7 +1257,8 @@ def apply_global_pose(
             indexing="ij"
         )
         grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
-        return latents, torch.zeros((B,1,1,2), device=device), grid, None
+        #return latents, torch.zeros((B,1,1,2), device=device), grid, None
+        return latents, torch.zeros((B,1,1,2), device=device), grid, None, torch.zeros((B,1,1,2), device=device)
 
     # =========================================================
     # 🔹 Key joints
@@ -1375,6 +1381,20 @@ def apply_global_pose(
 
     grid = grid + delta_px * strength * global_gain
 
+
+    # =========================================================
+    # 🔥 REAL WARP SHIFT (CRITICAL FIX)
+    # =========================================================
+    base_grid = torch.stack((xx, yy), -1).float().unsqueeze(0).repeat(B,1,1,1)
+
+    warp_delta = grid - base_grid  # (B,H,W,2)
+
+    # moyenne globale → shift réel
+    warp_shift = warp_delta.mean(dim=(1,2), keepdim=True)  # (B,1,1,2)
+
+    # clamp sécurité (évite spikes)
+    warp_shift = torch.clamp(warp_shift, -10.0, 10.0)
+
     # =========================================================
     # 🔹 Normalize for grid_sample
     # =========================================================
@@ -1411,7 +1431,8 @@ def apply_global_pose(
                 os.path.join(debug_dir, "global_pose_debug.png")
             )
 
-    return latents_out, delta_px, grid, grid_norm
+    #return latents_out, delta_px, grid, grid_norm
+    return latents_out, delta_px, grid, grid_norm, warp_shift
 
 
 #------------------------------------------------------------------------------------------
@@ -1678,6 +1699,7 @@ def apply_breathing(
 
 def apply_pose_driven_motion_ultra2(
     latents,
+    state,
     keypoints,
     prev_keypoints=None,
     frame_counter=0,
@@ -1692,7 +1714,7 @@ def apply_pose_driven_motion_ultra2(
     latents = latents.float()
     latents_base = latents.clone()
     latents_world = latents.clone()
-
+    dx, dy = 0, 0  # warp return
     # =========================
     # 🔹 Pose et deltas
     # =========================
@@ -1701,6 +1723,8 @@ def apply_pose_driven_motion_ultra2(
     pose.compute_torso_delta(latent_h=H, latent_w=W)
     prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
     timings["Pose"] = time.time() - start
+
+
 
     # =========================
     # 🔹 Animation Upper Body
@@ -1723,7 +1747,7 @@ def apply_pose_driven_motion_ultra2(
         # Mise à jour via animate_upper_body
         pose_copy = Pose(pose.keypoints.clone())
         updated_upper_body = animate_upper_body(
-            state=pose_copy,
+            pose=pose_copy,
             inputs=upper_body_inputs,
             mode="smooth",
             strength=0.35, debug=debug
@@ -1789,7 +1813,14 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     if should_freeze(frame_counter, 1): # Pause traitement
         start = time.time()
-        latents_world, global_delta, grid_raw, grid_global = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
+        latents_world, global_delta, grid_raw, grid_global, warp_shift = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
+        print("[DEBUG] WARP Shift: ")
+        dx = warp_shift[0,0,0,0].item()
+        dy = warp_shift[0,0,0,1].item()
+        print(f"[SHIFT FLOAT] dx={dx:.4f}, dy={dy:.4f}")
+        #warp_shift_norm = warp_shift.view(1,2) / [W, H]
+        warp_shift_norm = warp_shift.view(1,2) / torch.tensor([W, H], device=warp_shift.device, dtype=warp_shift.dtype)
+        state["global_shift"] = 0.6 * state["global_shift"] + 0.4 * warp_shift_norm
         if prev_pose is not None:
             key_joints = ['neck','left_shoulder','right_shoulder','left_hip','right_hip']
             for joint in key_joints:
@@ -2036,7 +2067,7 @@ def apply_pose_driven_motion_ultra2(
         print("[DEBUG] Ultra2 Full motion pipeline applied")
         print("[DEBUG] Timings per step:", timings)
 
-    return latents
+    return latents, state
 
     """
     Ultra PRO motion pipeline:

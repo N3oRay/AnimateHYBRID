@@ -359,7 +359,7 @@ def build_upper_body_inputs(
 
 
 def animate_upper_body(
-    state: Pose,
+    pose: Pose,
     inputs: dict,
     mapping: dict = None,
     mode: str = "smooth",
@@ -372,10 +372,10 @@ def animate_upper_body(
     """
 
     if mapping is None:
-        mapping = state.FACIAL_POINT_IDX
+        mapping = pose.FACIAL_POINT_IDX
 
     # Cloner les keypoints pour ne pas modifier directement l'original
-    keypoints = state.keypoints.clone()  # shape: (1, N, 2)
+    keypoints = pose.keypoints.clone()  # shape: (1, N, 2)
 
     # -----------------------------
     # Update des points du haut du corps
@@ -401,8 +401,8 @@ def animate_upper_body(
     # -----------------------------
     # Mise à jour interne
     # -----------------------------
-    state._prev_keypoints = keypoints.clone()
-    state.keypoints = keypoints.clone()
+    pose._prev_keypoints = keypoints.clone()
+    pose.keypoints = keypoints.clone()
 
     return keypoints
 
