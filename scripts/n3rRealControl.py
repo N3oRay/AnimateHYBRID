@@ -484,8 +484,8 @@ def main(args):
 
 
                                 # 🔹 Appliquer le mouvement du haut du corps / OpenPose - apply_pose_driven_motion_stable or apply_pose_driven_motion_ultra2
-                                latents = apply_pose_driven_motion_ultra2(
-                                    latents=latents, keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
+                                latents, state = apply_pose_driven_motion_ultra2(
+                                    latents=latents, state=state, keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
                                     breathing=True, debug=True, debug_dir=output_dir
                                 )
 
