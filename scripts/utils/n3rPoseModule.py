@@ -24,14 +24,15 @@ def update_motion_state(
     state,
     head_ids=(0,1,18,21,22,23,24),
     body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
-    anchor_smooth=0.08,        # 🔥 plus lent = plus stable
-    velocity_smooth=0.85,      # 🔥 plus inertiel
-    drift_smooth=0.90,         # 🔥 IMPORTANT (low-pass correct)
+    anchor_smooth=0.08,
+    velocity_smooth=0.85,
+    drift_smooth=0.90,
     head_lock=True,
-    head_lock_strength=0.95,   # 🔥 jamais 1.0 (évite freeze)
+    head_lock_strength=0.95,
     debug=False
 ):
     B, N, _ = kp.shape
+    device = kp.device
 
     # =========================================================
     # INIT
@@ -40,7 +41,8 @@ def update_motion_state(
         return kp, {
             "kp_prev": kp.clone(),
             "velocity": torch.zeros_like(kp[..., :2]),
-            "anchor": kp[:, body_ids, :2].mean(dim=1, keepdim=True)
+            "anchor": kp[:, body_ids, :2].mean(dim=1, keepdim=True),
+            "drift": torch.zeros((B,1,2), device=device)
         }
 
     kp_prev = state["kp_prev"]
@@ -49,76 +51,113 @@ def update_motion_state(
         kp_prev = kp.clone()
 
     # =========================================================
-    # 1. VELOCITY (correct inertia model)
+    # 1. VELOCITY (TRUE INERTIA CORE)
     # =========================================================
     raw_velocity = kp[..., :2] - kp_prev[..., :2]
 
     velocity = (
         state["velocity"] * velocity_smooth +
-        raw_velocity * (1 - velocity_smooth)
+        raw_velocity * (1.0 - velocity_smooth)
     )
 
     state["velocity"] = velocity
 
     # =========================================================
-    # 2. ANCHOR (camera stabilisation FIXED)
+    # 2. ANCHOR (VERY SLOW CAMERA MEMORY)
     # =========================================================
     anchor_prev = state["anchor"]
-
     anchor_now = kp[:, body_ids, :2].mean(dim=1, keepdim=True)
 
-    # EMA anchor (camera memory)
     anchor = (
-        anchor_prev * (1 - anchor_smooth) +
+        anchor_prev * (1.0 - anchor_smooth) +
         anchor_now * anchor_smooth
     )
 
     state["anchor"] = anchor
 
-    # =========================================================
-    # 3. DRIFT (CORRECT FILTERING)
-    # =========================================================
-    drift_raw = anchor_now - anchor_prev
 
+    # =========================================================
+    # 3. DRIFT (REAL LOW-PASS FILTER - SAFE) - stabilisation caméra
+    # =========================================================
+    drift_raw = anchor_now - anchor_prev  # (B,1,2)
+
+    # init safe
+    if "drift" not in state or not torch.is_tensor(state["drift"]):
+        state["drift"] = torch.zeros_like(drift_raw)
+
+    # sécurité shape (très important dans ton pipeline)
+    if state["drift"].shape != drift_raw.shape:
+        state["drift"] = torch.zeros_like(drift_raw)
+
+    # EMA drift (low-pass réel)
     drift = (
-        drift_raw * (1 - drift_smooth) +
-        drift_raw * drift_smooth   # ← remplacé correctement ci-dessous
+        state["drift"] * drift_smooth +
+        drift_raw * (1.0 - drift_smooth)
     )
 
-    # 🔥 FIX IMPORTANT : vrai low-pass filtering
-    drift = drift * 0.1  # global damping (critical)
-
-    kp[..., :2] = kp[..., :2] - drift
+    state["drift"] = drift
 
     # =========================================================
-    # 4. APPLY VELOCITY INERTIA (IMPORTANT FIX)
+    # 4. RECONSTRUCT MOTION FROM PREVIOUS STATE
     # =========================================================
-    kp[..., :2] = kp_prev[..., :2] + velocity * 0.5
+    kp_out = kp_prev.clone()
+
+    # apply inertia motion
+    kp_out[..., :2] = kp_prev[..., :2] + velocity
+
+    # apply drift compensation (camera stabilization)
+    kp_out[..., :2] = kp_out[..., :2] - drift
 
     # =========================================================
-    # 5. HEAD LOCK (SOFT FIX)
+    # 5. BLEND WITH CURRENT INPUT (CRUCIAL)
+    # =========================================================
+    # gives responsiveness without instability
+    kp_out[..., :2] = (
+        kp_out[..., :2] * 0.7 +
+        kp[..., :2] * 0.3
+    )
+
+    # =========================================================
+    # 6. HEAD LOCK (STABLE BUT NOT FROZEN)
     # =========================================================
     if head_lock:
-        kp[:, head_ids, :2] = (
-            kp[:, head_ids, :2] * (1 - head_lock_strength * 0.1) +
-            kp_prev[:, head_ids, :2] * (head_lock_strength * 0.1)
+        kp_out[:, head_ids, :2] = (
+            kp_prev[:, head_ids, :2] * head_lock_strength +
+            kp_out[:, head_ids, :2] * (1.0 - head_lock_strength)
         )
 
     # =========================================================
-    # 6. SAFETY CLAMP
+    # 7. FINAL DAMPING (ANTI-JITTER)
     # =========================================================
-    kp[..., :2] = torch.nan_to_num(kp[..., :2], nan=0.0)
-    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
+    kp_out[..., :2] = kp_prev[..., :2] + (
+        kp_out[..., :2] - kp_prev[..., :2]
+    ) * 0.9
 
     # =========================================================
-    # 7. UPDATE STATE
+    # 8. CLEAN
     # =========================================================
-    state["kp_prev"] = kp.clone()
+    kp_out[..., :2] = torch.nan_to_num(kp_out[..., :2], nan=0.0)
+    kp_out[..., :2] = torch.clamp(kp_out[..., :2], 0.0, 1.0)
 
-    return kp, state
+    # =========================================================
+    # 9. UPDATE STATE
+    # =========================================================
+    state["kp_prev"] = kp_out.clone()
+
+    # =========================================================
+    # DEBUG
+    # =========================================================
+    if debug:
+        print("\n[🎯 MOTION STATE STABLE] - velocity, drift, reconstruction, blend, head lock, damping")
+        print(f"velocity: {velocity.norm(dim=-1).mean().item():.6f}")
+        print(f"drift: {drift.norm(dim=-1).mean().item():.6f}")
+        print(f"anchor: {anchor.mean().item():.6f}")
+
+    return kp_out, state
 
 ACTOR_LABELS = {
     "base": "[BASE MOTION]",
+    "v5": "[V5 CINEMATIC STABLE]",
     "v6": "[V6 CINEMATIC]",
     "v7": "[V7 PHYSICS LAYER]",
     "v8": "[V8 ACTING SYSTEM]",
@@ -129,12 +168,13 @@ ACTOR_LABELS = {
 
 ACTOR_MODEL_SCHEDULE = [
     (0,  "base"),
-    (1,  "v9"),
+    (1,  "v5"),
+    (4,  "v9"),
     (6,  "v8"),
     (10,  "base"),
     (11, "v7"),
-    (15,  "base"),
-    (16, "v6"),
+    (14,  "base"),
+    (15, "v6"),
     (17,  "base"),
     (18, "v3"),
 ]
@@ -921,6 +961,159 @@ def cinematic_motion_graph_v7(
 
 
 
+def cinematic_motion_graph_v5(
+    kp,
+    state,
+    head_ids=(0,1,18,21,22,23,24,48,49,50,51),
+    body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
+    upper_ids=(5,6,7,8,9,10),
+    hip_ids=(11,12),
+    rotation_strength=0.5,
+    rotation_smooth=0.25,
+    motion_sensitivity=4.0,
+    head_lock=0.35,
+    max_rotation_deg=25.0,
+    debug=False
+):
+    B, N, _ = kp.shape
+    device = kp.device
+
+    # =========================================================
+    # 0. SAFE INIT
+    # =========================================================
+    if state is None:
+        return kp, {
+            "kp_prev": kp.clone(),
+            "angle": torch.zeros((B,1), device=device),
+            "angular_vel": torch.zeros((B,1), device=device),
+            "torso_vec_prev": None
+        }
+
+    kp_prev = state.get("kp_prev", kp.clone())
+
+    state.setdefault("angle", torch.zeros((B,1), device=device))
+    state.setdefault("angular_vel", torch.zeros((B,1), device=device))
+    state.setdefault("torso_vec_prev", None)
+
+    angle = state["angle"]
+    angular_vel = state["angular_vel"]
+
+    # =========================================================
+    # 1. MOTION ENERGY (robuste + non saturée)
+    # =========================================================
+    delta = kp[..., :2] - kp_prev[..., :2]
+    motion_per_joint = torch.norm(delta, dim=-1)
+
+    motion_score = (
+        motion_per_joint.mean(dim=1, keepdim=True) +
+        motion_per_joint.max(dim=1, keepdim=True).values
+    ) * 0.5
+
+    motion_gain = torch.tanh(motion_score * motion_sensitivity)
+
+    # =========================================================
+    # 2. TORSO ANGLE + PHYSICS (MAJOR UPGRADE)
+    # =========================================================
+    angle_raw, torso_vec = compute_torso_rotation_delta(
+        kp,
+        state["torso_vec_prev"]
+    )
+    state["torso_vec_prev"] = torso_vec
+
+    angle_raw = angle_raw.view(B,1).clamp(-1.0, 1.0)
+
+    # --- angular velocity (physics) ---
+    delta_angle = angle_raw - angle
+
+    angular_vel = (
+        angular_vel * 0.85 +
+        delta_angle * 0.15
+    )
+
+    angular_vel = torch.clamp(angular_vel, -0.12, 0.12)
+
+    state["angular_vel"] = angular_vel
+
+    # --- integrate angle ---
+    angle = angle + angular_vel
+    state["angle"] = angle
+
+    # =========================================================
+    # 3. PIVOT (robuste)
+    # =========================================================
+    l_hip = kp[:, hip_ids[0], :2]
+    r_hip = kp[:, hip_ids[1], :2]
+
+    valid = torch.isfinite(l_hip).all(dim=-1, keepdim=True) & \
+            torch.isfinite(r_hip).all(dim=-1, keepdim=True)
+
+    shoulder_center = kp[:, [5,6], :2].mean(dim=1, keepdim=True)
+
+    pivot = torch.where(valid, (l_hip + r_hip) * 0.5, shoulder_center)
+
+    # =========================================================
+    # 4. ROTATION (STATE-DRIVEN)
+    # =========================================================
+    kp_out = kp_prev.clone()  # 🔥 IMPORTANT FIX
+
+    strength = rotation_strength * (1.0 + motion_gain)
+
+    max_angle = math.radians(max_rotation_deg)
+
+    angle_final = torch.clamp(
+        angle * strength,
+        -max_angle,
+        max_angle
+    ).view(B,1,1)
+
+    rotated = rotate_points_around_pivot(
+        kp_prev[:, upper_ids, :2],  # 🔥 prev, pas kp
+        pivot,
+        angle_final
+    )
+
+    kp_out[:, upper_ids, :2] = rotated
+
+    # =========================================================
+    # 5. HEAD LOCK (plus naturel)
+    # =========================================================
+    if head_lock > 0:
+        kp_out[:, head_ids, :2] = (
+            kp_prev[:, head_ids, :2] * head_lock +
+            kp_out[:, head_ids, :2] * (1.0 - head_lock)
+        )
+
+    # =========================================================
+    # 6. GLOBAL DAMPING (anti jitter)
+    # =========================================================
+    kp_out[..., :2] = kp_prev[..., :2] + (
+        kp_out[..., :2] - kp_prev[..., :2]
+    ) * 0.9
+
+    # =========================================================
+    # 7. CLEAN
+    # =========================================================
+    kp_out[..., :2] = torch.nan_to_num(kp_out[..., :2], nan=0.0)
+    kp_out[..., :2] = torch.clamp(kp_out[..., :2], 0.0, 1.0)
+
+    # =========================================================
+    # 8. UPDATE STATE
+    # =========================================================
+    state["kp_prev"] = kp_out.clone()
+
+    # =========================================================
+    # DEBUG
+    # =========================================================
+    if debug:
+        print("\n[🎬 CINEMA V6 IMPROVED]")
+        print("motion:", motion_score.mean().item())
+        print("gain:", motion_gain.mean().item())
+        print("angle:", angle.mean().item())
+        print("angular_vel:", angular_vel.mean().item())
+        print("pivot:", pivot[0,0].tolist())
+
+    return kp_out, state
+
 
 def cinematic_motion_graph_v6(
     kp,
@@ -1031,165 +1224,137 @@ def cinematic_motion_graph_v6(
     return kp_out, state
 
 
+# 👉 lisser le mouvement + garder de la réactivité
+# 👉 stabiliser la tête
+# 👉 éviter toute déformation globale
+
 def cinematic_motion_graph_v3(
     kp,
     state,
     head_ids=(0,1,18,21,22,23,24),
     body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
-    rotation_strength=0.15,
-    rotation_smooth=0.15,
+    motion_smooth=0.85,
+    drift_smooth=0.9,          # 🔥 ajout clé
+    max_velocity=0.08,         # 🔥 limite physique
     head_lock=True,
     debug=False
 ):
     B, N, _ = kp.shape
+    device = kp.device
 
     # =========================================================
-    # INIT STATE
+    # INIT STATE (SAFE)
     # =========================================================
     if state is None:
         return kp, {
             "kp_prev": kp.clone(),
-            "angle": torch.zeros((B, 1, 1), device=kp.device),
-            "torso_vec_prev": None
+            "velocity": torch.zeros_like(kp[..., :2]),
+            "drift": torch.zeros((B,1,2), device=device)
         }
 
-    kp_prev = state["kp_prev"]
+    kp_prev = state.get("kp_prev", kp.clone())
 
-    # =========================================================
-    # 1. TORSO ROTATION (DELTA)
-    # =========================================================
-    angle_raw, torso_vec = compute_torso_rotation_delta(
-        kp,
-        state.get("torso_vec_prev")
+    if kp_prev.shape != kp.shape:
+        kp_prev = kp.clone()
+
+    velocity_prev = state.get(
+        "velocity",
+        torch.zeros_like(kp[..., :2])
     )
 
-    state["torso_vec_prev"] = torso_vec
+    state.setdefault("drift", torch.zeros((B,1,2), device=device))
 
-    # smooth rotation
-    angle = (
-        state["angle"] * (1 - rotation_smooth)
-        + angle_raw * rotation_smooth
+    # =========================================================
+    # 1. RAW MOTION
+    # =========================================================
+    delta = kp[..., :2] - kp_prev[..., :2]
+
+    # =========================================================
+    # 2. VELOCITY SMOOTHING (STABLE + CLAMP)
+    # =========================================================
+    velocity = (
+        velocity_prev * motion_smooth +
+        delta * (1.0 - motion_smooth)
     )
 
-    state["angle"] = angle
+    # 🔥 clamp vitesse (évite warp)
+    velocity = torch.clamp(velocity, -max_velocity, max_velocity)
+
+    kp_out = kp_prev.clone()
+    kp_out[..., :2] = kp_prev[..., :2] + velocity
+
+    state["velocity"] = velocity
 
     # =========================================================
-    # 2. MOTION-BASED INTENSITY
+    # 3. BODY DRIFT (EMA STABLE)
     # =========================================================
-    motion = torch.norm(kp - kp_prev, dim=-1).mean(dim=1, keepdim=True).unsqueeze(-1)
-    dynamic_strength = rotation_strength * (1 + motion * 2.0)
+    body_center_prev = kp_prev[:, body_ids, :2].mean(dim=1, keepdim=True)
+    body_center_now  = kp_out[:, body_ids, :2].mean(dim=1, keepdim=True)
 
-    # =========================================================
-    # HIP FALLBACK (CRITICAL FIX)
-    # =========================================================
-    l_hp = kp[:, 11, :2]
-    r_hp = kp[:, 12, :2]
+    drift_raw = body_center_now - body_center_prev
 
-    hips_missing = (
-        (l_hp.sum(dim=-1) == 0) |
-        (r_hp.sum(dim=-1) == 0)
-    ).view(B, 1, 1)
-
-    l_sh = kp[:, 5, :2]
-    r_sh = kp[:, 6, :2]
-    shoulder_center = (l_sh + r_sh) * 0.5
-
-    # approx torso length
-    offset = torch.tensor([0.0, 0.15], device=kp.device)
-
-    fake_l_hp = shoulder_center + offset
-    fake_r_hp = shoulder_center + offset
-
-    kp[:, 11, :2] = torch.where(hips_missing, fake_l_hp, l_hp)
-    kp[:, 12, :2] = torch.where(hips_missing, fake_r_hp, r_hp)
-
-    # =========================================================
-    # 3. PIVOT = pelvis center
-    # =========================================================
-    pivot = kp[:, [11, 12], :2].mean(dim=1, keepdim=True)
-
-    # fallback sécurité si NaN ou 0
-    invalid_pivot = (pivot.abs().sum(dim=-1, keepdim=True) == 0)
-
-    shoulder_center = kp[:, [5, 6], :2].mean(dim=1, keepdim=True)
-
-    pivot = torch.where(invalid_pivot, shoulder_center, pivot)
-
-    # =========================================================
-    # 4. APPLY ROTATION (WEIGHTED UPPER BODY)
-    # =========================================================
-    upper_ids = [5,6,7,8,9,10]
-
-    kp_rot = kp.clone()
-
-    # joint weights (shoulders > torso)
-    weights = torch.tensor(
-        [1.0, 1.0, 0.85, 0.85, 0.6, 0.6],
-        device=kp.device
-    ).view(1, -1, 1)
-
-    rotated = rotate_points_around_pivot(
-        kp[:, upper_ids, :2],
-        pivot,
-        angle * dynamic_strength
+    # 🔥 EMA drift (FIX MAJEUR)
+    drift = (
+        state["drift"] * drift_smooth +
+        drift_raw * (1.0 - drift_smooth)
     )
 
-    kp_rot[:, upper_ids, :2] = (
-        kp[:, upper_ids, :2] * (1 - weights)
-        + rotated * weights
-    )
+    # 🔥 clamp drift
+    drift = torch.clamp(drift, -0.05, 0.05)
 
-    kp = kp_rot
+    state["drift"] = drift
+
+    # apply stabilization
+    kp_out[..., :2] = kp_out[..., :2] - drift
 
     # =========================================================
-    # 5. HEAD BLEND (cinematic)
+    # 4. HEAD LOCK (STABLE, NON-RIGIDE)
     # =========================================================
     if head_lock:
         head_blend = 0.85
-        kp[:, head_ids, :2] = (
-            kp_prev[:, head_ids, :2] * head_blend
-            + kp[:, head_ids, :2] * (1 - head_blend)
+        kp_out[:, head_ids, :2] = (
+            kp_prev[:, head_ids, :2] * head_blend +
+            kp_out[:, head_ids, :2] * (1 - head_blend)
         )
 
     # =========================================================
-    # 6. STABILITY CLAMP
+    # 5. GLOBAL DAMPING (ANTI-JITTER FINAL)
     # =========================================================
-    kp[..., :2] = torch.nan_to_num(kp[..., :2], nan=0.0)
-    kp[..., :2] = torch.clamp(kp[..., :2], 0.0, 1.0)
+    kp_out[..., :2] = kp_prev[..., :2] + (
+        kp_out[..., :2] - kp_prev[..., :2]
+    ) * 0.9
 
     # =========================================================
-    # 7. UPDATE MEMORY
+    # 6. CLEAN
     # =========================================================
-    state["kp_prev"] = kp.clone()
+    kp_out[..., :2] = torch.nan_to_num(kp_out[..., :2], nan=0.0)
+    kp_out[..., :2] = torch.clamp(kp_out[..., :2], 0.0, 1.0)
 
+    # =========================================================
+    # 7. UPDATE STATE
+    # =========================================================
+    state["kp_prev"] = kp_out.clone()
+
+    # =========================================================
+    # DEBUG
+    # =========================================================
     if debug:
-        angle_deg = angle.mean().item() * 57.2958
-        raw_deg = angle_raw.mean().item() * 57.2958
+        motion_val = delta.norm(dim=-1).mean().item()
+        vel_val = velocity.norm(dim=-1).mean().item()
+        drift_val = drift.norm(dim=-1).mean().item()
 
-        motion_val = motion.mean().item()
-        strength_val = dynamic_strength.mean().item()
+        center = body_center_now.mean(dim=1)[0]
 
-        pivot_mean = pivot.mean(dim=1)[0]
+        print("\n[🎯 V3 STABLE]")
+        print(f"motion_raw: {motion_val:.6f}")
+        print(f"velocity: {vel_val:.6f}")
+        print(f"drift: {drift_val:.6f}")
+        print(f"body_center: ({center[0].item():.3f}, {center[1].item():.3f})")
 
-        print("\n[🎯 TORSO ROTATION DEBUG]")
-        print(f"angle_raw_deg: {raw_deg:.3f}")
-        print(f"angle_smooth_deg: {angle_deg:.3f}")
-        print(f"motion: {motion_val:.6f}")
-        print(f"rotation_strength: {strength_val:.4f}")
-
-        print(f"pivot: ({pivot_mean[0].item():.3f}, {pivot_mean[1].item():.3f})")
-
-        # stabilité du vecteur torso
-        if state.get("torso_vec_prev") is not None:
-            vec = torso_vec[0]
-            print(f"torso_vec: ({vec[0].item():.3f}, {vec[1].item():.3f})")
-
-    return kp, state
+    return kp_out, state
 
 
 def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
-
-
 
     # =========================
     # SAFE MODEL RESOLUTION
@@ -1313,6 +1478,7 @@ def resolve_actor_model(frame_idx: int) -> str:
 ACTOR_PIPELINE = {
     "base": update_motion_state,
     "v3": cinematic_motion_graph_v3,
+    "v5": cinematic_motion_graph_v5,
     "v6": cinematic_motion_graph_v6,
     "v7": cinematic_motion_graph_v7,
     "v8": cinematic_motion_graph_v8,
