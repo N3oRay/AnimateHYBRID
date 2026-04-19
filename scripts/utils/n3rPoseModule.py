@@ -1,4 +1,12 @@
 #n3rPoseModule.py
+# ✔ energy field
+# ✔ intent vector (mémoire directionnelle)
+# ✔ angular velocity (physique)
+# ✔ inertia / damping
+# ✔ pivot body (centre de rotation)
+# ✔ head lag (cinematic delay)
+# ✔ gaze system (attention model)
+# ✔ body segmentation (upper / hips / head)
 #cinematic_motion_graph_v3, update_motion_state
 
 import torch
