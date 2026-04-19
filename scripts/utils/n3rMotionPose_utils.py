@@ -203,14 +203,14 @@ def update_keypoints_from_pose(
             cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
 
             offset_y = H * 0.18
-            offset_y2 = H * 0.24
-            offset_y3 = H * 0.30
+            offset_y2 = H * 0.25
+            offset_y3 = H * 0.32
 
-            left_hip  = (cx - 50, cy + offset_y)
-            right_hip = (cx + 50, cy + offset_y)
+            left_hip  = (cx - 70, cy + offset_y)
+            right_hip = (cx + 70, cy + offset_y)
 
-            left_knee  = (cx - 65, cy + offset_y2)
-            right_knee = (cx + 65, cy + offset_y2)
+            left_knee  = (cx - 72, cy + offset_y2)
+            right_knee = (cx + 72, cy + offset_y2)
 
             left_ankle = (cx - 80, cy + offset_y3)
             right_ankle = (cx + 80, cy + offset_y3)
@@ -2307,9 +2307,9 @@ def update_sequence_from_keypoints_batch(
     prev_keypoints=None,
     state=None,
     profile=None,
-    time_scale=0.3,
+    time_scale=0.2,
     max_velocity=0.05,
-    camera_lock=0.5,
+    camera_lock=0.6,
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)

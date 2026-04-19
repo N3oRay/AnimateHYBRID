@@ -112,6 +112,8 @@ class Pose:
         }
 
 
+
+
     def get_bouche_expand_h(self):
         return self.bouche_expand_h
 
@@ -1074,7 +1076,7 @@ class Pose:
 
     # --------------- Mask decor ---------------------------------------------
     def create_decor_mask( self, H: int, W: int, mask_face=None, mask_torso=None, mask_hair=None, debug: bool = False, debug_dir: str = None, frame_counter: int = 0,
-                          expand=2.5, vertical_bias=1.2, falloff_strength=2.0 ):
+                          expand=4.2, vertical_bias=2.0, falloff_strength=3.0 ):
         device = self.device
         B = self.B
 
@@ -1091,30 +1093,31 @@ class Pose:
 
         for b in range(B):
 
-            # 🔹 Points clés
-            r_sh = to_px(self.get_point(self.FACIAL_POINT_IDX["right_shoulder"])[b])
-            l_sh = to_px(self.get_point(self.FACIAL_POINT_IDX["left_shoulder"])[b])
-            r_hip = to_px(self.get_point(self.FACIAL_POINT_IDX["right_hip"])[b])
-            l_hip = to_px(self.get_point(self.FACIAL_POINT_IDX["left_hip"])[b])
-            head = to_px(self.get_point(self.FACIAL_POINT_IDX["nose"])[b])
+            # 🔹 Points clés élargis
+            body_points = [
+                "nose", "chin", "neck", "left_side_neck", "right_side_neck", "anchor_neck",
+                "right_shoulder", "left_shoulder",
+                "right_elbow", "left_elbow",
+                "right_wrist", "left_wrist",
+                "right_hip", "left_hip",
+                "right_knee", "left_knee",
+                "right_ankle", "left_ankle"
+            ]
 
-            pts = torch.stack([r_sh, l_sh, r_hip, l_hip])
-
+            pts = torch.stack([to_px(self.get_point(self.FACIAL_POINT_IDX[p])[b]) for p in body_points])
             # 🔹 Bounding
             min_xy = pts.min(dim=0).values
             max_xy = pts.max(dim=0).values
             center = (min_xy + max_xy) / 2
 
             width = (max_xy[0] - min_xy[0]) * expand
-            height = (max_xy[1] - head[1]) * expand * vertical_bias
-
+            height = (max_xy[1] - min_xy[1]) * expand * vertical_bias
             # 🔹 Ellipse corps
             dx = xx - center[0]
             dy = yy - center[1]
 
             ellipse = (dx / (width / 2 + 1e-6))**2 + (dy / (height / 2 + 1e-6))**2
             inside = torch.exp(-ellipse * falloff_strength)
-
             # 🔥 Décor = extérieur
             mask[b, 0] = 1.0 - inside
 
