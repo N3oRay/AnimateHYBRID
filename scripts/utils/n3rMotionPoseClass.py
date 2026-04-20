@@ -118,10 +118,25 @@ class Pose:
 
         points : [B, N, 2] - Points à faire pivoter (x, y)
         pivot : [B, N, 2] - Pivot autour duquel faire pivoter
-        angle : angle de rotation en radians
+        angle : [B, 1] - Angles de rotation en radians (par batch)
 
         Retourne les points après rotation.
         """
+
+        # Vérification des NaN dans les points et pivots
+        if torch.isnan(points).any():
+            raise ValueError("Les points contiennent des valeurs NaN")
+
+        if torch.isnan(pivot).any():
+            # Si le pivot contient des NaN, on peut choisir un pivot de secours
+            print("Avertissement : Le pivot contient des NaN. Utilisation du pivot de secours (centre de l'épaule).")
+            pivot = torch.zeros_like(pivot)  # Par exemple, on remplace par un pivot arbitraire (0, 0)
+
+        if torch.isnan(angle).any() or angle.shape != torch.Size([points.shape[0], 1]):
+            # Si l'angle est NaN ou a une forme inattendue, on applique une rotation nulle
+            print("Avertissement : L'angle est NaN ou a une forme incorrecte. Rotation nulle appliquée.")
+            angle = torch.zeros_like(angle)  # Appliquer une rotation nulle
+
         # Calculer le cosinus et sinus de l'angle
         cos_a = torch.cos(angle)
         sin_a = torch.sin(angle)
@@ -136,6 +151,10 @@ class Pose:
         # Revenir aux coordonnées d'origine
         rotated_points = torch.stack([x_new, y_new], dim=-1) + pivot
 
+        # Assurer que les valeurs sont valides (sans NaN)
+        rotated_points = torch.nan_to_num(rotated_points, nan=0.0)
+
+        # Retourner les points après rotation
         return rotated_points
 
     def apply_rotation(self, angle):

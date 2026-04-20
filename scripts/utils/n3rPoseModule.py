@@ -159,7 +159,6 @@ def update_motion_state(
 
 ACTOR_LABELS = {
     "base": "[BASE MOTION]",
-    "v5": "[V5 CINEMATIC STABLE]",
     "v6": "[V6 CINEMATIC]",
     "v7": "[V7 PHYSICS LAYER]",
     "v8": "[V8 ACTING SYSTEM]",
@@ -170,8 +169,7 @@ ACTOR_LABELS = {
 
 ACTOR_MODEL_SCHEDULE = [
     (0,  "base"),
-    (1,  "v5"),
-    (4,  "v9"),
+    (1,  "v9"),
     (6,  "v8"),
     (10,  "base"),
     #(11, "v7"),
@@ -318,29 +316,7 @@ def compute_torso_rotation_delta(kp, prev_vec=None, eps=1e-6):
 #---------------------------------------------------------------------
 
 
-def compute_torso_rotation(kp, body_ids=(2,3,4,5,6,7,8,9,10,11,12,13)):
-    """
-    Estimate pseudo-3D torso rotation angle from shoulders & hips.
-    """
 
-    # shoulders
-    l_sh = kp[:, 5, :2]
-    r_sh = kp[:, 6, :2]
-
-    # hips
-    l_hp = kp[:, 11, :2]
-    r_hp = kp[:, 12, :2]
-
-    # vectors
-    shoulder_vec = r_sh - l_sh
-    hip_vec = r_hp - l_hp
-
-    # average direction (torso axis)
-    torso_vec = (shoulder_vec + hip_vec) * 0.5
-
-    angle = torch.atan2(torso_vec[..., 1], torso_vec[..., 0])  # radians
-
-    return angle
 
 
 def rotate_points_around_pivot(points, pivot, angle, name="ROT", debug=None):
@@ -380,45 +356,7 @@ def _dbg(debug, *args):
         print(*args)
 
 
-# ---------------------------------------------------------
-# SAFE ROTATION
-# ---------------------------------------------------------
-def compute_torso_rotation_delta_v2(kp, prev_vec=None, eps=1e-6):
-    l_sh = kp[:, 5, :2]
-    r_sh = kp[:, 6, :2]
-    l_hp = kp[:, 11, :2]
-    r_hp = kp[:, 12, :2]
 
-    shoulder_vec = r_sh - l_sh
-    hip_vec = r_hp - l_hp
-
-    hip_valid = torch.isfinite(hip_vec).all(dim=-1, keepdim=True)
-
-    torso_vec = torch.where(
-        hip_valid,
-        0.7 * shoulder_vec + 0.3 * hip_vec,
-        shoulder_vec
-    )
-
-    norm = torch.norm(torso_vec, dim=-1, keepdim=True)
-    torso_vec = torso_vec / (norm + eps)
-
-    if prev_vec is None:
-        return torch.zeros((kp.shape[0], 1, 1), device=kp.device), torso_vec
-
-    prev_vec = F.normalize(prev_vec, dim=-1)
-
-    cross = torso_vec[..., 0] * prev_vec[..., 1] - torso_vec[..., 1] * prev_vec[..., 0]
-    dot = (torso_vec * prev_vec).sum(dim=-1)
-
-    angle = torch.atan2(cross, dot)
-
-    # ↓↓↓ important: soft clamp, pas hard clamp brutal
-    angle = torch.tanh(angle) * 0.9
-
-    angle = torch.nan_to_num(angle, 0.0)
-
-    return angle.unsqueeze(-1).unsqueeze(-1), torso_vec
 
 # ---------------------------------------------------------
 # MAIN MOTION GRAPH (FIXED)
@@ -579,7 +517,10 @@ def actor_system_v9(
     # =========================================================
     # Liste des indices des points à faire pivoter
     # Création de l'instance de la classe Pose
-    pose = Pose(keypoints)  # "keypoints" étant le tensor des keypoints de la pose
+    kp_out = kp.clone()
+
+    # Créer une instance de la classe Pose avec les keypoints
+    pose = Pose(kp_out)  # on passe les keypoints ici
 
     # Calculer l'angle de rotation (par exemple)
     angle = torch.tensor(0.1)  # Remplacer par l'angle réel en radians
@@ -754,16 +695,18 @@ def cinematic_motion_graph_v8(
     # =========================================================
     # 5. ROTATION APPLY (SAFE)
     # =========================================================
+    # Duplique les keypoints pour conserver une copie originale
     kp_out = kp.clone()
 
     # Créer une instance de la classe Pose avec les keypoints
     pose = Pose(kp_out)  # on passe les keypoints ici
 
-    # Calculer l'angle de rotation, assure-toi que l'angle est bien un tensor de forme correcte
-    angle = angle.view(B, 1, 1)  # Formater l'angle correctement
+    # Calculer l'angle de rotation
+    # Assure-toi que l'angle est un tensor de forme [B, 1]
+    angle = angle.view(B, 1)  # Formater l'angle en [B, 1] si nécessaire
 
     # Appliquer la rotation via la méthode de la classe Pose
-    pose.apply_rotation(angle)
+    pose.apply_rotation(angle)  # Pas besoin de reformater l'angle si c'est déjà [B, 1]
 
     # Les keypoints après rotation sont maintenant dans pose.keypoints
     kp_out = pose.keypoints
@@ -967,160 +910,6 @@ def cinematic_motion_graph_v7(
 
     return kp_out, state
 
-
-
-def cinematic_motion_graph_v5(
-    kp,
-    state,
-    head_ids=(0,1,18,21,22,23,24,48,49,50,51),
-    body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
-    upper_ids=(5,6,7,8,9,10),
-    hip_ids=(11,12),
-    rotation_strength=0.5,
-    rotation_smooth=0.25,
-    motion_sensitivity=4.0,
-    head_lock=0.35,
-    max_rotation_deg=25.0,
-    debug=False
-):
-    B, N, _ = kp.shape
-    device = kp.device
-
-    # =========================================================
-    # 0. SAFE INIT
-    # =========================================================
-    if state is None:
-        return kp, {
-            "kp_prev": kp.clone(),
-            "angle": torch.zeros((B,1), device=device),
-            "angular_vel": torch.zeros((B,1), device=device),
-            "torso_vec_prev": None
-        }
-
-    kp_prev = state.get("kp_prev", kp.clone())
-
-    state.setdefault("angle", torch.zeros((B,1), device=device))
-    state.setdefault("angular_vel", torch.zeros((B,1), device=device))
-    state.setdefault("torso_vec_prev", None)
-
-    angle = state["angle"]
-    angular_vel = state["angular_vel"]
-
-    # =========================================================
-    # 1. MOTION ENERGY (robuste + non saturée)
-    # =========================================================
-    delta = kp[..., :2] - kp_prev[..., :2]
-    motion_per_joint = torch.norm(delta, dim=-1)
-
-    motion_score = (
-        motion_per_joint.mean(dim=1, keepdim=True) +
-        motion_per_joint.max(dim=1, keepdim=True).values
-    ) * 0.5
-
-    motion_gain = torch.tanh(motion_score * motion_sensitivity)
-
-    # =========================================================
-    # 2. TORSO ANGLE + PHYSICS (MAJOR UPGRADE)
-    # =========================================================
-    angle_raw, torso_vec = compute_torso_rotation_delta(
-        kp,
-        state["torso_vec_prev"]
-    )
-    state["torso_vec_prev"] = torso_vec
-
-    angle_raw = angle_raw.view(B,1).clamp(-1.0, 1.0)
-
-    # --- angular velocity (physics) ---
-    delta_angle = angle_raw - angle
-
-    angular_vel = (
-        angular_vel * 0.85 +
-        delta_angle * 0.15
-    )
-
-    angular_vel = torch.clamp(angular_vel, -0.12, 0.12)
-
-    state["angular_vel"] = angular_vel
-
-    # --- integrate angle ---
-    angle = angle + angular_vel
-    state["angle"] = angle
-
-    # =========================================================
-    # 3. PIVOT (robuste)
-    # =========================================================
-    l_hip = kp[:, hip_ids[0], :2]
-    r_hip = kp[:, hip_ids[1], :2]
-
-    valid = torch.isfinite(l_hip).all(dim=-1, keepdim=True) & \
-            torch.isfinite(r_hip).all(dim=-1, keepdim=True)
-
-    shoulder_center = kp[:, [5,6], :2].mean(dim=1, keepdim=True)
-
-    pivot = torch.where(valid, (l_hip + r_hip) * 0.5, shoulder_center)
-
-    # =========================================================
-    # 4. ROTATION (STATE-DRIVEN)
-    # =========================================================
-    kp_out = kp_prev.clone()  # 🔥 IMPORTANT FIX
-
-    strength = rotation_strength * (1.0 + motion_gain)
-
-    max_angle = math.radians(max_rotation_deg)
-
-    angle_final = torch.clamp(
-        angle * strength,
-        -max_angle,
-        max_angle
-    ).view(B,1,1)
-
-    rotated = rotate_points_around_pivot(
-        kp_prev[:, upper_ids, :2],  # 🔥 prev, pas kp
-        pivot,
-        angle_final
-    )
-
-    kp_out[:, upper_ids, :2] = rotated
-
-    # =========================================================
-    # 5. HEAD LOCK (plus naturel)
-    # =========================================================
-    if head_lock > 0:
-        kp_out[:, head_ids, :2] = (
-            kp_prev[:, head_ids, :2] * head_lock +
-            kp_out[:, head_ids, :2] * (1.0 - head_lock)
-        )
-
-    # =========================================================
-    # 6. GLOBAL DAMPING (anti jitter)
-    # =========================================================
-    kp_out[..., :2] = kp_prev[..., :2] + (
-        kp_out[..., :2] - kp_prev[..., :2]
-    ) * 0.9
-
-    # =========================================================
-    # 7. CLEAN
-    # =========================================================
-    kp_out[..., :2] = torch.nan_to_num(kp_out[..., :2], nan=0.0)
-    kp_out[..., :2] = torch.clamp(kp_out[..., :2], 0.0, 1.0)
-
-    # =========================================================
-    # 8. UPDATE STATE
-    # =========================================================
-    state["kp_prev"] = kp_out.clone()
-
-    # =========================================================
-    # DEBUG
-    # =========================================================
-    if debug:
-        print("\n[🎬 CINEMA V6 IMPROVED]")
-        print("motion:", motion_score.mean().item())
-        print("gain:", motion_gain.mean().item())
-        print("angle:", angle.mean().item())
-        print("angular_vel:", angular_vel.mean().item())
-        print("pivot:", pivot[0,0].tolist())
-
-    return kp_out, state
 
 
 def cinematic_motion_graph_v6(
@@ -1517,7 +1306,6 @@ def resolve_actor_model(frame_idx: int) -> str:
 ACTOR_PIPELINE = {
     "base": update_motion_state,
     "v3": cinematic_motion_graph_v3,
-    "v5": cinematic_motion_graph_v5,
     "v6": cinematic_motion_graph_v6,
     "v7": cinematic_motion_graph_v7,
     "v8": cinematic_motion_graph_v8,
