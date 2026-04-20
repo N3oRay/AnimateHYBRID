@@ -41,7 +41,7 @@ from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose,
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, gaussian_blur
 
-from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_from_keypoints_batch, update_keypoints_from_pose, update_sequence_from_keypoints_batch, compensate_latent_shift
+from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_from_keypoints_batch, update_keypoints_from_pose, update_sequence_from_keypoints_batch, compensate_latent_shift, compensate_latent_shift_dev
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -490,7 +490,7 @@ def main(args):
                                 )
 
                                 # compensation du mouvement state.get("kp_prev")
-                                latents = compensate_latent_shift( latents, shift = state["global_shift"], latent_size=(latents.shape[-1], latents.shape[-2]), padding_mode="reflect", debug=True )
+                                latents = compensate_latent_shift_dev( latents, shift = state["global_shift"], global_angle=state["global_angle"], latent_size=(latents.shape[-1], latents.shape[-2]), debug=True )
 
                                 # 🔹 Stocker les keypoints pour la frame suivante
                                 prev_keypoints = current_keypoints.clone()
