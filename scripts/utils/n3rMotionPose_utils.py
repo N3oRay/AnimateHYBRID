@@ -25,9 +25,6 @@ import traceback
 from torchvision.utils import save_image
 
 
-import torch
-import torch.nn.functional as F
-
 def compensate_latent_shift_dev(
     latent,
     shift,
@@ -35,93 +32,123 @@ def compensate_latent_shift_dev(
     image_size=(1280, 896),
     latent_size=None,
     max_shift_ratio=0.2,
-    compensation_gain=200.0,
-    padding_mode="reflect",
+    padding_mode="reflection",
     debug=False
 ):
 
+    if padding_mode == "reflect":
+        padding_mode = "reflection"
 
     B, C, H, W = latent.shape
+    device = latent.device
 
     # =========================================================
-    # 1. Read shift
+    # 1. Read + sanitize shift
     # =========================================================
-    shift_x = float(shift[0, 0])
-    shift_y = float(shift[0, 1])
+    shift = shift.to(device).view(-1)
+
+    shift_x = float(shift[0])
+    shift_y = float(shift[1])
 
     # =========================================================
-    # 2. Apply gain + clamp (IMPORTANT STABILITY STEP)
+    # 2. Stable gain (NO adaptive jitter)
     # =========================================================
-    shift = torch.tensor([shift_x, shift_y], device=latent.device)
+    compensation_gain = 8.0  # stable, évite oscillations
+    shift_x *= compensation_gain
+    shift_y *= compensation_gain
 
-    shift = shift * compensation_gain
-
+    # clamp
     max_shift_x = W * max_shift_ratio
     max_shift_y = H * max_shift_ratio
 
-    shift_x = float(torch.clamp(shift[0], -max_shift_x, max_shift_x))
-    shift_y = float(torch.clamp(shift[1], -max_shift_y, max_shift_y))
-
-    # =========================================================
-    # 3. Convert to pixel space (keep float precision first)
-    # =========================================================
-    if latent_size is None:
-        latent_W, latent_H = W, H
-    else:
-        latent_W, latent_H = latent_size
+    shift_x = max(-max_shift_x, min(max_shift_x, shift_x))
+    shift_y = max(-max_shift_y, min(max_shift_y, shift_y))
 
     dx = shift_x
     dy = shift_y
 
     if debug:
-        print(f"[SHIFT] dx={dx:.3f}, dy={dy:.3f}")
+        print(f"[SHIFT] dx={dx:.4f}, dy={dy:.4f}")
 
     # =========================================================
-    # 3.5 Rotation compensation (NEW)
+    # 3. Angle (safe)
     # =========================================================
     if global_angle is not None:
-        angle = float(global_angle[0,0].item()) if isinstance(global_angle, torch.Tensor) else float(global_angle)
+        if isinstance(global_angle, torch.Tensor):
+            angle = float(global_angle.mean().item())
+        else:
+            angle = float(global_angle)
+    else:
+        angle = 0.0
 
-        # convert latent center
-        cx, cy = W * 0.5, H * 0.5
+    # clamp angle (VERY IMPORTANT)
+    angle = max(-0.2, min(0.2, angle))  # ~±11°
 
-        cos_a = math.cos(-angle)
-        sin_a = math.sin(-angle)
+    if debug:
+        print(f"[ROT] angle(rad)={angle:.5f}")
 
-        # rotation matrix compensation (inverse rotation)
-        # applied implicitly via grid warp
+    # inverse transform
+    angle = -angle
 
-    # early exit
-    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
-        return latent
-
-    # =========================================================
-    # 4. Padding helper
-    # =========================================================
-    def pad_tensor(t, pad):
-        return F.pad(t, pad, mode=padding_mode)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
 
     # =========================================================
-    # 5. Apply shift (subpixel-safe via rounding only at padding stage)
+    # 4. Build grid
     # =========================================================
-    dx_i = int(round(dx))
-    dy_i = int(round(dy))
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing="ij"
+    )
 
-    # Horizontal
-    if dx_i > 0:
-        latent = pad_tensor(latent, (dx_i, 0, 0, 0))
-        latent = latent[:, :, :, :W]
-    elif dx_i < 0:
-        latent = pad_tensor(latent, (0, -dx_i, 0, 0))
-        latent = latent[:, :, :, -W:]
+    xx = xx.float()
+    yy = yy.float()
 
-    # Vertical
-    if dy_i > 0:
-        latent = pad_tensor(latent, (0, 0, dy_i, 0))
-        latent = latent[:, :, :H, :]
-    elif dy_i < 0:
-        latent = pad_tensor(latent, (0, 0, 0, -dy_i))
-        latent = latent[:, :, -H:, :]
+    # =========================================================
+    # 5. Center (NO shifted center → more stable)
+    # =========================================================
+    cx = (W - 1) * 0.5
+    cy = (H - 1) * 0.5
+
+    # =========================================================
+    # 6. Apply inverse rotation FIRST
+    # =========================================================
+    x = xx - cx
+    y = yy - cy
+
+    rx = x * cos_a - y * sin_a
+    ry = x * sin_a + y * cos_a
+
+    # back to image coords
+    rx = rx + cx
+    ry = ry + cy
+
+    # =========================================================
+    # 7. Apply translation AFTER rotation
+    # =========================================================
+    rx = rx - dx
+    ry = ry - dy
+
+    # =========================================================
+    # 8. Normalize grid
+    # =========================================================
+    grid_x = 2.0 * rx / (W - 1) - 1.0
+    grid_y = 2.0 * ry / (H - 1) - 1.0
+
+    grid = torch.stack((grid_x, grid_y), dim=-1)
+    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)
+
+    # =========================================================
+    # 9. Warp
+    # =========================================================
+    latent = F.grid_sample(
+        latent,
+        grid,
+        mode="bilinear",
+        padding_mode=padding_mode,
+        align_corners=True
+    )
 
     return latent
 
@@ -1356,7 +1383,8 @@ def apply_global_pose(
         )
         grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
         #return latents, torch.zeros((B,1,1,2), device=device), grid, None
-        return latents, torch.zeros((B,1,1,2), device=device), grid, None, torch.zeros((B,1,1,2), device=device)
+        global_angle = torch.zeros((B,1,1), device=device)
+        return latents, torch.zeros((B,1,1,2), device=device), grid, None, torch.zeros((B,1,1,2), device=device), global_angle
 
     # =========================================================
     # 🔹 Key joints
@@ -1530,7 +1558,14 @@ def apply_global_pose(
             )
 
     #return latents_out, delta_px, grid, grid_norm
-    return latents_out, delta_px, grid, grid_norm, warp_shift
+    #return latents_out, delta_px, grid, grid_norm, warp_shift
+    # stable per-batch angle (garde batch dimension)
+    sign = torch.where(torch.abs(cross) < 1e-6, torch.ones_like(cross), torch.sign(cross))
+    angle = angle * sign.unsqueeze(-1)
+
+    global_angle = angle.mean(dim=1, keepdim=True)  # stable batch-wise
+
+    return latents_out, delta_px, grid, grid_norm, warp_shift, global_angle
 
 
 #------------------------------------------------------------------------------------------
@@ -1877,7 +1912,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
     grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
-    #grid_base = grid + global_shift
+
 
     # =========================
     # 🔹 Masks
@@ -1911,7 +1946,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     if should_freeze(frame_counter, 1): # Pause traitement
         start = time.time()
-        latents_world, global_delta, grid_raw, grid_global, warp_shift = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
+        latents_world, global_delta, grid_raw, grid_global, warp_shift, global_angle = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
         print("[DEBUG] WARP Shift: ")
         dx = warp_shift[0,0,0,0].item()
         dy = warp_shift[0,0,0,1].item()
@@ -1919,6 +1954,62 @@ def apply_pose_driven_motion_ultra2(
         #warp_shift_norm = warp_shift.view(1,2) / [W, H]
         warp_shift_norm = warp_shift.view(1,2) / torch.tensor([W, H], device=warp_shift.device, dtype=warp_shift.dtype)
         state["global_shift"] = 0.6 * state["global_shift"] + 0.4 * warp_shift_norm
+
+        # =========================
+        # 🔹 GLOBAL ANGLE (NEW)
+        # =========================
+        if torch.is_tensor(global_angle):
+            global_angle = global_angle.mean().item()
+
+        # EMA smoothing (super important)
+        if "global_angle" not in state:
+            state["global_angle"] = global_angle
+        else:
+            state["global_angle"] = (
+                0.7 * state["global_angle"] +
+                0.3 * global_angle
+            )
+
+        # ==========================================================================
+        # 🔹 Global rotation (ANGLE)
+        # ==========================================================================
+        global_angle = torch.zeros((B,1,1), device=device)
+
+        if prev_pose is not None:
+            ls_idx = pose.FACIAL_POINT_IDX["left_shoulder"]
+            rs_idx = pose.FACIAL_POINT_IDX["right_shoulder"]
+
+            ls = pose.keypoints[:, ls_idx, :2]
+            rs = pose.keypoints[:, rs_idx, :2]
+
+            ls_prev = prev_pose.keypoints[:, ls_idx, :2]
+            rs_prev = prev_pose.keypoints[:, rs_idx, :2]
+
+            v = rs - ls
+            v_prev = rs_prev - ls_prev
+
+            angle = torch.atan2(v[:,1], v[:,0])
+            angle_prev = torch.atan2(v_prev[:,1], v_prev[:,0])
+
+            delta_angle = angle - angle_prev
+
+            # wrap propre
+            delta_angle = torch.atan2(torch.sin(delta_angle), torch.cos(delta_angle))
+
+            # clamp anti-explosion (CRUCIAL)
+            delta_angle = torch.clamp(delta_angle, -0.2, 0.2)
+
+            global_angle = delta_angle.view(B,1,1)
+
+        # =============================================================================
+        # 🔹 smoothing temporel
+        # =========================
+        if "global_angle" not in state:
+            state["global_angle"] = global_angle
+        else:
+            state["global_angle"] = 0.7 * state["global_angle"] + 0.3 * global_angle
+        #=============================================================================
+
         if prev_pose is not None:
             key_joints = ['neck','left_shoulder','right_shoulder','left_hip','right_hip']
             for joint in key_joints:
@@ -2522,7 +2613,7 @@ def ensure_kp3(kp):
         conf = torch.ones_like(kp[..., :1])
         kp = torch.cat([kp, conf], dim=-1)
     return kp
-
+# ============= FONCTION PRINCIPAL ============================
 def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
@@ -2590,6 +2681,7 @@ def update_sequence_from_keypoints_batch(
     state.setdefault("angle", 0.0)
     state.setdefault("rotation", 0.0)
     state.setdefault("initialized", True)
+    state.setdefault("global_angle", 0.0)
 
 
     # =========================================================
@@ -2741,7 +2833,15 @@ def update_sequence_from_keypoints_batch(
     if kp_prev is not None:
         center = kp[..., :2].mean(dim=1, keepdim=True)
 
-        angle = 0.08 * math.sin(frame_idx * 0.05)
+        #angle = 0.08 * math.sin(frame_idx * 0.05)
+        # priorité à la rotation globale réelle
+        angle_global = state.get("global_angle", 0.0)
+
+        # fallback léger si pas dispo
+        angle_fake = 0.02 * math.sin(frame_idx * 0.05)
+
+        # blend safe
+        angle = 0.8 * angle_global + 0.2 * angle_fake
         cos_a, sin_a = math.cos(angle), math.sin(angle)
 
         rot = torch.tensor(
@@ -2760,8 +2860,12 @@ def update_sequence_from_keypoints_batch(
         dist_before = torch.norm(kp_before[..., :2] - center, dim=-1)
 
         print("\n[DEBUG ROTATION]")
-        print(f"angle (rad): {angle:.6f}")
-        print(f"angle (deg): {angle * 57.2958:.2f}")
+        angle_val = angle
+        if torch.is_tensor(angle_val):
+            angle_val = angle_val.mean().item()
+
+        print(f"angle (rad): {angle_val:.6f}")
+        print(f"angle (deg): {angle_val * 57.2958:.2f}")
         print(f"center mean: {center.mean().item():.6f}")
         print(f"delta_rot mean: {delta_rot.abs().mean().item():.6f}")
         print(f"delta_rot max: {delta_rot.abs().max().item():.6f}")

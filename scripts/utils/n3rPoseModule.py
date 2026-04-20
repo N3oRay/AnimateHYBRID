@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 import inspect
 import math
+import traceback
 
 # =========================================================
 # ACTOR FUNCTION MAP (EXTENSIBLE SYSTEM)
@@ -172,8 +173,8 @@ ACTOR_MODEL_SCHEDULE = [
     (4,  "v9"),
     (6,  "v8"),
     (10,  "base"),
-    (11, "v7"),
-    (14,  "base"),
+    #(11, "v7"),
+    #(14,  "base"),
     (15, "v6"),
     (17,  "base"),
     (18, "v3"),
@@ -1387,7 +1388,7 @@ def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
         state = {}
 
     kp_prev = state.get("kp_prev", kp.clone())
-
+    state.setdefault("global_angle", 0.0)
     state.setdefault("kp_prev", kp_prev)
 
     # FIX: velocity always valid shape (B,N,2)
@@ -1423,6 +1424,7 @@ def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
         if debug:
             print(f"[⚠ ACTOR ERROR] model={rmodel} -> fallback base motion")
             print(f"error: {e}")
+            traceback.print_exc()
         result = update_motion_state(kp, state)
 
     # =========================
@@ -1433,8 +1435,32 @@ def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
     else:
         kp_out, new_state = result, state
 
+    global_angle = None
+
+    # cas 1 : pipeline renvoie 3 valeurs
+    if isinstance(result, tuple) and len(result) == 3:
+        kp_out, new_state, global_angle = result
+
+    # cas 2 : angle déjà dans state
+    if isinstance(new_state, dict):
+        if "global_angle" in new_state:
+            global_angle = new_state["global_angle"]
+
     if new_state is None:
         new_state = {}
+
+    if global_angle is not None:
+        try:
+            ga = float(global_angle)
+            prev = state.get("global_angle", 0.0)
+
+            # EMA smoothing
+            smooth = 0.9 * prev + 0.1 * ga
+
+            new_state["global_angle"] = smooth
+
+        except Exception:
+            new_state["global_angle"] = state.get("global_angle", 0.0)
 
     # =========================
     # SAFE STATE UPDATE (IMPORTANT FIX)
@@ -1447,6 +1473,9 @@ def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
 
     if "angle" not in new_state:
         new_state["angle"] = 0.0
+
+    if "global_angle" not in new_state:
+        new_state["global_angle"] = state.get("global_angle", 0.0)
 
     # =========================
     # DEBUG MOTION
