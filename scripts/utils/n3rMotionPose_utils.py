@@ -28,6 +28,104 @@ from torchvision.utils import save_image
 import torch
 import torch.nn.functional as F
 
+def compensate_latent_shift_dev(
+    latent,
+    shift,
+    global_angle=None,
+    image_size=(1280, 896),
+    latent_size=None,
+    max_shift_ratio=0.2,
+    compensation_gain=200.0,
+    padding_mode="reflect",
+    debug=False
+):
+
+
+    B, C, H, W = latent.shape
+
+    # =========================================================
+    # 1. Read shift
+    # =========================================================
+    shift_x = float(shift[0, 0])
+    shift_y = float(shift[0, 1])
+
+    # =========================================================
+    # 2. Apply gain + clamp (IMPORTANT STABILITY STEP)
+    # =========================================================
+    shift = torch.tensor([shift_x, shift_y], device=latent.device)
+
+    shift = shift * compensation_gain
+
+    max_shift_x = W * max_shift_ratio
+    max_shift_y = H * max_shift_ratio
+
+    shift_x = float(torch.clamp(shift[0], -max_shift_x, max_shift_x))
+    shift_y = float(torch.clamp(shift[1], -max_shift_y, max_shift_y))
+
+    # =========================================================
+    # 3. Convert to pixel space (keep float precision first)
+    # =========================================================
+    if latent_size is None:
+        latent_W, latent_H = W, H
+    else:
+        latent_W, latent_H = latent_size
+
+    dx = shift_x
+    dy = shift_y
+
+    if debug:
+        print(f"[SHIFT] dx={dx:.3f}, dy={dy:.3f}")
+
+    # =========================================================
+    # 3.5 Rotation compensation (NEW)
+    # =========================================================
+    if global_angle is not None:
+        angle = float(global_angle[0,0].item()) if isinstance(global_angle, torch.Tensor) else float(global_angle)
+
+        # convert latent center
+        cx, cy = W * 0.5, H * 0.5
+
+        cos_a = math.cos(-angle)
+        sin_a = math.sin(-angle)
+
+        # rotation matrix compensation (inverse rotation)
+        # applied implicitly via grid warp
+
+    # early exit
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        return latent
+
+    # =========================================================
+    # 4. Padding helper
+    # =========================================================
+    def pad_tensor(t, pad):
+        return F.pad(t, pad, mode=padding_mode)
+
+    # =========================================================
+    # 5. Apply shift (subpixel-safe via rounding only at padding stage)
+    # =========================================================
+    dx_i = int(round(dx))
+    dy_i = int(round(dy))
+
+    # Horizontal
+    if dx_i > 0:
+        latent = pad_tensor(latent, (dx_i, 0, 0, 0))
+        latent = latent[:, :, :, :W]
+    elif dx_i < 0:
+        latent = pad_tensor(latent, (0, -dx_i, 0, 0))
+        latent = latent[:, :, :, -W:]
+
+    # Vertical
+    if dy_i > 0:
+        latent = pad_tensor(latent, (0, 0, dy_i, 0))
+        latent = latent[:, :, :H, :]
+    elif dy_i < 0:
+        latent = pad_tensor(latent, (0, 0, 0, -dy_i))
+        latent = latent[:, :, -H:, :]
+
+    return latent
+
+
 def compensate_latent_shift(
     latent,
     shift,
