@@ -112,6 +112,63 @@ class Pose:
         }
 
 
+    def rotate_points_around_pivot(self, points, pivot, angle):
+        """
+        Applique une rotation autour du pivot pour les points donnés.
+
+        points : [B, N, 2] - Points à faire pivoter (x, y)
+        pivot : [B, N, 2] - Pivot autour duquel faire pivoter
+        angle : angle de rotation en radians
+
+        Retourne les points après rotation.
+        """
+        # Calculer le cosinus et sinus de l'angle
+        cos_a = torch.cos(angle)
+        sin_a = torch.sin(angle)
+
+        # Centrer les points autour du pivot
+        points_centered = points - pivot
+
+        # Appliquer la rotation
+        x_new = points_centered[..., 0] * cos_a - points_centered[..., 1] * sin_a
+        y_new = points_centered[..., 0] * sin_a + points_centered[..., 1] * cos_a
+
+        # Revenir aux coordonnées d'origine
+        rotated_points = torch.stack([x_new, y_new], dim=-1) + pivot
+
+        return rotated_points
+
+    def apply_rotation(self, angle):
+        """
+        Applique une rotation sur les points du corps (épaules, coudes, poignets) autour du pivot
+        calculé à partir des points du torse et du cou.
+
+        angle : angle de rotation en radians
+        """
+        # Indices des points à faire pivoter (épaules, coudes, poignets)
+        upper_ids = [
+            self.FACIAL_POINT_IDX['left_shoulder'],
+            self.FACIAL_POINT_IDX['right_shoulder'],
+            self.FACIAL_POINT_IDX['left_elbow'],
+            self.FACIAL_POINT_IDX['right_elbow'],
+            self.FACIAL_POINT_IDX['left_wrist'],
+            self.FACIAL_POINT_IDX['right_wrist']
+        ]
+
+        # Calculer le pivot comme la moyenne des points dans la plage spécifiée (ici de 5 à 12)
+        pivot = self.keypoints[:, 5:min(13, self.B), :2].mean(dim=1, keepdim=True)
+
+        # Adapter la forme de pivot pour qu'il corresponde à celle des points à faire pivoter
+        pivot = pivot.expand(-1, len(upper_ids), -1)
+
+        # Appliquer la rotation des points autour du pivot
+        self.keypoints[:, upper_ids, :2] = self.rotate_points_around_pivot(
+            self.keypoints[:, upper_ids, :2],
+            pivot,
+            angle
+        )
+
+
 
 
     def get_bouche_expand_h(self):

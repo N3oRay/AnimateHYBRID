@@ -31,7 +31,7 @@ def compensate_latent_shift_dev(
     global_angle=None,
     image_size=(1280, 896),
     latent_size=None,
-    max_shift_ratio=0.2,
+    max_shift_ratio=0.5,
     padding_mode="reflection",
     debug=False
 ):
@@ -68,7 +68,7 @@ def compensate_latent_shift_dev(
     dy = shift_y
 
     if debug:
-        print(f"[SHIFT] dx={dx:.4f}, dy={dy:.4f}")
+        print(f"[SHIFT COMPENSATE] dx={dx:.4f}, dy={dy:.4f}")
 
     # =========================================================
     # 3. Angle (safe)
@@ -85,7 +85,7 @@ def compensate_latent_shift_dev(
     angle = max(-0.2, min(0.2, angle))  # ~±11°
 
     if debug:
-        print(f"[ROT] angle(rad)={angle:.5f}")
+        print(f"[ROT COMPENSATE] angle(rad)={angle:.5f}")
 
     # inverse transform
     angle = -angle
@@ -149,6 +149,9 @@ def compensate_latent_shift_dev(
         padding_mode=padding_mode,
         align_corners=True
     )
+
+    if debug:
+            print(f"[DEBUG] After warp, latent size: {latent.shape}")  # Affichage après warp
 
     return latent
 

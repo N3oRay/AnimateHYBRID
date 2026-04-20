@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import inspect
 import math
 import traceback
+from .n3rMotionPoseClass import Pose
 
 # =========================================================
 # ACTOR FUNCTION MAP (EXTENSIBLE SYSTEM)
@@ -576,15 +577,17 @@ def actor_system_v9(
     # =========================================================
     # APPLY ROTATION
     # =========================================================
-    upper_ids = list(range(5, min(11, N)))
+    # Liste des indices des points à faire pivoter
+    # Création de l'instance de la classe Pose
+    pose = Pose(keypoints)  # "keypoints" étant le tensor des keypoints de la pose
 
-    pivot = kp[:, 5:min(13, N), :2].mean(dim=1, keepdim=True)
+    # Calculer l'angle de rotation (par exemple)
+    angle = torch.tensor(0.1)  # Remplacer par l'angle réel en radians
 
-    kp[:, upper_ids, :2] = rotate_points_around_pivot(
-        kp[:, upper_ids, :2],
-        pivot,
-        angle
-    )
+    # Appliquer la rotation
+    pose.apply_rotation(angle)
+
+    # Les keypoints après rotation sont maintenant stockés dans pose.keypoints
 
     # =========================================================
     # 7. MICRO NOISE (SAFE)
@@ -753,13 +756,17 @@ def cinematic_motion_graph_v8(
     # =========================================================
     kp_out = kp.clone()
 
-    upper_ids = list(range(5, 11))
+    # Créer une instance de la classe Pose avec les keypoints
+    pose = Pose(kp_out)  # on passe les keypoints ici
 
-    kp_out[:, upper_ids, :2] = rotate_points_around_pivot(
-        kp[:, upper_ids, :2],
-        pivot,
-        angle.view(B,1,1)  # IMPORTANT FIX
-    )
+    # Calculer l'angle de rotation, assure-toi que l'angle est bien un tensor de forme correcte
+    angle = angle.view(B, 1, 1)  # Formater l'angle correctement
+
+    # Appliquer la rotation via la méthode de la classe Pose
+    pose.apply_rotation(angle)
+
+    # Les keypoints après rotation sont maintenant dans pose.keypoints
+    kp_out = pose.keypoints
 
     # =========================================================
     # 6. MICRO INSTABILITY (CONTROLLED)
@@ -1163,7 +1170,7 @@ def cinematic_motion_graph_v6(
         state["torso_vec_prev"]
     )
     state["torso_vec_prev"] = torso_vec
-    angle_raw = angle_raw.view(B,1).clamp(-1.2, 1.2)
+    angle_raw = angle_raw.view(B, 1).clamp(-1.2, 1.2)
 
     state["angle"] = state["angle"] * (1 - rotation_smooth) + angle_raw * rotation_smooth
     angle = state["angle"]
@@ -1174,20 +1181,23 @@ def cinematic_motion_graph_v6(
     l_hip = kp[:, hip_ids[0], :2]
     r_hip = kp[:, hip_ids[1], :2]
     valid = torch.isfinite(l_hip).all(dim=-1, keepdim=True) & torch.isfinite(r_hip).all(dim=-1, keepdim=True)
-    shoulder_center = kp[:, [5,6], :2].mean(dim=1, keepdim=True)
-    pivot = torch.where(valid, (l_hip + r_hip)*0.5, shoulder_center)
+    shoulder_center = kp[:, [5, 6], :2].mean(dim=1, keepdim=True)
+    pivot = torch.where(valid, (l_hip + r_hip) * 0.5, shoulder_center)
 
     # =========================================================
-    # 4. ROTATION
+    # 4. ROTATION (using Pose class)
     # =========================================================
-    kp_out = kp.clone()
+    pose = Pose(kp.clone())  # Créer une instance de la classe Pose avec les keypoints actuels
+
+    # Calcul de la rotation (angle ajusté par la force de rotation)
     strength = rotation_strength * (1.0 + motion_gain)
-    angle_final = torch.clamp(angle * strength, -max_rotation_deg, max_rotation_deg).view(B,1)
-    kp_out[:, upper_ids, :2] = rotate_points_around_pivot(
-        kp[:, upper_ids, :2],
-        pivot,
-        angle_final
-    )
+    angle_final = torch.clamp(angle * strength, -max_rotation_deg, max_rotation_deg)
+
+    # Appliquer la rotation avec la méthode de la classe Pose
+    pose.apply_rotation(angle_final)
+
+    # Les keypoints après rotation sont stockés dans pose.keypoints
+    kp_out = pose.keypoints
 
     # =========================================================
     # 5. HEAD LOCK
@@ -1220,7 +1230,7 @@ def cinematic_motion_graph_v6(
         print("motion_gain:", motion_gain.mean().item())
         print("angle:", angle.mean().item())
         print("angle_final:", angle_final.mean().item())
-        print("pivot:", pivot[0,0].tolist())
+        print("pivot:", pivot[0, 0].tolist())
 
     return kp_out, state
 
