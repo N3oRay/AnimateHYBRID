@@ -3,50 +3,8 @@ import numpy as np
 import cv2
 import os
 from PIL import Image, ImageDraw
-from .n3rMotionPose_tools import save_debug_mask, feather_inside_strict, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, feather_outside_only_alpha, feather_inside_strict2, feather_outside_only_alpha2
+from .n3rMotionPose_tools import save_debug_mask, feather_inside_strict, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, feather_outside_only_alpha, feather_inside_strict2, feather_outside_only_alpha2, save_debug_mask_scale
 
-
-def save_debug_mask_scale(
-    mask: torch.Tensor,
-    debug_dir: str,
-    frame_counter: int,
-    name: str = "mouth_mask",
-    scale: int = 4,
-    verbose: bool = True,
-):
-    """
-    Sauvegarde debug d'un mask [B,1,H,W] en image PNG.
-    """
-
-    try:
-
-        os.makedirs(debug_dir, exist_ok=True)
-        m = mask[0, 0].detach().cpu().numpy()
-        if verbose:
-            print(f"[DEBUG][{name.upper()} MASK] mean={m.mean():.6f} max={m.max():.6f}")
-
-        img = (np.clip(m, 0, 1) * 255).astype(np.uint8)
-
-        h, w = img.shape
-        img = cv2.resize(
-            img,
-            (w * scale, h * scale),
-            interpolation=cv2.INTER_NEAREST
-        )
-
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-        path = os.path.join(debug_dir, f"{name}_{frame_counter:05d}.png")
-        cv2.imwrite(path, img)
-
-        if verbose:
-            print(f"[DEBUG] {name} saved: {path}")
-
-        return path
-
-    except Exception as e:
-        print(f"[WARN] save_debug_mask failed ({e})")
-        return None
 
 
 def ensure_2d(x):

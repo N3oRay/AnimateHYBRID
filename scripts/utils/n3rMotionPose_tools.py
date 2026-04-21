@@ -14,6 +14,60 @@ from PIL import Image, ImageDraw
 import traceback
 import torchvision.utils as vutils
 
+def save_debug_mask_scale(
+    mask: torch.Tensor,
+    debug_dir: str,
+    frame_counter: int,
+    name: str = "mask",
+    scale: int = 4,
+    verbose: bool = True,
+):
+    try:
+        os.makedirs(debug_dir, exist_ok=True)
+
+        # =========================
+        # SAFE NORMALIZATION
+        # =========================
+        if not torch.is_tensor(mask):
+            mask = torch.tensor(mask)
+
+        if mask.dim() == 4:
+            m = mask[0, 0]
+        elif mask.dim() == 3:
+            m = mask[0]
+        elif mask.dim() == 2:
+            m = mask
+        else:
+            raise ValueError(f"[save_debug_mask] invalid shape: {mask.shape}")
+
+        m = m.detach().cpu().numpy()
+
+        if verbose:
+            print(f"[DEBUG][{name.upper()} MASK] mean={m.mean():.6f} max={m.max():.6f}")
+
+        img = (np.clip(m, 0, 1) * 255).astype(np.uint8)
+
+        h, w = img.shape
+        img = cv2.resize(
+            img,
+            (w * scale, h * scale),
+            interpolation=cv2.INTER_NEAREST
+        )
+
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        path = os.path.join(debug_dir, f"{name}_{frame_counter:05d}.png")
+        cv2.imwrite(path, img)
+
+        if verbose:
+            print(f"[DEBUG] {name} saved: {path}")
+
+        return path
+
+    except Exception as e:
+        print(f"[WARN] save_debug_mask failed ({e})")
+        return None
+
 
 def dilate_mask(mask, kernel_size=3):
     # Vérifier que le masque est de forme [B, C, H, W] et le redimensionner si nécessaire

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body, reconstruct_hips
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale
 
 from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v6, cinematic_motion_graph_v7, cinematic_motion_graph_v8, actor_system_v9, apply_actor_model, resolve_motion_model
 
@@ -27,12 +27,15 @@ from torchvision.utils import save_image
 
 def compensate_latent_shift_dev(
     latent,
+    frame_counter,
     shift,
     global_angle=None,
     prev_latent=None,   # <-- NEW
     max_shift_ratio=0.5,
     padding_mode="reflection",
-    debug=False
+    image_size=(1280, 896),
+    debug=False,
+    debug_dir=None
 ):
 
     if padding_mode == "reflect":
@@ -155,7 +158,7 @@ def compensate_latent_shift_dev(
     shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
 
     # Dynamically adjust dilation size based on shift magnitude and image size
-    kernel_size = max(7, int(shift_magnitude * 10.0))  # Taille du noyau dynamique
+    kernel_size = max(9, int(shift_magnitude * 10.0))  # Taille du noyau dynamique
     kernel_size = min(kernel_size, 15)  # On limite la taille du noyau pour éviter une trop grande dilatation
 
     if debug:
@@ -163,45 +166,72 @@ def compensate_latent_shift_dev(
 
     # Ajuster en fonction de l'angle de rotation
     if global_angle is not None:
-        angle_factor = abs(global_angle) * 10  # Plus l'angle est grand, plus le noyau sera large
+        angle_factor = abs(global_angle) * 800  # Plus l'angle est grand, plus le noyau sera large # Valeur absolu exemple Input: -29 Output: 29
         kernel_size += int(angle_factor)
 
     # Assurer que la taille du noyau ne dépasse pas une certaine limite
-    kernel_size = min(kernel_size, 25)
+    #kernel_size = min(kernel_size, 25)
 
     if debug:
         print(f"[MASK] +Angle kernel_size={kernel_size:.4f}")
+
+    oriH, oriW = image_size
+    if oriH * oriW >= 1280 * 896:  # Ajuster cette condition selon les tailles d'image courantes
+        kernel_size += 4
+        if debug:
+            print(f"[MASK] +SIZE kernel_size={kernel_size:.4f}")
 
     # Agrandissement du masque avec dilatation
     valid_mask_dilated = dilate_mask(valid_mask, kernel_size=kernel_size)  # Dilatation pour agrandir les zones valides
 
     # Avant de passer à la fonction de flou gaussien, assurons-nous que le masque a la bonne forme.
-    # La fonction 'gaussian_blur_tensor' attend un tensor [B, C, H, W], donc nous devons nous assurer que
-    # le masque a au moins une dimension de batch, même si c'est une seule image.
-
-    # Si valid_mask_dilated a une forme [C, H, W], ajoutons la dimension batch.
     valid_mask_dilated = valid_mask_dilated.unsqueeze(0)  # Ajoute la dimension batch : [1, C, H, W]
-
-
-
 
     # Applique le flou gaussien sur le masque dilaté
     valid_mask = gaussian_blur_tensor(valid_mask_dilated, kernel_size=7, sigma=1.5)  # Paramètres à ajuster selon besoin
 
-    # Calcul du ratio de validité moyen
-    valid_mask = valid_mask.squeeze(0)  # Retirer la dimension du batch après traitement pour revenir à [C, H, W]
-    valid_mask = valid_mask.unsqueeze(0)  # Si nécessaire, remettre la dimension batch [B, 1, H, W]
+    # =========================================================
+    # Ajuster la taille du valid_mask pour correspondre aux latents
+    valid_mask = F.interpolate(valid_mask, size=(latent.shape[2], latent.shape[3]), mode="bilinear", align_corners=True)
 
-    # Calcul du ratio de validité
+    # Maintenant valid_mask est redimensionné pour correspondre à la taille de latent
+    valid_mask = valid_mask.squeeze(0)  # Enlevez la dimension batch après l'interpolation, maintenant [C, H, W]
+
+    # Calcul du ratio de validité moyen
     valid_ratio = valid_mask.mean().item()
 
     if debug:
         print(f"[MASK] valid_ratio={valid_ratio:.4f}")
+        save_debug_mask_scale(
+                mask=valid_mask,
+                debug_dir=debug_dir,
+                frame_counter=frame_counter,
+                name="compensate_mask",
+                scale=4
+            )
 
     # =========================================================
     # 6. BLEND (SOLUTION A)
     # =========================================================
     if prev_latent is not None:
+        # Vérification des dimensions avant de faire le blending
+        if latent_warped.shape != prev_latent.shape:
+            pB, pC, pH, pW = prev_latent.shape
+            # Redimensionner latent_warped à la taille exacte de prev_latent
+            latent_warped = F.interpolate(latent_warped, size=(pH, pW), mode="bilinear", align_corners=True)
+
+            # Vérification finale des dimensions après l'interpolation
+            if latent_warped.shape != prev_latent.shape:
+                # Correction possible des dimensions en utilisant un redimensionnement exact
+                latent_warped = latent_warped[:, :, :pH, :pW]  # Troncature si nécessaire
+
+            if debug:
+                print(f"[BLEND] Redimensionnement de latent_warped à la taille de : {prev_latent.shape}")
+
+        # Vérification finale des dimensions
+        if latent_warped.shape != prev_latent.shape:
+            raise ValueError(f"Les tailles de latent_warped {latent_warped.shape} et prev_latent {prev_latent.shape} ne correspondent toujours pas!")
+
         latent_out = latent_warped * valid_mask + prev_latent * (1.0 - valid_mask)
 
         if debug:
@@ -222,750 +252,10 @@ def compensate_latent_shift_dev(
         delta = (latent_out - latent).abs().mean().item()
         print(f"[OUTPUT] delta_mean={delta:.6f}")
 
+
+
+
     return latent_out
-
-
-def compensate_latent_shift_dev_v6(
-    latent,
-    shift,
-    global_angle=None,
-    image_size=(1280, 896),
-    latent_size=None,
-    max_shift_ratio=0.5,
-    padding_mode="reflection",
-    debug=False
-):
-    if padding_mode == "reflect":
-        padding_mode = "reflection"
-
-    B, C, H, W = latent.shape
-    device = latent.device
-
-    # =========================================================
-    # 1. Read + sanitize shift
-    # =========================================================
-    shift = shift.to(device).view(-1)
-
-    shift_x = float(shift[0])
-    shift_y = float(shift[1])
-
-    if debug:
-        print(f"[SHIFT INPUT] shift_x={shift_x:.4f}, shift_y={shift_y:.4f}")
-
-    # =========================================================
-    # 2. Stable gain (NO adaptive jitter)
-    # =========================================================
-    shift_x_tensor = torch.tensor(shift_x, device=device)
-    shift_y_tensor = torch.tensor(shift_y, device=device)
-
-    shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
-    #compensation_gain = 8.0 * torch.min(shift_magnitude / 10.0, torch.tensor(1.0, device=device))
-    #compensation_gain = 1.0 + 4.0 * torch.clamp(shift_magnitude * 10.0, 0.0, 1.0)
-
-    #t = torch.clamp(shift_magnitude * 10.0, 0.0, 1.0)
-    #compensation_gain = 1.0 + 5.0 * (t ** 1.5)
-
-    t = torch.clamp(shift_magnitude * 10.0, 0.0, 1.0)
-    t = t * t * (3 - 2 * t)  # smoothstep
-
-    compensation_gain = 1.0 + 6.0 * t
-
-    shift_x *= compensation_gain
-    shift_y *= compensation_gain
-
-    max_shift_x = W * max_shift_ratio
-    max_shift_y = H * max_shift_ratio
-
-    shift_x = max(-max_shift_x, min(max_shift_x, shift_x))
-    shift_y = max(-max_shift_y, min(max_shift_y, shift_y))
-
-    dx = shift_x
-    dy = shift_y
-
-    if debug:
-        print(f"[SHIFT COMPENSATE] dx={dx:.4f}, dy={dy:.4f}")
-
-
-    # =========================================================
-    # 3. Angle (safe with dynamic range)
-    # =========================================================
-    # Si global_angle est spécifié, calculer l'angle
-    if global_angle is not None:
-        # Log pour vérifier si global_angle est un tensor ou non
-        if isinstance(global_angle, torch.Tensor):
-            angle = global_angle.mean()  # Moyenne si c'est un tensor
-            print(f"[DEBUG] global_angle est un Tensor. Moyenne de global_angle : {angle.item():.5f}")
-        else:
-            angle = torch.tensor(global_angle, device=device)  # Convertir en tensor
-            print(f"[DEBUG] global_angle est un scalaire. Conversion en tensor : {angle.item():.5f}")
-    else:
-        angle = torch.tensor(0.0, device=device)  # Si global_angle est None
-        print(f"[DEBUG] global_angle est None. Angle initialisé à 0.0 : {angle.item():.5f}")
-
-
-    rotation_gain = 1.0 + 2.0 * torch.clamp(shift_magnitude * 10.0, 0.0, 1.0)
-    angle = angle * rotation_gain
-
-    max_angle = 0.1  # ~5.7°
-    if torch.abs(angle) > max_angle:
-        angle = torch.sign(angle) * max_angle
-
-    print(f"[DEBUG] Angle après clamp : {angle.item():.5f} ")
-
-    if debug:
-        print(f"[ROT COMPENSATE] angle (before inverse rotation) = {angle:.5f} rad")
-
-    # Inverse rotation
-    angle = -angle
-
-    # Log the angle after inversion
-    if debug:
-        print(f"[ROT COMPENSATE] angle (after inverse rotation) = {angle:.5f} rad")
-
-    cos_a = math.cos(angle.item())
-    sin_a = math.sin(angle.item())
-
-    # =========================================================
-    # 4. Build grid for warping
-    # =========================================================
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing="ij"
-    )
-
-    xx = xx.float()
-    yy = yy.float()
-
-    if debug:
-        print(f"[GRID] xx shape={xx.shape}, yy shape={yy.shape}")
-        print(f"[GRID] First 5 values of xx: {xx[0, :5]}")
-        print(f"[GRID] First 5 values of yy: {yy[0, :5]}")
-
-    # =========================================================
-    # 5. Centering and apply rotation
-    # =========================================================
-    cx = (W - 1) * 0.5
-    cy = (H - 1) * 0.5
-
-    if debug:
-        print(f"[CENTER] cx={cx:.4f}, cy={cy:.4f}")
-
-    # Apply rotation
-    x = xx - cx
-    y = yy - cy
-
-    rx = x * cos_a - y * sin_a
-    ry = x * sin_a + y * cos_a
-
-    if debug:
-        print(f"[ROTATE] rx (first 5 values): {rx[0, :5]}")
-        print(f"[ROTATE] ry (first 5 values): {ry[0, :5]}")
-
-    # Convert back to image coordinates
-    rx = rx + cx
-    ry = ry + cy
-
-    if debug:
-        print(f"[POST-ROTATE] rx (first 5 values): {rx[0, :5]}")
-        print(f"[POST-ROTATE] ry (first 5 values): {ry[0, :5]}")
-
-    # =========================================================
-    # 6. Apply translation after rotation
-    # =========================================================
-    rx = rx - dx
-    ry = ry - dy
-
-    if debug:
-        print(f"[TRANSLATE] rx (first 5 values after translation): {rx[0, :5]}")
-        print(f"[TRANSLATE] ry (first 5 values after translation): {ry[0, :5]}")
-
-    # =========================================================
-    # 7. Normalize grid for grid_sample
-    # =========================================================
-    grid_x = 2.0 * rx / (W - 1) - 1.0
-    grid_y = 2.0 * ry / (H - 1) - 1.0
-
-    grid = torch.stack((grid_x, grid_y), dim=-1)
-    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)
-
-    if debug:
-        print(f"[GRID] grid (first 5 values): {grid[0, :5, :5]}")
-
-    # =========================================================
-    # 8. Warp the latent tensor
-    # =========================================================
-    latent = F.grid_sample(
-        latent,
-        grid,
-        mode="bilinear",
-        padding_mode=padding_mode,
-        align_corners=True
-    )
-
-    if debug:
-        print(f"[DEBUG] After warp, latent size: {latent.shape}")
-
-    return latent
-
-def compensate_latent_shift_dev_v5(
-    latent,
-    shift,
-    global_angle=None,
-    image_size=(1280, 896),
-    latent_size=None,
-    max_shift_ratio=0.5,
-    padding_mode="reflection",
-    debug=False
-):
-    if padding_mode == "reflect":
-        padding_mode = "reflection"
-
-    B, C, H, W = latent.shape
-    device = latent.device
-
-    # =========================================================
-    # 1. Read + sanitize shift
-    # =========================================================
-    shift = shift.to(device).view(-1)
-
-    shift_x = float(shift[0])  # Convertir en float pour plus de clarté
-    shift_y = float(shift[1])
-
-    # =========================================================
-    # 2. Stable gain (NO adaptive jitter)
-    # =========================================================
-    shift_x_tensor = torch.tensor(shift_x, device=device)
-    shift_y_tensor = torch.tensor(shift_y, device=device)
-
-    # Calculer la magnitude
-    shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
-
-    compensation_gain = 8.0 * torch.min(shift_magnitude / 10.0, torch.tensor(1.0, device=device))
-    shift_x *= compensation_gain
-    shift_y *= compensation_gain
-
-    # Clamp shifts based on max shift ratio
-    max_shift_x = W * max_shift_ratio
-    max_shift_y = H * max_shift_ratio
-
-    shift_x = max(-max_shift_x, min(max_shift_x, shift_x))
-    shift_y = max(-max_shift_y, min(max_shift_y, shift_y))
-
-    dx = shift_x
-    dy = shift_y
-
-    if debug:
-        print(f"[SHIFT COMPENSATE] dx={dx:.4f}, dy={dy:.4f}")
-
-    # =========================================================
-    # 3. Angle (safe with dynamic range)
-    # =========================================================
-    if global_angle is not None:
-        if isinstance(global_angle, torch.Tensor):
-            angle = global_angle.mean()  # Utiliser directement la valeur du tensor
-        else:
-            angle = torch.tensor(global_angle, device=device)
-    else:
-        angle = torch.tensor(0.0, device=device)
-
-    # Dynamically adjust the angle clipping range based on image size or shift magnitude
-    angle_max_clip = torch.min(torch.abs(shift_x), torch.abs(shift_y)) / 10.0  # More shift = larger angle range
-    angle = torch.clamp(angle, -angle_max_clip, angle_max_clip)  # Clamp avec des tensors
-
-    if debug:
-        print(f"[ROT COMPENSATE] angle(rad)={angle:.5f}")
-
-    # Inverse rotation
-    angle = -angle  # Appliquer la rotation inverse
-
-    cos_a = math.cos(angle.item())  # Convertir en float pour les calculs mathématiques
-    sin_a = math.sin(angle.item())  # Convertir en float pour les calculs mathématiques
-
-    # =========================================================
-    # 4. Build grid for warping
-    # =========================================================
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing="ij"
-    )
-
-    xx = xx.float()
-    yy = yy.float()
-
-    # =========================================================
-    # 5. Centering
-    # =========================================================
-    cx = (W - 1) * 0.5
-    cy = (H - 1) * 0.5
-
-    # =========================================================
-    # 6. Apply Inverse Rotation First
-    # =========================================================
-    x = xx - cx
-    y = yy - cy
-
-    rx = x * cos_a - y * sin_a
-    ry = x * sin_a + y * cos_a
-
-    # Convert back to image coordinates
-    rx = rx + cx
-    ry = ry + cy
-
-    # =========================================================
-    # 7. Apply Translation After Rotation
-    # =========================================================
-    rx = rx - dx
-    ry = ry - dy
-
-    # =========================================================
-    # 8. Normalize grid for grid_sample (align_corners=True)
-    # =========================================================
-    grid_x = 2.0 * rx / (W - 1) - 1.0
-    grid_y = 2.0 * ry / (H - 1) - 1.0
-
-    grid = torch.stack((grid_x, grid_y), dim=-1)
-    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)
-
-    # =========================================================
-    # 9. Warp the latent tensor
-    # =========================================================
-    latent = F.grid_sample(
-        latent,
-        grid,
-        mode="bilinear",
-        padding_mode=padding_mode,
-        align_corners=True  # Reste aligné aux coins
-    )
-
-    if debug:
-        print(f"[DEBUG] After warp, latent size: {latent.shape}")
-
-    return latent
-
-def compensate_latent_shift_dev_v4(
-    latent,
-    shift,
-    global_angle=None,
-    image_size=(1280, 896),
-    latent_size=None,
-    max_shift_ratio=0.5,
-    padding_mode="reflection",
-    debug=False,
-    compensation_gain_factor=8.0,   # Nouveau paramètre pour ajuster le gain de compensation
-    max_rotation_angle=None,        # Nouveau paramètre pour limiter l'angle de rotation
-    clamp_translation=True,         # Nouveau paramètre pour limiter la translation
-    rotation_mode="inverse"         # Nouveau paramètre pour choisir le type de rotation
-):
-    if padding_mode == "reflect":
-        padding_mode = "reflection"
-
-    B, C, H, W = latent.shape
-    device = latent.device
-
-    # =========================================================
-    # 1. Read + sanitize shift
-    # =========================================================
-    shift = shift.to(device).view(-1)
-
-    shift_x = float(shift[0])  # Convertit en float pour plus de clarté
-    shift_y = float(shift[1])
-
-    # =========================================================
-    # 2. Stable gain (NO adaptive jitter)
-    # =========================================================
-    shift_x_tensor = torch.tensor(shift_x, device=device)
-    shift_y_tensor = torch.tensor(shift_y, device=device)
-
-    # Calculer la magnitude
-    shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
-
-    # Adjust compensation gain based on a custom factor
-    compensation_gain = compensation_gain_factor * torch.min(shift_magnitude / 10.0, torch.tensor(1.0, device=device))
-    shift_x *= compensation_gain
-    shift_y *= compensation_gain
-
-    # Clamp shifts based on max shift ratio
-    max_shift_x = W * max_shift_ratio
-    max_shift_y = H * max_shift_ratio
-
-    shift_x = max(-max_shift_x, min(max_shift_x, shift_x))
-    shift_y = max(-max_shift_y, min(max_shift_y, shift_y))
-
-    dx = shift_x
-    dy = shift_y
-
-    if debug:
-        print(f"[SHIFT COMPENSATE] dx={dx:.4f}, dy={dy:.4f}")
-
-    # =========================================================
-    # 3. Angle (safe with dynamic range)
-    # =========================================================
-    if global_angle is not None:
-        if isinstance(global_angle, torch.Tensor):
-            angle = global_angle.mean()  # Utiliser directement la valeur du tensor
-        else:
-            angle = torch.tensor(global_angle, device=device)
-    else:
-        angle = torch.tensor(0.0, device=device)
-
-    # Dynamically adjust the angle clipping range based on image size or shift magnitude
-    angle_max_clip = torch.min(torch.abs(shift_x), torch.abs(shift_y)) / 10.0  # More shift = larger angle range
-    # Utiliser la variable tensor directement, sans appeler .item()
-    angle = torch.clamp(angle, -angle_max_clip, angle_max_clip)  # Clamp avec des tensors
-
-    if debug:
-        print(f"[ROT COMPENSATE] angle(rad)={angle:.5f}")
-
-    # Apply rotation based on chosen mode
-    if rotation_mode == "inverse":
-        angle = -angle  # Apply inverse rotation
-    elif rotation_mode == "forward":
-        pass  # No need to modify the angle
-    else:
-        raise ValueError(f"Unsupported rotation mode: {rotation_mode}")
-
-    cos_a = math.cos(angle.item())  # Convertir en float pour les calculs mathématiques
-    sin_a = math.sin(angle.item())  # Convertir en float pour les calculs mathématiques
-
-    # =========================================================
-    # 4. Build grid for warping
-    # =========================================================
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing="ij"
-    )
-
-    xx = xx.float()
-    yy = yy.float()
-
-    # =========================================================
-    # 5. Centering
-    # =========================================================
-    cx = (W - 1) * 0.5
-    cy = (H - 1) * 0.5
-
-    # =========================================================
-    # 6. Apply Inverse Rotation First
-    # =========================================================
-    x = xx - cx
-    y = yy - cy
-
-    rx = x * cos_a - y * sin_a
-    ry = x * sin_a + y * cos_a
-
-    # Convert back to image coordinates
-    rx = rx + cx
-    ry = ry + cy
-
-    # =========================================================
-    # 7. Apply Translation After Rotation
-    # =========================================================
-    rx = rx - dx
-    ry = ry - dy
-
-    # =========================================================
-    # 8. Normalize grid for grid_sample
-    # =========================================================
-    grid_x = 2.0 * rx / (W - 1) - 1.0
-    grid_y = 2.0 * ry / (H - 1) - 1.0
-
-    grid = torch.stack((grid_x, grid_y), dim=-1)
-    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)
-
-    # =========================================================
-    # 9. Clamp Translation if needed
-    # =========================================================
-    if clamp_translation:
-        grid_x = torch.clamp(grid_x, -1.0, 1.0)
-        grid_y = torch.clamp(grid_y, -1.0, 1.0)
-
-    # =========================================================
-    # 10. Warp the latent tensor
-    # =========================================================
-    latent = F.grid_sample(
-        latent,
-        grid,
-        mode="bilinear",
-        padding_mode=padding_mode,
-        align_corners=True
-    )
-
-    if debug:
-        print(f"[DEBUG] After warp, latent size: {latent.shape}")
-
-    return latent
-
-def compensate_latent_shift_dev_v3(
-    latent,
-    shift,
-    global_angle=None,
-    image_size=(1280, 896),
-    latent_size=None,
-    max_shift_ratio=0.5,
-    padding_mode="reflection",
-    debug=False
-):
-    if padding_mode == "reflect":
-        padding_mode = "reflection"
-
-    B, C, H, W = latent.shape
-    device = latent.device
-
-    # =========================================================
-    # 1. Read + sanitize shift
-    # =========================================================
-    shift = shift.to(device).view(-1)
-
-    shift_x = float(shift[0])  # Convertit en float pour plus de clarté
-    shift_y = float(shift[1])
-
-    # =========================================================
-    # 2. Stable gain (NO adaptive jitter)
-    # =========================================================
-    # Convertir shift_x et shift_y en Tensors avant de les utiliser dans sqrt()
-    shift_x_tensor = torch.tensor(shift_x, device=device)
-    shift_y_tensor = torch.tensor(shift_y, device=device)
-
-    # Calculer la magnitude
-    shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
-
-    compensation_gain = 8.0 * torch.min(shift_magnitude / 10.0, torch.tensor(1.0, device=device))  # Adjust based on shift size
-    shift_x *= compensation_gain
-    shift_y *= compensation_gain
-
-    # Clamp shifts based on max shift ratio
-    max_shift_x = W * max_shift_ratio
-    max_shift_y = H * max_shift_ratio
-
-    shift_x = max(-max_shift_x, min(max_shift_x, shift_x))
-    shift_y = max(-max_shift_y, min(max_shift_y, shift_y))
-
-    dx = shift_x
-    dy = shift_y
-
-    if debug:
-        print(f"[SHIFT COMPENSATE] dx={dx:.4f}, dy={dy:.4f}")
-
-    # =========================================================
-    # 3. Angle (safe with dynamic range)
-    # =========================================================
-    if global_angle is not None:
-        if isinstance(global_angle, torch.Tensor):
-            angle = global_angle.mean()  # Utiliser directement la valeur du tensor
-        else:
-            angle = torch.tensor(global_angle, device=device)
-    else:
-        angle = torch.tensor(0.0, device=device)
-
-    # Dynamically adjust the angle clipping range based on image size or shift magnitude
-    angle_max_clip = torch.min(torch.abs(shift_x), torch.abs(shift_y)) / 10.0  # More shift = larger angle range
-    # Utiliser la variable tensor directement, sans appeler .item()
-    angle = torch.clamp(angle, -angle_max_clip, angle_max_clip)  # Clamp avec des tensors
-
-    if debug:
-        print(f"[ROT COMPENSATE] angle(rad)={angle:.5f}")
-
-    # Inverse rotation
-    angle = -angle  # Apply inverse rotation
-
-    cos_a = math.cos(angle.item())  # Convertir en float pour les calculs mathématiques
-    sin_a = math.sin(angle.item())  # Convertir en float pour les calculs mathématiques
-
-    # =========================================================
-    # 4. Build grid for warping
-    # =========================================================
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing="ij"
-    )
-
-    xx = xx.float()
-    yy = yy.float()
-
-    # =========================================================
-    # 5. Centering
-    # =========================================================
-    cx = (W - 1) * 0.5
-    cy = (H - 1) * 0.5
-
-    # =========================================================
-    # 6. Apply Inverse Rotation First
-    # =========================================================
-    x = xx - cx
-    y = yy - cy
-
-    rx = x * cos_a - y * sin_a
-    ry = x * sin_a + y * cos_a
-
-    # Convert back to image coordinates
-    rx = rx + cx
-    ry = ry + cy
-
-    # =========================================================
-    # 7. Apply Translation After Rotation
-    # =========================================================
-    rx = rx - dx
-    ry = ry - dy
-
-    # =========================================================
-    # 8. Normalize grid for grid_sample
-    # =========================================================
-    grid_x = 2.0 * rx / (W - 1) - 1.0
-    grid_y = 2.0 * ry / (H - 1) - 1.0
-
-    grid = torch.stack((grid_x, grid_y), dim=-1)
-    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)
-
-    # =========================================================
-    # 9. Warp the latent tensor
-    # =========================================================
-    latent = F.grid_sample(
-        latent,
-        grid,
-        mode="bilinear",
-        padding_mode=padding_mode,
-        align_corners=True
-    )
-
-    if debug:
-        print(f"[DEBUG] After warp, latent size: {latent.shape}")
-
-    return latent
-
-
-def compensate_latent_shift_v2(
-    latent,
-    shift,
-    global_angle=None,
-    image_size=(1280, 896),
-    latent_size=None,
-    max_shift_ratio=0.5,
-    padding_mode="reflection",
-    debug=False
-):
-
-    if padding_mode == "reflect":
-        padding_mode = "reflection"
-
-    B, C, H, W = latent.shape
-    device = latent.device
-
-    # =========================================================
-    # 1. Read + sanitize shift
-    # =========================================================
-    shift = shift.to(device).view(-1)
-
-    shift_x = float(shift[0])
-    shift_y = float(shift[1])
-
-    # =========================================================
-    # 2. Stable gain (NO adaptive jitter)
-    # =========================================================
-    compensation_gain = 8.0  # stable, évite oscillations
-    shift_x *= compensation_gain
-    shift_y *= compensation_gain
-
-    # clamp
-    max_shift_x = W * max_shift_ratio
-    max_shift_y = H * max_shift_ratio
-
-    shift_x = max(-max_shift_x, min(max_shift_x, shift_x))
-    shift_y = max(-max_shift_y, min(max_shift_y, shift_y))
-
-    dx = shift_x
-    dy = shift_y
-
-    if debug:
-        print(f"[SHIFT COMPENSATE] dx={dx:.4f}, dy={dy:.4f}")
-
-    # =========================================================
-    # 3. Angle (safe)
-    # =========================================================
-    if global_angle is not None:
-        if isinstance(global_angle, torch.Tensor):
-            angle = float(global_angle.mean().item())
-        else:
-            angle = float(global_angle)
-    else:
-        angle = 0.0
-
-    # clamp angle (VERY IMPORTANT)
-    angle = max(-0.2, min(0.2, angle))  # ~±11°
-
-    if debug:
-        print(f"[ROT COMPENSATE] angle(rad)={angle:.5f}")
-
-    # inverse transform
-    angle = -angle
-
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-
-    # =========================================================
-    # 4. Build grid
-    # =========================================================
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device),
-        torch.arange(W, device=device),
-        indexing="ij"
-    )
-
-    xx = xx.float()
-    yy = yy.float()
-
-    # =========================================================
-    # 5. Center (NO shifted center → more stable)
-    # =========================================================
-    cx = (W - 1) * 0.5
-    cy = (H - 1) * 0.5
-
-    # =========================================================
-    # 6. Apply inverse rotation FIRST
-    # =========================================================
-    x = xx - cx
-    y = yy - cy
-
-    rx = x * cos_a - y * sin_a
-    ry = x * sin_a + y * cos_a
-
-    # back to image coords
-    rx = rx + cx
-    ry = ry + cy
-
-    # =========================================================
-    # 7. Apply translation AFTER rotation
-    # =========================================================
-    rx = rx - dx
-    ry = ry - dy
-
-    # =========================================================
-    # 8. Normalize grid
-    # =========================================================
-    grid_x = 2.0 * rx / (W - 1) - 1.0
-    grid_y = 2.0 * ry / (H - 1) - 1.0
-
-    grid = torch.stack((grid_x, grid_y), dim=-1)
-    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)
-
-    # =========================================================
-    # 9. Warp
-    # =========================================================
-    latent = F.grid_sample(
-        latent,
-        grid,
-        mode="bilinear",
-        padding_mode=padding_mode,
-        align_corners=True
-    )
-
-    if debug:
-            print(f"[DEBUG] After warp, latent size: {latent.shape}")  # Affichage après warp
-
-    return latent
 
 
 def compensate_latent_shift(
