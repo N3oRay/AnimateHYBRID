@@ -207,7 +207,6 @@ def compensate_latent_shift_dev(
 
     # Ajuster en fonction de l'angle de rotation
     if global_angle is not None:
-        #angle_factor = abs(global_angle) * 800  # Plus l'angle est grand, plus le noyau sera large # Valeur absolu exemple Input: -29 Output: 29
         angle_factor = min(abs(float(global_angle)) * 200, 10)
         kernel_size += int(angle_factor)
 
@@ -228,37 +227,24 @@ def compensate_latent_shift_dev(
 
     # Agrandissement du masque avec dilatation
     valid_mask_dilated = dilate_mask(valid_mask, kernel_size=3)  # Dilatation pour agrandir les zones valides
-
-    #save_debug_mask_scale( mask=valid_mask_dilated, debug_dir=debug_dir, frame_counter=frame_counter, name="compensate_mask2", scale=4 )
     save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask2")
-
-    # Avant de passer à la fonction de flou gaussien, assurons-nous que le masque a la bonne forme.
-    #valid_mask_dilated = valid_mask_dilated.unsqueeze(0)  # Ajoute la dimension batch : [1, C, H, W]
 
     # Applique le flou gaussien sur le masque dilaté
     valid_mask = feather_outside_only_stable(valid_mask_dilated, radius=3, blur_kernel=kernel_size, sigma=3.0)  # Paramètres à ajuster selon besoin
-
-    #save_debug_mask_scale( mask=valid_mask, debug_dir=debug_dir, frame_counter=frame_counter, name="compensate_mask3", scale=4 )
     save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask3")
 
     valid_mask = valid_mask * 0.95 + 0.05
-
-    #save_debug_mask_scale( mask=valid_mask, debug_dir=debug_dir, frame_counter=frame_counter, name="compensate_mask4", scale=4 )
     save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask4")
 
     # =========================================================
     # Ajuster la taille du valid_mask pour correspondre aux latents
     valid_mask = F.interpolate(valid_mask, size=(latent.shape[2], latent.shape[3]), mode="bilinear", align_corners=True)
 
-    # Maintenant valid_mask est redimensionné pour correspondre à la taille de latent
-    #valid_mask = valid_mask.squeeze(0)  # Enlevez la dimension batch après l'interpolation, maintenant [C, H, W]
-
     # Calcul du ratio de validité moyen
     valid_ratio = valid_mask.mean().item()
 
     if debug:
         print(f"[MASK] valid_ratio={valid_ratio:.4f}")
-        #save_debug_mask_scale( mask=valid_mask, debug_dir=debug_dir, frame_counter=frame_counter, name="compensate_mask5", scale=4 )
         save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask5")
 
     # =========================================================
