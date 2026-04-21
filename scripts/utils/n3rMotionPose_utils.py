@@ -101,10 +101,13 @@ def compensate_latent_shift_dev(
     #angle = angle * angle_scale
 
     # --- Motion-aware damping ---
-    motion_factor = torch.clamp(shift_magnitude * 5.0, 0.0, 1.0)
-    angle = angle * motion_factor
+    #motion_factor = torch.clamp(shift_magnitude * 5.0, 0.0, 1.0)
+    #angle = angle * motion_factor
 
-    max_angle = 0.1
+    rotation_gain = 1.0 + 2.0 * torch.clamp(shift_magnitude * 10.0, 0.0, 1.0)
+    angle = angle * rotation_gain
+
+    max_angle = 0.1  # ~5.7°
     if torch.abs(angle) > max_angle:
         angle = torch.sign(angle) * max_angle
 
