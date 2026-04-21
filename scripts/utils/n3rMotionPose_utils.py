@@ -172,18 +172,6 @@ def compensate_latent_shift_dev(
     # =========================================================
     # VALID MASK (SAFE VERSION)
     # =========================================================
-    """
-    valid_mask = (
-        (grid[..., 0] >= -1.0) & (grid[..., 0] <= 1.0) &
-        (grid[..., 1] >= -1.0) & (grid[..., 1] <= 1.0)
-    ).float()
-
-    # shape: [B,H,W]
-    valid_mask = valid_mask.unsqueeze(1)  # => [B,1,H,W]
-    """
-    # =========================================================
-    # VALID MASK (ROBUST VERSION)
-    # =========================================================
 
     valid_mask = border_fade_mask(H, W, device, fade_ratio=0.1)
 
@@ -233,8 +221,10 @@ def compensate_latent_shift_dev(
     valid_mask = feather_outside_only_stable(valid_mask_dilated, radius=3, blur_kernel=kernel_size, sigma=3.0)  # Paramètres à ajuster selon besoin
     save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask3")
 
-    valid_mask = valid_mask * 0.95 + 0.05
-    save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask4")
+    #valid_mask = valid_mask * 0.95 + 0.05
+    #save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask4")
+
+    valid_mask = gaussian_blur_tensor(valid_mask, kernel_size=5, sigma=1.0)
 
     # =========================================================
     # Ajuster la taille du valid_mask pour correspondre aux latents
@@ -291,8 +281,6 @@ def compensate_latent_shift_dev(
     if debug:
         delta = (latent_out - latent).abs().mean().item()
         print(f"[OUTPUT] delta_mean={delta:.6f}")
-
-
 
 
     return latent_out
