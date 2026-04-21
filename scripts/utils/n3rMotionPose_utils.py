@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body, reconstruct_hips
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask
 
 from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v6, cinematic_motion_graph_v7, cinematic_motion_graph_v8, actor_system_v9, apply_actor_model, resolve_motion_model
 
@@ -25,11 +25,207 @@ import traceback
 from torchvision.utils import save_image
 
 
-import torch
-import math
-import torch.nn.functional as F
-
 def compensate_latent_shift_dev(
+    latent,
+    shift,
+    global_angle=None,
+    prev_latent=None,   # <-- NEW
+    max_shift_ratio=0.5,
+    padding_mode="reflection",
+    debug=False
+):
+
+    if padding_mode == "reflect":
+        padding_mode = "reflection"
+
+    B, C, H, W = latent.shape
+    device = latent.device
+
+    # =========================================================
+    # 1. SHIFT
+    # =========================================================
+    shift = shift.to(device).view(-1)
+    shift_x = float(shift[0])
+    shift_y = float(shift[1])
+
+    shift_mag = math.sqrt(shift_x**2 + shift_y**2)
+
+    # Smooth gain (stable)
+    t = min(max(shift_mag * 10.0, 0.0), 1.0)
+    t = t * t * (3 - 2 * t)  # smoothstep
+    gain = 1.0 + 6.0 * t
+
+    shift_x *= gain
+    shift_y *= gain
+
+    # Clamp spatial
+    max_dx = W * max_shift_ratio
+    max_dy = H * max_shift_ratio
+    dx = max(-max_dx, min(max_dx, shift_x))
+    dy = max(-max_dy, min(max_dy, shift_y))
+
+    if debug:
+        print(f"[SHIFT] in=({shift[0]:.4f},{shift[1]:.4f}) | gain={gain:.3f} | out=({dx:.4f},{dy:.4f})")
+
+    # =========================================================
+    # 2. ANGLE
+    # =========================================================
+    if global_angle is not None:
+        if isinstance(global_angle, torch.Tensor):
+            angle = float(global_angle.mean())
+        else:
+            angle = float(global_angle)
+    else:
+        angle = 0.0
+
+    # Rotation gain
+    rot_gain = 1.0 + 2.0 * min(max(shift_mag * 10.0, 0.0), 1.0)
+    angle *= rot_gain
+
+    # Clamp angle (~5.7°)
+    max_angle = 0.1
+    angle = max(-max_angle, min(max_angle, angle))
+
+    if debug:
+        print(f"[ANGLE] base={global_angle} | gain={rot_gain:.3f} | final={angle:.5f} rad")
+
+    # Inverse rotation
+    angle = -angle
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
+    # =========================================================
+    # 3. GRID
+    # =========================================================
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing="ij"
+    )
+
+    xx = xx.float()
+    yy = yy.float()
+
+    cx = (W - 1) * 0.5
+    cy = (H - 1) * 0.5
+
+    x = xx - cx
+    y = yy - cy
+
+    rx = x * cos_a - y * sin_a + cx
+    ry = x * sin_a + y * cos_a + cy
+
+    # Apply translation
+    rx = rx - dx
+    ry = ry - dy
+
+    # Normalize
+    grid_x = 2.0 * rx / (W - 1) - 1.0
+    grid_y = 2.0 * ry / (H - 1) - 1.0
+
+    grid = torch.stack((grid_x, grid_y), dim=-1)
+    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)
+
+    # =========================================================
+    # 4. WARP
+    # =========================================================
+    latent_warped = F.grid_sample(
+        latent,
+        grid,
+        mode="bilinear",
+        padding_mode=padding_mode,
+        align_corners=True
+    )
+
+    # =========================================================
+    # 5. VALID MASK + GAUSSIAN BLUR
+    # =========================================================
+    # Création du masque de validité : valeurs dans les limites de [-1, 1] pour chaque coordonnée
+    valid_mask = (
+        (grid[..., 0] >= -1.0) & (grid[..., 0] <= 1.0) &
+        (grid[..., 1] >= -1.0) & (grid[..., 1] <= 1.0)
+    ).float()
+
+    # =========================================================
+    # 5. Adapatation auto MASK
+    # =========================================================
+    shift_x_tensor = torch.tensor(shift_x, device=device)
+    shift_y_tensor = torch.tensor(shift_y, device=device)
+
+    shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
+
+    # Dynamically adjust dilation size based on shift magnitude and image size
+    kernel_size = max(7, int(shift_magnitude * 10.0))  # Taille du noyau dynamique
+    kernel_size = min(kernel_size, 15)  # On limite la taille du noyau pour éviter une trop grande dilatation
+
+    if debug:
+        print(f"[MASK] kernel_size={kernel_size:.4f}")
+
+    # Ajuster en fonction de l'angle de rotation
+    if global_angle is not None:
+        angle_factor = abs(global_angle) * 10  # Plus l'angle est grand, plus le noyau sera large
+        kernel_size += int(angle_factor)
+
+    # Assurer que la taille du noyau ne dépasse pas une certaine limite
+    kernel_size = min(kernel_size, 25)
+
+    if debug:
+        print(f"[MASK] +Angle kernel_size={kernel_size:.4f}")
+
+    # Agrandissement du masque avec dilatation
+    valid_mask_dilated = dilate_mask(valid_mask, kernel_size=kernel_size)  # Dilatation pour agrandir les zones valides
+
+    # Avant de passer à la fonction de flou gaussien, assurons-nous que le masque a la bonne forme.
+    # La fonction 'gaussian_blur_tensor' attend un tensor [B, C, H, W], donc nous devons nous assurer que
+    # le masque a au moins une dimension de batch, même si c'est une seule image.
+
+    # Si valid_mask_dilated a une forme [C, H, W], ajoutons la dimension batch.
+    valid_mask_dilated = valid_mask_dilated.unsqueeze(0)  # Ajoute la dimension batch : [1, C, H, W]
+
+
+
+
+    # Applique le flou gaussien sur le masque dilaté
+    valid_mask = gaussian_blur_tensor(valid_mask_dilated, kernel_size=7, sigma=1.5)  # Paramètres à ajuster selon besoin
+
+    # Calcul du ratio de validité moyen
+    valid_mask = valid_mask.squeeze(0)  # Retirer la dimension du batch après traitement pour revenir à [C, H, W]
+    valid_mask = valid_mask.unsqueeze(0)  # Si nécessaire, remettre la dimension batch [B, 1, H, W]
+
+    # Calcul du ratio de validité
+    valid_ratio = valid_mask.mean().item()
+
+    if debug:
+        print(f"[MASK] valid_ratio={valid_ratio:.4f}")
+
+    # =========================================================
+    # 6. BLEND (SOLUTION A)
+    # =========================================================
+    if prev_latent is not None:
+        latent_out = latent_warped * valid_mask + prev_latent * (1.0 - valid_mask)
+
+        if debug:
+            print("[BLEND] Using previous latent (temporal fix)")
+
+    else:
+        # fallback safe
+        fill = F.avg_pool2d(latent_warped, kernel_size=5, stride=1, padding=2)
+        latent_out = latent_warped * valid_mask + fill * (1.0 - valid_mask)
+
+        if debug:
+            print("[BLEND] Using spatial fallback")
+
+    # =========================================================
+    # 7. DEBUG FINAL
+    # =========================================================
+    if debug:
+        delta = (latent_out - latent).abs().mean().item()
+        print(f"[OUTPUT] delta_mean={delta:.6f}")
+
+    return latent_out
+
+
+def compensate_latent_shift_dev_v6(
     latent,
     shift,
     global_angle=None,
@@ -63,7 +259,17 @@ def compensate_latent_shift_dev(
     shift_y_tensor = torch.tensor(shift_y, device=device)
 
     shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
-    compensation_gain = 8.0 * torch.min(shift_magnitude / 10.0, torch.tensor(1.0, device=device))
+    #compensation_gain = 8.0 * torch.min(shift_magnitude / 10.0, torch.tensor(1.0, device=device))
+    #compensation_gain = 1.0 + 4.0 * torch.clamp(shift_magnitude * 10.0, 0.0, 1.0)
+
+    #t = torch.clamp(shift_magnitude * 10.0, 0.0, 1.0)
+    #compensation_gain = 1.0 + 5.0 * (t ** 1.5)
+
+    t = torch.clamp(shift_magnitude * 10.0, 0.0, 1.0)
+    t = t * t * (3 - 2 * t)  # smoothstep
+
+    compensation_gain = 1.0 + 6.0 * t
+
     shift_x *= compensation_gain
     shift_y *= compensation_gain
 
@@ -78,6 +284,7 @@ def compensate_latent_shift_dev(
 
     if debug:
         print(f"[SHIFT COMPENSATE] dx={dx:.4f}, dy={dy:.4f}")
+
 
     # =========================================================
     # 3. Angle (safe with dynamic range)
@@ -95,14 +302,6 @@ def compensate_latent_shift_dev(
         angle = torch.tensor(0.0, device=device)  # Si global_angle est None
         print(f"[DEBUG] global_angle est None. Angle initialisé à 0.0 : {angle.item():.5f}")
 
-
-
-    #angle_scale = 1.0  # ou dépend de motion_strength
-    #angle = angle * angle_scale
-
-    # --- Motion-aware damping ---
-    #motion_factor = torch.clamp(shift_magnitude * 5.0, 0.0, 1.0)
-    #angle = angle * motion_factor
 
     rotation_gain = 1.0 + 2.0 * torch.clamp(shift_magnitude * 10.0, 0.0, 1.0)
     angle = angle * rotation_gain
@@ -3236,7 +3435,7 @@ def update_sequence_from_keypoints_batch(
     prev_keypoints=None,
     state=None,
     profile=None,
-    time_scale=0.2,
+    time_scale=0.1, # 0.2
     max_velocity=0.05,
     camera_lock=0.9,
     debug=False,

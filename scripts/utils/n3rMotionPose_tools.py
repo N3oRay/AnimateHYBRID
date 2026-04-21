@@ -15,6 +15,46 @@ import traceback
 import torchvision.utils as vutils
 
 
+def dilate_mask(mask, kernel_size=3):
+    # Vérifier que le masque est de forme [B, C, H, W] et le redimensionner si nécessaire
+    if mask.dim() == 3:  # [C, H, W], ajouter un batch fictif
+        mask = mask.unsqueeze(0)  # Ajouter une dimension de batch
+    elif mask.dim() == 2:  # [H, W], ajouter un batch et un canal fictifs
+        mask = mask.unsqueeze(0).unsqueeze(0)  # Ajouter les dimensions [B, C, H, W]
+
+    # Créer un noyau de dilatation (kernel_size x kernel_size)
+    kernel = torch.ones(1, 1, kernel_size, kernel_size, device=mask.device)
+
+    # Appliquer la dilatation via la convolution (padding pour éviter les effets de bord)
+    dilated_mask = F.conv2d(mask, kernel, padding=kernel_size // 2)
+
+    # Convertir le résultat en un masque binaire (0 ou 1)
+    dilated_mask = (dilated_mask > 0).float()
+
+    return dilated_mask.squeeze(1)  # Retirer la dimension du canal, revenir à [B, H, W]
+
+# Exemple d'application dans la fonction :
+#valid_mask_dilated = dilate_mask(valid_mask, kernel_size=5)
+
+
+#(4D : [B, C, H, W])
+def dilate_mask_4D(mask, kernel_size=3):
+    # Applique une dilatation (l'élément le plus proche dans la fenêtre est choisi)
+    # Le kernel est une matrice de 1s de taille (kernel_size x kernel_size)
+    kernel = torch.ones(1, 1, kernel_size, kernel_size, device=mask.device)
+
+    # Dilatation via la convolution (padding pour éviter les effets de bord)
+    dilated_mask = F.conv2d(mask.unsqueeze(1), kernel, padding=kernel_size//2)
+
+    # Convertit en mask binaire (0 ou 1)
+    dilated_mask = (dilated_mask > 0).float()
+
+    return dilated_mask.squeeze(1)  # Retirer la dimension de canaux
+
+# Exemple d'application dans la fonction :
+#valid_mask_dilated = dilate_mask(valid_mask, kernel_size=5)
+
+
 def feather_outside_only_alpha2(mask: torch.Tensor, radius: int = 2, sigma: float = 1.0):
     """
     Adoucit uniquement l'extérieur d'un masque (feathering glow externe)

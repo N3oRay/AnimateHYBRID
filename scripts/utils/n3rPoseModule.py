@@ -172,8 +172,8 @@ ACTOR_MODEL_SCHEDULE = [
     (1,  "v9"),
     (6,  "v8"),
     (10,  "base"),
-    #(11, "v7"),
-    #(14,  "base"),
+    (11, "v7"),
+    (14,  "base"),
     (15, "v6"),
     (17,  "base"),
     (18, "v3"),
@@ -818,6 +818,7 @@ def cinematic_motion_graph_v7(
     # =========================================================
     # 2. TORSO ANGLE (SAFE)
     # =========================================================
+    """
     angle_raw, torso_vec = compute_torso_rotation_delta(
         kp,
         state["torso_vec_prev"]
@@ -836,7 +837,7 @@ def cinematic_motion_graph_v7(
 
     state["angular_vel"] = angular_vel
     state["angle"] = state["angle"] + angular_vel * inertia
-
+    """
     # =========================================================
     # 3. PIVOT (MORE STABLE BODY CENTER)
     # =========================================================
