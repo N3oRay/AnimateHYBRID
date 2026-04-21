@@ -456,6 +456,81 @@ def feather_mask_fast(mask, radius=3):
     return torch.clamp(mask + band * (1 - mask), 0, 1)
 
 
+def feather_outside_only_stable(mask, radius=3, blur_kernel=5, sigma=1.0, debug=False):
+    """
+    mask: attendu [B,1,H,W] (0 ou 1)
+    radius: largeur du dégradé extérieur (pixels)
+    """
+
+    # =========================================================
+    # 0. SAFETY SHAPE (CRITICAL)
+    # =========================================================
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0).unsqueeze(0)  # [H,W] -> [1,1,H,W]
+    elif mask.dim() == 3:
+        mask = mask.unsqueeze(1)               # [B,H,W] -> [B,1,H,W]
+
+    if mask.dim() != 4:
+        raise ValueError(f"[feather] Invalid mask shape: {mask.shape}")
+
+    B, C, H, W = mask.shape
+
+    if C != 1:
+        # On force 1 canal (important pour pooling / blur)
+        mask = mask.mean(dim=1, keepdim=True)
+
+    # Clamp sécurité
+    mask = mask.clamp(0, 1)
+
+    if debug:
+        print(f"[FEATHER] input shape: {mask.shape}")
+
+    # =========================================================
+    # 1. DILATATION (couronne extérieure)
+    # =========================================================
+    k = 2 * radius + 1
+    dilated = F.max_pool2d(mask, kernel_size=k, stride=1, padding=radius)
+
+    # =========================================================
+    # 2. BANDE EXTERNE
+    # =========================================================
+    band = (dilated - mask).clamp(0, 1)
+
+    # 🔥 SAFETY (évite ton crash actuel)
+    if band.dim() == 3:
+        band = band.unsqueeze(1)
+
+    if band.dim() != 4:
+        raise ValueError(f"[feather] band invalid shape: {band.shape}")
+
+    # =========================================================
+    # 3. BLUR (soft edge)
+    # =========================================================
+    band = gaussian_blur_tensor(band, kernel_size=blur_kernel, sigma=sigma)
+
+    # =========================================================
+    # 4. NORMALISATION
+    # =========================================================
+    band_max = band.max().clamp(min=1e-6)
+    band = band / band_max
+
+    # =========================================================
+    # 5. RECONSTRUCTION
+    # =========================================================
+    result = mask + band * (1 - mask)
+
+    result = torch.clamp(result, 0, 1)
+
+    # =========================================================
+    # 6. DEBUG
+    # =========================================================
+    if debug:
+        print(f"[FEATHER] band max={band_max.item():.6f}")
+        print(f"[FEATHER] result mean={result.mean().item():.6f}")
+
+    return result
+
+
 def feather_outside_only(mask, radius=3, blur_kernel=5, sigma=1.0):
     """
     mask: [B,1,H,W] (0 ou 1)
