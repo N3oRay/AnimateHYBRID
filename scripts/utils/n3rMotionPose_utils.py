@@ -110,9 +110,12 @@ def compensate_latent_shift_dev(
     # Appliquer la limite (clamp) pour éviter des valeurs d'angle trop extrêmes
     #angle = torch.clamp(angle, -angle_max_clip, angle_max_clip)
 
-    # Calcul de l'angle sans clamp
-    if angle.abs() > angle_max_clip:
-        angle = torch.sign(angle) * angle_max_clip
+    angle_scale = 1.0  # ou dépend de motion_strength
+    angle = angle * angle_scale
+
+    max_angle = 0.1
+    if torch.abs(angle) > max_angle:
+        angle = torch.sign(angle) * max_angle
 
     print(f"[DEBUG] Angle après clamp : {angle.item():.5f} (valeur limite : ±{angle_max_clip.item():.5f})")
 
