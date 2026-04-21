@@ -481,16 +481,16 @@ def main(args):
                                     current_keypoints, state = update_pose_from_keypoints_batch( keypoints_tensor=current_keypoints,
                                                                                                 state=state, frame_idx=frame_counter, debug=True )
 
-
-
+                                # compensation du mouvement backup
+                                prev_latent = latents
                                 # 🔹 Appliquer le mouvement du haut du corps / OpenPose - apply_pose_driven_motion_stable or apply_pose_driven_motion_ultra2
                                 latents, state = apply_pose_driven_motion_ultra2(
                                     latents=latents, state=state, keypoints=current_keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device,
                                     breathing=True, debug=True, debug_dir=output_dir
                                 )
 
-                                # compensation du mouvement state.get("kp_prev")
-                                latents = compensate_latent_shift_dev( latents, shift = state["global_shift"], global_angle=state["global_angle"], latent_size=(latents.shape[-1], latents.shape[-2]), debug=True )
+                                # compensation du mouvement :
+                                latents = compensate_latent_shift_dev( latents, frame_counter=frame_counter, shift = state["global_shift"], global_angle=state["global_angle"], prev_latent=prev_latent, image_size=image_size, debug=True, debug_dir=output_dir )
 
                                 # 🔹 Stocker les keypoints pour la frame suivante
                                 prev_keypoints = current_keypoints.clone()
