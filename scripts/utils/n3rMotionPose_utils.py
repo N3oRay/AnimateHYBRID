@@ -96,28 +96,19 @@ def compensate_latent_shift_dev(
         print(f"[DEBUG] global_angle est None. Angle initialisé à 0.0 : {angle.item():.5f}")
 
 
-    # Calculer le clipping de l'angle basé sur les décalages (shift_x, shift_y)
-    angle_max_clip = torch.min(torch.abs(shift_x), torch.abs(shift_y)) / 10.0
 
-    # S'assurer que angle_max_clip a une valeur minimale pour éviter qu'il soit trop petit
-    angle_max_clip = torch.max(angle_max_clip, torch.tensor(1e-6, device=device))  # Valeur minimale
+    #angle_scale = 1.0  # ou dépend de motion_strength
+    #angle = angle * angle_scale
 
-    # Si nécessaire, on peut aussi ajouter un seuil supérieur
-    angle_max_clip = torch.min(angle_max_clip, torch.tensor(1e-2, device=device))  # Valeur maximale raisonnable
-
-    print(f"[DEBUG] Calcul de angle_max_clip : {angle_max_clip.item():.5f} (basé sur shift_x = {shift_x:.5f}, shift_y = {shift_y:.5f})")
-
-    # Appliquer la limite (clamp) pour éviter des valeurs d'angle trop extrêmes
-    #angle = torch.clamp(angle, -angle_max_clip, angle_max_clip)
-
-    angle_scale = 1.0  # ou dépend de motion_strength
-    angle = angle * angle_scale
+    # --- Motion-aware damping ---
+    motion_factor = torch.clamp(shift_magnitude * 5.0, 0.0, 1.0)
+    angle = angle * motion_factor
 
     max_angle = 0.1
     if torch.abs(angle) > max_angle:
         angle = torch.sign(angle) * max_angle
 
-    print(f"[DEBUG] Angle après clamp : {angle.item():.5f} (valeur limite : ±{angle_max_clip.item():.5f})")
+    print(f"[DEBUG] Angle après clamp : {angle.item():.5f} ")
 
     if debug:
         print(f"[ROT COMPENSATE] angle (before inverse rotation) = {angle:.5f} rad")
