@@ -252,25 +252,16 @@ def compensate_latent_shift_dev(
 
     oriH, oriW = image_size
     if oriH * oriW >= 1280 * 896:  # Ajuster cette condition selon les tailles d'image courantes
-        kernel_size += 4
+        kernel_size += 2
         if debug:
             print(f"[MASK] +SIZE kernel_size={kernel_size:.4f}")
 
     if kernel_size % 2 == 0:
         kernel_size += 1
 
-    # Agrandissement du masque avec dilatation
-    #valid_mask_dilated = dilate_mask(valid_mask, kernel_size=3)  # Dilatation pour agrandir les zones valides
-    #save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask2")
 
     # Applique le flou gaussien sur le masque dilaté
     valid_mask = feather_outside_only_stable(valid_mask, radius=3, blur_kernel=kernel_size, sigma=3.0)  # Paramètres à ajuster selon besoin
-    #save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask3")
-
-    #valid_mask = valid_mask * 0.95 + 0.05
-    #save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask4")
-
-    #valid_mask = gaussian_blur_tensor(valid_mask, kernel_size=kernel_size, sigma=1.0)
 
     # =========================================================
     # Ajuster la taille du valid_mask pour correspondre aux latents
