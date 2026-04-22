@@ -25,6 +25,49 @@ import traceback
 from torchvision.utils import save_image
 
 
+def border_fade_mask_rotate(H, W, device, fade_ratio=0.1, angle=0.0):
+    """
+    Masque de bords avec pivot central + compensation rotation
+    fade_ratio = épaisseur des bords (ex: 0.1 = 10%)
+    angle = rotation inverse appliquée au masque (rad)
+    """
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing="ij"
+    )
+
+    # centre
+    cx, cy = 0.0, 0.0
+
+    # rotation inverse autour du centre
+    if angle != 0.0:
+        cos_a = torch.cos(torch.tensor(-angle, device=device))
+        sin_a = torch.sin(torch.tensor(-angle, device=device))
+
+        x_rot = xx * cos_a - yy * sin_a
+        y_rot = xx * sin_a + yy * cos_a
+
+        xx, yy = x_rot, y_rot
+
+    # distance aux bords dans espace normalisé
+    dx = torch.min(xx + 1, 1 - xx)  # 0 aux bords
+    dy = torch.min(yy + 1, 1 - yy)
+
+    dist = torch.min(dx, dy)
+
+    # largeur de fade
+    fade = fade_ratio * 1.0  # stable en coord [-1,1]
+
+    mask = (1.0 - dist / fade).clamp(0, 1)
+
+    # smoothstep
+    mask = mask * mask * (3 - 2 * mask)
+
+    return mask.unsqueeze(0).unsqueeze(0)
+
+
 def border_fade_mask(H, W, device, fade_ratio=0.1):
     """
     fade_ratio = 0.1 → 10% des bords
@@ -173,7 +216,10 @@ def compensate_latent_shift_dev(
     # VALID MASK (SAFE VERSION)
     # =========================================================
 
-    valid_mask = border_fade_mask(H, W, device, fade_ratio=0.1)
+    if global_angle is not None:
+        valid_mask = border_fade_mask_rotate(H, W, device, fade_ratio=0.1, angle=-float(global_angle))
+    else:
+        valid_mask = border_fade_mask(H, W, device, fade_ratio=0.1)
 
     #save_debug_mask_scale( mask=valid_mask, debug_dir=debug_dir, frame_counter=frame_counter, name="compensate_mask1", scale=4 )
     save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask1")
@@ -214,17 +260,17 @@ def compensate_latent_shift_dev(
         kernel_size += 1
 
     # Agrandissement du masque avec dilatation
-    valid_mask_dilated = dilate_mask(valid_mask, kernel_size=3)  # Dilatation pour agrandir les zones valides
-    save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask2")
+    #valid_mask_dilated = dilate_mask(valid_mask, kernel_size=3)  # Dilatation pour agrandir les zones valides
+    #save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask2")
 
     # Applique le flou gaussien sur le masque dilaté
-    valid_mask = feather_outside_only_stable(valid_mask_dilated, radius=3, blur_kernel=kernel_size, sigma=3.0)  # Paramètres à ajuster selon besoin
-    save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask3")
+    valid_mask = feather_outside_only_stable(valid_mask, radius=3, blur_kernel=kernel_size, sigma=3.0)  # Paramètres à ajuster selon besoin
+    #save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask3")
 
     #valid_mask = valid_mask * 0.95 + 0.05
     #save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask4")
 
-    valid_mask = gaussian_blur_tensor(valid_mask, kernel_size=5, sigma=1.0)
+    #valid_mask = gaussian_blur_tensor(valid_mask, kernel_size=kernel_size, sigma=1.0)
 
     # =========================================================
     # Ajuster la taille du valid_mask pour correspondre aux latents
