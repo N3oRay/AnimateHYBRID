@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body, reconstruct_hips
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask, dilate_mask
 
 from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v6, cinematic_motion_graph_v7, cinematic_motion_graph_v8, actor_system_v9, apply_actor_model, resolve_motion_model
 
@@ -98,27 +98,6 @@ def border_fade_mask(H, W, device, fade_ratio=0.1):
     return mask.unsqueeze(0).unsqueeze(0)  # Ajout des dimensions batch et channel
 
 #---------------------------------------------------------------------
-
-
-def dilate_mask(mask, kernel_size=5):
-    """
-    Appliquer une dilatation au masque pour étendre la zone où le bruit peut être appliqué,
-    mais en évitant que le bruit se propage au-delà de la zone désirée.
-    """
-    # Assurez-vous que mask est un tensor 4D avant d'utiliser max_pool2d
-    if mask.dim() == 2:  # Si mask est 2D
-        mask = mask.unsqueeze(0).unsqueeze(0)  # Ajouter deux dimensions (batch et canaux)
-    elif mask.dim() == 3:  # Si mask est 3D, ajoutez juste la dimension du batch
-        mask = mask.unsqueeze(0)
-
-    # Appliquer la dilatation
-    dilated_mask = F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-
-    # Revenir à la forme originale (retirer les dimensions batch et canaux si nécessaire)
-    dilated_mask = dilated_mask.squeeze(0).squeeze(0)  # Enlever les dimensions ajoutées (batch et canaux)
-
-    return dilated_mask
-
 
 def add_gaussian_noise(latent, valid_mask, noise_std=0.1, noise_strength=1.0, kernel_size=5):
     """
@@ -349,7 +328,6 @@ def compensate_latent_shift_dev(
 
         # Application du blending : plus marqué pour les bords, plus doux au centre
 
-        #latent_out = latent_warped * (1.0 - valid_mask) + prev_latent * valid_mask
         latent_out = latent_warped * (1.0 - valid_mask) + prev_latent * valid_mask
 
         if debug:
@@ -637,11 +615,16 @@ def update_keypoints_from_pose(
     left_hip, right_hip = pair(hips_coords, debug=debug)
     left_hip, right_hip, hips_reconstructed = reconstruct_hips( left_hip, right_hip, left_shoulder, right_shoulder, image_size, image_size, debug=debug )
 
+    left_knee = (0,0)
+    right_knee = (0,0)
+    left_ankle = (0,0)
+    left_ankle = (0,0)
+
     left_eye, right_eye = pair(eye_coords, debug=debug)
     left_ear, right_ear  = pair(ear_coords, debug=debug)
 
     # =========================================================
-    # 🔥 HIP RECONSTRUCTION (CRITICAL)
+    # 🔥 HIP - KNEE - ANKLE  RECONSTRUCTION (CRITICAL)
     # =========================================================
     if (left_hip is None or right_hip is None or
         left_hip == (0,0) or right_hip == (0,0)):
@@ -651,20 +634,40 @@ def update_keypoints_from_pose(
             cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
 
             offset_y = H * 0.18
-            offset_y2 = H * 0.25
-            offset_y3 = H * 0.32
-
             left_hip  = (cx - 70, cy + offset_y)
             right_hip = (cx + 70, cy + offset_y)
 
+
+            if debug:
+                print("🦿 HIP RECONSTRUCTED")
+
+    if (left_knee is None or right_knee is None or
+        left_knee == (0,0) or right_knee == (0,0)):
+
+        if left_shoulder and right_shoulder:
+            cx = (left_shoulder[0] + right_shoulder[0]) * 0.5
+            cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
+
+            offset_y2 = H * 0.25
             left_knee  = (cx - 72, cy + offset_y2)
             right_knee = (cx + 72, cy + offset_y2)
 
+            if debug:
+                print("🦿 KNEE RECONSTRUCTED")
+
+    if (left_ankle is None or left_ankle is None or
+        left_ankle == (0,0) or left_ankle == (0,0)):
+
+        if left_shoulder and right_shoulder:
+            cx = (left_shoulder[0] + right_shoulder[0]) * 0.5
+            cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
+
+            offset_y3 = H * 0.32
             left_ankle = (cx - 80, cy + offset_y3)
             right_ankle = (cx + 80, cy + offset_y3)
 
             if debug:
-                print("🦿 HIP RECONSTRUCTED")
+                print("🦿 ANKLE RECONSTRUCTED")
 
     # =========================================================
     # 🔹 NECK SAFE

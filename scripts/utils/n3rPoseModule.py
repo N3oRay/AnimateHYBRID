@@ -20,7 +20,6 @@ from .n3rMotionPoseClass import Pose
 # ACTOR FUNCTION MAP (EXTENSIBLE SYSTEM)
 # =========================================================
 
-
 def update_motion_state(
     kp,
     state,
@@ -169,14 +168,11 @@ ACTOR_LABELS = {
 
 ACTOR_MODEL_SCHEDULE = [
     (0,  "base"),
-    (1,  "v9"),
-    (6,  "v8"),
-    (10,  "base"),
-    (11, "v7"),
-    (14,  "base"),
-    (15, "v6"),
-    (17,  "base"),
-    (18, "v3"),
+    (5,  "v9"),
+    (11,  "v8"),
+    (16, "v7"),
+    (20, "v6"),
+    (25, "v3"),
 ]
 
 
@@ -758,11 +754,11 @@ def cinematic_motion_graph_v7(
     upper_ids=(5,6,7,8,9,10),
     hip_ids=(11,12),
     rotation_strength=1.2,
-    motion_sensitivity=6.0,
+    motion_sensitivity=4.0,
     damping=0.90,
     inertia=0.85,
     head_lag=0.7,
-    max_deg=25.0,
+    max_deg=10.0,
     debug=False
 ):
     B, N, _ = kp.shape
@@ -816,35 +812,13 @@ def cinematic_motion_graph_v7(
     motion_gain = torch.tanh(motion_energy * motion_sensitivity)
 
     # =========================================================
-    # 2. TORSO ANGLE (SAFE)
-    # =========================================================
-    """
-    angle_raw, torso_vec = compute_torso_rotation_delta(
-        kp,
-        state["torso_vec_prev"]
-    )
-    state["torso_vec_prev"] = torso_vec
-
-    if angle_raw.dim() > 2:
-        angle_raw = angle_raw.mean(dim=-1, keepdim=True)
-
-    angle_raw = angle_raw.view(B,1).clamp(-1.0, 1.0)
-
-    delta_angle = angle_raw - state["angle"]
-
-    angular_vel = state["angular_vel"] * damping + delta_angle * 0.15
-    angular_vel = torch.clamp(angular_vel, -0.2, 0.2)
-
-    state["angular_vel"] = angular_vel
-    state["angle"] = state["angle"] + angular_vel * inertia
-    """
-    # =========================================================
     # 3. PIVOT (MORE STABLE BODY CENTER)
     # =========================================================
     upper_center = kp[:, torso_ids, :2].mean(dim=1, keepdim=True)
     hip_center = kp[:, hip_ids, :2].mean(dim=1, keepdim=True)
 
-    pivot = upper_center * 0.4 + hip_center * 0.6
+    #pivot = upper_center * 0.4 + hip_center * 0.6
+    pivot = upper_center * 0.3 + hip_center * 0.7  # Le pivot devient plus centré sur les hanches, réduisant l'impact de la rotation
 
     valid = torch.isfinite(pivot).all(dim=-1, keepdim=True)
     shoulder_center = kp[:, [5,6], :2].mean(dim=1, keepdim=True)
@@ -881,7 +855,8 @@ def cinematic_motion_graph_v7(
     # =========================================================
     # 6. GLOBAL STABILITY (SLIGHTLY ADAPTIVE FIX)
     # =========================================================
-    alpha = 0.88 + 0.08 * (1.0 - motion_gain)
+    #alpha = 0.88 + 0.08 * (1.0 - motion_gain)
+    alpha = 0.85 + 0.05 * (1.0 - motion_gain)  # Rend le mouvement plus stable et moins réactif
 
     kp_out[..., :2] = kp_prev[..., :2] + (
         kp_out[..., :2] - kp_prev[..., :2]
@@ -921,9 +896,9 @@ def cinematic_motion_graph_v6(
     hip_ids=(11,12),
     rotation_strength=0.5,
     rotation_smooth=0.3,
-    motion_sensitivity=8.0,   # 🔥 BOOST IMPORTANT
+    motion_sensitivity=4.0,   # 🔥 BOOST IMPORTANT valeur conseillé 4.0
     head_lock=0.65,           # 🔥 réduit (IMPORTANT)
-    max_rotation_deg=30.0,
+    max_rotation_deg=20.0,
     debug=False
 ):
     B, N, _ = kp.shape

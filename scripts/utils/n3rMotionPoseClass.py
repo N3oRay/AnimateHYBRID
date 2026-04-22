@@ -1201,7 +1201,7 @@ class Pose:
             save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="decor_mask")
 
         return mask
-    # -------- version pose
+    # -------- version pose -----------------------------------
     def create_decor_outpose_mask( self, H: int, W: int, debug: bool = False, debug_dir: str = None, frame_counter: int = 0, expand=2.2, vertical_bias=1.2, falloff_strength=2.0 ):
         mask = torch.zeros(self.B, 1, H, W, device=self.device)
 
@@ -1673,10 +1673,7 @@ class Pose:
         temporal_smooth=0.8,
         min_size=6
     ):
-        import torch
-        import os
-        import numpy as np
-        from PIL import Image
+
 
         device = self.device
         B = self.B

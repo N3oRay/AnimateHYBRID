@@ -14,6 +14,26 @@ from PIL import Image, ImageDraw
 import traceback
 import torchvision.utils as vutils
 
+#---- Dilation d'un mask ---- Version stable'
+def dilate_mask(mask, kernel_size=5):
+    """
+    Appliquer une dilatation au masque pour étendre la zone où le bruit peut être appliqué,
+    mais en évitant que le bruit se propage au-delà de la zone désirée.
+    """
+    # Assurez-vous que mask est un tensor 4D avant d'utiliser max_pool2d
+    if mask.dim() == 2:  # Si mask est 2D
+        mask = mask.unsqueeze(0).unsqueeze(0)  # Ajouter deux dimensions (batch et canaux)
+    elif mask.dim() == 3:  # Si mask est 3D, ajoutez juste la dimension du batch
+        mask = mask.unsqueeze(0)
+
+    # Appliquer la dilatation
+    dilated_mask = F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+
+    # Revenir à la forme originale (retirer les dimensions batch et canaux si nécessaire)
+    dilated_mask = dilated_mask.squeeze(0).squeeze(0)  # Enlever les dimensions ajoutées (batch et canaux)
+
+    return dilated_mask
+
 def save_debug_mask_scale(
     mask: torch.Tensor,
     debug_dir: str,
