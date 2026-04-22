@@ -97,6 +97,58 @@ def border_fade_mask(H, W, device, fade_ratio=0.1):
 
     return mask.unsqueeze(0).unsqueeze(0)  # Ajout des dimensions batch et channel
 
+#---------------------------------------------------------------------
+
+
+def dilate_mask(mask, kernel_size=5):
+    """
+    Appliquer une dilatation au masque pour étendre la zone où le bruit peut être appliqué,
+    mais en évitant que le bruit se propage au-delà de la zone désirée.
+    """
+    # Assurez-vous que mask est un tensor 4D avant d'utiliser max_pool2d
+    if mask.dim() == 2:  # Si mask est 2D
+        mask = mask.unsqueeze(0).unsqueeze(0)  # Ajouter deux dimensions (batch et canaux)
+    elif mask.dim() == 3:  # Si mask est 3D, ajoutez juste la dimension du batch
+        mask = mask.unsqueeze(0)
+
+    # Appliquer la dilatation
+    dilated_mask = F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+
+    # Revenir à la forme originale (retirer les dimensions batch et canaux si nécessaire)
+    dilated_mask = dilated_mask.squeeze(0).squeeze(0)  # Enlever les dimensions ajoutées (batch et canaux)
+
+    return dilated_mask
+
+
+def add_gaussian_noise(latent, valid_mask, noise_std=0.1, noise_strength=1.0, kernel_size=5):
+    """
+    Ajouter du bruit gaussien uniquement dans les zones invalides de l'image,
+    avec une transition progressive sur les bords.
+
+    :param latent: Tensor d'entrée de forme (B, C, H, W) représentant l'image.
+    :param valid_mask: Tensor de masque valide (1 pour zones valides, 0 pour invalides).
+    :param noise_std: Écart type du bruit de base.
+    :param noise_strength: Facteur d'intensité du bruit, permettant d'ajuster la quantité de bruit.
+    :param kernel_size: Taille du noyau pour dilater le masque.
+    :return: Tensor latent avec bruit ajouté.
+    """
+
+    # Générer le bruit aléatoire gaussien de même forme que 'latent'
+    noise = torch.randn_like(latent) * noise_std
+
+    # Dilater le masque pour permettre une zone tampon
+    dilated_mask = dilate_mask(valid_mask, kernel_size)
+
+    # Appliquer le bruit uniquement dans les zones invalides (où valid_mask == 0)
+    noise_applied = noise * (1 - dilated_mask)  # bruit dans les zones invalides
+
+    # Ajouter le bruit progressif dans les zones invalides
+    noisy_latent = latent + noise_applied * noise_strength
+
+    return noisy_latent
+
+
+
 
 def compensate_latent_shift_dev(
     latent,
@@ -223,32 +275,29 @@ def compensate_latent_shift_dev(
         valid_mask = border_fade_mask_rotate( H, W, device, fade_ratio=0.1, angle=angle_warp, inverse=True )
     else:
         valid_mask = border_fade_mask(H, W, device, fade_ratio=0.05)
-
-    save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask1")
+    if debug:
+        save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask1")
 
     # =========================================================
     # 5. Adapatation auto MASK
     # =========================================================
-    shift_x_tensor = torch.tensor(shift_x, device=device)
-    shift_y_tensor = torch.tensor(shift_y, device=device)
 
-    shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
+    shift_tensor = torch.tensor(shift, device=device)
+    shift_magnitude = torch.norm(shift_tensor)  # Directement norme du vecteur
 
     if debug:
         print(f"[MASK] shift_magnitude={shift_magnitude:.4f}")
 
     # Dynamically adjust dilation size based on shift magnitude and image size
-    kernel_size = int(shift_magnitude * max(H, W) * 0.5)
-    kernel_size = max(3, kernel_size)
-    kernel_size = min(kernel_size, 51) # On limite la taille du noyau pour éviter une trop grande dilatation
+    kernel_size = max(3, int(shift_magnitude * max(H, W) * 0.5))
+    kernel_size = min(kernel_size, 51)  # Limite la taille du noyau pour éviter une dilatation trop importante
 
     if debug:
         print(f"[MASK] kernel_size={kernel_size:.4f}")
 
-    # Ajuster en fonction de l'angle de rotation
-    if global_angle is not None:
-        angle_factor = min(abs(float(global_angle)) * 200, 10)
-        kernel_size += int(angle_factor)
+    # Ajuster la taille du noyau en fonction de l'angle
+    angle_factor = min(abs(float(global_angle)) * 200, 10) if global_angle is not None else 0
+    kernel_size += int(angle_factor)
 
     if debug:
         print(f"[MASK] +Angle kernel_size={kernel_size:.4f}")
@@ -267,9 +316,10 @@ def compensate_latent_shift_dev(
     # Paramètres à ajuster selon besoin sigma valeur du flou, blur_kernel longueur, radius valeur bande
     valid_mask = feather_outside_only_stable(valid_mask, radius=0, blur_kernel=kernel_size, sigma=0.005)
 
+
     # =========================================================
     # Ajuster la taille du valid_mask pour correspondre aux latents
-    valid_mask = F.interpolate(valid_mask, size=(latent.shape[2], latent.shape[3]), mode="bilinear", align_corners=True)
+    valid_mask = F.interpolate(valid_mask, size=(latent.shape[2], latent.shape[3]), mode="bilinear", align_corners=False)
 
     # Calcul du ratio de validité moyen
     valid_ratio = valid_mask.mean().item()
@@ -284,25 +334,22 @@ def compensate_latent_shift_dev(
     if prev_latent is not None:
         # Vérification des dimensions avant de faire le blending
         if latent_warped.shape != prev_latent.shape:
-            pB, pC, pH, pW = prev_latent.shape
-            # Redimensionner latent_warped à la taille exacte de prev_latent
-            latent_warped = F.interpolate(latent_warped, size=(pH, pW), mode="bilinear", align_corners=True)
-
-            # Vérification finale des dimensions après l'interpolation
+            latent_warped = F.interpolate(latent_warped, size=prev_latent.shape[2:], mode="bilinear", align_corners=False)
             if latent_warped.shape != prev_latent.shape:
-                # Correction possible des dimensions en utilisant un redimensionnement exact
-                latent_warped = latent_warped[:, :, :pH, :pW]  # Troncature si nécessaire
-
-            if debug:
-                print(f"[BLEND] Redimensionnement de latent_warped à la taille de : {prev_latent.shape}")
+                latent_warped = latent_warped[:, :, :prev_latent.shape[2], :prev_latent.shape[3]]
+                if debug:
+                    print(f"[BLEND] Redimensionnement de latent_warped à la taille de : {prev_latent.shape}")
 
         # Vérification finale des dimensions
         if latent_warped.shape != prev_latent.shape:
             raise ValueError(f"Les tailles de latent_warped {latent_warped.shape} et prev_latent {prev_latent.shape} ne correspondent toujours pas!")
 
-        #latent_out = latent_warped * valid_mask + prev_latent * (1.0 - valid_mask)
+        #Ajout de bruit zone vide
+        prev_latent = add_gaussian_noise(prev_latent, valid_mask, noise_std=0.1)
 
         # Application du blending : plus marqué pour les bords, plus doux au centre
+
+        #latent_out = latent_warped * (1.0 - valid_mask) + prev_latent * valid_mask
         latent_out = latent_warped * (1.0 - valid_mask) + prev_latent * valid_mask
 
         if debug:
@@ -311,6 +358,10 @@ def compensate_latent_shift_dev(
     else:
         # fallback safe
         fill = F.avg_pool2d(latent_warped, kernel_size=5, stride=1, padding=2)
+
+        #Ajout de bruit zone vide
+        #latent_warped = add_gaussian_noise(latent_warped, valid_mask, noise_std=0.1)
+
         latent_out = latent_warped * valid_mask + fill * (1.0 - valid_mask)
 
         if debug:
