@@ -103,7 +103,7 @@ def compensate_latent_shift_dev(
     frame_counter,
     shift,
     global_angle=None,
-    prev_latent=None,   # <-- NEW
+    prev_latent=None,
     max_shift_ratio=0.5,
     padding_mode="reflection",
     image_size=(1280, 896),
@@ -219,13 +219,11 @@ def compensate_latent_shift_dev(
     # =========================================================
 
     if global_angle is not None:
-        #valid_mask = border_fade_mask_rotate(H, W, device, fade_ratio=0.05, angle=-float(global_angle)) #fade_ratio=0.1
         angle_warp = float(global_angle)
         valid_mask = border_fade_mask_rotate( H, W, device, fade_ratio=0.1, angle=angle_warp, inverse=True )
     else:
         valid_mask = border_fade_mask(H, W, device, fade_ratio=0.05)
 
-    #save_debug_mask_scale( mask=valid_mask, debug_dir=debug_dir, frame_counter=frame_counter, name="compensate_mask1", scale=4 )
     save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask1")
 
     # =========================================================
@@ -252,9 +250,6 @@ def compensate_latent_shift_dev(
         angle_factor = min(abs(float(global_angle)) * 200, 10)
         kernel_size += int(angle_factor)
 
-    # Assurer que la taille du noyau ne dépasse pas une certaine limite
-    #kernel_size = min(kernel_size, 25)
-
     if debug:
         print(f"[MASK] +Angle kernel_size={kernel_size:.4f}")
 
@@ -270,7 +265,7 @@ def compensate_latent_shift_dev(
 
     # Applique le flou gaussien sur le masque dilaté
     # Paramètres à ajuster selon besoin sigma valeur du flou, blur_kernel longueur, radius valeur bande
-    valid_mask = feather_outside_only_stable(valid_mask, radius=1, blur_kernel=kernel_size, sigma=0.005)
+    valid_mask = feather_outside_only_stable(valid_mask, radius=0, blur_kernel=kernel_size, sigma=0.005)
 
     # =========================================================
     # Ajuster la taille du valid_mask pour correspondre aux latents
