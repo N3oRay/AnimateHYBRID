@@ -236,9 +236,13 @@ def compensate_latent_shift_dev(
 
     shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
 
+    if debug:
+        print(f"[MASK] shift_magnitude={shift_magnitude:.4f}")
+
     # Dynamically adjust dilation size based on shift magnitude and image size
-    kernel_size = max(200, int(shift_magnitude * 10.0))  # Taille du noyau dynamique
-    #kernel_size = min(kernel_size, 15)  # On limite la taille du noyau pour éviter une trop grande dilatation
+    kernel_size = int(shift_magnitude * max(H, W) * 0.5)
+    kernel_size = max(3, kernel_size)
+    kernel_size = min(kernel_size, 51) # On limite la taille du noyau pour éviter une trop grande dilatation
 
     if debug:
         print(f"[MASK] kernel_size={kernel_size:.4f}")
