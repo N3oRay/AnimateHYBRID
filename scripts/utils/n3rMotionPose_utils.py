@@ -24,12 +24,17 @@ from PIL import Image, ImageDraw
 import traceback
 from torchvision.utils import save_image
 
-
-def border_fade_mask_rotate(H, W, device, fade_ratio=0.1, angle=0.0):
+def border_fade_mask_rotate(
+    H, W, device,
+    fade_ratio=0.1,
+    angle=0.0,
+    inverse=False
+):
     """
-    Masque de bords avec pivot central + compensation rotation
-    fade_ratio = épaisseur des bords (ex: 0.1 = 10%)
-    angle = rotation inverse appliquée au masque (rad)
+    Masque de bords avec pivot central + gestion du sens de rotation
+
+    angle   : angle de référence (rad)
+    inverse : si True → rotation inverse (compensation warp)
     """
 
     yy, xx = torch.meshgrid(
@@ -38,27 +43,24 @@ def border_fade_mask_rotate(H, W, device, fade_ratio=0.1, angle=0.0):
         indexing="ij"
     )
 
-    # centre
-    cx, cy = 0.0, 0.0
+    # 🎯 Choix du sens
+    angle_used = -angle if inverse else angle
 
-    # rotation inverse autour du centre
-    if angle != 0.0:
-        cos_a = torch.cos(torch.tensor(-angle, device=device))
-        sin_a = torch.sin(torch.tensor(-angle, device=device))
+    if angle_used != 0.0:
+        cos_a = math.cos(angle_used)
+        sin_a = math.sin(angle_used)
 
         x_rot = xx * cos_a - yy * sin_a
         y_rot = xx * sin_a + yy * cos_a
 
         xx, yy = x_rot, y_rot
 
-    # distance aux bords dans espace normalisé
-    dx = torch.min(xx + 1, 1 - xx)  # 0 aux bords
-    dy = torch.min(yy + 1, 1 - yy)
+    # Distance aux bords
+    dx = torch.minimum(xx + 1, 1 - xx)
+    dy = torch.minimum(yy + 1, 1 - yy)
+    dist = torch.minimum(dx, dy)
 
-    dist = torch.min(dx, dy)
-
-    # largeur de fade
-    fade = fade_ratio * 1.0  # stable en coord [-1,1]
+    fade = fade_ratio
 
     mask = (1.0 - dist / fade).clamp(0, 1)
 
@@ -217,9 +219,11 @@ def compensate_latent_shift_dev(
     # =========================================================
 
     if global_angle is not None:
-        valid_mask = border_fade_mask_rotate(H, W, device, fade_ratio=0.1, angle=-float(global_angle))
+        #valid_mask = border_fade_mask_rotate(H, W, device, fade_ratio=0.05, angle=-float(global_angle)) #fade_ratio=0.1
+        angle_warp = float(global_angle)
+        valid_mask = border_fade_mask_rotate( H, W, device, fade_ratio=0.1, angle=angle_warp, inverse=True )
     else:
-        valid_mask = border_fade_mask(H, W, device, fade_ratio=0.1)
+        valid_mask = border_fade_mask(H, W, device, fade_ratio=0.05)
 
     #save_debug_mask_scale( mask=valid_mask, debug_dir=debug_dir, frame_counter=frame_counter, name="compensate_mask1", scale=4 )
     save_debug_mask(valid_mask, H, W, debug_dir, frame_counter, prefix="compensate_mask1")
@@ -233,8 +237,8 @@ def compensate_latent_shift_dev(
     shift_magnitude = torch.sqrt(shift_x_tensor ** 2 + shift_y_tensor ** 2)
 
     # Dynamically adjust dilation size based on shift magnitude and image size
-    kernel_size = max(3, int(shift_magnitude * 10.0))  # Taille du noyau dynamique
-    kernel_size = min(kernel_size, 15)  # On limite la taille du noyau pour éviter une trop grande dilatation
+    kernel_size = max(200, int(shift_magnitude * 10.0))  # Taille du noyau dynamique
+    #kernel_size = min(kernel_size, 15)  # On limite la taille du noyau pour éviter une trop grande dilatation
 
     if debug:
         print(f"[MASK] kernel_size={kernel_size:.4f}")
@@ -251,7 +255,7 @@ def compensate_latent_shift_dev(
         print(f"[MASK] +Angle kernel_size={kernel_size:.4f}")
 
     oriH, oriW = image_size
-    if oriH * oriW >= 1280 * 896:  # Ajuster cette condition selon les tailles d'image courantes
+    if oriH * oriW > 1280 * 896:  # Ajuster cette condition selon les tailles d'image courantes
         kernel_size += 2
         if debug:
             print(f"[MASK] +SIZE kernel_size={kernel_size:.4f}")
@@ -261,7 +265,8 @@ def compensate_latent_shift_dev(
 
 
     # Applique le flou gaussien sur le masque dilaté
-    valid_mask = feather_outside_only_stable(valid_mask, radius=3, blur_kernel=kernel_size, sigma=3.0)  # Paramètres à ajuster selon besoin
+    # Paramètres à ajuster selon besoin sigma valeur du flou, blur_kernel longueur, radius valeur bande
+    valid_mask = feather_outside_only_stable(valid_mask, radius=1, blur_kernel=kernel_size, sigma=0.005)
 
     # =========================================================
     # Ajuster la taille du valid_mask pour correspondre aux latents
