@@ -2037,12 +2037,100 @@ def apply_pro_net_with_mouth(
     detail_strength=0.35,
     blur_kernel=5,
     mouth_radius_ratio=0.08,
+    mask_blur_kernel=7,
+    fusion_strength=0.35,   # 🔥 NOUVEAU (clé)
+    preserve_base=0.6       # 🔥 NOUVEAU (anti écrasement)
+):
+
+
+    B, C, H, W = latents.shape
+    device, dtype = latents.device, latents.dtype
+
+    # =========================================================
+    # 🔹 1. ProNet (base HD)
+    # =========================================================
+    latents_prot = apply_n3r_pro_net(
+        latents,
+        model=n3r_pro_net,
+        strength=n3r_pro_strength,
+        sanitize_fn=sanitize_fn
+    ).to(dtype)
+
+    if not mouth_coords:
+        return latents_prot
+
+    # =========================================================
+    # 🔹 2. MASK (inchangé mais plus smooth)
+    # =========================================================
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )
+
+    mouth_mask = torch.zeros((B,1,H,W), device=device, dtype=dtype)
+
+    for x, y in mouth_coords:
+        rx = int(W * mouth_radius_ratio)
+        ry = int(H * mouth_radius_ratio)
+
+        dist = ((X - x)**2)/(rx**2+1e-6) + ((Y - y)**2)/(ry**2+1e-6)
+        mouth_mask += (dist <= 1).float()
+
+    mouth_mask = mouth_mask.clamp(0,1)
+
+    if mask_blur_kernel > 1:
+        mouth_mask = F.avg_pool2d(
+            mouth_mask,
+            kernel_size=mask_blur_kernel,
+            stride=1,
+            padding=mask_blur_kernel//2
+        ).clamp(0,1)
+
+    # =========================================================
+    # 🔹 3. EXTRACTION DETAILS (HF uniquement)
+    # =========================================================
+    blurred = F.avg_pool2d(latents_prot, blur_kernel, stride=1, padding=blur_kernel//2)
+    details = latents_prot - blurred
+
+    # 👉 compression (évite HDR violent)
+    details = torch.tanh(details * 2.0) * 0.5
+
+    # =========================================================
+    # 🔹 4. GATE ADAPTATIF (super important)
+    # =========================================================
+    detail_energy = details.abs().mean(dim=1, keepdim=True)
+    gate = torch.sigmoid(detail_energy * 10.0)  # focus zones utiles
+
+    # =========================================================
+    # 🔹 5. RESIDUAL FUSION (non destructive)
+    # =========================================================
+    weight = mouth_mask * gate * fusion_strength
+
+    latents_out = latents + details * weight
+
+    # =========================================================
+    # 🔹 6. PRESERVE BASE (anti flicker)
+    # =========================================================
+    latents_out = latents * preserve_base + latents_out * (1 - preserve_base)
+
+    print("👄 Fusion bouche HDR (soft + motion preserved)")
+
+    return latents_out.clamp(-1.0, 1.0)
+
+def apply_pro_net_with_mouth_clean(
+    latents,
+    mouth_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    detail_strength=0.35,
+    blur_kernel=5,
+    mouth_radius_ratio=0.08,
     mask_blur_kernel=5,
     blend_strength=0.5,        # 🔥 nouveau
     preserve_motion=0.6        # 🔥 nouveau
 ):
-
-    import torch.nn.functional as F
 
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
@@ -4549,7 +4637,7 @@ def kelvin_to_rgb(temp):
         max(0, min(255, b)) / 255.0
     )
 
-def adjust_color_temperature(
+def adjust_color_temperature_v1(
     image,
     target_temp=7800,
     reference_temp=6500,
@@ -4610,6 +4698,110 @@ def adjust_color_temperature(
     return Image.fromarray((img * 255).astype(np.uint8))
 
 
+
+from PIL import Image
+import numpy as np
+
+def kelvin_to_rgb(temperature):
+    """
+    Convertit la température en kelvins en valeurs RGB approximatives.
+    Température en Kelvin (ex: 6500K pour une lumière blanche neutre).
+    """
+    temp = temperature / 100.0
+
+    if temp <= 66:
+        r = 255
+        g = temp
+        g = 99.4708025861 * np.log(g) - 161.1195681661
+        if temp <= 19:
+            b = 0
+        else:
+            b = temp - 10
+            b = 138.5177312231 * np.log(b) - 305.0447927307
+    else:
+        r = temp - 60
+        r = 329.698727446 * (r ** -0.1332047592)
+        g = temp - 60
+        g = 288.1221695283 * (g ** -0.0755148492)
+        b = 255
+
+    return np.clip([r, g, b], 0, 255)
+
+def adjust_color_temperature(
+    image,
+    target_temp=7800,
+    reference_temp=6500,
+    strength=0.5,
+    adaptive=True,
+    max_gain=2.0,
+    debug=False
+):
+    img = np.array(image).astype(np.float32) / 255.0
+
+    # --- 1. Gains température (comme ton code)
+    r1, g1, b1 = kelvin_to_rgb(reference_temp)
+    r2, g2, b2 = kelvin_to_rgb(target_temp)
+
+    base_gain = np.array([
+        r2 / r1,
+        g2 / g1,
+        b2 / b1
+    ])
+
+    # --- 2. Estimation rapide du WB actuel (gray-world simplifié)
+    if adaptive:
+        mean_rgb = img.reshape(-1, 3).mean(axis=0)
+        mean_rgb = np.maximum(mean_rgb, 1e-6)
+
+        # normalisation sur G
+        wb_ratio = mean_rgb / mean_rgb[1]
+
+        # mesure du déséquilibre
+        imbalance = np.std(wb_ratio)
+
+        # facteur adaptatif doux (évite overcorrection)
+        adaptive_factor = 1.0 + min(1.0, imbalance * 2.0)
+
+        # --- 3. Détermination automatique du type de température
+        if np.mean(wb_ratio[0]) < 1:
+            # Image plus froide, vers plus de chaleur
+            print("Image trop froide, ajustement vers une température plus chaude.")
+            target_temp = min(target_temp * (1 + strength), 10000)
+        elif np.mean(wb_ratio[0]) > 1:
+            # Image plus chaude, vers plus de froid
+            print("Image trop chaude, ajustement vers une température plus froide.")
+            target_temp = max(target_temp * (1 - strength), 3000)
+
+    else:
+        adaptive_factor = 1.0
+
+    # --- 4. Interpolation (ta logique conservée 💡)
+    final_gain = (1 - strength) + strength * base_gain * adaptive_factor
+
+    # --- 5. Clamp sécurité (très important en pratique)
+    final_gain = np.clip(final_gain, 1 / max_gain, max_gain)
+
+    # --- 6. Application
+    img *= final_gain
+
+    img = np.clip(img, 0, 1)
+
+    if debug:
+        print("=== DEBUG TEMP ===")
+        print(f"mean_rgb: {mean_rgb if adaptive else 'disabled'}")
+        print(f"base_gain: {base_gain}")
+        print(f"adaptive_factor: {adaptive_factor}")
+        print(f"final_gain: {final_gain}")
+        print("==================")
+
+    return Image.fromarray((img * 255).astype(np.uint8))
+
+# Exemple d'appel
+#image = Image.open("exemple_image.jpg")
+#adjusted_image = adjust_color_temperature(image, adaptive=True, debug=True)
+#adjusted_image.show()
+
+
 def adjust_color_temperature_basic(image, target_temp=10000, reference_temp=6500, strength=0.5):
     import numpy as np
 
@@ -4630,25 +4822,6 @@ def adjust_color_temperature_basic(image, target_temp=10000, reference_temp=6500
     img = np.clip(img, 0, 1)
     return Image.fromarray((img * 255).astype(np.uint8))
 
-def adjust_color_temperature_simple(image, target_temp=7800, reference_temp=6500):
-    import numpy as np
-
-    img = np.array(image).astype(np.float32) / 255.0
-
-    # Gains relatifs (IMPORTANT → comme GIMP)
-    r1, g1, b1 = kelvin_to_rgb(reference_temp)
-    r2, g2, b2 = kelvin_to_rgb(target_temp)
-
-    r_gain = r2 / r1
-    g_gain = g2 / g1
-    b_gain = b2 / b1
-
-    img[..., 0] *= r_gain
-    img[..., 1] *= g_gain
-    img[..., 2] *= b_gain
-
-    img = np.clip(img, 0, 1)
-    return Image.fromarray((img * 255).astype(np.uint8))
 
 
 def soft_tone_map(img):
@@ -4853,12 +5026,9 @@ def full_frame_postprocess_add( frame_pil: Image.Image, output_dir: Path, frame_
 
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="01", psave=psave)
     # 🔥 1. Température
-    frame_pil = adjust_color_temperature(
-        frame_pil,
-        target_temp=target_temp,
-        reference_temp=reference_temp,
-        strength=temp_strength
-    )
+    frame_pil = adjust_color_temperature(frame_pil, adaptive=True, debug=True)
+    #frame_pil = adjust_color_temperature( frame_pil, target_temp=target_temp, reference_temp=reference_temp, strength=temp_strength )
+
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="02", psave=psave)
 
     # 🔥 2. Neutralisation de la dominante
