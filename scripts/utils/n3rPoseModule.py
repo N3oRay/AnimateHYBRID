@@ -27,7 +27,7 @@ def update_motion_state(
     body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
     anchor_smooth=0.08,
     velocity_smooth=0.85,
-    drift_smooth=0.90,
+    drift_smooth=0.80,
     head_lock=True,
     head_lock_strength=0.95,
     debug=False
@@ -896,8 +896,9 @@ def cinematic_motion_graph_v6(
     hip_ids=(11,12),
     rotation_strength=0.5,
     rotation_smooth=0.3,
-    motion_sensitivity=4.0,   # 🔥 BOOST IMPORTANT valeur conseillé 4.0
-    head_lock=0.65,           # 🔥 réduit (IMPORTANT)
+    motion_sensitivity=3.0,   # 🔥 BOOST IMPORTANT valeur conseillé 4.0
+    head_lock=0.95,
+    head_lag=0.7,
     max_rotation_deg=20.0,
     debug=False
 ):
@@ -940,14 +941,6 @@ def cinematic_motion_graph_v6(
     state["angle"] = state["angle"] * (1 - rotation_smooth) + angle_raw * rotation_smooth
     angle = state["angle"]
 
-    # =========================================================
-    # 3. PIVOT STABLE (hip fallback)
-    # =========================================================
-    l_hip = kp[:, hip_ids[0], :2]
-    r_hip = kp[:, hip_ids[1], :2]
-    valid = torch.isfinite(l_hip).all(dim=-1, keepdim=True) & torch.isfinite(r_hip).all(dim=-1, keepdim=True)
-    shoulder_center = kp[:, [5, 6], :2].mean(dim=1, keepdim=True)
-    pivot = torch.where(valid, (l_hip + r_hip) * 0.5, shoulder_center)
 
     # =========================================================
     # 4. ROTATION (using Pose class)
@@ -956,7 +949,9 @@ def cinematic_motion_graph_v6(
 
     # Calcul de la rotation (angle ajusté par la force de rotation)
     strength = rotation_strength * (1.0 + motion_gain)
-    angle_final = torch.clamp(angle * strength, -max_rotation_deg, max_rotation_deg)
+
+    max_rotation_deg_dynamic = max_rotation_deg * torch.clamp(motion_gain, 0.5, 1.0)
+    angle_final = torch.clamp(angle * strength, -max_rotation_deg_dynamic, max_rotation_deg_dynamic)
 
     # Appliquer la rotation avec la méthode de la classe Pose
     pose.apply_rotation(angle_final)
@@ -965,15 +960,27 @@ def cinematic_motion_graph_v6(
     kp_out = pose.keypoints
 
     # =========================================================
-    # 5. HEAD LOCK
+    # 5. HEAD LAG (UNCHANGED)
     # =========================================================
-    if head_lock > 0:
-        kp_out[:, head_ids, :2] = kp_prev[:, head_ids, :2] * head_lock + kp_out[:, head_ids, :2] * (1.0 - head_lock)
+    kp_out[:, head_ids, :2] = (
+        kp_prev[:, head_ids, :2] * head_lag +
+        kp_out[:, head_ids, :2] * (1.0 - head_lag)
+    )
 
     # =========================================================
     # 6. FULL BODY SOFT DAMPING
     # =========================================================
     kp_out[..., :2] = kp_prev[..., :2] + (kp_out[..., :2] - kp_prev[..., :2]) * 0.95
+
+    # =========================================================
+    # 6. GLOBAL STABILITY (SLIGHTLY ADAPTIVE FIX)
+    # =========================================================
+    #alpha = 0.88 + 0.08 * (1.0 - motion_gain)
+    alpha = 0.85 + 0.05 * (1.0 - motion_gain)  # Rend le mouvement plus stable et moins réactif
+
+    kp_out[..., :2] = kp_prev[..., :2] + (
+        kp_out[..., :2] - kp_prev[..., :2]
+    ) * alpha
 
     # =========================================================
     # 7. CLEAN OUTPUT

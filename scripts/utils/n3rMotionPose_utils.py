@@ -648,9 +648,9 @@ def update_keypoints_from_pose(
             cx = (left_shoulder[0] + right_shoulder[0]) * 0.5
             cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
 
-            offset_y2 = H * 0.25
-            left_knee  = (cx - 72, cy + offset_y2)
-            right_knee = (cx + 72, cy + offset_y2)
+            offset_y2 = H * 0.26
+            left_knee  = (cx - 90, cy + offset_y2)
+            right_knee = (cx + 90, cy + offset_y2)
 
             if debug:
                 print("🦿 KNEE RECONSTRUCTED")
@@ -662,9 +662,9 @@ def update_keypoints_from_pose(
             cx = (left_shoulder[0] + right_shoulder[0]) * 0.5
             cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
 
-            offset_y3 = H * 0.32
-            left_ankle = (cx - 80, cy + offset_y3)
-            right_ankle = (cx + 80, cy + offset_y3)
+            offset_y3 = H * 0.36
+            left_ankle = (cx - 100, cy + offset_y3)
+            right_ankle = (cx + 100, cy + offset_y3)
 
             if debug:
                 print("🦿 ANKLE RECONSTRUCTED")
