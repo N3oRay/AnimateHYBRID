@@ -26,8 +26,8 @@ def update_motion_state(
     head_ids=(0,1,18,21,22,23,24),
     body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
     anchor_smooth=0.08,
-    velocity_smooth=0.85,
-    drift_smooth=0.80,
+    velocity_smooth=0.65,
+    drift_smooth=0.95,
     head_lock=True,
     head_lock_strength=0.95,
     debug=False
@@ -174,9 +174,6 @@ ACTOR_MODEL_SCHEDULE = [
     (20, "v6"),
     (25, "v3"),
 ]
-
-
-
 
 # =========================================================
 # ACTOR MODEL RESOLUTION (DIRECTOR SYSTEM)
@@ -971,7 +968,6 @@ def cinematic_motion_graph_v6(
     # 6. FULL BODY SOFT DAMPING
     # =========================================================
     kp_out[..., :2] = kp_prev[..., :2] + (kp_out[..., :2] - kp_prev[..., :2]) * 0.95
-
     # =========================================================
     # 6. GLOBAL STABILITY (SLIGHTLY ADAPTIVE FIX)
     # =========================================================
@@ -1002,7 +998,6 @@ def cinematic_motion_graph_v6(
         print("motion_gain:", motion_gain.mean().item())
         print("angle:", angle.mean().item())
         print("angle_final:", angle_final.mean().item())
-        print("pivot:", pivot[0, 0].tolist())
 
     return kp_out, state
 

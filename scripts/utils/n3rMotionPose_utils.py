@@ -644,21 +644,42 @@ def update_keypoints_from_pose(
     if (left_knee is None or right_knee is None or
         left_knee == (0,0) or right_knee == (0,0)):
 
-        if left_shoulder and right_shoulder:
-            cx = (left_shoulder[0] + right_shoulder[0]) * 0.5
-            cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
+        if left_hip and right_hip:
+            cy = (left_hip[1] + right_hip[1]) * 0.5  # Calcul du centre
+
+            offset_y2 = H * 0.12
+            left_knee  = (left_hip[0], cy + offset_y2)
+            right_knee = (right_hip[0], cy + offset_y2)
+
+            if debug:
+                print("🦿 KNEE RECONSTRUCTED BY HIP")
+
+        elif left_shoulder and right_shoulder:
+            cx = (left_shoulder[0] + right_shoulder[0]) * 0.5 # Calcul du centre
+            cy = (left_shoulder[1] + right_shoulder[1]) * 0.5 # Calcul du centre
 
             offset_y2 = H * 0.26
             left_knee  = (cx - 90, cy + offset_y2)
             right_knee = (cx + 90, cy + offset_y2)
 
             if debug:
-                print("🦿 KNEE RECONSTRUCTED")
+                print("🦿 KNEE RECONSTRUCTED BY SHOULDER")
 
     if (left_ankle is None or left_ankle is None or
         left_ankle == (0,0) or left_ankle == (0,0)):
 
-        if left_shoulder and right_shoulder:
+        if left_hip and right_hip:
+            cx = (left_hip[0] + right_hip[0]) * 0.5
+            cy = (left_hip[1] + right_hip[1]) * 0.5
+
+            offset_y2 = H * 0.1
+            left_ankle  = (cx - 10, cy - offset_y2)
+            right_ankle = (cx + 10, cy - offset_y2)
+
+            if debug:
+                print("🦿 ANKLE RECONSTRUCTED BY HIP")
+
+        elif left_shoulder and right_shoulder:
             cx = (left_shoulder[0] + right_shoulder[0]) * 0.5
             cy = (left_shoulder[1] + right_shoulder[1]) * 0.5
 
@@ -667,7 +688,7 @@ def update_keypoints_from_pose(
             right_ankle = (cx + 100, cy + offset_y3)
 
             if debug:
-                print("🦿 ANKLE RECONSTRUCTED")
+                print("🦿 ANKLE RECONSTRUCTED BY SHOULDER")
 
     # =========================================================
     # 🔹 NECK SAFE
