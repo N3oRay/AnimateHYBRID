@@ -169,7 +169,7 @@ ACTOR_LABELS = {
 }
 
 
-ACTOR_MODEL_SCHEDULE = [
+ACTOR_MODEL_SCHEDULE_test = [
     (0, "pause"),
     (1, "v12"),
     (10, "v8"),
@@ -177,19 +177,20 @@ ACTOR_MODEL_SCHEDULE = [
 
 ]
 
-ACTOR_MODEL_SCHEDULE_V1 = [
+ACTOR_MODEL_SCHEDULE = [
     (0, "pause"),
     (2,  "base"),
     (5,  "v9"),
     (10,  "pause"),
     (11,  "v11"),
     (19, "pause"),
-    #(21, "v6"),
     (22, "v3"),
     (25, "pause"),
     (30,  "v12"),
     (35, "pause"),
-    (36, "v7"),
+    (40, "v7"),
+    (45, "v8"),
+    (50, "v6"),
 ]
 
 # =========================================================
@@ -1180,7 +1181,7 @@ def cinematic_motion_graph_v8(
     # -----------------------------
     # HARD LIMIT (PLUS STRICT)
     # -----------------------------
-    max_angle = 0.191  # ~11° → ajusté pour éviter des rotations trop larges
+    max_angle = 0.1  # ~5° → ajusté pour éviter des rotations trop larges
     target_angle = torch.clamp(target_angle, -max_angle, max_angle)
 
     # -----------------------------
