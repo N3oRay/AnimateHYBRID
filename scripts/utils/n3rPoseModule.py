@@ -169,7 +169,7 @@ ACTOR_LABELS = {
 }
 
 
-ACTOR_MODEL_SCHEDULE_TEST = [
+ACTOR_MODEL_SCHEDULE = [
     (0, "pause"),
     (1, "v12"),
     (10, "v8"),
@@ -177,7 +177,7 @@ ACTOR_MODEL_SCHEDULE_TEST = [
 
 ]
 
-ACTOR_MODEL_SCHEDULE = [
+ACTOR_MODEL_SCHEDULE_V1 = [
     (0, "pause"),
     (2,  "base"),
     (5,  "v9"),
@@ -422,6 +422,7 @@ def cinematic_motion_graph_v12(
     inertia=0.85,
     head_lag=0.7,
     max_deg=11.0,
+    fish_eyes=False,
 ):
     B, N, _ = kp.shape
     device = kp.device
@@ -520,7 +521,7 @@ def cinematic_motion_graph_v12(
     angle_vel = angle - prev_angle
 
     # clamp velocity (anti-jerk)
-    angle_vel = torch.clamp(angle_vel, -0.02, 0.02)
+    angle_vel = torch.clamp(angle_vel, -0.05, 0.05)
 
     state["angle_vel"] = angle_vel
     state["angle"] = angle
@@ -528,7 +529,7 @@ def cinematic_motion_graph_v12(
     # -----------------------------
     # ROTATION DAMPING PER FRAME
     # -----------------------------
-    rotation_damping = 0.92
+    rotation_damping = 0.85  # Réduire le damping pour moins de perte d'angle au fil du temps
     angle = angle * rotation_damping
 
     # =========================================================
@@ -538,9 +539,7 @@ def cinematic_motion_graph_v12(
 
     # Appliquer la rotation ici (Pose logic non modifié)
     pose = Pose(kp_out)
-    pose.apply_rotation_z(angle)
-
-    # Les keypoints après rotation sont maintenant stockés dans pose.keypoints
+    pose.apply_rotation_z(angle * 1.5)  # Appliquer plus de force à la rotation pour plus de dynamisme
 
     # =========================================================
     # 4. PIVOT (MORE STABLE BODY CENTER)
@@ -554,7 +553,8 @@ def cinematic_motion_graph_v12(
     # =========================================================
     # 5. FISH-EYE DISTORTION (NEW ADDITION)
     # =========================================================
-    kp_out = fish_eye_distortion(kp, pivot, strength=fish_eye_strength, max_radius=fish_eye_max_radius)
+    if fish_eyes:
+        kp_out = fish_eye_distortion(kp, pivot, strength=fish_eye_strength, max_radius=fish_eye_max_radius)
 
     # =========================================================
     # 6. HEAD LAG (UNCHANGED)
