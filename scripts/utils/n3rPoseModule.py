@@ -164,9 +164,18 @@ ACTOR_LABELS = {
     "v9": "[V9 FULL ACTOR SYSTEM]",
     "pause": "[V10 PAUSE INTER]",
     "v11": "[V11 ROTATION Z]",
+    "v12": "[V12 FISH EYES]",
     "v3": "[V3 SYSTEM]",
 }
 
+
+ACTOR_MODEL_SCHEDULE_TEST = [
+    (0, "pause"),
+    (1, "v12"),
+    (10, "v8"),
+    (15, "v6"),
+
+]
 
 ACTOR_MODEL_SCHEDULE = [
     (0, "pause"),
@@ -175,10 +184,10 @@ ACTOR_MODEL_SCHEDULE = [
     (10,  "pause"),
     (11,  "v11"),
     (19, "pause"),
-    (21, "v6"),
+    #(21, "v6"),
     (22, "v3"),
     (25, "pause"),
-    (30,  "v8"),
+    (30,  "v12"),
     (35, "pause"),
     (36, "v7"),
 ]
@@ -363,6 +372,241 @@ def _dbg(debug, *args):
 # MAIN MOTION GRAPH (FIXED)
 # ---------------------------------------------------------
 
+
+
+def fish_eye_distortion(kp, pivot, strength=1.5, max_radius=1.0):
+    """
+    Applique une distorsion fish-eye uniquement sur l'axe X des points autour du pivot,
+    tout en maintenant l'axe Y inchangé.
+
+    kp : [B, N, 2] - Keypoints à distordre (x, y)
+    pivot : [B, 1, 2] - Le centre de distorsion (généralement le centre de la caméra)
+    strength : Intensité de l'effet fish-eye
+    max_radius : Rayon maximal à partir du pivot pour appliquer la distorsion
+
+    Retourne les points distordus.
+    """
+    B, N, _ = kp.shape
+    kp_centered = kp - pivot  # Centrer les points par rapport au pivot
+
+    # Calculer la distance de chaque point par rapport au centre
+    dist = torch.norm(kp_centered, dim=-1, keepdim=True)  # [B, N, 1]
+    dist = torch.clamp(dist, max=max_radius)  # Limiter la distance au rayon max
+
+    # Appliquer la distorsion fish-eye uniquement sur l'axe X
+    factor = 1 + strength * dist ** 2  # Facteur de distorsion basé sur la distance radiale
+
+    # Appliquer la distorsion uniquement à l'axe X (garder Y inchangé)
+    kp_centered[:, :, 0] = kp_centered[:, :, 0] * factor[:, :, 0]  # Appliquer sur X seulement
+
+    # Revenir aux coordonnées d'origine (ajuster X, mais laisser Y inchangé)
+    kp_out = kp_centered + pivot  # Recentrer les points distordus
+
+    return kp_out
+
+
+
+
+def cinematic_motion_graph_v12(
+    kp,
+    state,
+    head_ids=(0, 1, 18, 21, 22, 23, 24),
+    upper_ids=(5, 6, 7, 8, 9, 10),
+    hip_ids=(11, 12),
+    debug=False,
+    fish_eye_strength=1.5,
+    fish_eye_max_radius=1.0,
+    rotation_strength=1.2,
+    motion_sensitivity=4.0,
+    damping=0.90,
+    inertia=0.85,
+    head_lag=0.7,
+    max_deg=11.0,
+):
+    B, N, _ = kp.shape
+    device = kp.device
+
+    # =========================================================
+    # 0. SAFE INIT (NO SHAPE DRIFT EVER)
+    # =========================================================
+    def to_B1(x, default=0.0):
+        if x is None:
+            return torch.full((B, 1), default, device=device)
+        if isinstance(x, (float, int)):
+            return torch.full((B, 1), float(x), device=device)
+        if torch.is_tensor(x):
+            if x.dim() == 0:
+                return x.view(1, 1).expand(B, 1)
+            if x.dim() == 1:
+                return x.view(B, 1)
+            if x.dim() == 2:
+                return x[:, :1]
+        return torch.full((B, 1), default, device=device)
+
+    if state is None:
+        state = {}
+
+    kp_prev = state.get("kp_prev", kp.clone())
+
+    state["energy"] = to_B1(state.get("energy", 0.0), B)
+    state["inertia"] = state.get("inertia", 0.75)
+    state["intent_vec"] = state.get("intent_vec", None)
+    state.setdefault("angle", torch.zeros((B, 1), device=device))
+    state.setdefault("angle_vel", torch.zeros((B, 1), device=device))
+
+    # =========================================================
+    # 1. MOTION ENERGY (STABLE)
+    # =========================================================
+    delta = kp[..., :2] - kp_prev[..., :2]
+    motion_vec = delta.mean(dim=1, keepdim=True)  # (B,1,2)
+
+    energy_raw = torch.norm(motion_vec, dim=-1, keepdim=True)  # (B,1,1)
+    energy_raw = energy_raw[:, :, 0]  # → (B,1)
+
+    state["energy"] = torch.clamp(
+        state["energy"] * state["inertia"] + energy_raw * (1.0 - state["inertia"]),
+        min=0.0,
+        max=1.0
+    )
+    energy = state["energy"]  # (B,1)
+
+    # =========================================================
+    # 2. INTENT VECTOR (SAFE)
+    # =========================================================
+    if state["intent_vec"] is None:
+        state["intent_vec"] = motion_vec
+    else:
+        alpha_intent = 0.85 + 0.1 * state["energy"]
+        state["intent_vec"] = state["intent_vec"] * alpha_intent + motion_vec * (1.0 - alpha_intent)
+
+    intent = state["intent_vec"]  # (B,1,2)
+
+    # =========================================================
+    # 3. BODY ROTATION (STABLE CINEMATIC VERSION)
+    # =========================================================
+
+    intent_angle = torch.atan2(
+        intent[..., 1],
+        intent[..., 0] + 1e-6
+    )
+
+    # -----------------------------
+    # ENERGY GAIN (soft, non explosif)
+    # -----------------------------
+    energy = state["energy"].clamp(0.0, 1.0)
+
+    gain = 0.25 + 0.9 * energy   # 🔥 réduit fortement
+
+    target_angle = intent_angle * gain
+
+    # -----------------------------
+    # HARD LIMIT (safe cinematic range)
+    # -----------------------------
+    max_angle = math.radians(11)  # 🔥 réduit de 25 → 11
+    target_angle = torch.clamp(target_angle, -max_angle, max_angle)
+
+    # -----------------------------
+    # ANGLE SMOOTHING (IMPORTANT FIX)
+    # -----------------------------
+    prev_angle = state["angle"]
+
+    # EMA smoothing (critical stability)
+    alpha = 0.95  # Smooth more to avoid large first frame jumps
+    angle = prev_angle * alpha + target_angle * (1.0 - alpha)
+
+    # -----------------------------
+    # ANGULAR VELOCITY CONTROLLED
+    # -----------------------------
+    angle_vel = angle - prev_angle
+
+    # clamp velocity (anti-jerk)
+    angle_vel = torch.clamp(angle_vel, -0.02, 0.02)
+
+    state["angle_vel"] = angle_vel
+    state["angle"] = angle
+
+    # -----------------------------
+    # ROTATION DAMPING PER FRAME
+    # -----------------------------
+    rotation_damping = 0.92
+    angle = angle * rotation_damping
+
+    # =========================================================
+    # APPLY ROTATION
+    # =========================================================
+    kp_out = kp.clone()
+
+    # Appliquer la rotation ici (Pose logic non modifié)
+    pose = Pose(kp_out)
+    pose.apply_rotation_z(angle)
+
+    # Les keypoints après rotation sont maintenant stockés dans pose.keypoints
+
+    # =========================================================
+    # 4. PIVOT (MORE STABLE BODY CENTER)
+    # =========================================================
+    upper = kp[:, 5:11, :2].mean(dim=1, keepdim=True)
+    lower = kp[:, 11:13, :2].mean(dim=1, keepdim=True)
+    pivot = upper * 0.4 + lower * 0.6
+    invalid = ~torch.isfinite(pivot).all(dim=-1, keepdim=True)
+    pivot = torch.where(invalid, upper, pivot)
+
+    # =========================================================
+    # 5. FISH-EYE DISTORTION (NEW ADDITION)
+    # =========================================================
+    kp_out = fish_eye_distortion(kp, pivot, strength=fish_eye_strength, max_radius=fish_eye_max_radius)
+
+    # =========================================================
+    # 6. HEAD LAG (UNCHANGED)
+    # =========================================================
+    kp_out[:, head_ids, :2] = (
+        kp_prev[:, head_ids, :2] * head_lag +
+        kp_out[:, head_ids, :2] * (1.0 - head_lag)
+    )
+
+    # =========================================================
+    # 7. GLOBAL STABILITY (SLIGHTLY ADAPTIVE FIX)
+    # =========================================================
+    # Stabilisation supplémentaire pour éviter les mouvements brusques
+    delta = kp[..., :2] - kp_prev[..., :2]
+    motion = torch.norm(delta, dim=-1)
+    w = torch.ones_like(motion)
+    torso_ids = list(range(5, 11))
+
+    w[:, torso_ids] *= 1.5
+    w[:, hip_ids] *= 1.2
+    w[:, [0, 1]] *= 0.8
+    motion_energy = (motion * w).mean(dim=1, keepdim=True)
+    motion_gain = torch.tanh(motion_energy * motion_sensitivity)
+    alpha = 0.85 + 0.05 * (1.0 - motion_gain)
+    kp_out[..., :2] = kp_prev[..., :2] + (kp_out[..., :2] - kp_prev[..., :2]) * alpha
+
+    # =========================================================
+    # 8. CLEAN OUTPUT
+    # =========================================================
+    kp_out[..., :2] = torch.nan_to_num(kp_out[..., :2], nan=0.0)
+    kp_out[..., :2] = torch.clamp(kp_out[..., :2], 0.0, 1.0)
+
+    # =========================================================
+    # 9. UPDATE STATE
+    # =========================================================
+    state["kp_prev"] = kp_out.clone()
+
+    # =========================================================
+    # DEBUG
+    # =========================================================
+    if debug:
+        print("\n[🎬 V12 ADVANCED FISHEYE EFFECT WITH NO Y MOVEMENT]")
+        print("energy:", energy.mean().item())
+        print("intent:", intent.norm(dim=-1).mean().item())
+        print("angle:", angle.mean().item())
+        print("motion:", energy_raw.mean().item())
+        print("pivot:", pivot[0, 0].tolist())
+
+    # Sortie avec aucun mouvement sur l'axe Y
+    return kp_out, state
+
+
 def cinematic_motion_graph_v11(
     kp,
     state,
@@ -370,7 +614,7 @@ def cinematic_motion_graph_v11(
     upper_ids=(5,6,7,8,9,10),
     hip_ids=(11,12),
     rotation_strength=1.2,
-    motion_sensitivity=4.0,
+    motion_sensitivity=3.0,
     damping=0.90,
     inertia=0.85,
     head_lag=0.7,
@@ -619,7 +863,7 @@ def cinematic_motion_graph_v10_pause(
     # DEBUG
     # =========================================================
     if debug:
-        print("\n[🎬 V8 PAUSE TRANSITION]")
+        print("\n[🎬 V10 PAUSE TRANSITION]")
         print("energy:", energy.mean().item())
         print("intent:", intent.norm(dim=-1).mean().item())
         print("pivot:", state["pivot_prev"][0, 0].tolist())
@@ -902,14 +1146,10 @@ def cinematic_motion_graph_v8(
     if state["intent_vec"] is None:
         state["intent_vec"] = motion_vec
     else:
-        #state["intent_vec"] = ( state["intent_vec"] * 0.85 + motion_vec * 0.15 )
-        # Lissage dynamique du vecteur d'intention en fonction de l'énergie
         alpha_intent = 0.85 + 0.1 * state["energy"]  # Augmenter l'alpha si l'énergie est élevée
         state["intent_vec"] = state["intent_vec"] * alpha_intent + motion_vec * (1.0 - alpha_intent)
 
     intent = state["intent_vec"]  # (B,1,2)
-
-
 
     # =========================================================
     # 3. ROTATION (REDUCED + STABLE)
@@ -930,7 +1170,7 @@ def cinematic_motion_graph_v8(
     # -----------------------------
     # HARD LIMIT (PLUS STRICT)
     # -----------------------------
-    max_angle = 0.6  # ~34° → OK mais plus safe
+    max_angle = 0.191  # ~11° → ajusté pour éviter des rotations trop larges
     target_angle = torch.clamp(target_angle, -max_angle, max_angle)
 
     # -----------------------------
@@ -938,20 +1178,20 @@ def cinematic_motion_graph_v8(
     # -----------------------------
     prev_angle = state.get("angle", torch.zeros_like(target_angle))
 
-    alpha = 0.9  # 🔥 plus stable
+    alpha = 0.95  # Diminution de l'alpha pour des rotations plus douces
     angle = prev_angle * alpha + target_angle * (1 - alpha)
 
     # -----------------------------
     # LIMIT ANGULAR SPEED (CRUCIAL FIX)
     # -----------------------------
     angle_vel = angle - prev_angle
-    angle_vel = torch.clamp(angle_vel, -0.03, 0.03)
+    angle_vel = torch.clamp(angle_vel, -0.02, 0.02)  # Réduction de la vitesse angulaire pour plus de stabilité
 
-    # integrate softly
+    # Intégration douce
     angle = prev_angle + angle_vel
 
     # optional damping
-    angle = angle * 0.92
+    angle = angle * 0.95  # Réduction plus importante de l'amortissement
 
     state["angle"] = angle
     state["angle_vel"] = angle_vel
@@ -962,7 +1202,8 @@ def cinematic_motion_graph_v8(
     upper = kp[:, 5:11, :2].mean(dim=1, keepdim=True)
     lower = kp[:, 11:13, :2].mean(dim=1, keepdim=True)
 
-    pivot = upper * 0.35 + lower * 0.65
+    # Ajuster le pivot pour éviter des distorsions
+    pivot = upper * 0.4 + lower * 0.6
 
     invalid = ~torch.isfinite(pivot).all(dim=-1, keepdim=True)
     pivot = torch.where(invalid, upper, pivot)
@@ -970,18 +1211,16 @@ def cinematic_motion_graph_v8(
     # =========================================================
     # 5. ROTATION APPLY (SAFE)
     # =========================================================
-    # Duplique les keypoints pour conserver une copie originale
     kp_out = kp.clone()
 
     # Créer une instance de la classe Pose avec les keypoints
     pose = Pose(kp_out)  # on passe les keypoints ici
 
     # Calculer l'angle de rotation
-    # Assure-toi que l'angle est un tensor de forme [B, 1]
     angle = angle.view(B, 1)  # Formater l'angle en [B, 1] si nécessaire
 
     # Appliquer la rotation via la méthode de la classe Pose
-    pose.apply_rotation(angle)  # Pas besoin de reformater l'angle si c'est déjà [B, 1]
+    pose.apply_rotation(angle)
 
     # Les keypoints après rotation sont maintenant dans pose.keypoints
     kp_out = pose.keypoints
@@ -989,11 +1228,8 @@ def cinematic_motion_graph_v8(
     # =========================================================
     # 6. HEAD STABILITY
     # =========================================================
-    #kp_out[:, head_ids, :2] = ( kp_out[:, head_ids, :2] * 0.96 + kp_prev[:, head_ids, :2] * 0.04 )
-
-    # Améliorer la stabilité de la tête en ajustant l'amortissement
     kp_out[:, head_ids, :2] = (
-        kp_out[:, head_ids, :2] * 0.98 +  # Augmenter l'amortissement
+        kp_out[:, head_ids, :2] * 0.98 +  # Amortissement réduit
         kp_prev[:, head_ids, :2] * 0.02
     )
 
@@ -1569,5 +1805,6 @@ ACTOR_PIPELINE = {
     "v9": actor_system_v9,
     "pause": cinematic_motion_graph_v10_pause,
     "v11": cinematic_motion_graph_v11,
+    "v12": cinematic_motion_graph_v12,
 }
 

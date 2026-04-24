@@ -69,6 +69,81 @@ class Pose:
             'mouth_bottom': 51,  # index approximatif du bas de la bouche
         }
 
+    def rotate_points_around_z_axis(self, points, pivot, angle):
+        """
+        Applique une rotation autour de l'axe Z pour les points donnés.
+
+        points : [B, N, 2] - Points à faire pivoter (x, y)
+        pivot : [B, 2] - Pivot autour duquel faire pivoter (x, y)
+        angle : [B, 1] - Angles de rotation en radians (par batch)
+
+        Retourne les points après rotation.
+        """
+        B, N, _ = points.shape
+
+        # Vérification des NaN dans les points et pivots
+        if torch.isnan(points).any():
+            raise ValueError("Les points contiennent des valeurs NaN")
+
+        if torch.isnan(pivot).any():
+            # Si le pivot contient des NaN, utiliser un pivot de secours (exemple : centre des épaules)
+            print("Avertissement : Le pivot contient des NaN. Utilisation du pivot de secours.")
+            pivot = torch.zeros_like(pivot)  # Remplacer par un pivot arbitraire (ex. centre des épaules)
+
+        if torch.isnan(angle).any() or angle.shape != torch.Size([B, 1]):
+            # Si l'angle est NaN ou a une forme inattendue, rotation nulle
+            print("Avertissement : L'angle est NaN ou a une forme incorrecte. Rotation nulle appliquée.")
+            angle = torch.zeros_like(angle)  # Rotation nulle
+
+        # Calculer les sinus et cosinus de l'angle
+        cos_a = torch.cos(angle)
+        sin_a = torch.sin(angle)
+
+        # Centrer les points autour du pivot pour les faire pivoter autour de l'origine
+        points_centered = points - pivot.unsqueeze(1)  # [B, N, 2]
+
+        # Appliquer la rotation autour de l'axe Z (2D)
+        x_new = points_centered[..., 0] * cos_a - points_centered[..., 1] * sin_a
+        y_new = points_centered[..., 0] * sin_a + points_centered[..., 1] * cos_a
+
+        # Ajouter à nouveau le pivot pour remettre les points à leurs positions finales
+        rotated_points = torch.stack([x_new, y_new], dim=-1) + pivot.unsqueeze(1)
+
+        # Assurer que les valeurs sont valides (sans NaN)
+        rotated_points = torch.nan_to_num(rotated_points, nan=0.0)
+
+        # Retourner les points après rotation
+        return rotated_points
+
+    def apply_rotation_z(self, angle):
+        """
+        Applique une rotation sur les points du corps (épaules, coudes, poignets) autour du pivot
+        calculé à partir des points du torse et du cou.
+
+        angle : angle de rotation en radians
+        """
+        # Indices des points à faire pivoter (épaules, coudes, poignets)
+        upper_ids = [
+            self.FACIAL_POINT_IDX['left_shoulder'],
+            self.FACIAL_POINT_IDX['right_shoulder'],
+            self.FACIAL_POINT_IDX['left_elbow'],
+            self.FACIAL_POINT_IDX['right_elbow'],
+            self.FACIAL_POINT_IDX['left_wrist'],
+            self.FACIAL_POINT_IDX['right_wrist']
+        ]
+
+        # Calculer le pivot comme la moyenne des points dans la plage spécifiée (ici de 5 à 12)
+        pivot = self.keypoints[:, 5:min(13, self.B), :2].mean(dim=1, keepdim=True)
+
+        # Adapter la forme de pivot pour qu'il corresponde à celle des points à faire pivoter
+        pivot = pivot.expand(-1, len(upper_ids), -1)
+
+        # Appliquer la rotation des points autour du pivot
+        self.keypoints[:, upper_ids, :2] = self.rotate_points_around_z_axis(
+            self.keypoints[:, upper_ids, :2],
+            pivot,
+            angle
+        )
 
     def rotate_points_around_pivot(self, points, pivot, angle):
         """
