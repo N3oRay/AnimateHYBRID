@@ -416,13 +416,16 @@ def cinematic_motion_graph_v12(
     debug=False,
     fish_eye_strength=1.5,
     fish_eye_max_radius=1.0,
-    rotation_strength=1.2,
+    rotation_strength=2.0,  # Augmenter légèrement la force de la rotation Z
     motion_sensitivity=4.0,
     damping=0.90,
     inertia=0.85,
     head_lag=0.7,
     max_deg=11.0,
     fish_eyes=False,
+    stability=False,
+    apply_head_lag=False,
+    noise_strength=0.0,  # Réduire le bruit pour qu'il soit moins perceptible
 ):
     B, N, _ = kp.shape
     device = kp.device
@@ -537,9 +540,13 @@ def cinematic_motion_graph_v12(
     # =========================================================
     kp_out = kp.clone()
 
-    # Appliquer la rotation ici (Pose logic non modifié)
+    # Appliquer un bruit léger si activé
+    if noise_strength > 0:
+        kp_out[..., :2] += noise_strength * torch.randn_like(kp_out[..., :2])
+
+    # Amplifier la force de la rotation Z pour plus de visibilité
     pose = Pose(kp_out)
-    pose.apply_rotation_z(angle * 1.5)  # Appliquer plus de force à la rotation pour plus de dynamisme
+    pose.apply_rotation_z(angle * rotation_strength)  # Appliquer plus de force à la rotation pour plus de dynamisme
 
     # =========================================================
     # 4. PIVOT (MORE STABLE BODY CENTER)
@@ -557,29 +564,32 @@ def cinematic_motion_graph_v12(
         kp_out = fish_eye_distortion(kp, pivot, strength=fish_eye_strength, max_radius=fish_eye_max_radius)
 
     # =========================================================
-    # 6. HEAD LAG (UNCHANGED)
+    # 6. HEAD LAG (OPTIONAL)
     # =========================================================
-    kp_out[:, head_ids, :2] = (
-        kp_prev[:, head_ids, :2] * head_lag +
-        kp_out[:, head_ids, :2] * (1.0 - head_lag)
-    )
+    if apply_head_lag:
+        kp_out[:, head_ids, :2] = (
+            kp_prev[:, head_ids, :2] * head_lag +
+            kp_out[:, head_ids, :2] * (1.0 - head_lag)
+        )
 
     # =========================================================
-    # 7. GLOBAL STABILITY (SLIGHTLY ADAPTIVE FIX)
+    # 7. GLOBAL STABILITY (OPTIONAL)
     # =========================================================
-    # Stabilisation supplémentaire pour éviter les mouvements brusques
-    delta = kp[..., :2] - kp_prev[..., :2]
-    motion = torch.norm(delta, dim=-1)
-    w = torch.ones_like(motion)
-    torso_ids = list(range(5, 11))
+    if stability:
+        # Stabilisation supplémentaire pour éviter les mouvements brusques
+        delta = kp[..., :2] - kp_prev[..., :2]
+        motion = torch.norm(delta, dim=-1)
+        w = torch.ones_like(motion)
+        torso_ids = list(range(5, 11))
 
-    w[:, torso_ids] *= 1.5
-    w[:, hip_ids] *= 1.2
-    w[:, [0, 1]] *= 0.8
-    motion_energy = (motion * w).mean(dim=1, keepdim=True)
-    motion_gain = torch.tanh(motion_energy * motion_sensitivity)
-    alpha = 0.85 + 0.05 * (1.0 - motion_gain)
-    kp_out[..., :2] = kp_prev[..., :2] + (kp_out[..., :2] - kp_prev[..., :2]) * alpha
+        w[:, torso_ids] *= 1.5
+        w[:, hip_ids] *= 1.2
+        w[:, [0, 1]] *= 0.8
+        motion_energy = (motion * w).mean(dim=1, keepdim=True)
+        motion_gain = torch.tanh(motion_energy * motion_sensitivity)
+        alpha = 0.85 + 0.05 * (1.0 - motion_gain)
+        kp_out[..., :2] = kp_prev[..., :2] + (kp_out[..., :2] - kp_prev[..., :2]) * alpha
+
 
     # =========================================================
     # 8. CLEAN OUTPUT
