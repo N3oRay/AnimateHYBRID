@@ -40,15 +40,15 @@ class Pose:
         # -----------------------------
 
         self.FACIAL_POINT_IDX = {
-            'nose': 0,
-            'neck': 1,
-            'right_shoulder': 2,
-            'right_elbow': 3,
-            'right_wrist': 4,
-            'left_shoulder': 5,
-            'left_elbow': 6,
-            'left_wrist': 7,
-            'right_hip': 8,
+            'nose': 0,  # 'nez' : 0,
+            'neck': 1,  # 'cou' : 1,
+            'right_shoulder': 2, # 'épaule_droite' : 2,
+            'right_elbow': 3, # 'coude_droit' : 3,
+            'right_wrist': 4, # 'poignet_droit' : 4,
+            'left_shoulder': 5, # 'épaule_gauche' : 5,
+            'left_elbow': 6, # 'coude_gauche' : 6,
+            'left_wrist': 7, # 'poignet_gauche' : 7,
+            'right_hip': 8, # 'hanche_droite' : 8,
             'right_knee': 9, # 9	genou droit (right knee)
             'right_ankle': 10, # 10	cheville droite (right ankle)
             'left_hip': 11,
