@@ -17,6 +17,37 @@ import traceback
 from .n3rMotionPoseClass import Pose
 
 # =========================================================
+# UTILS
+# =========================================================
+
+def ensure_B1(x, B, device):
+    if x is None:
+        return torch.zeros((B,1), device=device)
+
+    if not torch.is_tensor(x):
+        return torch.full((B,1), float(x), device=device)
+
+    if x.numel() != B:
+        return torch.zeros((B,1), device=device)
+
+    return x.view(B,1)
+
+
+def to_B1(x, B, device):
+    if x is None:
+        return torch.zeros((B,1), device=device)
+    if not torch.is_tensor(x):
+        return torch.full((B,1), float(x), device=device)
+    if x.dim() == 0:
+        return x.view(1,1).expand(B,1)
+    if x.dim() == 1:
+        return x.view(B,1)
+    if x.dim() == 2:
+        return x[:, :1]
+    return torch.zeros((B,1), device=device)
+
+
+# =========================================================
 # ACTOR FUNCTION MAP (EXTENSIBLE SYSTEM)
 # =========================================================
 
@@ -68,14 +99,8 @@ def update_motion_state(
     # =========================================================
     anchor_prev = state["anchor"]
     anchor_now = kp[:, body_ids, :2].mean(dim=1, keepdim=True)
-
-    anchor = (
-        anchor_prev * (1.0 - anchor_smooth) +
-        anchor_now * anchor_smooth
-    )
-
+    anchor = ( anchor_prev * (1.0 - anchor_smooth) + anchor_now * anchor_smooth )
     state["anchor"] = anchor
-
 
     # =========================================================
     # 3. DRIFT (REAL LOW-PASS FILTER - SAFE) - stabilisation caméra
@@ -91,10 +116,7 @@ def update_motion_state(
         state["drift"] = torch.zeros_like(drift_raw)
 
     # EMA drift (low-pass réel)
-    drift = (
-        state["drift"] * drift_smooth +
-        drift_raw * (1.0 - drift_smooth)
-    )
+    drift = ( state["drift"] * drift_smooth + drift_raw * (1.0 - drift_smooth) )
 
     state["drift"] = drift
 
@@ -113,10 +135,7 @@ def update_motion_state(
     # 5. BLEND WITH CURRENT INPUT (CRUCIAL)
     # =========================================================
     # gives responsiveness without instability
-    kp_out[..., :2] = (
-        kp_out[..., :2] * 0.7 +
-        kp[..., :2] * 0.3
-    )
+    kp_out[..., :2] = ( kp_out[..., :2] * 0.7 + kp[..., :2] * 0.3 )
 
     # =========================================================
     # 6. HEAD LOCK (STABLE BUT NOT FROZEN)
@@ -163,25 +182,25 @@ ACTOR_LABELS = {
     "v8": "[V8 ACTING SYSTEM]",
     "v9": "[V9 FULL ACTOR SYSTEM]",
     "pause": "[V10 PAUSE INTER]",
-    "v11": "[V11 ROTATION Z]",
+    "v14": "[V14 ROTATION Z]",
     "v12": "[V12 FISH EYES]",
     "v3": "[V3 SYSTEM]",
 }
 
 
-ACTOR_MODEL_SCHEDULE_test = [
+ACTOR_MODEL_SCHEDULE = [
     (0, "pause"),
-    (1, "v12"),
+    (1, "v14"),
+    (5, "v12"),
     (10, "v8"),
     (15, "v6"),
 
 ]
 
-ACTOR_MODEL_SCHEDULE = [
+ACTOR_MODEL_SCHEDULE_final = [
     (0, "pause"),
     (2,  "base"),
     (5,  "v9"),
-    (10,  "pause"),
     (11,  "v11"),
     (19, "pause"),
     (22, "v3"),
@@ -434,26 +453,13 @@ def cinematic_motion_graph_v12(
     # =========================================================
     # 0. SAFE INIT (NO SHAPE DRIFT EVER)
     # =========================================================
-    def to_B1(x, default=0.0):
-        if x is None:
-            return torch.full((B, 1), default, device=device)
-        if isinstance(x, (float, int)):
-            return torch.full((B, 1), float(x), device=device)
-        if torch.is_tensor(x):
-            if x.dim() == 0:
-                return x.view(1, 1).expand(B, 1)
-            if x.dim() == 1:
-                return x.view(B, 1)
-            if x.dim() == 2:
-                return x[:, :1]
-        return torch.full((B, 1), default, device=device)
 
     if state is None:
         state = {}
 
     kp_prev = state.get("kp_prev", kp.clone())
 
-    state["energy"] = to_B1(state.get("energy", 0.0), B)
+    state["energy"] = to_B1(state.get("energy", 0.0), B, device=device)
     state["inertia"] = state.get("inertia", 0.75)
     state["intent_vec"] = state.get("intent_vec", None)
     state.setdefault("angle", torch.zeros((B, 1), device=device))
@@ -618,140 +624,217 @@ def cinematic_motion_graph_v12(
     return kp_out, state
 
 
-def cinematic_motion_graph_v11(
+def cinematic_motion_graph_v14(
     kp,
     state,
+
     head_ids=(0,1,18,21,22,23,24),
     upper_ids=(5,6,7,8,9,10),
     hip_ids=(11,12),
-    rotation_strength=1.2,
-    motion_sensitivity=3.0,
+
+    # =========================
+    # TOGGLES
+    # =========================
+    enable_rotation=True,
+    enable_inertia=True,
+    enable_handheld=True,
+    enable_breathing=False,
+    enable_overshoot=True,
+
+    # =========================
+    # PARAMETERS
+    # =========================
+    max_deg=12.0,
+    rotation_strength=1.8,
+    motion_sensitivity=2.5,
+
+    inertia=0.80,
     damping=0.90,
-    inertia=0.85,
-    head_lag=0.7,
-    max_deg=10.0,
+
+    overshoot_strength=0.25,
+    handheld_strength=0.0025,
+    breathing_strength=0.0015,
+
+    head_lag=0.65,
+    lock_y=True,
+
     debug=False
 ):
     B, N, _ = kp.shape
     device = kp.device
 
     # =========================================================
-    # 0. SAFE STATE INIT (UNCHANGED BUT HARDENED)
+    # INIT STATE
     # =========================================================
-    def to_B1(x, default=0.0):
-        if x is None:
-            return torch.zeros((B,1), device=device)
-        if isinstance(x, (float, int)):
-            return torch.full((B,1), float(x), device=device)
-        if torch.is_tensor(x):
-            if x.dim() == 0:
-                return x.view(1,1).expand(B,1)
-            if x.dim() == 1:
-                return x.view(B,1)
-            if x.dim() == 2:
-                return x[:, :1]
-        return torch.zeros((B,1), device=device)
-
     if state is None:
         state = {}
 
     kp_prev = state.get("kp_prev", kp.clone())
 
-    angle = to_B1(state.get("angle", 0.0), B)
-    angular_vel = to_B1(state.get("angular_vel", 0.0), B)
+    angle = ensure_B1(state.get("angle"), B, device)
+    angular_vel = ensure_B1(state.get("angular_vel"), B, device)
+    prev_target = ensure_B1(state.get("prev_target"), B, device)
 
-    state["angle"] = angle
-    state["angular_vel"] = angular_vel
-    state.setdefault("torso_vec_prev", None)
+    t = state.get("time", 0.0) + 1.0
+    state["time"] = t
 
     # =========================================================
-    # 1. MOTION ENERGY (STRUCTURED FIX)
+    # 1. MOTION ENERGY (clean + stable)
     # =========================================================
     delta = kp[..., :2] - kp_prev[..., :2]
-    motion = torch.norm(delta, dim=-1)  # (B,N)
 
-    # body weighting (minimal but critical fix)
+    motion = torch.norm(delta, dim=-1)
+
     w = torch.ones_like(motion)
-
-    torso_ids = list(range(5, 11))
-
-    w[:, torso_ids] *= 1.5
+    w[:, upper_ids] *= 1.5
     w[:, hip_ids] *= 1.2
-    w[:, [0,1]] *= 0.8
 
     motion_energy = (motion * w).mean(dim=1, keepdim=True)
     motion_gain = torch.tanh(motion_energy * motion_sensitivity)
 
     # =========================================================
-    # 3. PIVOT (MORE STABLE BODY CENTER)
+    # 2. INTENT (STABLE VERSION 🔥)
     # =========================================================
-    upper_center = kp[:, torso_ids, :2].mean(dim=1, keepdim=True)
-    hip_center = kp[:, hip_ids, :2].mean(dim=1, keepdim=True)
+    motion_vec = (kp[:, upper_ids, :2] - kp_prev[:, upper_ids, :2]).mean(dim=1)
 
-    pivot = upper_center * 0.3 + hip_center * 0.7  # Le pivot devient plus centré sur les hanches, réduisant l'impact de la rotation
+    intent_angle = torch.atan2(
+        motion_vec[..., 1],
+        motion_vec[..., 0] + 1e-6
+    ).unsqueeze(-1)
 
-    valid = torch.isfinite(pivot).all(dim=-1, keepdim=True)
-    shoulder_center = kp[:, [5,6], :2].mean(dim=1, keepdim=True)
+    target_angle = intent_angle * rotation_strength * motion_gain
 
-    pivot = torch.where(valid, pivot, shoulder_center)
+    # clamp direct (important)
+    max_angle = math.radians(max_deg)
+    target_angle = torch.clamp(target_angle, -max_angle, max_angle)
 
     # =========================================================
-    # 4. ROTATION (UNCHANGED BUT STABILIZED INPUT)
+    # 3. OVERSHOOT (cinematic effect)
+    # =========================================================
+    if enable_overshoot:
+        delta_target = target_angle - prev_target
+        target_angle = target_angle + delta_target * overshoot_strength
+
+    state["prev_target"] = target_angle
+
+    # =========================================================
+    # 4. PHYSICS ROTATION (REALISTIC 🔥)
+    # =========================================================
+    if enable_rotation:
+
+        angular_acc = target_angle - angle
+
+        if enable_inertia:
+            angular_vel = angular_vel * inertia + angular_acc * (1 - inertia)
+        else:
+            angular_vel = angular_acc
+
+        angular_vel = angular_vel * damping
+        angle = angle + angular_vel
+
+        angle = torch.clamp(angle, -max_angle, max_angle)
+
+    # =========================================================
+    # 5. PIVOT (stable body center)
+    # =========================================================
+    upper = kp[:, upper_ids, :2].mean(dim=1, keepdim=True)
+    hips  = kp[:, hip_ids, :2].mean(dim=1, keepdim=True)
+
+    pivot = upper * 0.35 + hips * 0.65
+    pivot = torch.nan_to_num(pivot)
+
+    # =========================================================
+    # 6. APPLY ROTATION (FIXED)
     # =========================================================
     kp_out = kp.clone()
 
-    strength = rotation_strength * (1.0 + motion_gain)
+    if enable_rotation:
 
-    angle_final = torch.clamp(
-        state["angle"] * strength,
-        -max_deg,
-        max_deg
-    ).view(B,1,1)
+        angle = torch.nan_to_num(angle)
+        angle = torch.clamp(angle, -math.radians(max_deg), math.radians(max_deg))
+        if debug:
+            print("ANGLE SHAPE:", angle.shape, "NUMEL:", angle.numel())
 
-    kp_out[:, upper_ids, :2] = rotate_points_around_z_axis(
-        kp[:, upper_ids, :2],
-        pivot,
-        angle_final
-    )
+        angle_safe = angle.view(B,1,1)
+        pivot_safe = pivot.view(B,1,2)
+
+
+        kp_out[:, upper_ids, :2] = Pose.rotate_points_around_z_axis(
+            kp[:, upper_ids, :2],
+            pivot_safe,
+            angle_safe
+        )
 
     # =========================================================
-    # 5. HEAD LAG (UNCHANGED)
+    # 7. HANDHELD CAMERA (REALISTIC MICRO SHAKE)
+    # =========================================================
+    if enable_handheld:
+        t_tensor = torch.tensor(t, device=device)
+
+        noise_x = (
+            torch.sin(t_tensor * 0.6) +
+            torch.sin(t_tensor * 1.3) * 0.5
+        ) * handheld_strength
+
+        kp_out[..., 0] += noise_x
+
+        if not lock_y:
+            noise_y = torch.cos(t_tensor * 0.9) * handheld_strength
+            kp_out[..., 1] += noise_y
+
+    # =========================================================
+    # 8. BREATHING
+    # =========================================================
+    if enable_breathing and not lock_y:
+        t_tensor = torch.tensor(t, device=device)
+        breath = torch.sin(t_tensor * 0.2) * breathing_strength
+        kp_out[:, upper_ids, 1] += breath
+
+    # =========================================================
+    # 9. HEAD LAG
     # =========================================================
     kp_out[:, head_ids, :2] = (
         kp_prev[:, head_ids, :2] * head_lag +
-        kp_out[:, head_ids, :2] * (1.0 - head_lag)
+        kp_out[:, head_ids, :2] * (1 - head_lag)
     )
 
     # =========================================================
-    # 6. GLOBAL STABILITY (SLIGHTLY ADAPTIVE FIX)
+    # 10. GLOBAL SMOOTH (anti jitter)
     # =========================================================
-    alpha = 0.85 + 0.05 * (1.0 - motion_gain)  # Rend le mouvement plus stable et moins réactif
+    alpha = 0.80 + 0.10 * (1.0 - motion_gain)
 
     kp_out[..., :2] = kp_prev[..., :2] + (
         kp_out[..., :2] - kp_prev[..., :2]
     ) * alpha
 
     # =========================================================
-    # 7. CLEAN OUTPUT
+    # 11. LOCK Y (clean)
     # =========================================================
-    kp_out[..., :2] = torch.nan_to_num(kp_out[..., :2], nan=0.0)
+    if lock_y:
+        kp_out[..., 1] = kp_prev[..., 1]
+
+    # =========================================================
+    # CLEAN
+    # =========================================================
+    kp_out[..., :2] = torch.nan_to_num(kp_out[..., :2])
     kp_out[..., :2] = torch.clamp(kp_out[..., :2], 0.0, 1.0)
 
     # =========================================================
-    # 8. STATE UPDATE
+    # UPDATE STATE
     # =========================================================
     state["kp_prev"] = kp_out.clone()
+    state["angle"] = angle
+    state["angular_vel"] = angular_vel
 
     # =========================================================
-    # DEBUG (UNCHANGED)
+    # DEBUG
     # =========================================================
     if debug:
-        print("\n[🎬 V11 SAFE FIXED]")
+        print("\n[🎬 V14 CINEMATIC CAMERA]")
         print("motion:", motion_energy.mean().item())
-        print("gain:", motion_gain.mean().item())
-        print("angle:", state["angle"].mean().item())
-        print("vel:", state["angular_vel"].mean().item())
-        print("pivot:", pivot[0,0].tolist())
+        print("target:", target_angle.mean().item())
+        print("angle:", angle.mean().item())
+        print("vel:", angular_vel.mean().item())
 
     return kp_out, state
 
@@ -769,26 +852,13 @@ def cinematic_motion_graph_v10_pause(
     # =========================================================
     # 0. SAFE INIT (NO SHAPE DRIFT EVER)
     # =========================================================
-    def to_B1(x, default=0.0):
-        if x is None:
-            return torch.full((B, 1), default, device=device)
-        if isinstance(x, (float, int)):
-            return torch.full((B, 1), float(x), device=device)
-        if torch.is_tensor(x):
-            if x.dim() == 0:
-                return x.view(1, 1).expand(B, 1)
-            if x.dim() == 1:
-                return x.view(B, 1)
-            if x.dim() == 2:
-                return x[:, :1]
-        return torch.full((B, 1), default, device=device)
 
     if state is None:
         state = {}
 
     kp_prev = state.get("kp_prev", kp.clone())
 
-    state["energy"] = to_B1(state.get("energy", 0.0), B)
+    state["energy"] = to_B1(state.get("energy", 0.0), B, device=device)
     state["inertia"] = state.get("inertia", 0.75)
     state["intent_vec"] = state.get("intent_vec", None)
     state.setdefault("angle", torch.zeros((B, 1), device=device))
@@ -1107,26 +1177,13 @@ def cinematic_motion_graph_v8(
     # =========================================================
     # 0. SAFE INIT (NO SHAPE DRIFT EVER)
     # =========================================================
-    def to_B1(x, default=0.0):
-        if x is None:
-            return torch.full((B,1), default, device=device)
-        if isinstance(x, (float, int)):
-            return torch.full((B,1), float(x), device=device)
-        if torch.is_tensor(x):
-            if x.dim() == 0:
-                return x.view(1,1).expand(B,1)
-            if x.dim() == 1:
-                return x.view(B,1)
-            if x.dim() == 2:
-                return x[:, :1]
-        return torch.full((B,1), default, device=device)
 
     if state is None:
         state = {}
 
     kp_prev = state.get("kp_prev", kp.clone())
 
-    state["energy"] = to_B1(state.get("energy", 0.0), B)
+    state["energy"] = to_B1(state.get("energy", 0.0), B, device=device)
     state["inertia"] = state.get("inertia", 0.75)
     state["intent_vec"] = state.get("intent_vec", None)
     state.setdefault("angle", torch.zeros((B,1), device=device))
@@ -1290,27 +1347,14 @@ def cinematic_motion_graph_v7(
     # =========================================================
     # 0. SAFE STATE INIT (UNCHANGED BUT HARDENED)
     # =========================================================
-    def to_B1(x, default=0.0):
-        if x is None:
-            return torch.zeros((B,1), device=device)
-        if isinstance(x, (float, int)):
-            return torch.full((B,1), float(x), device=device)
-        if torch.is_tensor(x):
-            if x.dim() == 0:
-                return x.view(1,1).expand(B,1)
-            if x.dim() == 1:
-                return x.view(B,1)
-            if x.dim() == 2:
-                return x[:, :1]
-        return torch.zeros((B,1), device=device)
 
     if state is None:
         state = {}
 
     kp_prev = state.get("kp_prev", kp.clone())
 
-    angle = to_B1(state.get("angle", 0.0), B)
-    angular_vel = to_B1(state.get("angular_vel", 0.0), B)
+    angle = to_B1(state.get("angle", 0.0), B, device=device)
+    angular_vel = to_B1(state.get("angular_vel", 0.0), B, device=device)
 
     state["angle"] = angle
     state["angular_vel"] = angular_vel
@@ -1815,7 +1859,7 @@ ACTOR_PIPELINE = {
     "v8": cinematic_motion_graph_v8,
     "v9": actor_system_v9,
     "pause": cinematic_motion_graph_v10_pause,
-    "v11": cinematic_motion_graph_v11,
+    "v14": cinematic_motion_graph_v14,
     "v12": cinematic_motion_graph_v12,
 }
 
