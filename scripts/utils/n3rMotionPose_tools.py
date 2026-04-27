@@ -332,9 +332,30 @@ def debug_draw_openpose_skeleton(
         "legs_l": (0, 200, 255),
         "bouche": (0, 128, 255), # orange
         "nez": (0, 64, 255), # orange
+        "cheveux": (255, 64, 255), # violet
         "default": (200, 200, 200)
     }
+    """
+            'hair_root': 25,
 
+            'hair_left': 26,
+            'hair_right': 27,
+            'hair_top': 28, # millieu centre
+            'hair_top_left': 29,
+            'hair_top_right': 30,
+
+            'left_top_hair1': 31, # premier point
+            'left_top_hair2': 32, # Point gauche au sommet, 2ème point centre gauche
+            'left_top_hair3': 33, # point le plus eloigné
+
+            'right_top_hair1': 34, # premier point
+            'right_top_hair2': 35, # Point gauche au sommet, 2ème point centre droit
+            'right_top_hair3': 36, # point le plus eloigné
+
+            'top_hair1': 37,
+            'top_hair2': 38,
+            'top_hair3': 39,
+    """
     # =========================
     # POINTS
     # =========================
@@ -369,6 +390,8 @@ def debug_draw_openpose_skeleton(
             color = COLORS["bouche"]
         elif i in [42,43,0]:
             color = COLORS["nez"]
+        elif i in [26,27,28,29,30,31,32,33,34,35,36]:
+            color = COLORS["nez"]
         else:
             color = COLORS["default"]
 
@@ -383,7 +406,8 @@ def debug_draw_openpose_skeleton(
         (1,8),(1,11),(0,43),(0,42),(40,18),(18,41),
         (14,0),(15,0),(16,15),(17,14),
         (8,9),(9,10),(11,12),(12,13),
-        (21,22),(21,23),(21,24)
+        (21,22),(21,23),(21,24),
+        (28,34),(28,31),(31,32),(32,33),(34,35),(35,36),
     ]
 
     for i, j in skeleton:
