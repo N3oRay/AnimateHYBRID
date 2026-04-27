@@ -513,6 +513,34 @@ def extract_keypoints_from_pose(
         [307/W, 282/H, 1.0],
         [529/W, 349/H, 1.0],
         [422/W, 428/H, 1.0],
+
+
+
+
+        [197/W, 405/H, 1.0], # Hair detected: [(197, 405), (300, 389), (403, 374)]  #'hair_root': 1000, 'hair_left': 1001, 'hair_right': 1002, 'hair_top': 1003,
+        [300/W, 389/H, 1.0],
+        [403/W, 374/H, 1.0],
+        [629/W, 189/H, 1.0], #hair_top : (629, 189) hair_top_left : (540, 189) hair_top_right : (718, 189)
+        [540/W, 189/H, 1.0],
+        [718/W, 189/H, 1.0],
+
+        [359/W, 432/H, 1.0], #left_top_hair1 OK
+        [413/W, 425/H, 1.0], #left_top_hair2  KO
+        [338/W, 288/H, 1.0], #left_top_hair3
+
+        [499/W, 449/H, 1.0], # right_top_m bouche
+        [491/W, 403/H, 1.0], # right_top_hair, right_top_hair1, right_top_hair2, right_top_hair3, right_hair, (center_x, center_y)]
+        [434/W, 427/H, 1.0], # right_top_hair3 KO
+
+        [499/W, 249/H, 1.0], # top_hair1
+        [491/W, 203/H, 1.0], # top_hair2
+        [434/W, 227/H, 1.0], # top_hair3
+
+
+        [449/W, 449/H, 1.0], # bouche
+        [359/W, 432/H, 1.0], #
+        [432/W, 427/H, 1.0], # nez
+        [413/W, 425/H, 1.0], #
     ]
 
     # =========================================================
@@ -591,6 +619,7 @@ def update_keypoints_from_pose(
     eye_coords,
     ear_coords,
     mouth_coords,
+    hair_coords,
     image_size=(1280, 896),
     device="cuda",
     frame_counter=0,
@@ -600,6 +629,34 @@ def update_keypoints_from_pose(
     """
     Robust keypoint injection with fallback + reconstruction
     """
+
+    # =========================================================
+    # 🔹 VALIDATION FUNCTION
+    # =========================================================
+    def is_valid(coord, label):
+        if coord is None:
+            return False
+        coord = normalize_coord(coord)
+
+        if debug and coord is None:
+            print(f"[WARN] {label} coord dropped (invalid format)")
+        if coord is None:
+            return False
+
+        x, y = coord
+        if x is None or y is None:
+            print(f"[DEBUG] x or y is None: x={x}, y={y}")
+            return False
+        if not np.isfinite(x) or not np.isfinite(y):
+            print(f"[DEBUG] Non-finite values: x={x}, y={y}")
+            return False
+        if x <= 0 or y <= 0:
+            print(f"[DEBUG] Invalid coordinates: x={x}, y={y}")
+            return False
+        if x > W or y > H:
+            print(f"[DEBUG] Out of bounds: x={x}, y={y}, W={W}, H={H}")
+            return False
+        return True
 
     H, W = image_size
 
@@ -615,6 +672,25 @@ def update_keypoints_from_pose(
     left_hip, right_hip = pair(hips_coords, debug=debug)
     left_hip, right_hip, hips_reconstructed = reconstruct_hips( left_hip, right_hip, left_shoulder, right_shoulder, image_size, image_size, debug=debug )
 
+    #💇 Hair detected: [(197, 405), (300, 389), (403, 374)]  #'hair_root': 25, 'hair_left': 26, 'hair_right': 27, 'hair_top': 28,
+
+        # Retourner les coordonnées des points
+    # return [left_hair, left_top_hair, mouth_left, nose_left, left_top_m, top_hair, right_top_hair, mouth_right, right_top_hair1, nose_right, right_hair, (center_x, center_y), top_hair1, top_hair2, top_hair3]
+
+
+    hair_left, hair_top_left, mouth_left, nose_left, left_top_m, right_top_m, hair_top, hair_top_right, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, nose_right, hair_right, hair_root, top_hair1, top_hair2, top_hair3  = pair(hair_coords, debug=debug)
+
+
+    print(f"Position de hair_root en pixels : {hair_root}")
+    hair_center = np.mean([hair_left, hair_right], axis=0)
+    # vecteur tête → cheveux -> Pose.get_head_up()
+    head_up = np.array(hair_center) - np.array(left_clavicle)
+    head_up = head_up / (np.linalg.norm(head_up) + 1e-6)
+
+
+    # =========================================================
+    # 🔥 KNEE ANKLE - GENOU ET CHEVILLE
+    # =========================================================
     left_knee = (0,0)
     right_knee = (0,0)
     left_ankle = (0,0)
@@ -689,7 +765,7 @@ def update_keypoints_from_pose(
 
             if debug:
                 print("🦿 ANKLE RECONSTRUCTED BY SHOULDER")
-
+    # =========================================================
     # =========================================================
     # 🔹 NECK SAFE
     # =========================================================
@@ -704,29 +780,7 @@ def update_keypoints_from_pose(
     else:
         neck_map = {"neck": neck_coords}
 
-    # =========================================================
-    # 🔹 VALIDATION FUNCTION
-    # =========================================================
-    def is_valid(coord):
-        if coord is None:
-            return False
-        coord = normalize_coord(coord)
 
-        if debug and coord is None:
-            print(f"[WARN] {label} coord dropped (invalid format)")
-        if coord is None:
-            return False
-
-        x, y = coord
-        if x is None or y is None:
-            return False
-        if not np.isfinite(x) or not np.isfinite(y):
-            return False
-        if x <= 0 or y <= 0:
-            return False
-        if x > W or y > H:
-            return False
-        return True
 
     # =========================================================
     # 🔹 SAFE UPDATE WRAPPER
@@ -734,7 +788,7 @@ def update_keypoints_from_pose(
     def safe_apply(idx, coord, label):
         coord = normalize_coord(coord)
 
-        if is_valid(coord):
+        if is_valid(coord, label):
             safe_update(idx, coord, keypoints_np, W=W, H=H, label=label, debug=debug)
         else:
             if debug:
@@ -779,6 +833,33 @@ def update_keypoints_from_pose(
         22: ("left_side_neck", neck_map.get("left_side_neck")),
         23: ("right_side_neck", neck_map.get("right_side_neck")),
         24: ("anchor", neck_map.get("anchor")),
+
+
+        25: ("hair_root", hair_root), #OK
+        26: ("hair_left", hair_left), #OK
+        27: ("hair_right", hair_right), #OK
+        28: ("hair_top", hair_top), #OK
+        29: ("hair_top_left", hair_top_left), #OK
+        30: ("hair_top_right", hair_top_right), #OK
+
+        31: ("left_top_hair1", left_top_hair1),
+        32: ("left_top_hair2", left_top_hair2),
+        33: ("left_top_hair3", left_top_m), #OK
+
+        34: ("right_top_hair1", right_top_hair1),
+        35: ("right_top_hair2", right_top_hair2), #OK
+        36: ("right_top_hair3", right_top_hair3),
+
+        37: ("top_hair1", top_hair1), #OK
+        38: ("top_hair2", top_hair2), #OK
+        39: ("top_hair3", top_hair3), #OK
+
+        40: ("mouth_left", mouth_left),
+        41: ("mouth_right", mouth_right),
+
+        42: ("nose_left", nose_left),
+        43: ("nose_right", nose_right),
+
     }
 
     for idx, (label, coord) in updates.items():
@@ -1535,7 +1616,7 @@ def apply_torso_warp(
     W,
     device,
     prev_delta_px=None,
-    strength=0.3,   # 🔥 NEW 0.3–1.2
+    strength=0.1,   # 🔥 NEW 0.3
     debug=False,
     debug_dir=None
 ):
@@ -1562,7 +1643,6 @@ def apply_torso_warp(
         delta_px = alpha * delta_px + (1 - alpha) * prev_delta_px
 
     # -------------------- strength control --------------------
-    #delta_px = delta_px * strength
     delta_px = torch.tanh(delta_px) * 5.0 * strength
 
     # -------------------- Feather dynamique --------------------
@@ -1806,9 +1886,6 @@ def apply_global_pose(
                 os.path.join(debug_dir, "global_pose_debug.png")
             )
 
-    #return latents_out, delta_px, grid, grid_norm
-    #return latents_out, delta_px, grid, grid_norm, warp_shift
-    # stable per-batch angle (garde batch dimension)
     sign = torch.where(torch.abs(cross) < 1e-6, torch.ones_like(cross), torch.sign(cross))
     angle = angle * sign.unsqueeze(-1)
 
@@ -1853,7 +1930,8 @@ def apply_face_warp(
     debug_dir=None,
     smooth=0.85,
     prev_grid=None,
-    strength=2.0
+    strength=2.0,
+    paused=False  # Paramètre pour activer/désactiver l'effet
 ):
     if device is None:
         device = latents.device
@@ -1862,10 +1940,14 @@ def apply_face_warp(
     latents_in = latents.clone()
 
     # =========================
-    # Facial points
+    # Facial points (toujours calculés)
     # =========================
     facial_points = pose.estimate_facial_points_full(smooth=smooth)
     pose.set_prev_facial_points(facial_points)
+
+    # Si la fonction est en pause, on renvoie les valeurs de base sans modifier latents
+    if paused:
+        return latents, torch.zeros((B, H, W, 2), device=device), facial_points
 
     # =========================
     # Time
@@ -2278,22 +2360,23 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 Torso
     # =========================
-    t = torch.tensor(frame_counter/10.0, device=device)
-    delta_px = pose.delta.clone()
-    delta_px[...,0] *= W
-    delta_px[...,1] *= H
-    delta_px = delta_px.view(B,1,1,2)
+    if should_freeze(frame_counter, 2): # Pause traitement
+        t = torch.tensor(frame_counter/10.0, device=device)
+        delta_px = pose.delta.clone()
+        delta_px[...,0] *= W
+        delta_px[...,1] *= H
+        delta_px = delta_px.view(B,1,1,2)
 
-    #if frame_counter % 2 == 0:
-    start = time.time()
-    latents_before = latents_world.clone()
-    latents_torso, delta_px = apply_torso_warp(latents_world, pose, mask_torso, grid, H, W, device=device, debug=debug, debug_dir=debug_dir)
-    breath_strength = 0.2 + 0.1 * torch.sin(t)
-    #latents_world = latents_torso*(breath_strength*mask_torso_exp) + latents_before*(1.0 - breath_strength*mask_torso_exp)
-    latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_torso*(breath_strength*mask_torso_exp)
-    timings["TORSO+BREATH"] = time.time() - start
-    if debug:
-        save_impact_map(latents_world, latents_before, debug_dir, frame_counter, prefix="torso_warp")
+
+        start = time.time()
+        latents_before = latents_world.clone()
+        latents_torso, delta_px = apply_torso_warp(latents_world, pose, mask_torso, grid, H, W, device=device, debug=debug, debug_dir=debug_dir)
+        breath_strength = 0.2 + 0.1 * torch.sin(t)
+
+        latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_torso*(breath_strength*mask_torso_exp)
+        timings["TORSO+BREATH"] = time.time() - start
+        if debug:
+            save_impact_map(latents_world, latents_before, debug_dir, frame_counter, prefix="torso_warp")
     # =====================================================================
     # 🔹 BREATHING
     # =====================================================================
@@ -2324,10 +2407,11 @@ def apply_pose_driven_motion_ultra2(
     if not hasattr(apply_pose_driven_motion_ultra2,"prev_face_grid"):
         apply_pose_driven_motion_ultra2.prev_face_grid = [None]*B
     start = time.time()
+    paused = (frame_counter % 2 == 0)
     latents_local, face_delta, facial_points = apply_face_warp(
         latents_local, pose, mask_face, grid, H, W, frame_counter,
         device=device, debug=debug, debug_dir=debug_dir, smooth=0.85,
-        prev_grid=apply_pose_driven_motion_ultra2.prev_face_grid[0] if B==1 else None
+        prev_grid=apply_pose_driven_motion_ultra2.prev_face_grid[0] if B==1 else None, paused=paused
     )
     apply_pose_driven_motion_ultra2.prev_face_grid[0] = grid.clone() if B==1 else None
 
@@ -2810,7 +2894,7 @@ MOTION_PROFILES = {
 
     "cinematic": {
         "time_scale": 0.5,
-        "camera_lock": 0.7,
+        "camera_lock": 0.85,
         "max_velocity": 0.03,
         "rotation_gain": 1.2,
         "cinematic_start": 20

@@ -63,57 +63,160 @@ class Pose:
             'left_side_neck': 22,
             'right_side_neck': 23,
             'anchor_neck': 24,
-            'mouth_left': 48,    # coin gauche des lèvres supérieures
-            'mouth_right': 49,   # coin droit des lèvres supérieures
+            'mouth_left_c': 48,    # coin gauche des lèvres supérieures
+            'mouth_right_c': 49,   # coin droit des lèvres supérieures
             'mouth_top': 50,     # index approximatif du haut de la bouche (à ajuster selon ton keypoints)
             'mouth_bottom': 51,  # index approximatif du bas de la bouche
+            # =========================
+            # 🔥 VIRTUAL / CINEMATIC POINTS
+            # =========================
+
+            'hair_root': 25,
+            'hair_left': 26,
+            'hair_right': 27, # bouche gauche 'mouth_left': 48
+            'hair_top': 28, # nez gauche - nose_left'  -> 'nose': 0,
+            'hair_top_left': 29,
+            'hair_top_right': 30,
+
+            'left_top_hair1': 31,
+            'left_top_hair2': 32, # bouche droite 'mouth_right': 49,
+            'left_top_hair3': 33,
+
+            'right_top_hair1': 34, # nez droite - nose_right
+            'right_top_hair2': 35,
+            'right_top_hair3': 36,
+
+            'top_hair1': 37,
+            'top_hair2': 38,
+            'top_hair3': 39,
+
+            'mouth_left': 40,    # coin gauche des lèvres supérieures
+            'mouth_right': 41,   # coin droit des lèvres supérieures
+
+            'nose_left': 42,    # coin gauche du nez
+            'nose_right': 43,   # coin droit du nez
+
         }
 
-    def rotate_points_around_z_axis(self, points, pivot, angle):
+    def get_head_up(self):
         """
-        Applique une rotation autour de l'axe Z pour les points donnés.
-
-        points : [B, N, 2] - Points à faire pivoter (x, y)
-        pivot : [B, 2] - Pivot autour duquel faire pivoter (x, y)
-        angle : [B, 1] - Angles de rotation en radians (par batch)
-
-        Retourne les points après rotation.
+        Retourne le vecteur `head_up` basé sur les points du visage et des cheveux.
         """
+        hair_left = self.get_point(self.FACIAL_POINT_IDX["hair_left"])
+        hair_right = self.get_point(self.FACIAL_POINT_IDX["hair_right"])
+
+        if hair_left is None or hair_right is None:
+            return None
+
+        # Déplacer vers CPU si nécessaire
+        if isinstance(hair_left, torch.Tensor) and hair_left.is_cuda:
+            hair_left = hair_left.cpu().numpy()  # Déplacer sur le CPU
+        elif isinstance(hair_left, torch.Tensor):
+            hair_left = hair_left.numpy()
+
+        if isinstance(hair_right, torch.Tensor) and hair_right.is_cuda:
+            hair_right = hair_right.cpu().numpy()  # Déplacer sur le CPU
+        elif isinstance(hair_right, torch.Tensor):
+            hair_right = hair_right.numpy()
+
+        # Calcul du centre des cheveux
+        hair_center = (hair_left + hair_right) * 0.5
+
+        # Calcul du vecteur head_up
+        neck = self.get_point(self.FACIAL_POINT_IDX["neck"])
+        nose = self.get_point(self.FACIAL_POINT_IDX["nose"])
+
+        if neck is None or nose is None:
+            return None
+
+        # Déplacer vers CPU si nécessaire
+        if isinstance(neck, torch.Tensor) and neck.is_cuda:
+            neck = neck.cpu().numpy()
+        elif isinstance(neck, torch.Tensor):
+            neck = neck.numpy()
+
+        if isinstance(nose, torch.Tensor) and nose.is_cuda:
+            nose = nose.cpu().numpy()
+        elif isinstance(nose, torch.Tensor):
+            nose = nose.numpy()
+
+        # Assurez-vous que neck et nose sont des vecteurs 1D avec 2 éléments
+        neck = torch.tensor(neck.squeeze(), device=self.device)
+        nose = torch.tensor(nose.squeeze(), device=self.device)
+        hair_center = torch.tensor(hair_center.squeeze(), device=self.device)
+
+        # Vérification de la forme
+        assert neck.shape == torch.Size([2]), f"Neck should be a 2D vector, but got {neck.shape}"
+        assert nose.shape == torch.Size([2]), f"Nose should be a 2D vector, but got {nose.shape}"
+        assert hair_center.shape == torch.Size([2]), f"Hair center should be a 2D vector, but got {hair_center.shape}"
+
+        # Calcul du vecteur directionnel `head_up`
+        # Par exemple, ici head_up est la direction de la ligne reliant le nez et le cou
+        head_up = nose - neck  # Vecteur de direction du cou au nez (comme une approximation)
+        head_up = head_up / head_up.norm()  # Normalisation pour avoir une direction unitaire
+
+        # =========================
+        # HEAD CENTER (ROBUST)
+        # =========================
+        head_center = (hair_center + nose + neck) / 3.0
+
+        # Vérification de la forme de head_center avant d'accéder aux indices
+        if head_center.shape != torch.Size([2]):
+            raise ValueError(f"Expected head_center to be 2D vector, but got shape {head_center.shape}")
+
+        cx = head_center[0]
+        cy = head_center[1]
+
+        return head_up
+
+
+    @staticmethod
+    def rotate_points_around_z_axis(points, pivot, angle):
+        """
+        points: [B,N,2]
+        pivot : [B,2] ou [B,1,2]
+        angle : [B,1]
+        """
+
         B, N, _ = points.shape
 
-        # Vérification des NaN dans les points et pivots
-        if torch.isnan(points).any():
-            raise ValueError("Les points contiennent des valeurs NaN")
+        # =========================================================
+        # SANITIZE
+        # =========================================================
+        points = torch.nan_to_num(points, nan=0.0)
+        pivot  = torch.nan_to_num(pivot,  nan=0.0)
+        angle  = torch.nan_to_num(angle,  nan=0.0)
 
-        if torch.isnan(pivot).any():
-            # Si le pivot contient des NaN, utiliser un pivot de secours (exemple : centre des épaules)
-            print("Avertissement : Le pivot contient des NaN. Utilisation du pivot de secours.")
-            pivot = torch.zeros_like(pivot)  # Remplacer par un pivot arbitraire (ex. centre des épaules)
+        # =========================================================
+        # 🔥 SHAPE FIX CRITIQUE
+        # =========================================================
+        angle = angle.view(B, 1, 1)   # 👉 FORCE SHAPE SAFE
 
-        if torch.isnan(angle).any() or angle.shape != torch.Size([B, 1]):
-            # Si l'angle est NaN ou a une forme inattendue, rotation nulle
-            print("Avertissement : L'angle est NaN ou a une forme incorrecte. Rotation nulle appliquée.")
-            angle = torch.zeros_like(angle)  # Rotation nulle
+        if pivot.ndim == 2:
+            pivot = pivot.unsqueeze(1)  # [B,1,2]
 
-        # Calculer les sinus et cosinus de l'angle
-        cos_a = torch.cos(angle)
+        # =========================================================
+        # LIMIT
+        # =========================================================
+        angle = torch.clamp(angle, -0.2, 0.2)
+
+        # =========================================================
+        # ROTATION
+        # =========================================================
+        cos_a = torch.cos(angle)  # [B,1,1]
         sin_a = torch.sin(angle)
 
-        # Centrer les points autour du pivot pour les faire pivoter autour de l'origine
-        points_centered = points - pivot.unsqueeze(1)  # [B, N, 2]
+        centered = points - pivot  # [B,N,2]
 
-        # Appliquer la rotation autour de l'axe Z (2D)
-        x_new = points_centered[..., 0] * cos_a - points_centered[..., 1] * sin_a
-        y_new = points_centered[..., 0] * sin_a + points_centered[..., 1] * cos_a
+        x = centered[..., 0:1]  # [B,N,1]
+        y = centered[..., 1:2]
 
-        # Ajouter à nouveau le pivot pour remettre les points à leurs positions finales
-        rotated_points = torch.stack([x_new, y_new], dim=-1) + pivot.unsqueeze(1)
+        x_new = x * cos_a - y * sin_a  # SAFE broadcast
+        y_new = x * sin_a + y * cos_a
 
-        # Assurer que les valeurs sont valides (sans NaN)
-        rotated_points = torch.nan_to_num(rotated_points, nan=0.0)
+        rotated = torch.cat([x_new, y_new], dim=-1)
 
-        # Retourner les points après rotation
-        return rotated_points
+        return rotated + pivot
 
     def apply_rotation_z(self, angle):
         """
@@ -219,9 +322,6 @@ class Pose:
             pivot,
             angle
         )
-
-
-
 
     def get_bouche_expand_h(self):
         return self.bouche_expand_h
@@ -458,6 +558,10 @@ class Pose:
         kp = self.keypoints
         nose = kp[:, 0, :2]
 
+        hair_root = kp[:, 25, :2]
+        hair_left = kp[:, 26, :2]
+        hair_right = kp[:, 27, :2]
+
         right_eye = kp[:, 14, :2] if kp.shape[1] > 14 else None
         left_eye  = kp[:, 15, :2] if kp.shape[1] > 15 else None
 
@@ -536,6 +640,11 @@ class Pose:
         # NOSE + CHIN + HEAD CORE
         # =========================
         points["nose"] = nose
+
+        points["hair_root"] = hair_root
+        points["hair_left"] = hair_left
+        points["hair_right"] = hair_right
+
         points["head_center"] = head_center
 
         # chin approx (important pour hair mask stability)
@@ -546,8 +655,8 @@ class Pose:
         # =========================
         points.update({
             "mouth_center": mouth_center,
-            "mouth_left": mouth_left,
-            "mouth_right": mouth_right,
+            "mouth_left_c": mouth_left,
+            "mouth_right_c": mouth_right,
             "mouth_top": mouth_top,
             "mouth_bottom": mouth_bottom,
         })
@@ -621,8 +730,8 @@ class Pose:
         mouth_bottom[:,1] += mouth_height / 2
 
         estimated_points['mouth_center'] = mouth_center
-        estimated_points['mouth_left'] = mouth_left
-        estimated_points['mouth_right'] = mouth_right
+        estimated_points['mouth_left_c'] = mouth_left
+        estimated_points['mouth_right_c'] = mouth_right
         estimated_points['mouth_top'] = mouth_top
         estimated_points['mouth_bottom'] = mouth_bottom
 
@@ -860,8 +969,8 @@ class Pose:
         # =========================
         facial_points = pose.estimate_facial_points_full(smooth=smooth)
 
-        mouth_left  = facial_points['mouth_left']
-        mouth_right = facial_points['mouth_right']
+        mouth_left  = facial_points['mouth_left_c']
+        mouth_right = facial_points['mouth_right_c']
 
         # =========================
         # 🔥 ALIGNEMENT AVEC get_mouth_region (profil correction)
@@ -1002,8 +1111,8 @@ class Pose:
         # =========================
         facial_points = pose.estimate_facial_points_full(smooth=smooth)
 
-        mouth_left  = facial_points['mouth_left']
-        mouth_right = facial_points['mouth_right']
+        mouth_left  = facial_points['mouth_left_c']
+        mouth_right = facial_points['mouth_right_c']
 
         # =========================
         # 2. MASK (stable + clean)
@@ -1427,7 +1536,283 @@ class Pose:
 
         return mask
 
+    def create_hair_mask_test(
+            self,
+            H: int,
+            W: int,
+            debug: bool = False,
+            debug_dir: str = None,
+            frame_counter: int = 0,
+            top_extend=0.55,
+            side_extend=0.25,
+            height_factor=1.15,
+        ):
+        # Masque du visage
+        mask_face = self.create_face_mask(
+            H, W,
+            debug=debug,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
+        )
+
+        mask_hair = torch.zeros_like(mask_face)
+
+        for b in range(self.B):
+
+            # Calcul des points pour les cheveux
+            hair_left = self.get_point(self.FACIAL_POINT_IDX["hair_left"])
+            hair_right = self.get_point(self.FACIAL_POINT_IDX["hair_right"])
+
+            if hair_left is None or hair_right is None:
+                continue
+
+            # Convertir les coordonnées des points
+            hair_left = torch.tensor(hair_left, device=self.device)
+            hair_right = torch.tensor(hair_right, device=self.device)
+
+            # Calcul du centre des cheveux
+            hair_center = (hair_left + hair_right) * 0.5
+
+            # Calcul de la tête et de la direction (head_up)
+            neck = self.get_point(self.FACIAL_POINT_IDX["neck"])
+            nose = self.get_point(self.FACIAL_POINT_IDX["nose"])
+
+            if neck is None or nose is None:
+                continue
+
+            neck = torch.tensor(neck, device=self.device)
+            nose = torch.tensor(nose, device=self.device)
+
+            # Calcul du centre de la tête
+            head_center = (hair_center + nose + neck) / 3.0
+            head_center = head_center.squeeze()  # Supprimer la dimension superflue
+
+            if head_center.shape != torch.Size([2]):
+                raise ValueError(f"head_center should be a 2D vector, but got shape {head_center.shape}")
+
+            cx = head_center[0]
+            cy = head_center[1]
+
+            # Calcul des dimensions de l'ellipse
+            angle = torch.atan2(
+                head_up[1],
+                head_up[0] + 1e-6
+            )
+            angle_deg = angle * 180.0 / 3.14159265
+
+            head_width = torch.norm(hair_right - hair_left)
+            head_height = torch.norm(nose - hair_center)
+
+            h_face = head_height * 2.2
+            w_face = head_width * 1.8
+
+            rx = (w_face * 0.5) * (1.0 + side_extend)
+            ry = (h_face * 0.5) * (1.0 + top_extend) * height_factor
+
+            # Ajustement de l'échelle des rayons
+            rx *= 2  # Doublez la taille des rayons pour les rendre visibles
+            ry *= 1.5  # Ajustez la taille de la hauteur des cheveux
+
+            # Limite les coordonnées du centre à l'image
+            cx = int(torch.clamp(cx, 0, W - 1).item())
+            cy = int(torch.clamp(cy, 0, H - 1).item())
+            rx = max(2, int(rx.item()))
+            ry = max(2, int(ry.item()))
+
+            # Dessiner l'ellipse
+            mask_np = torch.zeros((H, W), dtype=torch.uint8, device=self.device)
+
+            # Assurez-vous que cv2 reçoit une image numpy correcte
+            cv2.ellipse(
+                mask_np.cpu().numpy(),  # Convertir en numpy pour cv2
+                (cx, cy),
+                (rx, ry),
+                angle=float(angle_deg),
+                startAngle=0,
+                endAngle=360,
+                color=255,
+                thickness=-1
+            )
+
+            # Appliquez le masque des cheveux
+            mask_hair[b, 0] = mask_np / 255.0
+
+            # Vérification du masque après application
+            if debug:
+                print(f"mask_hair sample (avant softening): {mask_hair[b, 0][0:10, 0:10]}")
+
+        # Nettoyage du masque
+        mask_hair = mask_hair * (1.0 - mask_face)
+        mask_hair = mask_hair ** 2.1  # Appliquez un lissage si nécessaire
+        mask_hair = feather_outside_only_alpha(mask_hair, radius=6, sigma=2.2)
+
+        # Sauvegarder le masque de débogage
+        if debug and debug_dir is not None:
+            save_debug_mask(
+                mask_hair,
+                H,
+                W,
+                debug_dir,
+                frame_counter,
+                prefix="hair_mask_keypoint_"
+            )
+
+        # Vérification finale du masque
+        print(f"mask_hair final sample (final): {mask_hair[0, 0][0:10, 0:10]}")
+
+        return mask_hair
+
     def create_hair_mask(
+        self,
+        H: int,
+        W: int,
+        debug: bool = False,
+        debug_dir: str = None,
+        frame_counter: int = 0,
+        top_extend=0.55,
+        side_extend=0.25,
+        height_factor=1.15,
+    ):
+        """
+        Hair mask basé sur keypoints :
+        - ears + eyes + nose → orientation de tête
+        - ellipse inclinée (tilt head-aware)
+        - centre stabilisé
+        """
+
+        mask_face = self.create_face_mask(
+            H, W,
+            debug=debug,
+            debug_dir=debug_dir,
+            frame_counter=frame_counter
+        )
+
+        mask_hair = torch.zeros_like(mask_face)
+
+        for b in range(self.B):
+
+            fp = self.estimate_facial_points_full(smooth=True)
+
+            # =========================
+            # KEYPOINTS SAFE (FIX IMPORTANT)
+            # =========================
+             # Calcul des points pour les cheveux
+            hair_left = ensure_2d(fp['hair_left'])
+            hair_right = ensure_2d(fp['hair_right'])
+            hair_root = ensure_2d(fp['hair_root'])
+            nose = ensure_2d(fp['nose'])
+            left_eye = ensure_2d(fp['left_eye'])
+            right_eye = ensure_2d(fp['right_eye'])
+            left_ear = ensure_2d(fp['left_ear'])
+            right_ear = ensure_2d(fp['right_ear'])
+
+            # skip si invalid
+            if any(k is None for k in [hair_left, hair_right, hair_root, nose, left_eye, right_eye, left_ear, right_ear]):
+                continue
+
+            # =========================
+            # pixels conversion
+            # =========================
+            def to_px(p):
+                return p * torch.tensor([W - 1, H - 1], device=self.device)
+
+            lhair_px = to_px(hair_left)
+            rhair_px = to_px(hair_right)
+            hair_px = to_px(hair_root)
+            nose_px = to_px(nose)
+            leye_px = to_px(left_eye)
+            reye_px = to_px(right_eye)
+            lear_px = to_px(left_ear)
+            rear_px = to_px(right_ear)
+
+            # =========================
+            # HEAD CENTER ROBUST
+            # =========================
+            hair_center = (lhair_px + rhair_px) * 0.5
+            eye_center = (leye_px + reye_px) * 0.5
+            ear_center = (lear_px + rear_px) * 0.5
+            head_center = (nose_px + eye_center + ear_center) / 3.0
+
+            cx = head_center[0]
+            cy = head_center[1]
+
+            # =========================
+            # HEAD ORIENTATION
+            # =========================
+            eye_vec = reye_px - leye_px
+            angle = torch.atan2(eye_vec[1], eye_vec[0])
+            angle_deg = angle * 180.0 / 3.14159265
+
+            # =========================
+            # HEAD SIZE
+            # =========================
+            head_width = torch.norm(rear_px - lear_px)
+            head_height = torch.norm(nose_px - eye_center)
+
+            h_face = head_height * 2.2
+            w_face = head_width * 1.6
+
+            # =========================
+            # HAIR EXTENSION
+            # =========================
+            rx = (w_face * 0.5) * (1.0 + side_extend)
+            ry = (h_face * 0.5) * (1.0 + top_extend) * height_factor
+
+            cy = cy - h_face * 0.55  # shift scalp upward
+
+            # =========================
+            # SAFE CLAMP
+            # =========================
+            cx = int(torch.clamp(cx, 0, W - 1).item())
+            cy = int(torch.clamp(cy, 0, H - 1).item())
+            rx = max(2, int(rx.item()))
+            ry = max(2, int(ry.item()))
+
+            # =========================
+            # ELLIPSE MASK
+            # =========================
+            mask_np = np.zeros((H, W), dtype=np.uint8)
+
+            cv2.ellipse(
+                mask_np,
+                (cx, cy),
+                (rx, ry),
+                angle=float(angle_deg),
+                startAngle=0,
+                endAngle=360,
+                color=255,
+                thickness=-1
+            )
+
+            mask_hair[b, 0] = torch.from_numpy(mask_np / 255.0).to(self.device)
+
+        # =========================
+        # REMOVE FACE AREA
+        # =========================
+        mask_hair = mask_hair * (1.0 - mask_face)
+
+        # =========================
+        # SOFTENING
+        # =========================
+        mask_hair = mask_hair ** 2.1
+        mask_hair = feather_outside_only_alpha(mask_hair, radius=6, sigma=2.2)
+
+        # =========================
+        # DEBUG
+        # =========================
+        if debug and debug_dir is not None:
+            save_debug_mask(
+                mask_hair,
+                H,
+                W,
+                debug_dir,
+                frame_counter,
+                prefix="hair_mask_keypoint_"
+            )
+
+        return mask_hair
+
+    def create_hair_mask_ori(
         self,
         H: int,
         W: int,

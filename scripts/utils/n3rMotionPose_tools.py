@@ -330,6 +330,8 @@ def debug_draw_openpose_skeleton(
         "hip": (255, 64, 64), #'right_hip': 8, 'left_hip': 11,
         "legs_r": (0, 255, 255),
         "legs_l": (0, 200, 255),
+        "bouche": (0, 128, 255), # orange
+        "nez": (0, 64, 255), # orange
         "default": (200, 200, 200)
     }
 
@@ -349,7 +351,7 @@ def debug_draw_openpose_skeleton(
             color = COLORS["eyes"]
         elif i == 0:
             color = COLORS["nose"]
-        elif i in [16,17,18]:
+        elif i in [16,17]:
             color = COLORS["head"]
         elif i in [2,3,4,19]:
             color = COLORS["arms_r"]
@@ -363,6 +365,10 @@ def debug_draw_openpose_skeleton(
             color = COLORS["legs_r"]
         elif i in [12,13]:
             color = COLORS["legs_l"]
+        elif i in [40,41,18]:
+            color = COLORS["bouche"]
+        elif i in [42,43,0]:
+            color = COLORS["nez"]
         else:
             color = COLORS["default"]
 
@@ -374,7 +380,7 @@ def debug_draw_openpose_skeleton(
     skeleton = [
         (0,1),(1,19),(19,2),(2,3),(3,4),
         (1,20),(20,5),(5,6),(6,7),
-        (1,8),(1,11),
+        (1,8),(1,11),(0,43),(0,42),(40,18),(18,41),
         (14,0),(15,0),(16,15),(17,14),
         (8,9),(9,10),(11,12),(12,13),
         (21,22),(21,23),(21,24)
@@ -402,8 +408,10 @@ def debug_draw_openpose_skeleton(
             color = COLORS["legs_r"]
         elif i in [12,13]:
             color = COLORS["legs_l"]
-        elif i == 0:
-            color = COLORS["nose"]
+        elif i in [42,43,0]:
+            color = COLORS["nez"]
+        elif i in [40,41,18]:
+            color = COLORS["bouche"]
         else:
             color = COLORS["default"]
 

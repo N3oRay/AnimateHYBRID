@@ -813,6 +813,170 @@ def release_face_mesh():
         get_face_mesh._instance.close()
         del get_face_mesh._instance
         print("🧹 FaceMesh libéré")
+# --------- detection des cheveux  ---------------------------
+
+
+def get_hair_coords_safe(image_pil, face_mesh, H=None, W=None):
+    try:
+        coords = get_hair_coords(image_pil, face_mesh)
+
+        if coords is None:
+            print("⚠️ Aucun visage détecté (hair)")
+            return None
+
+        print(f"💇 Hair detected: {coords}")
+        return coords
+
+    except Exception as e:
+        print(f"[Hair detection ERROR] {e}")
+        return None
+
+
+def get_hair_coords(image_pil, face_mesh):
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    results = face_mesh.process(image)
+
+    if not results.multi_face_landmarks:
+        return None
+
+    face_landmarks = results.multi_face_landmarks[0]
+
+    # =========================
+    # HAIR PROXY POINTS (MediaPipe FaceMesh)
+    # =========================
+    HAIR_LEFT = [70, 63, 105, 66, 107]  # Points sur le côté gauche des cheveux
+    HAIR_RIGHT = [300, 293, 334, 296, 336]  # Points sur le côté droit des cheveux
+
+    # Indices des points sur le sommet de la tête
+    NOZE_LEFT = [43]  # Point gauche au sommet, 1er point NOZE
+    NOZE_RIGHT = [290]  # Point droit au sommet, 3ème point NOZE
+
+
+    HAIR_TOP2 = [44]  # Point gauche au sommet, 2ème point
+
+    M_LEFT = [46]  # Point gauche point coins de la bouche
+    M_RIGHT = [287]  # Point droit point coins de la bouche
+
+    HAIR_RIGHT_TOP1 = [288]  # Point droit au sommet, 2ème point
+    HAIR_RIGHT_TOP2 = [300]  # Point droit au sommet, 2ème point
+    HAIR_RIGHT_TOP3 = [334]  # Point droit au sommet, 2ème point
+
+    HAIR_LEFT_TOP1 = [70]  # Point droit au sommet, 2ème point
+    HAIR_LEFT_TOP2 = [63]  # Point droit au sommet, 2ème point
+
+    HAIR_TOP = [176, 175, 174]  # Point central au sommet
+
+    HAIR_TOP1 = [174] # 174
+    HAIR_TOP2 = [107] # 175
+    HAIR_TOP3 = [336] # 176
+
+    def get_center(indices):
+        xs, ys = [], []
+        for idx in indices:
+            lm = face_landmarks.landmark[idx]
+            xs.append(lm.x * w)
+            ys.append(lm.y * h)
+        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+    left_hair = get_center(HAIR_LEFT)
+    right_hair = get_center(HAIR_RIGHT)
+
+    HAIR_LEFT_TOP = [104, 105, 106]  # Points vers le sommet des cheveux (gauche)
+    HAIR_RIGHT_TOP = [333, 334, 335]  # Points vers le sommet des cheveux (droit)
+
+
+    # Calculer le centre du sommet des cheveux
+    left_top_hair = get_center(HAIR_LEFT_TOP) #OK
+
+    mouth_left = get_center(HAIR_RIGHT_TOP) #OK
+    mouth_right = get_center(M_RIGHT) #OK
+
+    nose_left = get_center(NOZE_LEFT) #OK
+    nose_right = get_center(NOZE_RIGHT) #OK
+
+    right_top_hair = get_center(HAIR_TOP2)
+
+
+    right_top_m = get_center(HAIR_TOP2)
+    left_top_m = get_center(M_LEFT) #OK
+
+
+    right_top_hair1 = get_center(HAIR_RIGHT_TOP1) #OK
+    right_top_hair2 = get_center(HAIR_RIGHT_TOP2) #OK
+    right_top_hair3 = get_center(HAIR_RIGHT_TOP3) #OK
+
+    left_top_hair1 = get_center(HAIR_LEFT_TOP1) #OK
+    left_top_hair2 = get_center(HAIR_LEFT_TOP2) #OK
+
+
+    top_hair = get_center(HAIR_TOP) #OK
+
+    top_hair1 = get_center(HAIR_TOP1) #OK
+    top_hair2 = get_center(HAIR_TOP2) #OK
+    top_hair3 = get_center(HAIR_TOP3) #OK
+
+    # Calculer le centre du front (base des cheveux)
+    center_x = (left_hair[0] + right_hair[0]) // 2
+    center_y = (left_hair[1] + right_hair[1]) // 2
+
+
+
+    return [left_hair, left_top_hair, mouth_left, nose_left, left_top_m, right_top_m, top_hair, right_top_hair, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, nose_right, right_hair, (center_x, center_y), top_hair1, top_hair2, top_hair3]
+
+
+
+def get_hair_coords_v1(image_pil, face_mesh):
+    # Convertir l'image PIL en un tableau numpy et obtenir la hauteur et la largeur
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    # Traiter l'image pour obtenir les landmarks du visage
+    results = face_mesh.process(image)
+
+    if not results.multi_face_landmarks:
+        return None
+
+    face_landmarks = results.multi_face_landmarks[0]
+
+    # =========================
+    # HAIR PROXY POINTS (MediaPipe FaceMesh)
+    # =========================
+    HAIR_LEFT = [70, 63, 105, 66, 107]  # Points sur le côté gauche des cheveux
+    HAIR_RIGHT = [300, 293, 334, 296, 336]  # Points sur le côté droit des cheveux
+
+    # Points supplémentaires pour les nouveaux repères
+    HAIR_LEFT_TOP = [104, 105, 106]  # Points vers le sommet des cheveux (gauche)
+    HAIR_RIGHT_TOP = [333, 334, 335]  # Points vers le sommet des cheveux (droit)
+    HAIR_TOP = [176, 175, 174]  # Points sur le sommet des cheveux (entre les deux côtés)
+
+    # Fonction pour calculer le centre des points de repère
+    def get_center(indices):
+        xs, ys = [], []
+        for idx in indices:
+            lm = face_landmarks.landmark[idx]
+            xs.append(lm.x * w)  # Convertir en pixels
+            ys.append(lm.y * h)  # Convertir en pixels
+        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+    # Calculer les centres des points pour les différentes régions des cheveux
+    left_hair = get_center(HAIR_LEFT)
+    right_hair = get_center(HAIR_RIGHT)
+
+    # Calculer le centre du sommet des cheveux
+    left_top_hair = get_center(HAIR_LEFT_TOP)
+    right_top_hair = get_center(HAIR_RIGHT_TOP)
+    top_hair = get_center(HAIR_TOP)
+
+    # Centre du front (base des cheveux)
+    center_x = (left_hair[0] + right_hair[0]) // 2
+    center_y = (left_hair[1] + right_hair[1]) // 2
+
+    # Retourner les points calculés
+    return [left_hair, left_top_hair, top_hair, right_top_hair, right_hair, (center_x, center_y)]
+
+# ---------- detection des oreilles ----------
 
 def get_ear_coords_safe(image_pil, face_mesh, H=None, W=None):
     try:
