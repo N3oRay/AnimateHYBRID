@@ -869,41 +869,63 @@ def get_hair_coords(image_pil, face_mesh):
         return None
 
     face_landmarks = results.multi_face_landmarks[0]
+    """
+            'hair_root': 25,
 
+            'hair_left': 26,
+            'hair_right': 27, # bouche gauche 'mouth_left': 48
+            'hair_top': 28, # nez gauche - nose_left'  -> 'nose': 0,
+            'hair_top_left': 29,
+            'hair_top_right': 30,
+
+            'left_top_hair1': 31,
+            'left_top_hair2': 32, # bouche droite 'mouth_right': 49,
+            'left_top_hair3': 33,
+
+            'right_top_hair1': 34, # nez droite - nose_right
+            'right_top_hair2': 35,
+            'right_top_hair3': 36,
+
+            'top_hair1': 37,
+            'top_hair2': 38,
+            'top_hair3': 39,
+
+            'mouth_left': 40,    # coin gauche des lèvres supérieures
+            'mouth_right': 41,   # coin droit des lèvres supérieures
+
+            'nose_left': 42,    # coin gauche du nez
+            'nose_right': 43,   # coin droit du nez
+    """
     # =========================
     # HAIR PROXY POINTS (MediaPipe FaceMesh)
     # =========================
-    HAIR_LEFT = [70, 63, 105, 66, 107]  # Points sur le côté gauche des cheveux
-    HAIR_RIGHT = [300, 293, 334, 296, 336]  # Points sur le côté droit des cheveux
-
-    HAIR_LEFT_TOP = [104, 105, 106]  # Points vers le sommet des cheveux (gauche)
-    HAIR_RIGHT_TOP = [333, 334, 335]  # Points vers le sommet des cheveux (droit)
-
-    # Points sur le nez
-    NOZE_LEFT = [98]  # Point gauche au sommet, 1er point NOZE
-    NOZE_RIGHT = [290]  # Point droit au sommet, 3ème point NOZE
+    HAIR_LEFT = [251, 389]  # Points sur le côté gauche des cheveux
+    HAIR_RIGHT = [21, 162]  # Points sur le côté droit des cheveux
+    HAIR_TOP = [10]  # Point central au sommet
+    HAIR_LEFT_TOP = [338, 297, 332, 284, 251]  # Points vers le sommet des cheveux (gauche)
+    HAIR_RIGHT_TOP = [109, 67, 103, 51, 21]  # Points vers le sommet des cheveux (droit)
 
 
-    HAIR_TOP2 = [44]  # Point gauche au sommet, 2ème point
-
-    M_LEFT = [46]  # Point gauche point coins de la bouche
-
-    # Points pour les coins de la bouche
+    # Points pour les coins de la bouche MOUTH_OUTER = [61, 291, 0, 17, 37, 267, 78, 308]
     M_L = [287]  # Point gauche point coins de la bouche OK
     M_R = [43]  # Point droite point coins de la bouche OK
 
-    HAIR_RIGHT_TOP1 = [288]  # Point droit au sommet, 2ème point
-    HAIR_RIGHT_TOP2 = [300]  # Point droit au sommet, 2ème point
-    HAIR_RIGHT_TOP3 = [334]  # Point droit au sommet, 2ème point
+    # Points sur le nez  NOSE_TIP    = 1 NOSE_TOP    = 168 NOSE_LEFT   = 98 NOSE_RIGHT  = 327
+    NOZE_LEFT = [98]  # Point gauche au sommet, 1er point NOZE
+    NOZE_RIGHT = [327]  # Point droit au sommet, 3ème point NOZE (290 narine)
 
-    HAIR_LEFT_TOP1 = [70]  # Point droit au sommet, 2ème point
-    HAIR_LEFT_TOP2 = [63]  # Point droit au sommet, 2ème point
+    HAIR_RIGHT_TOP1 = [109]  # Point droit au sommet, 2ème point
+    HAIR_RIGHT_TOP2 = [103]  # Point droit au sommet, 2ème point centre droit
+    HAIR_RIGHT_TOP3 = [21]  # Point droit au sommet, 2ème point
 
-    HAIR_TOP = [176, 175, 174]  # Point central au sommet
+    HAIR_LEFT_TOP1 = [338]  # Point gauche au sommet, 1ème point
+    HAIR_LEFT_TOP2 = [332]  # Point gauche au sommet, 2ème point centre gauche
+    HAIR_LEFT_TOP3 = [251]  # Point gauche au sommet, 3ème point
 
-    HAIR_TOP1 = [174] # 174
-    HAIR_TOP2 = [107] # 175
-    HAIR_TOP3 = [336] # 176
+
+    HAIR_TOP1 = [151] # point anexe cheveux long milleu
+    HAIR_TOP2 = [162] # point anexe cheveux long droite
+    HAIR_TOP3 = [389] # point anexe cheveux long gauche
 
     def get_center(indices):
         xs, ys = [], []
@@ -915,10 +937,25 @@ def get_hair_coords(image_pil, face_mesh):
 
     left_hair = get_center(HAIR_LEFT)
     right_hair = get_center(HAIR_RIGHT)
-
-
+    hair_top = get_center(HAIR_TOP) #OK
     # Calculer le centre du sommet des cheveux
     left_top_hair = get_center(HAIR_LEFT_TOP) #OK
+    right_top_hair = get_center(HAIR_RIGHT_TOP)
+
+
+    right_top_hair1 = get_center(HAIR_RIGHT_TOP1) #OK
+    right_top_hair2 = get_center(HAIR_RIGHT_TOP2) #OK
+    right_top_hair3 = get_center(HAIR_RIGHT_TOP3) #OK
+
+    left_top_hair1 = get_center(HAIR_LEFT_TOP1) #OK
+    left_top_hair2 = get_center(HAIR_LEFT_TOP2) #OK
+    left_top_hair3 = get_center(HAIR_LEFT_TOP3) #OK
+
+
+    top_hair1 = get_center(HAIR_TOP1) #OK # point anexe cheveux long milleu
+    top_hair2 = get_center(HAIR_TOP2) #OK
+    top_hair3 = get_center(HAIR_TOP3) #OK
+
 
 
     # Calcul des points pour le nez et les coins de la bouche
@@ -927,30 +964,13 @@ def get_hair_coords(image_pil, face_mesh):
     nose_left = get_center(NOZE_LEFT) #OK
     nose_right = get_center(NOZE_RIGHT) #OK
 
-    right_top_hair = get_center(HAIR_TOP2)
-    right_top_m = get_center(HAIR_TOP2)
-    right_top_hair1 = get_center(HAIR_RIGHT_TOP1) #OK
-    right_top_hair2 = get_center(HAIR_RIGHT_TOP2) #OK
-    right_top_hair3 = get_center(HAIR_RIGHT_TOP3) #OK
-
-
-    left_top_m = get_center(M_LEFT) #OK
-    left_top_hair1 = get_center(HAIR_LEFT_TOP1) #OK
-    left_top_hair2 = get_center(HAIR_LEFT_TOP2) #OK
-
-
-    top_hair = get_center(HAIR_TOP) #OK
-    top_hair1 = get_center(HAIR_TOP1) #OK
-    top_hair2 = get_center(HAIR_TOP2) #OK
-    top_hair3 = get_center(HAIR_TOP3) #OK
 
     # Calculer le centre du front (base des cheveux)
     center_x = (left_hair[0] + right_hair[0]) // 2
     center_y = (left_hair[1] + right_hair[1]) // 2
 
 
-
-    return [left_hair, left_top_hair, mouth_left, nose_left, left_top_m, right_top_m, top_hair, right_top_hair, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, nose_right, right_hair, (center_x, center_y), top_hair1, top_hair2, top_hair3]
+    return [left_hair, left_top_hair, mouth_left, nose_left, hair_top, right_top_hair, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, left_top_hair3, nose_right, right_hair, (center_x, center_y), top_hair1, top_hair2, top_hair3]
 
 
 
