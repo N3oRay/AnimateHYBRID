@@ -850,14 +850,16 @@ def get_hair_coords(image_pil, face_mesh):
     HAIR_RIGHT = [300, 293, 334, 296, 336]  # Points sur le côté droit des cheveux
 
     # Indices des points sur le sommet de la tête
-    NOZE_LEFT = [43]  # Point gauche au sommet, 1er point NOZE
+    NOZE_LEFT = [98]  # Point gauche au sommet, 1er point NOZE
     NOZE_RIGHT = [290]  # Point droit au sommet, 3ème point NOZE
 
 
     HAIR_TOP2 = [44]  # Point gauche au sommet, 2ème point
 
     M_LEFT = [46]  # Point gauche point coins de la bouche
-    M_RIGHT = [287]  # Point droit point coins de la bouche
+
+    M_L = [287]  # Point droit point coins de la bouche OK
+    M_R = [43]  # Point droit point coins de la bouche OK
 
     HAIR_RIGHT_TOP1 = [288]  # Point droit au sommet, 2ème point
     HAIR_RIGHT_TOP2 = [300]  # Point droit au sommet, 2ème point
@@ -890,8 +892,8 @@ def get_hair_coords(image_pil, face_mesh):
     # Calculer le centre du sommet des cheveux
     left_top_hair = get_center(HAIR_LEFT_TOP) #OK
 
-    mouth_left = get_center(HAIR_RIGHT_TOP) #OK
-    mouth_right = get_center(M_RIGHT) #OK
+    mouth_left = get_center(M_L) #OK
+    mouth_right = get_center(M_R) #OK
 
     nose_left = get_center(NOZE_LEFT) #OK
     nose_right = get_center(NOZE_RIGHT) #OK
