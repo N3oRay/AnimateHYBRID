@@ -798,12 +798,12 @@ class Pose:
             print(f"[WARN] mouth_region: estimation failed → fallback empty ({e})")
             return mask
 
-        required_keys = ['mouth_left', 'mouth_right', 'mouth_top', 'mouth_bottom']
+        required_keys = ['mouth_left_c', 'mouth_right_c', 'mouth_top', 'mouth_bottom']
         if not all(k in points_dict for k in required_keys):
             return mask
 
-        ml = points_dict['mouth_left']
-        mr = points_dict['mouth_right']
+        ml = points_dict['mouth_left_c']
+        mr = points_dict['mouth_right_c']
         mt = points_dict['mouth_top']
         mb = points_dict['mouth_bottom']
 
@@ -2074,13 +2074,13 @@ class Pose:
             print(f"[WARN] create_mouth_mask: estimation failed ({e})")
             return mask, mouth_points_batch
 
-        required_keys = ['mouth_left', 'mouth_right', 'mouth_top', 'mouth_bottom']
+        required_keys = ['mouth_left_c', 'mouth_right_c', 'mouth_top', 'mouth_bottom']
 
         if not all(k in points_dict for k in required_keys):
             return mask, mouth_points_batch
 
-        ml = points_dict['mouth_left']
-        mr = points_dict['mouth_right']
+        ml = points_dict['mouth_left_c']
+        mr = points_dict['mouth_right_c']
         mt = points_dict['mouth_top']
         mb = points_dict['mouth_bottom']
 
@@ -2091,8 +2091,8 @@ class Pose:
 
             mouth_points_batch.append({
                 'mouth_center': ((ml[b] + mr[b]) * 0.5).detach().cpu().numpy(),
-                'mouth_left': ml[b].detach().cpu().numpy(),
-                'mouth_right': mr[b].detach().cpu().numpy(),
+                'mouth_left_c': ml[b].detach().cpu().numpy(),
+                'mouth_right_c': mr[b].detach().cpu().numpy(),
                 'mouth_top': mt[b].detach().cpu().numpy(),
                 'mouth_bottom': mb[b].detach().cpu().numpy(),
             })
@@ -2150,11 +2150,11 @@ class Pose:
             print(f"[WARN] mouth_corners: estimation failed ({e})")
             return mask, corners_points_batch
 
-        if 'mouth_left' not in points_dict or 'mouth_right' not in points_dict:
+        if 'mouth_left_c' not in points_dict or 'mouth_right_c' not in points_dict:
             return mask, corners_points_batch
 
-        ml = points_dict['mouth_left']
-        mr = points_dict['mouth_right']
+        ml = points_dict['mouth_left_c']
+        mr = points_dict['mouth_right_c']
 
         # 🔥 mémoire temporelle
         if not hasattr(self, "_mouth_corners_state"):
@@ -2217,8 +2217,8 @@ class Pose:
             # 🔹 SAVE POINTS
             # =========================================================
             corners_points_batch.append({
-                'mouth_left': left.detach().cpu().numpy(),
-                'mouth_right': right.detach().cpu().numpy(),
+                'mouth_left_c': left.detach().cpu().numpy(),
+                'mouth_right_c': right.detach().cpu().numpy(),
             })
 
             # save state
