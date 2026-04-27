@@ -528,6 +528,17 @@ def get_eye_coords(image_pil, face_mesh):
     LEFT_IRIS = [474, 475, 476, 477]
     RIGHT_IRIS = [469, 470, 471, 472]
 
+
+    LEFT_IRIS1 = [474]
+    LEFT_IRIS2 = [475]
+    LEFT_IRIS3 = [476]
+    LEFT_IRIS4 = [477]
+
+    RIGHT_IRIS1 = [469]
+    RIGHT_IRIS2 = [470]
+    RIGHT_IRIS3 = [471]
+    RIGHT_IRIS4 = [472]
+
     def get_center(indices):
         xs, ys = [], []
         for idx in indices:
@@ -539,7 +550,23 @@ def get_eye_coords(image_pil, face_mesh):
     left_eye = get_center(LEFT_IRIS)
     right_eye = get_center(RIGHT_IRIS)
 
-    return [left_eye, right_eye]
+    left_iris1 = get_center(LEFT_IRIS1)
+    left_iris2 = get_center(LEFT_IRIS2)
+    left_iris3 = get_center(LEFT_IRIS3)
+    left_iris4 = get_center(LEFT_IRIS4)
+
+    right_iris1 = get_center(RIGHT_IRIS1)
+    right_iris2 = get_center(RIGHT_IRIS2)
+    right_iris3 = get_center(RIGHT_IRIS3)
+    right_iris4 = get_center(RIGHT_IRIS4)
+
+    # Left eye indices list
+    # LEFT_EYE =[ 362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398 ]
+    # Right eye indices list
+    # RIGHT_EYE=[ 33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161 , 246 ]
+
+
+    return [left_eye, right_eye, left_iris1, left_iris2, left_iris3, left_iris4, right_iris1, right_iris2, right_iris3, right_iris4]
 
 
 def get_elbows_coords_safe_test(image_pil, pose_model):
@@ -849,7 +876,10 @@ def get_hair_coords(image_pil, face_mesh):
     HAIR_LEFT = [70, 63, 105, 66, 107]  # Points sur le côté gauche des cheveux
     HAIR_RIGHT = [300, 293, 334, 296, 336]  # Points sur le côté droit des cheveux
 
-    # Indices des points sur le sommet de la tête
+    HAIR_LEFT_TOP = [104, 105, 106]  # Points vers le sommet des cheveux (gauche)
+    HAIR_RIGHT_TOP = [333, 334, 335]  # Points vers le sommet des cheveux (droit)
+
+    # Points sur le nez
     NOZE_LEFT = [98]  # Point gauche au sommet, 1er point NOZE
     NOZE_RIGHT = [290]  # Point droit au sommet, 3ème point NOZE
 
@@ -858,8 +888,9 @@ def get_hair_coords(image_pil, face_mesh):
 
     M_LEFT = [46]  # Point gauche point coins de la bouche
 
-    M_L = [287]  # Point droit point coins de la bouche OK
-    M_R = [43]  # Point droit point coins de la bouche OK
+    # Points pour les coins de la bouche
+    M_L = [287]  # Point gauche point coins de la bouche OK
+    M_R = [43]  # Point droite point coins de la bouche OK
 
     HAIR_RIGHT_TOP1 = [288]  # Point droit au sommet, 2ème point
     HAIR_RIGHT_TOP2 = [300]  # Point droit au sommet, 2ème point
@@ -885,36 +916,30 @@ def get_hair_coords(image_pil, face_mesh):
     left_hair = get_center(HAIR_LEFT)
     right_hair = get_center(HAIR_RIGHT)
 
-    HAIR_LEFT_TOP = [104, 105, 106]  # Points vers le sommet des cheveux (gauche)
-    HAIR_RIGHT_TOP = [333, 334, 335]  # Points vers le sommet des cheveux (droit)
-
 
     # Calculer le centre du sommet des cheveux
     left_top_hair = get_center(HAIR_LEFT_TOP) #OK
 
+
+    # Calcul des points pour le nez et les coins de la bouche
     mouth_left = get_center(M_L) #OK
     mouth_right = get_center(M_R) #OK
-
     nose_left = get_center(NOZE_LEFT) #OK
     nose_right = get_center(NOZE_RIGHT) #OK
 
     right_top_hair = get_center(HAIR_TOP2)
-
-
     right_top_m = get_center(HAIR_TOP2)
-    left_top_m = get_center(M_LEFT) #OK
-
-
     right_top_hair1 = get_center(HAIR_RIGHT_TOP1) #OK
     right_top_hair2 = get_center(HAIR_RIGHT_TOP2) #OK
     right_top_hair3 = get_center(HAIR_RIGHT_TOP3) #OK
 
+
+    left_top_m = get_center(M_LEFT) #OK
     left_top_hair1 = get_center(HAIR_LEFT_TOP1) #OK
     left_top_hair2 = get_center(HAIR_LEFT_TOP2) #OK
 
 
     top_hair = get_center(HAIR_TOP) #OK
-
     top_hair1 = get_center(HAIR_TOP1) #OK
     top_hair2 = get_center(HAIR_TOP2) #OK
     top_hair3 = get_center(HAIR_TOP3) #OK

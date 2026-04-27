@@ -696,7 +696,7 @@ def update_keypoints_from_pose(
     left_ankle = (0,0)
     left_ankle = (0,0)
 
-    left_eye, right_eye = pair(eye_coords, debug=debug)
+    left_eye, right_eye, left_iris1, left_iris2, left_iris3, left_iris4, right_iris1, right_iris2, right_iris3, right_iris4 = pair(eye_coords, debug=debug)
     left_ear, right_ear  = pair(ear_coords, debug=debug)
 
     # =========================================================
