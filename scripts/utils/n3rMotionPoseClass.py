@@ -73,16 +73,16 @@ class Pose:
 
             'hair_root': 25,
             'hair_left': 26,
-            'hair_right': 27, # bouche gauche 'mouth_left': 48
-            'hair_top': 28, # nez gauche - nose_left'  -> 'nose': 0,
+            'hair_right': 27,
+            'hair_top': 28,
             'hair_top_left': 29,
             'hair_top_right': 30,
 
             'left_top_hair1': 31,
-            'left_top_hair2': 32, # bouche droite 'mouth_right': 49,
+            'left_top_hair2': 32,
             'left_top_hair3': 33,
 
-            'right_top_hair1': 34, # nez droite - nose_right
+            'right_top_hair1': 34,
             'right_top_hair2': 35,
             'right_top_hair3': 36,
 
@@ -101,9 +101,12 @@ class Pose:
     def get_head_up(self):
         """
         Retourne le vecteur `head_up` basé sur les points du visage et des cheveux.
+
+
+
         """
-        hair_left = self.get_point(self.FACIAL_POINT_IDX["hair_left"])
-        hair_right = self.get_point(self.FACIAL_POINT_IDX["hair_right"])
+        hair_left = self.get_point(self.FACIAL_POINT_IDX["left_top_hair3"]) # hair_left
+        hair_right = self.get_point(self.FACIAL_POINT_IDX["right_top_hair3"]) #hair_right
 
         if hair_left is None or hair_right is None:
             return None
@@ -562,6 +565,11 @@ class Pose:
         hair_left = kp[:, 26, :2]
         hair_right = kp[:, 27, :2]
 
+        hair_top = kp[:, 28, :2]
+        left_top_hair3 = kp[:, 33, :2]
+        right_top_hair3 = kp[:, 36, :2]
+
+
         right_eye = kp[:, 14, :2] if kp.shape[1] > 14 else None
         left_eye  = kp[:, 15, :2] if kp.shape[1] > 15 else None
 
@@ -644,6 +652,10 @@ class Pose:
         points["hair_root"] = hair_root
         points["hair_left"] = hair_left
         points["hair_right"] = hair_right
+
+        points["hair_top"] = hair_top
+        points["left_top_hair3"] = left_top_hair3
+        points["right_top_hair3"] = right_top_hair3
 
         points["head_center"] = head_center
 
@@ -1536,131 +1548,6 @@ class Pose:
 
         return mask
 
-    def create_hair_mask_test(
-            self,
-            H: int,
-            W: int,
-            debug: bool = False,
-            debug_dir: str = None,
-            frame_counter: int = 0,
-            top_extend=0.55,
-            side_extend=0.25,
-            height_factor=1.15,
-        ):
-        # Masque du visage
-        mask_face = self.create_face_mask(
-            H, W,
-            debug=debug,
-            debug_dir=debug_dir,
-            frame_counter=frame_counter
-        )
-
-        mask_hair = torch.zeros_like(mask_face)
-
-        for b in range(self.B):
-
-            # Calcul des points pour les cheveux
-            hair_left = self.get_point(self.FACIAL_POINT_IDX["hair_left"])
-            hair_right = self.get_point(self.FACIAL_POINT_IDX["hair_right"])
-
-            if hair_left is None or hair_right is None:
-                continue
-
-            # Convertir les coordonnées des points
-            hair_left = torch.tensor(hair_left, device=self.device)
-            hair_right = torch.tensor(hair_right, device=self.device)
-
-            # Calcul du centre des cheveux
-            hair_center = (hair_left + hair_right) * 0.5
-
-            # Calcul de la tête et de la direction (head_up)
-            neck = self.get_point(self.FACIAL_POINT_IDX["neck"])
-            nose = self.get_point(self.FACIAL_POINT_IDX["nose"])
-
-            if neck is None or nose is None:
-                continue
-
-            neck = torch.tensor(neck, device=self.device)
-            nose = torch.tensor(nose, device=self.device)
-
-            # Calcul du centre de la tête
-            head_center = (hair_center + nose + neck) / 3.0
-            head_center = head_center.squeeze()  # Supprimer la dimension superflue
-
-            if head_center.shape != torch.Size([2]):
-                raise ValueError(f"head_center should be a 2D vector, but got shape {head_center.shape}")
-
-            cx = head_center[0]
-            cy = head_center[1]
-
-            # Calcul des dimensions de l'ellipse
-            angle = torch.atan2(
-                head_up[1],
-                head_up[0] + 1e-6
-            )
-            angle_deg = angle * 180.0 / 3.14159265
-
-            head_width = torch.norm(hair_right - hair_left)
-            head_height = torch.norm(nose - hair_center)
-
-            h_face = head_height * 2.2
-            w_face = head_width * 1.8
-
-            rx = (w_face * 0.5) * (1.0 + side_extend)
-            ry = (h_face * 0.5) * (1.0 + top_extend) * height_factor
-
-            # Ajustement de l'échelle des rayons
-            rx *= 2  # Doublez la taille des rayons pour les rendre visibles
-            ry *= 1.5  # Ajustez la taille de la hauteur des cheveux
-
-            # Limite les coordonnées du centre à l'image
-            cx = int(torch.clamp(cx, 0, W - 1).item())
-            cy = int(torch.clamp(cy, 0, H - 1).item())
-            rx = max(2, int(rx.item()))
-            ry = max(2, int(ry.item()))
-
-            # Dessiner l'ellipse
-            mask_np = torch.zeros((H, W), dtype=torch.uint8, device=self.device)
-
-            # Assurez-vous que cv2 reçoit une image numpy correcte
-            cv2.ellipse(
-                mask_np.cpu().numpy(),  # Convertir en numpy pour cv2
-                (cx, cy),
-                (rx, ry),
-                angle=float(angle_deg),
-                startAngle=0,
-                endAngle=360,
-                color=255,
-                thickness=-1
-            )
-
-            # Appliquez le masque des cheveux
-            mask_hair[b, 0] = mask_np / 255.0
-
-            # Vérification du masque après application
-            if debug:
-                print(f"mask_hair sample (avant softening): {mask_hair[b, 0][0:10, 0:10]}")
-
-        # Nettoyage du masque
-        mask_hair = mask_hair * (1.0 - mask_face)
-        mask_hair = mask_hair ** 2.1  # Appliquez un lissage si nécessaire
-        mask_hair = feather_outside_only_alpha(mask_hair, radius=6, sigma=2.2)
-
-        # Sauvegarder le masque de débogage
-        if debug and debug_dir is not None:
-            save_debug_mask(
-                mask_hair,
-                H,
-                W,
-                debug_dir,
-                frame_counter,
-                prefix="hair_mask_keypoint_"
-            )
-
-        # Vérification finale du masque
-        print(f"mask_hair final sample (final): {mask_hair[0, 0][0:10, 0:10]}")
-
-        return mask_hair
 
     def create_hair_mask(
         self,
@@ -1678,6 +1565,16 @@ class Pose:
         - ears + eyes + nose → orientation de tête
         - ellipse inclinée (tilt head-aware)
         - centre stabilisé
+
+            'hair_top': 28, # millieu centre
+
+            'left_top_hair1': 31, # premier point
+            'left_top_hair2': 32, # Point gauche au sommet, 2ème point centre gauche
+            'left_top_hair3': 33, # point le plus eloigné
+
+            'right_top_hair1': 34, # premier point
+            'right_top_hair2': 35, # Point gauche au sommet, 2ème point centre droit
+            'right_top_hair3': 36, # point le plus eloigné
         """
 
         mask_face = self.create_face_mask(
@@ -1697,8 +1594,9 @@ class Pose:
             # KEYPOINTS SAFE (FIX IMPORTANT)
             # =========================
              # Calcul des points pour les cheveux
-            hair_left = ensure_2d(fp['hair_left'])
-            hair_right = ensure_2d(fp['hair_right'])
+            hair_top = ensure_2d(fp['hair_top'])
+            hair_left = ensure_2d(fp['left_top_hair3'])
+            hair_right = ensure_2d(fp['right_top_hair3'])
             hair_root = ensure_2d(fp['hair_root'])
             nose = ensure_2d(fp['nose'])
             left_eye = ensure_2d(fp['left_eye'])
@@ -1707,7 +1605,7 @@ class Pose:
             right_ear = ensure_2d(fp['right_ear'])
 
             # skip si invalid
-            if any(k is None for k in [hair_left, hair_right, hair_root, nose, left_eye, right_eye, left_ear, right_ear]):
+            if any(k is None for k in [hair_top, hair_left, hair_right, hair_root, nose, left_eye, right_eye, left_ear, right_ear]):
                 continue
 
             # =========================
@@ -1747,7 +1645,7 @@ class Pose:
             # HEAD SIZE
             # =========================
             head_width = torch.norm(rear_px - lear_px)
-            head_height = torch.norm(nose_px - eye_center)
+            head_height = torch.norm(nose_px - hair_center) #eye_center
 
             h_face = head_height * 2.2
             w_face = head_width * 1.6
