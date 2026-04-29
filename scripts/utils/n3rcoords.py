@@ -240,7 +240,22 @@ UPPER_BODY_MAP = {
     "left_ear": 17,
     "mouth": 18,
 
-    "hips_center": 19
+    "hips_center": 19,
+    # =========================
+    # 🔥 VIRTUAL / CINEMATIC POINTS
+    # =========================
+    'hair_root': 25,
+    'hair_left': 26,
+    'hair_right': 27,
+    'hair_top': 28,
+    'hair_top_left': 29,
+    'hair_top_right': 30,
+
+    'front_left_1': 52, # front gauche 1
+    'front_left_2': 53, # front gauche 2
+    'front_m': 54, # front milleu
+    'front_right_1': 55, # front droit 1
+    'front_right_2': 56, # front droit 2
 }
 
 class UpperBodySkeleton:

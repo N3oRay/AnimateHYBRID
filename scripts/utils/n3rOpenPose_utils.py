@@ -15,6 +15,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw
 import traceback
 
+
 def gaussian_blur(x, kernel_size=5, sigma=0.5):
     """
     Gaussian blur 2D pour tenseurs BCHW.
@@ -393,9 +394,7 @@ def tensor_to_pil(tensor):
         raise ValueError(f"Tensor shape non supportée: {tensor.shape}")
     return pil_img
 
-import os
-from PIL import Image
-import torch
+
 
 def save_debug_pose_image(pose_tensor, frame_counter, output_dir, cfg=None, prefix="openpose"):
     """

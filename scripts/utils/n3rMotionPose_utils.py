@@ -32,7 +32,6 @@ def border_fade_mask_rotate(
 ):
     """
     Masque de bords avec pivot central + gestion du sens de rotation
-
     angle   : angle de référence (rad)
     inverse : si True → rotation inverse (compensation warp)
     """

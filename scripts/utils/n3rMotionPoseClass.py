@@ -6,7 +6,6 @@ from PIL import Image, ImageDraw
 from .n3rMotionPose_tools import save_debug_mask, feather_inside_strict, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, feather_outside_only_alpha, feather_inside_strict2, feather_outside_only_alpha2, save_debug_mask_scale
 
 
-
 def ensure_2d(x):
     """
     Force shape [2] (x,y)
@@ -63,14 +62,6 @@ class Pose:
             'left_side_neck': 22,
             'right_side_neck': 23,
             'anchor_neck': 24,
-            'mouth_left_c': 48,    # coin gauche des lèvres supérieures
-            'mouth_right_c': 49,   # coin droit des lèvres supérieures
-            'mouth_top': 50,     # index approximatif du haut de la bouche (à ajuster selon ton keypoints)
-            'mouth_bottom': 51,  # index approximatif du bas de la bouche
-            # =========================
-            # 🔥 VIRTUAL / CINEMATIC POINTS
-            # =========================
-
             'hair_root': 25,
             'hair_left': 26,
             'hair_right': 27,
@@ -86,15 +77,30 @@ class Pose:
             'right_top_hair2': 35,
             'right_top_hair3': 36,
 
-            'top_hair1': 37,
-            'top_hair2': 38,
-            'top_hair3': 39,
-
             'mouth_left': 40,    # coin gauche des lèvres supérieures
             'mouth_right': 41,   # coin droit des lèvres supérieures
 
             'nose_left': 42,    # coin gauche du nez
             'nose_right': 43,   # coin droit du nez
+            # =========================
+            # 🔥 VIRTUAL / CINEMATIC POINTS
+            # =========================
+
+            'mouth_left_c': 48,    # index approximatif coin gauche des lèvres supérieures
+            'mouth_right_c': 49,   # index approximatif coin droit des lèvres supérieures
+            'mouth_top': 50,     # index approximatif du haut de la bouche (à ajuster selon ton keypoints)
+            'mouth_bottom': 51,  # index approximatif du bas de la bouche
+
+
+            # =========================
+            # 🔥 Point réel
+            # =========================
+
+            'front_left_1': 52, # front gauche 1
+            'front_left_2': 53, # front gauche 2
+            'front_m': 54, # front milleu
+            'front_right_1': 55, # front droit 1
+            'front_right_2': 56, # front droit 2
 
         }
 
@@ -704,7 +710,10 @@ class Pose:
 
         # ----------------- Points de base -----------------
         nose = self.keypoints[:, 0, :2]       # point 0 = nez
+
         mouth_detected = self.keypoints[:, 18, :2]  # point 18 = bouche
+        mouth_detected_left = self.keypoints[:, 40, :2] if self.keypoints.shape[1] > 40 else None # point 40 = bouche left
+        mouth_detected_rigth = self.keypoints[:, 41, :2] if self.keypoints.shape[1] > 41 else None # point 41 = bouche right
 
         # Yeux
         right_eye = self.keypoints[:, 14, :2] if self.keypoints.shape[1] > 14 else None
@@ -717,6 +726,9 @@ class Pose:
         # ----------------- BOUCHE -----------------
         # Si bouche détectée, centre = point détecté
         mouth_center = mouth_detected.clone()
+        mouth_d_left = mouth_detected_left.clone()
+        mouth_d_right = mouth_detected_rigth.clone()
+
 
         # Largeur de la bouche : si oreilles connues, sinon distance yeux
         if right_ear is not None and left_ear is not None:
@@ -741,9 +753,13 @@ class Pose:
         mouth_bottom = mouth_center.clone()
         mouth_bottom[:,1] += mouth_height / 2
 
-        estimated_points['mouth_center'] = mouth_center
-        estimated_points['mouth_left_c'] = mouth_left
-        estimated_points['mouth_right_c'] = mouth_right
+        estimated_points['mouth_center'] = mouth_center # point réel
+        if mouth_d_left is not None and mouth_d_right is not None:
+            estimated_points['mouth_left'] = mouth_d_left # point réel
+            estimated_points['mouth_right'] = mouth_d_right # point réel
+
+        estimated_points['mouth_left_c'] = mouth_left #calculé
+        estimated_points['mouth_right_c'] = mouth_right #calculé
         estimated_points['mouth_top'] = mouth_top
         estimated_points['mouth_bottom'] = mouth_bottom
 
@@ -1647,7 +1663,7 @@ class Pose:
             head_width = torch.norm(rear_px - lear_px)
             head_height = torch.norm(nose_px - hair_center) #eye_center
 
-            h_face = head_height * 2.2
+            h_face = head_height * 2.0
             w_face = head_width * 1.6
 
             # =========================
@@ -1972,28 +1988,49 @@ class Pose:
             print(f"[WARN] create_mouth_mask: estimation failed ({e})")
             return mask, mouth_points_batch
 
-        required_keys = ['mouth_left_c', 'mouth_right_c', 'mouth_top', 'mouth_bottom']
+        required_keys = ['mouth_left', 'mouth_right', 'mouth_left_c', 'mouth_right_c', 'mouth_top', 'mouth_bottom']
 
         if not all(k in points_dict for k in required_keys):
             return mask, mouth_points_batch
 
-        ml = points_dict['mouth_left_c']
-        mr = points_dict['mouth_right_c']
-        mt = points_dict['mouth_top']
-        mb = points_dict['mouth_bottom']
 
-        for b in range(self.B):
+        if points_dict['mouth_left'] is not None and points_dict['mouth_right'] is not None:
+            ml = points_dict['mouth_left']
+            mr = points_dict['mouth_right']
+            mt = points_dict['mouth_top']
+            mb = points_dict['mouth_bottom']
 
-            if torch.isnan(ml[b]).any():
-                continue
+            for b in range(self.B):
 
-            mouth_points_batch.append({
-                'mouth_center': ((ml[b] + mr[b]) * 0.5).detach().cpu().numpy(),
-                'mouth_left_c': ml[b].detach().cpu().numpy(),
-                'mouth_right_c': mr[b].detach().cpu().numpy(),
-                'mouth_top': mt[b].detach().cpu().numpy(),
-                'mouth_bottom': mb[b].detach().cpu().numpy(),
-            })
+                if torch.isnan(ml[b]).any():
+                    continue
+
+                mouth_points_batch.append({
+                    'mouth_center': ((ml[b] + mr[b]) * 0.5).detach().cpu().numpy(),
+                    'mouth_left': ml[b].detach().cpu().numpy(),
+                    'mouth_right': mr[b].detach().cpu().numpy(),
+                    'mouth_top': mt[b].detach().cpu().numpy(),
+                    'mouth_bottom': mb[b].detach().cpu().numpy(),
+                })
+
+        else:
+            ml = points_dict['mouth_left_c']
+            mr = points_dict['mouth_right_c']
+            mt = points_dict['mouth_top']
+            mb = points_dict['mouth_bottom']
+
+            for b in range(self.B):
+
+                if torch.isnan(ml[b]).any():
+                    continue
+
+                mouth_points_batch.append({
+                    'mouth_center': ((ml[b] + mr[b]) * 0.5).detach().cpu().numpy(),
+                    'mouth_left_c': ml[b].detach().cpu().numpy(),
+                    'mouth_right_c': mr[b].detach().cpu().numpy(),
+                    'mouth_top': mt[b].detach().cpu().numpy(),
+                    'mouth_bottom': mb[b].detach().cpu().numpy(),
+                })
 
         # =========================================================
         # 🔹 3. FEATHER FINAL (léger uniquement)
@@ -2177,7 +2214,14 @@ class Pose:
                 self.get_point(15)[b].cpu().numpy(),  # left_eye
                 self.get_point(0)[b].cpu().numpy(),   # nose
                 self.get_point(16)[b].cpu().numpy(),  # right_ear
-                self.get_point(17)[b].cpu().numpy()   # left_ear
+                self.get_point(17)[b].cpu().numpy(),   # left_ear
+                self.get_point(52)[b].cpu().numpy(),  #  front_left_1
+                self.get_point(53)[b].cpu().numpy(),  #  front_left_2
+                self.get_point(54)[b].cpu().numpy(),   #  front_m
+                self.get_point(55)[b].cpu().numpy(),  #  front_right_1
+                self.get_point(56)[b].cpu().numpy(),   #  front_right_2
+                self.get_point(40)[b].cpu().numpy(),    #mouth_left 40
+                self.get_point(41)[b].cpu().numpy()     #mouth_right 41
             ]
             pts = np.array([[p[0]*(W-1), p[1]*(H-1)] for p in points], dtype=np.float32)
 
@@ -2187,8 +2231,8 @@ class Pose:
             h_face = np.max(pts[:,1]) - np.min(pts[:,1])
 
             # Ajustement pour un ovale réaliste (plus haut que large)
-            w_face *= 1.15  # élargir légèrement
-            h_face *= 1.4   # hauteur accentuée
+            w_face *= 1.1  # élargir légèrement
+            h_face *= 1.55   # hauteur accentuée
 
             # Création masque ovale
             mask_np = np.zeros((H, W), dtype=np.uint8)

@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import mediapipe as mp
 
 
+
 def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
     """
     Convertit des coordonnées de bouche dans l'image originale
@@ -923,9 +924,11 @@ def get_hair_coords(image_pil, face_mesh):
     HAIR_LEFT_TOP3 = [251]  # Point gauche au sommet, 3ème point
 
 
-    HAIR_TOP1 = [151] # point anexe cheveux long milleu
-    HAIR_TOP2 = [162] # point anexe cheveux long droite
-    HAIR_TOP3 = [389] # point anexe cheveux long gauche
+    FRONT_299  = [299] # point anexe cheveux long milleu
+    FRONT_104  = [104] # point anexe cheveux long milleu
+    FRONT_TOP0 = [151] # point anexe cheveux long milleu
+    FRONT_162 = [162] # point anexe cheveux long droite
+    FRONT_389 = [389] # point anexe cheveux long gauche
 
     def get_center(indices):
         xs, ys = [], []
@@ -952,9 +955,15 @@ def get_hair_coords(image_pil, face_mesh):
     left_top_hair3 = get_center(HAIR_LEFT_TOP3) #OK
 
 
-    top_hair1 = get_center(HAIR_TOP1) #OK # point anexe cheveux long milleu
-    top_hair2 = get_center(HAIR_TOP2) #OK
-    top_hair3 = get_center(HAIR_TOP3) #OK
+    front_left2 = get_center(FRONT_389) #OK 389 point exterme
+    front_left1 = get_center(FRONT_299) # 299
+    front_m = get_center(FRONT_TOP0) #OK # point anexe Front milleu 151
+    front_right1 = get_center(FRONT_104) # 104
+    front_right2 = get_center(FRONT_162) #OK 162 point exterme
+
+
+
+
 
 
 
@@ -970,7 +979,7 @@ def get_hair_coords(image_pil, face_mesh):
     center_y = (left_hair[1] + right_hair[1]) // 2
 
 
-    return [left_hair, left_top_hair, mouth_left, nose_left, hair_top, right_top_hair, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, left_top_hair3, nose_right, right_hair, (center_x, center_y), top_hair1, top_hair2, top_hair3]
+    return [left_hair, left_top_hair, mouth_left, nose_left, hair_top, right_top_hair, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, left_top_hair3, nose_right, right_hair, (center_x, center_y), front_m, front_left1, front_left2, front_right1, front_right2]
 
 
 
@@ -1229,8 +1238,7 @@ def get_shoulders_coords_1(image_pil):
     Returns:
         list[(x, y)]: gauche et droite des épaules en coordonnées image
     """
-    import numpy as np
-    import mediapipe as mp
+
 
     mp_pose = mp.solutions.pose
     mp_face_mesh = mp.solutions.face_mesh

@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw
 import traceback
 import torchvision.utils as vutils
 
+
 #---- Dilation d'un mask ---- Version stable'
 def dilate_mask(mask, kernel_size=5):
     """
@@ -333,6 +334,7 @@ def debug_draw_openpose_skeleton(
         "bouche": (0, 128, 255), # orange
         "nez": (0, 64, 255), # orange
         "cheveux": (255, 64, 255), # violet
+        "front": (255, 128, 255), # violet clair
         "default": (200, 200, 200)
     }
     """
@@ -355,6 +357,13 @@ def debug_draw_openpose_skeleton(
             'top_hair1': 37,
             'top_hair2': 38,
             'top_hair3': 39,
+
+            'front_left_1': 52, # front gauche 1
+            'front_left_2': 53, # front gauche 2
+            'front_m': 54, # front milleu
+            'front_right_1': 55, # front droit 1
+            'front_right_2': 56, # front droit 2
+
     """
     # =========================
     # POINTS
@@ -408,6 +417,7 @@ def debug_draw_openpose_skeleton(
         (8,9),(9,10),(11,12),(12,13),
         (21,22),(21,23),(21,24),
         (28,34),(28,31),(31,32),(32,33),(34,35),(35,36),
+        (54,52),(54,55),(52,53),(55,56)
     ]
 
     for i, j in skeleton:
@@ -436,6 +446,8 @@ def debug_draw_openpose_skeleton(
             color = COLORS["nez"]
         elif i in [40,41,18]:
             color = COLORS["bouche"]
+        elif i in [52,53,54,55,56]:
+            color = COLORS["front"]
         else:
             color = COLORS["default"]
 
@@ -674,8 +686,7 @@ def rotate_mask_around_torso_simple(mask, torso_points_px, angle, device="cuda")
     Returns:
         mask_rotated: [B, C, H, W]
     """
-    import torch
-    import torch.nn.functional as F
+
 
     B, C, H, W = mask.shape
 
