@@ -515,8 +515,6 @@ def extract_keypoints_from_pose(
         [422/W, 428/H, 1.0],
 
 
-
-
         [197/W, 405/H, 1.0], # Hair detected: [(197, 405), (300, 389), (403, 374)]  #'hair_root': 1000, 'hair_left': 1001, 'hair_right': 1002, 'hair_top': 1003,
         [300/W, 389/H, 1.0],
         [403/W, 374/H, 1.0],
@@ -532,15 +530,31 @@ def extract_keypoints_from_pose(
         [491/W, 403/H, 1.0], # right_top_hair, right_top_hair1, right_top_hair2, right_top_hair3, right_hair, (center_x, center_y)]
         [434/W, 427/H, 1.0], # right_top_hair3 KO
 
-        [499/W, 249/H, 1.0], # top_hair1
-        [491/W, 203/H, 1.0], # top_hair2
-        [434/W, 227/H, 1.0], # top_hair3
+        [0.0, 0.0, 0.0], # top_hair1
+        [0.0, 0.0, 0.0], # top_hair2
+        [0.0, 0.0, 0.0], # top_hair3
 
 
         [449/W, 449/H, 1.0], # bouche
         [359/W, 432/H, 1.0], #
         [432/W, 427/H, 1.0], # nez
-        [413/W, 425/H, 1.0], #
+        [413/W, 425/H, 1.0], # 43
+
+        [0.0, 0.0, 0.0], # 44
+        [0.0, 0.0, 0.0], # 45
+        [0.0, 0.0, 0.0], # 46
+        [0.0, 0.0, 0.0], # 47
+        [0.0, 0.0, 0.0], # 48
+        [0.0, 0.0, 0.0], # 49
+        [0.0, 0.0, 0.0], # 50
+        [0.0, 0.0, 0.0], # 51
+        [0.0, 0.0, 0.0], # 52
+
+        [0.0, 0.0, 0.0], # 53
+        [0.0, 0.0, 0.0], # 54
+        [0.0, 0.0, 0.0], # 55
+        [0.0, 0.0, 0.0], # 56
+
     ]
 
     # =========================================================
@@ -674,7 +688,7 @@ def update_keypoints_from_pose(
 
     #💇 Hair detected: [(197, 405), (300, 389), (403, 374)]  #'hair_root': 25, 'hair_left': 26, 'hair_right': 27, 'hair_top': 28,
 
-    hair_left, hair_top_left, mouth_left, nose_left, hair_top, hair_top_right, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, left_top_hair3, nose_right, hair_right, hair_root, top_hair1, top_hair2, top_hair3  = pair(hair_coords, debug=debug)
+    hair_left, hair_top_left, mouth_left, nose_left, hair_top, hair_top_right, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, left_top_hair3, nose_right, hair_right, hair_root, front_m, front_left1, front_left2, front_right1, front_right2  = pair(hair_coords, debug=debug)
 
 
     print(f"Position de hair_root en pixels : {hair_root}")
@@ -846,15 +860,22 @@ def update_keypoints_from_pose(
         35: ("right_top_hair2", right_top_hair2), #OK
         36: ("right_top_hair3", right_top_hair3),
 
-        37: ("top_hair1", top_hair1), #OK
-        38: ("top_hair2", top_hair2), #OK
-        39: ("top_hair3", top_hair3), #OK
+        #37: ("top_hair1", top_hair1), #OK
+        #38: ("top_hair2", top_hair2), #OK
+        #39: ("top_hair3", top_hair3), #OK
 
         40: ("mouth_left", mouth_left),
         41: ("mouth_right", mouth_right),
 
         42: ("nose_left", nose_left),
         43: ("nose_right", nose_right),
+
+        52: ("front_left_1", front_left1), #OK
+        53: ("front_left_2", front_left2), #OK
+        54: ("front_m", front_m), #OK
+        55: ("front_right_1", front_right1), #OK
+        56: ("front_right_2", front_right2), #OK
+
 
     }
 
