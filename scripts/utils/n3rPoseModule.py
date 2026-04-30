@@ -54,7 +54,7 @@ def to_B1(x, B, device):
 def update_motion_state(
     kp,
     state,
-    head_ids=(0,1,18,21,22,23,24),
+    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
     anchor_smooth=0.08,
     velocity_smooth=0.65,
@@ -188,7 +188,7 @@ ACTOR_LABELS = {
 }
 
 
-ACTOR_MODEL_SCHEDULE = [
+ACTOR_MODEL_SCHEDULE_test = [
     (0, "pause"),
     (1, "v14"),
     (5, "v12"),
@@ -197,15 +197,14 @@ ACTOR_MODEL_SCHEDULE = [
 
 ]
 
-ACTOR_MODEL_SCHEDULE_final = [
+ACTOR_MODEL_SCHEDULE = [
     (0, "pause"),
     (2,  "base"),
     (5,  "v9"),
-    (11,  "v11"),
     (19, "pause"),
     (22, "v3"),
-    (25, "pause"),
-    (30,  "v12"),
+    (25, "v14"), #25,26
+    (30,  "v12"), #30 a 32
     (35, "pause"),
     (40, "v7"),
     (45, "v8"),
@@ -430,13 +429,13 @@ def fish_eye_distortion(kp, pivot, strength=1.5, max_radius=1.0):
 def cinematic_motion_graph_v12(
     kp,
     state,
-    head_ids=(0, 1, 18, 21, 22, 23, 24),
+    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     upper_ids=(5, 6, 7, 8, 9, 10),
     hip_ids=(11, 12),
     debug=False,
     fish_eye_strength=1.5,
     fish_eye_max_radius=1.0,
-    rotation_strength=2.0,  # Augmenter légèrement la force de la rotation Z
+    rotation_strength=1.0,  # Augmenter légèrement la force de la rotation Z
     motion_sensitivity=4.0,
     damping=0.90,
     inertia=0.85,
@@ -628,14 +627,14 @@ def cinematic_motion_graph_v14(
     kp,
     state,
 
-    head_ids=(0,1,18,21,22,23,24),
+    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     upper_ids=(5,6,7,8,9,10),
     hip_ids=(11,12),
 
     # =========================
     # TOGGLES
     # =========================
-    enable_rotation=True,
+    enable_rotation=False,
     enable_inertia=True,
     enable_handheld=True,
     enable_breathing=False,
@@ -644,8 +643,8 @@ def cinematic_motion_graph_v14(
     # =========================
     # PARAMETERS
     # =========================
-    max_deg=12.0,
-    rotation_strength=1.8,
+    max_deg=6.0,
+    rotation_strength=1.2,
     motion_sensitivity=2.5,
 
     inertia=0.80,
@@ -843,7 +842,7 @@ def cinematic_motion_graph_v14(
 def cinematic_motion_graph_v10_pause(
     kp,
     state,
-    head_ids=(0,1,18,21,22,23,24),
+    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     debug=False
 ):
     B, N, _ = kp.shape
@@ -956,7 +955,7 @@ def cinematic_motion_graph_v10_pause(
 def actor_system_v9(
     kp,
     state,
-    head_ids=(0,1,18,21,22,23,24),
+    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
     debug=False
 ):
@@ -1168,7 +1167,7 @@ def actor_system_v9(
 def cinematic_motion_graph_v8(
     kp,
     state,
-    head_ids=(0,1,18,21,22,23,24),
+    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     debug=False
 ):
     B, N, _ = kp.shape
@@ -1330,7 +1329,7 @@ def cinematic_motion_graph_v8(
 def cinematic_motion_graph_v7(
     kp,
     state,
-    head_ids=(0,1,18,21,22,23,24),
+    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     upper_ids=(5,6,7,8,9,10),
     hip_ids=(11,12),
     rotation_strength=1.2,
@@ -1458,7 +1457,7 @@ def cinematic_motion_graph_v7(
 def cinematic_motion_graph_v6(
     kp,
     state,
-    head_ids=(0,1,18,21,22,23,24),
+    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
     hip_ids=(11,12),
     rotation_strength=0.5,
@@ -1579,7 +1578,7 @@ def cinematic_motion_graph_v6(
 def cinematic_motion_graph_v3(
     kp,
     state,
-    head_ids=(0,1,18,21,22,23,24),
+    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
     motion_smooth=0.85,
     drift_smooth=0.9,          # 🔥 ajout clé
