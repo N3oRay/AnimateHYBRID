@@ -1632,33 +1632,36 @@ def apply_torso_warp(
     W,
     device,
     prev_delta_px=None,
-    strength=0.1,   # 🔥 NEW 0.3
+    strength=0.3,   # 🔥 NEW: 0.3
     debug=False,
     debug_dir=None
 ):
     B = latents.shape[0]
 
     # -------------------- Centre du torse --------------------
-    points_idx = [2, 5, 8, 11]
-    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)
+    # Points clés pour le torse : épaules et hanches
+    points_idx = [2, 5, 8, 11]  # 'right_shoulder', 'left_shoulder', 'right_hip', 'left_hip'
+    pts = torch.stack([pose.get_point(i) for i in points_idx], dim=1)  # [B, 4, 2]
 
-    torso_center = pts.mean(dim=1)
-    torso_center_px = torso_center * torch.tensor([W-1, H-1], device=device)
-    torso_center_px = torso_center_px.view(B,1,1,2)
+    # Calcul du centre du torse
+    torso_center = pts.mean(dim=1)  # [B, 2]
+    torso_center_px = torso_center * torch.tensor([W - 1, H - 1], device=device)  # [B, 2]
+    torso_center_px = torso_center_px.view(B, 1, 1, 2)  # [B, 1, 1, 2]
 
     # -------------------- Delta torse --------------------
-    delta_px = pose.delta.clone()
-    delta_px[...,0] *= W
-    delta_px[...,1] *= H
-    delta_px = delta_px.view(B,1,1,2)
+    delta_px = pose.delta.clone()  # delta initial
+    delta_px[..., 0] *= W  # mise à l'échelle en fonction de la largeur
+    delta_px[..., 1] *= H  # mise à l'échelle en fonction de la hauteur
+    delta_px = delta_px.view(B, 1, 1, 2)  # [B, 1, 1, 2]
     print("delta_px max:", delta_px.abs().max().item())
 
     # -------------------- Lissage temporel --------------------
     if prev_delta_px is not None:
-        alpha = 0.7
+        alpha = 0.7  # facteur de lissage
         delta_px = alpha * delta_px + (1 - alpha) * prev_delta_px
 
-    # -------------------- strength control --------------------
+    # -------------------- Strength control --------------------
+    # Appliquer une transformation contrôlée par la force (strength)
     delta_px = torch.tanh(delta_px) * 5.0 * strength
 
     # -------------------- Feather dynamique --------------------
@@ -1670,25 +1673,30 @@ def apply_torso_warp(
         scale=2.0
     )
 
-    mask_expand = mask_torso.permute(0,2,3,1)
+    mask_expand = mask_torso.permute(0, 2, 3, 1)  # Permuter pour correspondre aux dimensions attendues
 
     # -------------------- Déformation non-linéaire (IMPORTANT) --------------------
+    # Calcul du vecteur d'offset (écart par rapport au centre du torse)
     offset = grid - torso_center_px
-    distance = torch.norm(offset, dim=-1, keepdim=True)
-    falloff = torch.exp(-distance / (0.35 * W))
+    distance = torch.norm(offset, dim=-1, keepdim=True)  # Calcul de la distance euclidienne
+    falloff = torch.exp(-distance / (0.35 * W))  # Fonction d'atténuation basée sur la distance
 
     # -------------------- Warp torse --------------------
+    # Appliquer le warp basé sur delta_px et la force
     warp = delta_px * strength
-    # safety clamp (IMPORTANT)
-    warp = torch.tanh(warp / 5.0) * 5.0
-    grid_torso = grid + strength * delta_px * mask_expand * falloff
+    warp = torch.tanh(warp / 5.0) * 5.0  # Clamp sécuritaire pour éviter les déformations extrêmes
+    grid_torso = grid + warp * mask_expand * falloff  # Appliquer l'atténuation
+
     # -------------------- Normalisation --------------------
-    grid_torso[...,0] = 2.0 * grid_torso[...,0] / (W-1) - 1.0
-    grid_torso[...,1] = 2.0 * grid_torso[...,1] / (H-1) - 1.0
+    # Normaliser les coordonnées du grid pour être dans l'intervalle [-1, 1] pour grid_sample
+    grid_torso[..., 0] = 2.0 * grid_torso[..., 0] / (W - 1) - 1.0
+    grid_torso[..., 1] = 2.0 * grid_torso[..., 1] / (H - 1) - 1.0
 
     # -------------------- Sampling --------------------
+    # Appliquer la transformation de grille aux latents
     latents_out = F.grid_sample(latents, grid_torso, align_corners=True)
 
+    # -------------------- Debug --------------------
     if debug:
         print("[DEBUG][TORSO] strength:", strength)
         print("[DEBUG][TORSO] delta_px mean:", delta_px.abs().mean().item())
@@ -1696,7 +1704,9 @@ def apply_torso_warp(
         print("[DEBUG][TORSO] falloff mean:", falloff.mean().item())
         print("[DEBUG][TORSO] mask mean:", mask_expand.mean().item())
 
+    # -------------------- Return --------------------
     return latents_out, delta_px
+
 
 # version corriger
 def apply_global_pose(
@@ -1954,7 +1964,7 @@ def apply_face_warp(
     if device is None:
         device = latents.device
 
-    B, C, H, W = latents.shape
+    B, C, H_lat, W_lat = latents.shape
     latents_in = latents.clone()
 
     # =========================
@@ -1965,7 +1975,7 @@ def apply_face_warp(
 
     # Si la fonction est en pause, on renvoie les valeurs de base sans modifier latents
     if paused:
-        return latents, torch.zeros((B, H, W, 2), device=device), facial_points
+        return latents, torch.zeros((B, H_lat, W_lat, 2), device=device), facial_points
 
     # =========================
     # Time
@@ -1976,9 +1986,9 @@ def apply_face_warp(
     # =========================
     # 🔥 BASE MOTION (boosté volontairement)
     # =========================
-    face_delta = torch.zeros((B, H, W, 2), device=device)
+    face_delta = torch.zeros((B, H_lat, W_lat, 2), device=device)
 
-    # mouvement global visage
+    # Mouvement global du visage : oscillations sinusoïdales pour un mouvement naturel
     dx = 0.03 * torch.sin(t * 2.0)
     dy = 0.04 * torch.sin(t * 1.7)
 
@@ -1992,8 +2002,9 @@ def apply_face_warp(
     if mask.ndim == 4:
         mask = mask.squeeze(1)
 
-    mask = mask.unsqueeze(-1)  # [B,H,W,1]
+    mask = mask.unsqueeze(-1)  # [B, H, W, 1]
 
+    # Animation du vent sur le visage avec un effet plus réaliste
     wind1 = torch.sin(t * 1.5)
     wind2 = torch.cos(t * 1.1)
 
@@ -2006,8 +2017,9 @@ def apply_face_warp(
     # =========================
     # 🔥 FACE CENTER (nose)
     # =========================
+    # Le centre du visage est situé au niveau du nez (point 'nose')
     face_center = pose.get_point(0)
-    face_center_px = face_center * torch.tensor([W - 1, H - 1], device=device)
+    face_center_px = face_center * torch.tensor([W_lat - 1, H_lat - 1], device=device)
     face_center_px = face_center_px.view(B, 1, 1, 2)
 
     # =========================
@@ -2020,6 +2032,7 @@ def apply_face_warp(
     # =========================
     # 🔥 TEMPORAL SMOOTHING
     # =========================
+    # Appliquer un lissage temporel pour rendre les transitions plus douces
     if prev_grid is not None:
         alpha = 0.7
         grid_face = alpha * prev_grid + (1.0 - alpha) * grid_face
@@ -2029,8 +2042,8 @@ def apply_face_warp(
     # =========================
     grid_face = grid_face.clone()
 
-    grid_face[..., 0] = 2.0 * grid_face[..., 0] / (W - 1) - 1.0
-    grid_face[..., 1] = 2.0 * grid_face[..., 1] / (H - 1) - 1.0
+    grid_face[..., 0] = 2.0 * grid_face[..., 0] / (W_lat - 1) - 1.0
+    grid_face[..., 1] = 2.0 * grid_face[..., 1] / (H_lat - 1) - 1.0
 
     # =========================
     # WARP
@@ -2043,9 +2056,22 @@ def apply_face_warp(
         padding_mode="reflection"
     )
 
+    # =========================
+    # Debugging information
+    # =========================
     if debug:
         print("[DEBUG] Face warp applied OK")
         print("  grid mean:", grid_face.abs().mean().item())
+
+        # Visualisation du visage pour le débogage
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            img = latents_out[0].detach().float().cpu()
+            img = img[:3] if img.shape[0] > 3 else img
+            torchvision.utils.save_image(
+                (img + 1) / 2,
+                os.path.join(debug_dir, f"face_warp_debug_{frame_counter}.png")
+            )
 
     return latents_out, face_delta, facial_points
 
@@ -2066,7 +2092,6 @@ def apply_mouth_smil(
     strength=2.0,
     npy=False
 ):
-
     if device is None:
         device = latents.device
 
@@ -2089,18 +2114,30 @@ def apply_mouth_smil(
     )
 
     # =========================
-    # 8. GRID WARP (inchangé)
+    # Sélectionner les points de la bouche (exemple d'indices pour les coins de la bouche)
     # =========================
-    face_center = pose.get_point(0)
-    face_center_px = face_center * torch.tensor([W-1, H-1], device=device)
-    face_center_px = face_center_px.view(B,1,1,2)
+    mouth_points_idx = [40, 41, 18]  # Vous pouvez ajuster en fonction des indices exacts de votre modèle.
 
-    grid_mouth = grid.clone() - face_center_px
+    # On récupère les points de la bouche et on les empile en un tensor
+    mouth_points = torch.stack([pose.get_point(i) for i in mouth_points_idx], dim=1)  # [B, 4, 2]
+
+    # Calculer le centre de la bouche (moyenne des 4 points)
+    mouth_center = mouth_points.mean(dim=1)  # [B, 2]
+
+    # =========================
+    # Appliquer les déformations en fonction du centre de la bouche
+    # =========================
+    mouth_center_px = mouth_center * torch.tensor([W-1, H-1], device=device)
+    mouth_center_px = mouth_center_px.view(B, 1, 1, 2)
+
+    # Calculer les décalages de la bouche
+    grid_mouth = grid.clone() - mouth_center_px
     grid_mouth = grid_mouth + delta
-    grid_mouth = grid_mouth + face_center_px
+    grid_mouth = grid_mouth + mouth_center_px
 
-    grid_mouth[...,0] = 2.0 * grid_mouth[...,0] / (W-1) - 1.0
-    grid_mouth[...,1] = 2.0 * grid_mouth[...,1] / (H-1) - 1.0
+    # Normaliser les coordonnées du grid pour grid_sample
+    grid_mouth[..., 0] = 2.0 * grid_mouth[..., 0] / (W-1) - 1.0
+    grid_mouth[..., 1] = 2.0 * grid_mouth[..., 1] / (H-1) - 1.0
 
     # =========================
     # 9. SAMPLE (amélioré)
@@ -2127,6 +2164,7 @@ def apply_mouth_smil(
             print(f"[WARN] mouth debug failed: {e}")
 
     return latents_out, delta, facial_points
+
 
 #-------------------------------------------------test -----------------------------------------
 def normalize_mask(mask):
@@ -2455,7 +2493,7 @@ def apply_pose_driven_motion_ultra2(
         start = time.time()
         latents_local, mouth_delta, _ = apply_mouth_smil(
             latents_local, pose, mask_mouth, grid, H, W, frame_counter,
-            device=device, debug=debug, debug_dir=debug_dir, smooth=0.85
+            device=device, debug=debug, debug_dir=debug_dir, smooth=0.85, strength=2.0, npy=False
         )
         print("MOUTH DELTA MEAN:", mouth_delta.abs().mean().item())
 
