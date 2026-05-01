@@ -1458,7 +1458,7 @@ class Pose:
         # =========================
         # 🔹 Debug
         # =========================
-        if debug and debug_dir is not None:
+        if debug and debug_dir is not None and frame_counter == 0:
             save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="decor_mask")
 
         return mask
@@ -1532,7 +1532,7 @@ class Pose:
         # =========================
         mask = feather_inside_strict(mask, radius=8, blur_kernel=5, sigma=2.0)
 
-        if debug and debug_dir is not None:
+        if debug and debug_dir is not None and frame_counter == 0:
             save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="decor_mask")
 
         return mask
@@ -1607,7 +1607,7 @@ class Pose:
         mask = feather_inside_strict(mask, radius=5, blur_kernel=3, sigma=1.2)
 
         # Debug
-        if debug and debug_dir is not None:
+        if debug and debug_dir is not None and frame_counter == 0:
             save_debug_mask(mask, H, W, debug_dir, frame_counter, prefix="torso_mask_PRO")
 
 
@@ -1763,15 +1763,8 @@ class Pose:
         # =========================
         # DEBUG
         # =========================
-        if debug and debug_dir is not None:
-            save_debug_mask(
-                mask_hair,
-                H,
-                W,
-                debug_dir,
-                frame_counter,
-                prefix="hair_mask_keypoint_"
-            )
+        if debug and debug_dir is not None and frame_counter == 0:
+            save_debug_mask( mask_hair, H, W, debug_dir, frame_counter, prefix="hair_mask_keypoint_" )
 
         return mask_hair
 
@@ -1905,15 +1898,8 @@ class Pose:
         # =========================
         # DEBUG
         # =========================
-        if debug and debug_dir is not None:
-            save_debug_mask(
-                mask_hair,
-                H,
-                W,
-                debug_dir,
-                frame_counter,
-                prefix="hair_mask_keypoint_"
-            )
+        if debug and debug_dir is not None and frame_counter == 0:
+            save_debug_mask( mask_hair, H, W, debug_dir, frame_counter, prefix="hair_mask_keypoint_" )
 
         return mask_hair
 
@@ -1950,7 +1936,7 @@ class Pose:
         mask = feather_inside_strict(mask, radius=2, blur_kernel=3, sigma=0.8)
         mask = feather_outside_only_alpha(mask, radius=2, sigma=1.2)
 
-        if debug and debug_dir is not None:
+        if debug and debug_dir is not None and frame_counter == 0:
             os.makedirs(debug_dir, exist_ok=True)
             save_path = os.path.join(debug_dir, f"left_eye_mask_{frame_counter:05d}.png")
             mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
@@ -1993,7 +1979,7 @@ class Pose:
         mask = feather_inside_strict(mask, radius=2, blur_kernel=3, sigma=0.8)
         mask = feather_outside_only_alpha(mask, radius=2, sigma=1.2)
 
-        if debug and debug_dir is not None:
+        if debug and debug_dir is not None and frame_counter == 0:
             os.makedirs(debug_dir, exist_ok=True)
             save_path = os.path.join(debug_dir, f"right_eye_mask_{frame_counter:05d}.png")
             mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)
@@ -2093,7 +2079,7 @@ class Pose:
         # =========================================================
         # 🔹 4. DEBUG VISUEL
         # =========================================================
-        if debug and debug_dir is not None:
+        if debug and debug_dir is not None and frame_counter == 0:
             os.makedirs(debug_dir, exist_ok=True)
 
             mask_img = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
@@ -2234,7 +2220,7 @@ class Pose:
         # =========================================================
         # 🔹 DEBUG IMAGE
         # =========================================================
-        if debug and debug_dir is not None:
+        if debug and debug_dir is not None and frame_counter == 0:
             os.makedirs(debug_dir, exist_ok=True)
 
             mask_img = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
@@ -2298,7 +2284,7 @@ class Pose:
 
         # Debug
 
-        if debug and debug_dir is not None:
+        if debug and debug_dir is not None and frame_counter == 0:
             os.makedirs(debug_dir, exist_ok=True)
             save_path = os.path.join(debug_dir, f"face_mask_pro_{frame_counter:05d}.png")
             mask_img = (mask[0,0].cpu().numpy() * 255).astype(np.uint8)

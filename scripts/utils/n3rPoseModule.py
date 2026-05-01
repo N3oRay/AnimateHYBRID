@@ -184,7 +184,6 @@ ACTOR_LABELS = {
     "pause": "[V10 PAUSE INTER]",
     "v14": "[V14 ROTATION Z]",
     "v12": "[V12 FISH EYES]",
-    "v3": "[V3 SYSTEM]",
 }
 
 
@@ -196,10 +195,9 @@ ACTOR_MODEL_SCHEDULE_test = [
 
 ACTOR_MODEL_SCHEDULE = [
     (0, "pause"),
-    (2,  "base"),
-    (5,  "v9"),
+    (12,  "base"),
+    (15,  "v9"),
     (19, "pause"),
-    (22, "v3"),
     (25, "v14"), #OK
     (30,  "v12"), #OK
     (35, "pause"),
@@ -214,10 +212,11 @@ ACTOR_MODEL_SCHEDULE = [
 
 MOTION_MODEL_SCHEDULE = [
     (0,  "locked"),
-    (5,  "stable"),
-    (10, "warp"),
+    (15, "stable"),
     (20, "cinematic"),
+    (30, "locked"),
     (35, "dynamic"),
+    (50, "warp"),
 ]
 
 def resolve_motion_model(frame_idx: int) -> str:
@@ -225,7 +224,7 @@ def resolve_motion_model(frame_idx: int) -> str:
     Motion system:
     controls physics behavior over time (camera + velocity + warp).
     """
-    model = "dynamic"
+    model = "locked"
 
     for threshold, name in MOTION_MODEL_SCHEDULE:
         if frame_idx >= threshold:
@@ -243,7 +242,7 @@ breathing séparé propre
 full skeleton graph (pas seulement bras)
 compatible diffusion latents (anti-blur garanti)
 
-“Cinematic Motion Graph Engine V3”
+“Cinematic Motion Graph Engine”
 rotation du buste (pseudo 3D)
 inertie physique (spring system)
 shoulders follow pelvis rotation
@@ -839,7 +838,7 @@ def cinematic_motion_graph_v14(
 def cinematic_motion_graph_v10_pause(
     kp,
     state,
-    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
+    head_ids=(0, 1, 18, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 40, 41, 42, 43, 52, 53, 54, 55, 56),
     debug=False
 ):
     B, N, _ = kp.shape
@@ -848,7 +847,6 @@ def cinematic_motion_graph_v10_pause(
     # =========================================================
     # 0. SAFE INIT (NO SHAPE DRIFT EVER)
     # =========================================================
-
     if state is None:
         state = {}
 
@@ -918,10 +916,11 @@ def cinematic_motion_graph_v10_pause(
     kp_out = kp_prev.clone()
 
     # =========================================================
-    # 6. HEAD STABILITY
+    # 6. HEAD STABILITY - **AUCUN MOUVEMENT DE TÊTE**
     # =========================================================
-    # On conserve la position de la tête stable, sans mouvement
-    kp_out[:, head_ids, :2] = kp_prev[:, head_ids, :2]
+    # Cette section est désormais complètement désactivée
+    # kp_out[:, head_ids, :2] = kp_prev[:, head_ids, :2]
+    # Le mouvement de la tête est totalement désactivé.
 
     # =========================================================
     # 7. CLEAN OUTPUT
@@ -1568,134 +1567,7 @@ def cinematic_motion_graph_v6(
     return kp_out, state
 
 
-# 👉 lisser le mouvement + garder de la réactivité
-# 👉 stabiliser la tête
-# 👉 éviter toute déformation globale
 
-def cinematic_motion_graph_v3(
-    kp,
-    state,
-    head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
-    body_ids=(2,3,4,5,6,7,8,9,10,11,12,13),
-    motion_smooth=0.85,
-    drift_smooth=0.9,          # 🔥 ajout clé
-    max_velocity=0.08,         # 🔥 limite physique
-    head_lock=True,
-    debug=False
-):
-    B, N, _ = kp.shape
-    device = kp.device
-
-    # =========================================================
-    # INIT STATE (SAFE)
-    # =========================================================
-    if state is None:
-        return kp, {
-            "kp_prev": kp.clone(),
-            "velocity": torch.zeros_like(kp[..., :2]),
-            "drift": torch.zeros((B,1,2), device=device)
-        }
-
-    kp_prev = state.get("kp_prev", kp.clone())
-
-    if kp_prev.shape != kp.shape:
-        kp_prev = kp.clone()
-
-    velocity_prev = state.get(
-        "velocity",
-        torch.zeros_like(kp[..., :2])
-    )
-
-    state.setdefault("drift", torch.zeros((B,1,2), device=device))
-
-    # =========================================================
-    # 1. RAW MOTION
-    # =========================================================
-    delta = kp[..., :2] - kp_prev[..., :2]
-
-    # =========================================================
-    # 2. VELOCITY SMOOTHING (STABLE + CLAMP)
-    # =========================================================
-    velocity = (
-        velocity_prev * motion_smooth +
-        delta * (1.0 - motion_smooth)
-    )
-
-    # 🔥 clamp vitesse (évite warp)
-    velocity = torch.clamp(velocity, -max_velocity, max_velocity)
-
-    kp_out = kp_prev.clone()
-    kp_out[..., :2] = kp_prev[..., :2] + velocity
-
-    state["velocity"] = velocity
-
-    # =========================================================
-    # 3. BODY DRIFT (EMA STABLE)
-    # =========================================================
-    body_center_prev = kp_prev[:, body_ids, :2].mean(dim=1, keepdim=True)
-    body_center_now  = kp_out[:, body_ids, :2].mean(dim=1, keepdim=True)
-
-    drift_raw = body_center_now - body_center_prev
-
-    # 🔥 EMA drift (FIX MAJEUR)
-    drift = (
-        state["drift"] * drift_smooth +
-        drift_raw * (1.0 - drift_smooth)
-    )
-
-    # 🔥 clamp drift
-    drift = torch.clamp(drift, -0.05, 0.05)
-
-    state["drift"] = drift
-
-    # apply stabilization
-    kp_out[..., :2] = kp_out[..., :2] - drift
-
-    # =========================================================
-    # 4. HEAD LOCK (STABLE, NON-RIGIDE)
-    # =========================================================
-    if head_lock:
-        head_blend = 0.85
-        kp_out[:, head_ids, :2] = (
-            kp_prev[:, head_ids, :2] * head_blend +
-            kp_out[:, head_ids, :2] * (1 - head_blend)
-        )
-
-    # =========================================================
-    # 5. GLOBAL DAMPING (ANTI-JITTER FINAL)
-    # =========================================================
-    kp_out[..., :2] = kp_prev[..., :2] + (
-        kp_out[..., :2] - kp_prev[..., :2]
-    ) * 0.9
-
-    # =========================================================
-    # 6. CLEAN
-    # =========================================================
-    kp_out[..., :2] = torch.nan_to_num(kp_out[..., :2], nan=0.0)
-    kp_out[..., :2] = torch.clamp(kp_out[..., :2], 0.0, 1.0)
-
-    # =========================================================
-    # 7. UPDATE STATE
-    # =========================================================
-    state["kp_prev"] = kp_out.clone()
-
-    # =========================================================
-    # DEBUG
-    # =========================================================
-    if debug:
-        motion_val = delta.norm(dim=-1).mean().item()
-        vel_val = velocity.norm(dim=-1).mean().item()
-        drift_val = drift.norm(dim=-1).mean().item()
-
-        center = body_center_now.mean(dim=1)[0]
-
-        print("\n[🎯 V3 STABLE]")
-        print(f"motion_raw: {motion_val:.6f}")
-        print(f"velocity: {vel_val:.6f}")
-        print(f"drift: {drift_val:.6f}")
-        print(f"body_center: ({center[0].item():.3f}, {center[1].item():.3f})")
-
-    return kp_out, state
 
 
 def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
@@ -1849,7 +1721,6 @@ def resolve_actor_model(frame_idx: int) -> str:
 
 ACTOR_PIPELINE = {
     "base": update_motion_state,
-    "v3": cinematic_motion_graph_v3,
     "v6": cinematic_motion_graph_v6,
     "v7": cinematic_motion_graph_v7,
     "v8": cinematic_motion_graph_v8,

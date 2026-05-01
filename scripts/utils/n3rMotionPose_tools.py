@@ -992,7 +992,7 @@ def apply_breathing_real(
     mask_torso,
     frame_counter,
     breathing=True,
-    amplitude=1.2,
+    amplitude=2.0,
     asymmetry=0.08,   # 🔥 micro naturel gauche/droite
     vertical_bias=0.15, # 🔥 respiration légèrement plus verticale
     debug=False,
@@ -1216,7 +1216,7 @@ def apply_breathing_simple_anime(
     return latents_out
 
 
-def save_debug_mask(mask: torch.Tensor, H: int, W: int, debug_dir: str, frame_counter: int, prefix: str = "mask", scale: int = 4):
+def save_debug_mask(mask: torch.Tensor, H: int, W: int, debug_dir: str, frame_counter: int, prefix: str = "mask", scale: int = 8):
     """
     Sauvegarde un masque pour debug.
     - mask: tensor [B,1,H,W]

@@ -9,9 +9,9 @@ import torch.nn.functional as F
 from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body, reconstruct_hips
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask, dilate_mask
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, apply_breathing_simple_anime, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask
 
-from .n3rPoseModule import cinematic_motion_graph_v3, update_motion_state, cinematic_motion_graph_v6, cinematic_motion_graph_v7, cinematic_motion_graph_v8, actor_system_v9, apply_actor_model, resolve_motion_model
+from .n3rPoseModule import apply_actor_model, resolve_motion_model
 
 from .n3rMotionPoseClass import Pose
 import numpy as np
@@ -355,101 +355,6 @@ def compensate_latent_shift_dev(
     return latent_out
 
 
-def compensate_latent_shift(
-    latent,
-    shift,
-    image_size=(1280, 896),
-    latent_size=None,
-    max_shift_ratio=0.2,
-    padding_mode="reflect",  # "reflect", "replicate", "noise"
-    debug=False
-):
-    """
-    Compense les zones vides dans un latent après mouvement vertical/horizontal.
-
-    Args:
-        latent: Tensor (B, C, H, W)
-        kp: keypoints actuels (B, N, 2) normalisés [0,1]
-        kp_prev: keypoints précédents (B, N, 2)
-        image_size: taille image originale (W, H)
-        latent_size: taille latent (W, H) si différente
-        max_shift_ratio: clamp du shift (sécurité)
-        padding_mode: stratégie de remplissage
-    """
-
-    B, C, H, W = latent.shape
-
-    # =========================================================
-    # 1. Compute global motion (center shift)
-    # =========================================================
-    shift_x = float(shift[0,0])
-    shift_y = float(shift[0,1])
-
-    compensation_gain = 10.0  # ou 5-20 selon pipeline
-
-    shift_x *= compensation_gain
-    shift_y *= compensation_gain
-
-    # =========================================================
-    # 2. Convert to latent pixels
-    # =========================================================
-    if latent_size is None:
-        latent_W, latent_H = W, H
-    else:
-        latent_W, latent_H = latent_size
-
-    dx = int(shift_x * latent_W)
-    dy = int(shift_y * latent_H)
-
-    if debug:
-        print(f"[SHIFT] dx={dx}, dy={dy}")
-
-    if dx == 0 and dy == 0:
-        return latent
-
-    # =========================================================
-    # 3. Padding helper
-    # =========================================================
-    def pad_tensor(t, pad):
-        if padding_mode == "reflect":
-            return F.pad(t, pad, mode="reflect")
-        elif padding_mode == "replicate":
-            return F.pad(t, pad, mode="replicate")
-        elif padding_mode == "noise":
-            padded = F.pad(t, pad, mode="constant", value=0.0)
-            mask = (padded == 0.0).float()
-            noise = torch.randn_like(padded) * 0.02
-            return padded + noise * mask
-        else:
-            return F.pad(t, pad, mode="constant", value=0.0)
-
-    # =========================================================
-    # 4. Apply shift compensation
-    # =========================================================
-
-    # Horizontal
-    if dx > 0:
-        # move right → hole left
-        latent = pad_tensor(latent, (dx, 0, 0, 0))
-        latent = latent[:, :, :, :W]
-    elif dx < 0:
-        # move left → hole right
-        latent = pad_tensor(latent, (0, -dx, 0, 0))
-        latent = latent[:, :, :, -W:]
-
-    # Vertical
-    if dy > 0:
-        # move down → hole top
-        latent = pad_tensor(latent, (0, 0, dy, 0))
-        latent = latent[:, :, :H, :]
-    elif dy < 0:
-        # move up → hole bottom
-        latent = pad_tensor(latent, (0, 0, 0, -dy))
-        latent = latent[:, :, -H:, :]
-
-    return latent
-
-
 #------extract_keypoints_from_pose
 
 def extract_keypoints_from_pose(
@@ -758,8 +663,8 @@ def update_keypoints_from_pose(
             cy = (left_hip[1] + right_hip[1]) * 0.5
 
             offset_y2 = H * 0.1
-            left_ankle  = (cx - 10, cy - offset_y2)
-            right_ankle = (cx + 10, cy - offset_y2)
+            left_ankle  = (cx - 100, cy - offset_y2)
+            right_ankle = (cx + 100, cy - offset_y2)
 
             if debug:
                 print("🦿 ANKLE RECONSTRUCTED BY HIP")
@@ -1958,7 +1863,7 @@ def apply_face_warp(
     debug_dir=None,
     smooth=0.85,
     prev_grid=None,
-    strength=2.0,
+    strength=1.0,
     paused=False  # Paramètre pour activer/désactiver l'effet
 ):
     if device is None:
@@ -2208,17 +2113,27 @@ def apply_breathing(
     mask_torso_exp,
     frame_counter,
     breathing,
-    mode="soft",
     debug=False,
     debug_dir=None,
 ):
-    if mode == "real":
+    #if mode == "real":
+    if frame_counter % 2 == 0:
         return apply_breathing_real(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
+    elif frame_counter % 3 == 0:
+        return apply_breathing_simple_anime(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
     else:
         return apply_breathing_soft(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
 
-def apply_pose_driven_motion_ultra2(
-    latents,
+
+def apply_pose_world(
+    latents_base,
+    latents_world,
+    mask_torso,
+    mask_torso_exp,
+    grid,
+    timings,
+    pose,
+    prev_pose,
     state,
     keypoints,
     prev_keypoints=None,
@@ -2228,110 +2143,13 @@ def apply_pose_driven_motion_ultra2(
     debug=False,
     debug_dir=None
 ):
-    timings = {}
-    B, C, H, W = latents.shape
-    device = latents.device
-    latents = latents.float()
-    latents_base = latents.clone()
-    latents_world = latents.clone()
-    dx, dy = 0, 0  # warp return
-    # =========================
-    # 🔹 Pose et deltas
-    # =========================
-    start = time.time()
-    pose = Pose(keypoints.to(device))
-    pose.compute_torso_delta(latent_h=H, latent_w=W)
-    prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
-    timings["Pose"] = time.time() - start
-
-
-
-    # =========================
-    # 🔹 Animation Upper Body
-    # =========================
-    try:
-        # On récupère les coordonnées brutes depuis keypoints
-        upper_body_inputs = {
-            "nose": keypoints[:, pose.FACIAL_POINT_IDX["nose"], :2],
-            "neck": keypoints[:, pose.FACIAL_POINT_IDX["neck"], :2],
-            "right_shoulder": keypoints[:, pose.FACIAL_POINT_IDX["right_shoulder"], :2],
-            "right_elbow": keypoints[:, pose.FACIAL_POINT_IDX["right_elbow"], :2],
-            "right_wrist": keypoints[:, pose.FACIAL_POINT_IDX["right_wrist"], :2],
-            "left_shoulder": keypoints[:, pose.FACIAL_POINT_IDX["left_shoulder"], :2],
-            "left_elbow": keypoints[:, pose.FACIAL_POINT_IDX["left_elbow"], :2],
-            "left_wrist": keypoints[:, pose.FACIAL_POINT_IDX["left_wrist"], :2],
-            "right_clavicle": keypoints[:, pose.FACIAL_POINT_IDX.get("right_clavicle", 19), :2],
-            "left_clavicle": keypoints[:, pose.FACIAL_POINT_IDX.get("left_clavicle", 20), :2],
-        }
-
-        # Mise à jour via animate_upper_body
-        pose_copy = Pose(pose.keypoints.clone())
-        updated_upper_body = animate_upper_body(
-            pose=pose_copy,
-            inputs=upper_body_inputs,
-            mode="smooth",
-            strength=0.35, debug=debug
-        )
-        n = min(pose.keypoints.shape[1], updated_upper_body.shape[1])
-        pose.keypoints[:, :n] = updated_upper_body[:, :n]
-
-        if debug:
-            print(f"[DEBUG] Upper body animated, first shoulder delta:",
-                (pose.keypoints[0, pose.FACIAL_POINT_IDX['left_shoulder'], :2] -
-                keypoints[0, pose.FACIAL_POINT_IDX['left_shoulder'], :2]))
-
-    except Exception as e:
-        print("[WARN] Upper body animation failed:", e)
-
-    # =========================
-    # 🔹 Global compensation
-    # =========================
-    global_shift = torch.zeros((B,1,1,2), device=device)
-    if prev_pose is not None:
-        c1 = pose.get_center()[..., :2]
-        c0 = prev_pose.get_center()[..., :2]
-        delta = c1 - c0
-        delta = torch.clamp(delta, -5.0, 5.0)
-        global_shift = delta.view(B,1,1,2)
-
-    # =========================
-    # 🔹 Grid
-    # =========================
-    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
-
-
-    # =========================
-    # 🔹 Masks
-    # =========================
-    mask_face  = torch.clamp(pose.create_face_mask(H,W, debug=debug, debug_dir=debug_dir),0,1).float()
-    mask_mouth, _ = pose.create_mouth_mask(H,W, debug=debug, debug_dir=debug_dir)
-    mask_mouth = torch.clamp(mask_mouth,0,1).float()
-    mask_mouth_corners, _ = pose.create_mouth_corners_mask(H,W, debug=debug, debug_dir=debug_dir)
-    mask_mouth_corners = torch.clamp(mask_mouth_corners,0,1).float()
-    mask_torso = torch.clamp(pose.create_upper_body_mask(H,W, debug=debug, debug_dir=debug_dir),0,1).float()
-    mask_hair = torch.clamp(pose.create_hair_mask(H,W, debug=debug, debug_dir=debug_dir),0,1).float()
-    mask_left_eye = torch.clamp(pose.create_left_eye_mask(H,W, debug=debug, debug_dir=debug_dir),0,1).float()
-    mask_right_eye = torch.clamp(pose.create_right_eye_mask(H,W, debug=debug, debug_dir=debug_dir),0,1).float()
-
-    mask_torso_exp = mask_torso * (1.0 - mask_face)
-    mask_hair_exp = mask_hair * (1.0 - mask_face)
-    mask_face_exp = mask_face
-    mask_mouth_exp = mask_mouth
-
-    print("mask_hair_exp mean:", mask_hair_exp.mean().item())
-    print("mask_face_exp mean:", mask_face_exp.mean().item())
-    print("mask_mouth_exp mean:", mask_mouth_exp.mean().item())
-
-    # 🔥 NOUVEAU MASQUE DÉCOR
-    mask_decor = pose.create_decor_mask(H, W, mask_face, mask_torso, mask_hair, debug=debug, debug_dir=debug_dir)  # doit devenir
-    mask_decor = torch.clamp(mask_decor, 0, 1).float()
-
     #============================================== PARTI WORD ========================================
+    B, C, H, W = latents_world.shape
     # =========================
     # 🔹 Global pose & stabilisation avancée
     # =========================
-    if should_freeze(frame_counter, 1): # Pause traitement
+    #if should_freeze(frame_counter, 1): # Pause traitement
+    if frame_counter > 1:
         start = time.time()
         latents_world, global_delta, grid_raw, grid_global, warp_shift, global_angle = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
         print("[DEBUG] WARP Shift: ")
@@ -2437,11 +2255,11 @@ def apply_pose_driven_motion_ultra2(
     # 🔹 BREATHING
     # =====================================================================
     start = time.time()
-    freeze = should_freeze(frame_counter, 3)
+    freeze = should_freeze(frame_counter, 1)
     mode, mode_strength = get_breathing_mode(frame_counter, freeze)
     latents_before = latents_world
     # breathing field (single output)
-    latents_breath = apply_breathing( latents_world, pose, mask_torso_exp, frame_counter, breathing, mode=mode, debug=debug, debug_dir=debug_dir )
+    latents_breath = apply_breathing( latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir )
     # temporal modulation
     t = frame_counter / 10.0
     breath_strength = (0.2 + 0.2 * math.sin(t)) * mode_strength
@@ -2453,6 +2271,121 @@ def apply_pose_driven_motion_ultra2(
     timings["breathing"] = time.time() - start
     if debug:
         print(f"[DEBUG] Breathing applied ({mode})")
+
+    return latents_world, state, delta_px
+
+def apply_pose_driven_motion_ultra2(
+    latents,
+    state,
+    keypoints,
+    prev_keypoints=None,
+    frame_counter=0,
+    device="cuda",
+    breathing=True,
+    debug=False,
+    debug_dir=None
+):
+    timings = {}
+    B, C, H, W = latents.shape
+    device = latents.device
+    latents = latents.float()
+    latents_base = latents.clone()
+    latents_world = latents.clone()
+    dx, dy = 0, 0  # warp return
+    # =========================
+    # 🔹 Pose et deltas
+    # =========================
+    start = time.time()
+    pose = Pose(keypoints.to(device))
+    pose.compute_torso_delta(latent_h=H, latent_w=W)
+    prev_pose = Pose(prev_keypoints.to(device)) if prev_keypoints is not None else None
+    timings["Pose"] = time.time() - start
+
+
+
+    # =========================
+    # 🔹 Animation Upper Body
+    # =========================
+    try:
+        # On récupère les coordonnées brutes depuis keypoints
+        upper_body_inputs = {
+            "nose": keypoints[:, pose.FACIAL_POINT_IDX["nose"], :2],
+            "neck": keypoints[:, pose.FACIAL_POINT_IDX["neck"], :2],
+            "right_shoulder": keypoints[:, pose.FACIAL_POINT_IDX["right_shoulder"], :2],
+            "right_elbow": keypoints[:, pose.FACIAL_POINT_IDX["right_elbow"], :2],
+            "right_wrist": keypoints[:, pose.FACIAL_POINT_IDX["right_wrist"], :2],
+            "left_shoulder": keypoints[:, pose.FACIAL_POINT_IDX["left_shoulder"], :2],
+            "left_elbow": keypoints[:, pose.FACIAL_POINT_IDX["left_elbow"], :2],
+            "left_wrist": keypoints[:, pose.FACIAL_POINT_IDX["left_wrist"], :2],
+            "right_clavicle": keypoints[:, pose.FACIAL_POINT_IDX.get("right_clavicle", 19), :2],
+            "left_clavicle": keypoints[:, pose.FACIAL_POINT_IDX.get("left_clavicle", 20), :2],
+        }
+
+        # Mise à jour via animate_upper_body
+        pose_copy = Pose(pose.keypoints.clone())
+        updated_upper_body = animate_upper_body(
+            pose=pose_copy,
+            inputs=upper_body_inputs,
+            mode="smooth",
+            strength=0.35, debug=debug
+        )
+        n = min(pose.keypoints.shape[1], updated_upper_body.shape[1])
+        pose.keypoints[:, :n] = updated_upper_body[:, :n]
+
+        if debug:
+            print(f"[DEBUG] Upper body animated, first shoulder delta:",
+                (pose.keypoints[0, pose.FACIAL_POINT_IDX['left_shoulder'], :2] -
+                keypoints[0, pose.FACIAL_POINT_IDX['left_shoulder'], :2]))
+
+    except Exception as e:
+        print("[WARN] Upper body animation failed:", e)
+
+    # =========================
+    # 🔹 Global compensation
+    # =========================
+    global_shift = torch.zeros((B,1,1,2), device=device)
+    if prev_pose is not None:
+        c1 = pose.get_center()[..., :2]
+        c0 = prev_pose.get_center()[..., :2]
+        delta = c1 - c0
+        delta = torch.clamp(delta, -5.0, 5.0)
+        global_shift = delta.view(B,1,1,2)
+
+    # =========================
+    # 🔹 Grid
+    # =========================
+    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B,1,1,1)
+
+
+    # =========================
+    # 🔹 Masks
+    # =========================
+    mask_face  = torch.clamp(pose.create_face_mask(H,W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter),0,1).float()
+    mask_mouth, _ = pose.create_mouth_mask(H,W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask_mouth = torch.clamp(mask_mouth,0,1).float()
+    mask_mouth_corners, _ = pose.create_mouth_corners_mask(H,W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter)
+    mask_mouth_corners = torch.clamp(mask_mouth_corners,0,1).float()
+    mask_torso = torch.clamp(pose.create_upper_body_mask(H,W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter),0,1).float()
+    mask_hair = torch.clamp(pose.create_hair_mask(H,W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter),0,1).float()
+    mask_left_eye = torch.clamp(pose.create_left_eye_mask(H,W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter),0,1).float()
+    mask_right_eye = torch.clamp(pose.create_right_eye_mask(H,W, debug=debug, debug_dir=debug_dir, frame_counter=frame_counter),0,1).float()
+
+    mask_torso_exp = mask_torso * (1.0 - mask_face)
+    mask_hair_exp = mask_hair * (1.0 - mask_face)
+    mask_face_exp = mask_face
+    mask_mouth_exp = mask_mouth
+
+    print("mask_hair_exp mean:", mask_hair_exp.mean().item())
+    print("mask_face_exp mean:", mask_face_exp.mean().item())
+    print("mask_mouth_exp mean:", mask_mouth_exp.mean().item())
+
+    # 🔥 NOUVEAU MASQUE DÉCOR
+    mask_decor = pose.create_decor_mask(H, W, mask_face, mask_torso, mask_hair, debug=debug, debug_dir=debug_dir)  # doit devenir
+    mask_decor = torch.clamp(mask_decor, 0, 1).float()
+
+    #================== PARTI WORD ========================================
+    latents_world, state, delta_px = apply_pose_world(latents_base=latents_base, latents_world=latents_world, mask_torso=mask_torso, mask_torso_exp=mask_torso_exp, grid=grid, timings=timings, pose=pose, prev_pose=prev_pose, state=state, keypoints=keypoints, prev_keypoints=prev_keypoints, frame_counter=frame_counter, device=device, breathing=breathing, debug=debug, debug_dir=debug_dir )
 
     #================== PARTI LOCAL ========================================
 
@@ -2523,7 +2456,8 @@ def apply_pose_driven_motion_ultra2(
     # ==============================
     # 🔹 Hair motion cycle - OK
     # ==============================
-    if should_freeze(frame_counter, 2): # Pause traitement
+    #if should_freeze(frame_counter, 2): # Pause traitement
+    if frame_counter > 10:
         if not hasattr(apply_pose_driven_motion_ultra2,"prev_hair_fields"):
             apply_pose_driven_motion_ultra2.prev_hair_fields = [None]*B
         start = time.time()
@@ -2542,7 +2476,8 @@ def apply_pose_driven_motion_ultra2(
     # ===========================
     # 🔹 Decor motion cycle - OK
     # ===========================
-    if should_freeze(frame_counter, 2): # Pause traitement
+    #if should_freeze(frame_counter, 10): # Pause traitement
+    if frame_counter > 10:
         if not hasattr(apply_pose_driven_motion_ultra2,"prev_decor_fields"):
             apply_pose_driven_motion_ultra2.prev_decor_fields = [None]*B
         start = time.time()
@@ -2971,12 +2906,12 @@ MOTION_PROFILES = {
         "rotation_gain": 1.35,
         "cinematic_start": 10
     },
-
+    # pas d'animation des keypoints casi null'
     "locked": {
         "time_scale": 0.3,
         "camera_lock": 0.98,
-        "max_velocity": 0.002,
-        "rotation_gain": 0.8,
+        "max_velocity": 0.001,
+        "rotation_gain": 0.001,
         "cinematic_start": 9999
     },
 
