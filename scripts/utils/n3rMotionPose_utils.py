@@ -1727,17 +1727,20 @@ def apply_global_pose(
             indexing="ij"
         )
         grid = torch.stack((xx, yy), dim=-1).float().unsqueeze(0).repeat(B, 1, 1, 1)
-        #return latents, torch.zeros((B,1,1,2), device=device), grid, None
-        global_angle = torch.zeros((B,1,1), device=device)
-        return latents, torch.zeros((B,1,1,2), device=device), grid, None, torch.zeros((B,1,1,2), device=device), global_angle
+        global_angle = torch.zeros((B, 1, 1), device=device)
+        return latents, torch.zeros((B, 1, 1, 2), device=device), grid, None, torch.zeros((B, 1, 1, 2), device=device), global_angle
 
     # =========================================================
     # 🔹 Key joints
     # =========================================================
-    joints = ["left_shoulder", "right_shoulder", "left_hip", "right_hip"]
+    joints = [
+        "left_shoulder", "right_shoulder", "left_hip", "right_hip",
+        "left_elbow", "right_elbow", "left_wrist", "right_wrist",
+        "left_knee", "right_knee", "left_ankle", "right_ankle"
+    ]
     idx = [pose.FACIAL_POINT_IDX[j] for j in joints]
 
-    pts = torch.stack([pose.get_point(i) for i in idx], dim=1)        # [B,4,2]
+    pts = torch.stack([pose.get_point(i) for i in idx], dim=1)  # [B, 12, 2]
     prev_pts = torch.stack([prev_pose.get_point(i) for i in idx], 1)
 
     # =========================================================
@@ -1750,11 +1753,11 @@ def apply_global_pose(
     # =========================================================
     # 🔹 Spine axis (NEW)
     # =========================================================
-    spine_top = (pts[:,0] + pts[:,1]) * 0.5   # shoulders
-    spine_bottom = (pts[:,2] + pts[:,3]) * 0.5  # hips
+    spine_top = (pts[:, 0] + pts[:, 1]) * 0.5  # shoulders
+    spine_bottom = (pts[:, 2] + pts[:, 3]) * 0.5  # hips
 
     spine_vec = spine_top - spine_bottom
-    prev_spine_vec = (prev_pts[:,0]+prev_pts[:,1])*0.5 - (prev_pts[:,2]+prev_pts[:,3])*0.5
+    prev_spine_vec = (prev_pts[:, 0] + prev_pts[:, 1]) * 0.5 - (prev_pts[:, 2] + prev_pts[:, 3]) * 0.5
 
     spine_len = torch.norm(spine_vec, dim=-1, keepdim=True).clamp(1e-6)
     prev_len = torch.norm(prev_spine_vec, dim=-1, keepdim=True).clamp(1e-6)
@@ -1767,7 +1770,7 @@ def apply_global_pose(
     angle = torch.acos(dot)
 
     # signed approx
-    cross = spine_dir[...,0]*prev_dir[...,1] - spine_dir[...,1]*prev_dir[...,0]
+    cross = spine_dir[..., 0] * prev_dir[..., 1] - spine_dir[..., 1] * prev_dir[..., 0]
     angle = angle * torch.sign(cross).unsqueeze(-1)
 
     # =========================================================
@@ -1780,13 +1783,13 @@ def apply_global_pose(
     # 🔹 Pixel conversion
     # =========================================================
     delta_px = torch.zeros_like(delta)
-    delta_px[...,0] = delta[...,0] * W_lat
-    delta_px[...,1] = delta[...,1] * H_lat
+    delta_px[..., 0] = delta[..., 0] * W_lat
+    delta_px[..., 1] = delta[..., 1] * H_lat
 
     if clamp:
         delta_px = torch.tanh(delta_px / 4.0) * 4.0
 
-    delta_px = delta_px.view(B,1,1,2)
+    delta_px = delta_px.view(B, 1, 1, 2)
 
     # =========================================================
     # 🔹 Base grid
@@ -1797,41 +1800,41 @@ def apply_global_pose(
         indexing="ij"
     )
 
-    grid = torch.stack((xx, yy), -1).float().unsqueeze(0).repeat(B,1,1,1)
+    grid = torch.stack((xx, yy), -1).float().unsqueeze(0).repeat(B, 1, 1, 1)
 
     # =========================================================
     # 🔹 CENTER-BASED ROTATION (stable)
     # =========================================================
     center_px = center.clone()
-    center_px[...,0] *= W_lat
-    center_px[...,1] *= H_lat
-    center_px = center_px.view(B,1,1,2)
+    center_px[..., 0] *= W_lat
+    center_px[..., 1] *= H_lat
+    center_px = center_px.view(B, 1, 1, 2)
 
     theta = angle * strength * 0.6
 
-    cos_t = torch.cos(theta).view(B,1,1,1)
-    sin_t = torch.sin(theta).view(B,1,1,1)
+    cos_t = torch.cos(theta).view(B, 1, 1, 1)
+    sin_t = torch.sin(theta).view(B, 1, 1, 1)
 
-    x = grid[...,0:1] - center_px[...,0:1]
-    y = grid[...,1:2] - center_px[...,1:2]
+    x = grid[..., 0:1] - center_px[..., 0:1]
+    y = grid[..., 1:2] - center_px[..., 1:2]
 
-    rot_x = x*cos_t - y*sin_t
-    rot_y = x*sin_t + y*cos_t
+    rot_x = x * cos_t - y * sin_t
+    rot_y = x * sin_t + y * cos_t
 
-    grid = torch.cat([rot_x + center_px[...,0:1],
-                      rot_y + center_px[...,1:2]], dim=-1)
+    grid = torch.cat([rot_x + center_px[..., 0:1],
+                      rot_y + center_px[..., 1:2]], dim=-1)
 
     # =========================================================
     # 🔹 SPINE AXIS DEFORMATION (NEW CORE FEATURE)
     # =========================================================
     spine_mid = (spine_top + spine_bottom) * 0.5
     spine_mid_px = spine_mid.clone()
-    spine_mid_px[...,0] *= W_lat
-    spine_mid_px[...,1] *= H_lat
-    spine_mid_px = spine_mid_px.view(B,1,1,2)
+    spine_mid_px[..., 0] *= W_lat
+    spine_mid_px[..., 1] *= H_lat
+    spine_mid_px = spine_mid_px.view(B, 1, 1, 2)
 
     spine_dir_px = spine_dir.clone()
-    spine_dir_px = spine_dir_px.view(B,1,1,2)
+    spine_dir_px = spine_dir_px.view(B, 1, 1, 2)
 
     # projection of pixel onto spine axis
     rel = grid - spine_mid_px
@@ -1852,16 +1855,15 @@ def apply_global_pose(
 
     grid = grid + delta_px * strength * global_gain
 
-
     # =========================================================
     # 🔥 REAL WARP SHIFT (CRITICAL FIX)
     # =========================================================
-    base_grid = torch.stack((xx, yy), -1).float().unsqueeze(0).repeat(B,1,1,1)
+    base_grid = torch.stack((xx, yy), -1).float().unsqueeze(0).repeat(B, 1, 1, 1)
 
     warp_delta = grid - base_grid  # (B,H,W,2)
 
     # moyenne globale → shift réel
-    warp_shift = warp_delta.mean(dim=(1,2), keepdim=True)  # (B,1,1,2)
+    warp_shift = warp_delta.mean(dim=(1, 2), keepdim=True)  # (B,1,1,2)
 
     # clamp sécurité (évite spikes)
     warp_shift = torch.clamp(warp_shift, -10.0, 10.0)
@@ -1870,8 +1872,8 @@ def apply_global_pose(
     # 🔹 Normalize for grid_sample
     # =========================================================
     grid_norm = grid.clone()
-    grid_norm[...,0] = 2.0 * grid_norm[...,0] / (W_lat - 1) - 1.0
-    grid_norm[...,1] = 2.0 * grid_norm[...,1] / (H_lat - 1) - 1.0
+    grid_norm[..., 0] = 2.0 * grid_norm[..., 0] / (W_lat - 1) - 1.0
+    grid_norm[..., 1] = 2.0 * grid_norm[..., 1] / (H_lat - 1) - 1.0
 
     # =========================================================
     # 🔹 Apply warp
@@ -1889,7 +1891,7 @@ def apply_global_pose(
         print(f"Delta px mean: {delta_px.abs().mean().item():.5f}")
 
         for i, j in enumerate(joints):
-            mv = (pts[:,i]-prev_pts[:,i]) * torch.tensor([W_lat, H_lat], device=device)
+            mv = (pts[:, i] - prev_pts[:, i]) * torch.tensor([W_lat, H_lat], device=device)
             print(f"{j}: {mv.squeeze().tolist()}")
 
         if debug_dir:
@@ -1898,7 +1900,7 @@ def apply_global_pose(
             img = img[:3] if img.shape[0] > 3 else img
 
             torchvision.utils.save_image(
-                (img+1)/2,
+                (img + 1) / 2,
                 os.path.join(debug_dir, "global_pose_debug.png")
             )
 
@@ -2376,7 +2378,7 @@ def apply_pose_driven_motion_ultra2(
     # =========================
     # 🔹 Torso
     # =========================
-    if should_freeze(frame_counter, 2): # Pause traitement
+    if should_freeze(frame_counter, 1): # Pause traitement
         t = torch.tensor(frame_counter/10.0, device=device)
         delta_px = pose.delta.clone()
         delta_px[...,0] *= W
@@ -2423,7 +2425,7 @@ def apply_pose_driven_motion_ultra2(
     if not hasattr(apply_pose_driven_motion_ultra2,"prev_face_grid"):
         apply_pose_driven_motion_ultra2.prev_face_grid = [None]*B
     start = time.time()
-    paused = (frame_counter % 2 == 0)
+    paused = (frame_counter % 10 == 0)
     latents_local, face_delta, facial_points = apply_face_warp(
         latents_local, pose, mask_face, grid, H, W, frame_counter,
         device=device, debug=debug, debug_dir=debug_dir, smooth=0.85,
@@ -2449,7 +2451,7 @@ def apply_pose_driven_motion_ultra2(
     # ===================================
     # 🔹 Mouth & micro-expressions - OK
     # ==================================
-    if should_freeze(frame_counter, 4): # Pause traitement
+    if should_freeze(frame_counter, 2): # Pause traitement
         start = time.time()
         latents_local, mouth_delta, _ = apply_mouth_smil(
             latents_local, pose, mask_mouth, grid, H, W, frame_counter,
@@ -2483,7 +2485,7 @@ def apply_pose_driven_motion_ultra2(
     # ==============================
     # 🔹 Hair motion cycle - OK
     # ==============================
-    if should_freeze(frame_counter, 6): # Pause traitement
+    if should_freeze(frame_counter, 2): # Pause traitement
         if not hasattr(apply_pose_driven_motion_ultra2,"prev_hair_fields"):
             apply_pose_driven_motion_ultra2.prev_hair_fields = [None]*B
         start = time.time()
@@ -2502,7 +2504,7 @@ def apply_pose_driven_motion_ultra2(
     # ===========================
     # 🔹 Decor motion cycle - OK
     # ===========================
-    if should_freeze(frame_counter, 6): # Pause traitement
+    if should_freeze(frame_counter, 2): # Pause traitement
         if not hasattr(apply_pose_driven_motion_ultra2,"prev_decor_fields"):
             apply_pose_driven_motion_ultra2.prev_decor_fields = [None]*B
         start = time.time()

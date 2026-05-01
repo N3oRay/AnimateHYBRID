@@ -77,7 +77,7 @@ class Pose:
             'right_top_hair2': 35,
             'right_top_hair3': 36,
 
-            'mouth_left': 40,    # coin gauche des lèvres supérieures
+            'mouth_left': 40,    # coin gauche des lèvres supérieures upper_ids=(5,6,7,8,9,10),
             'mouth_right': 41,   # coin droit des lèvres supérieures
 
             'nose_left': 42,    # coin gauche du nez
@@ -85,17 +85,14 @@ class Pose:
             # =========================
             # 🔥 VIRTUAL / CINEMATIC POINTS
             # =========================
-
             'mouth_left_c': 48,    # index approximatif coin gauche des lèvres supérieures
             'mouth_right_c': 49,   # index approximatif coin droit des lèvres supérieures
             'mouth_top': 50,     # index approximatif du haut de la bouche (à ajuster selon ton keypoints)
             'mouth_bottom': 51,  # index approximatif du bas de la bouche
 
-
             # =========================
             # 🔥 Point réel
             # =========================
-
             'front_left_1': 52, # front gauche 1
             'front_left_2': 53, # front gauche 2
             'front_m': 54, # front milleu
@@ -107,8 +104,6 @@ class Pose:
     def get_head_up(self):
         """
         Retourne le vecteur `head_up` basé sur les points du visage et des cheveux.
-
-
 
         """
         hair_left = self.get_point(self.FACIAL_POINT_IDX["left_top_hair3"]) # hair_left
@@ -227,7 +222,7 @@ class Pose:
 
         return rotated + pivot
 
-    def apply_rotation_z(self, angle):
+    def apply_rotation_z_v1(self, angle):
         """
         Applique une rotation sur les points du corps (épaules, coudes, poignets) autour du pivot
         calculé à partir des points du torse et du cou.
@@ -246,6 +241,43 @@ class Pose:
 
         # Calculer le pivot comme la moyenne des points dans la plage spécifiée (ici de 5 à 12)
         pivot = self.keypoints[:, 5:min(13, self.B), :2].mean(dim=1, keepdim=True)
+
+        # Adapter la forme de pivot pour qu'il corresponde à celle des points à faire pivoter
+        pivot = pivot.expand(-1, len(upper_ids), -1)
+
+        # Appliquer la rotation des points autour du pivot
+        self.keypoints[:, upper_ids, :2] = self.rotate_points_around_z_axis(
+            self.keypoints[:, upper_ids, :2],
+            pivot,
+            angle
+        )
+
+    def apply_rotation_z(self, angle):
+        """
+        Applique une rotation sur les points du corps (épaules, coudes, poignets) autour du pivot
+        calculé à partir des points du torse et du cou.
+
+        angle : angle de rotation en radians
+        """
+        # Indices des points à faire pivoter (épaules, coudes, poignets, etc.)
+        upper_ids = [
+            self.FACIAL_POINT_IDX['left_shoulder'],
+            self.FACIAL_POINT_IDX['right_shoulder'],
+            self.FACIAL_POINT_IDX['left_elbow'],
+            self.FACIAL_POINT_IDX['right_elbow'],
+            self.FACIAL_POINT_IDX['left_wrist'],
+            self.FACIAL_POINT_IDX['right_wrist'],
+            self.FACIAL_POINT_IDX['left_hip'],
+            self.FACIAL_POINT_IDX['right_hip'],
+            self.FACIAL_POINT_IDX['left_knee'],
+            self.FACIAL_POINT_IDX['right_knee'],
+            self.FACIAL_POINT_IDX['left_ankle'],
+            self.FACIAL_POINT_IDX['right_ankle']
+        ]
+
+        # Calculer le pivot comme la moyenne des points du torse et du cou (ici entre 'neck' et les épaules)
+        # On prend l'index 1 pour le 'neck' et les indices des épaules gauche et droite
+        pivot = self.keypoints[:, [self.FACIAL_POINT_IDX['neck'], self.FACIAL_POINT_IDX['left_shoulder'], self.FACIAL_POINT_IDX['right_shoulder']], :2].mean(dim=1, keepdim=True)
 
         # Adapter la forme de pivot pour qu'il corresponde à celle des points à faire pivoter
         pivot = pivot.expand(-1, len(upper_ids), -1)
@@ -582,6 +614,14 @@ class Pose:
         right_ear = kp[:, 16, :2] if kp.shape[1] > 16 else None
         left_ear  = kp[:, 17, :2] if kp.shape[1] > 17 else None
 
+        # 'mouth_right': 41,   # coin droit des lèvres supérieures
+        mouth_right = kp[:, 41, :2] if kp.shape[1] > 41 else None
+        # 'mouth_left': 40,    # coin gauche des lèvres supérieures
+        mouth_left  = kp[:, 42, :2] if kp.shape[1] > 42 else None
+        # 'mouth': 18, # centre des lèvres supérieures
+        mouth_center = kp[:, 18, :2] if kp.shape[1] > 18 else None
+
+
         # =========================
         # FALLBACK STABLE DISTANCE
         # =========================
@@ -620,11 +660,18 @@ class Pose:
         # =========================
         # MOUTH (FRAME-BASED)
         # =========================
-        mouth_center = head_center + head_up * (0.65 * face_h)
+        if mouth_center is not None :
+            mouth_center = head_center + head_up * (0.65 * face_h)
 
-        mouth_left = mouth_center - head_right * (0.35 * face_w)
-        mouth_right = mouth_center + head_right * (0.35 * face_w)
+        if mouth_left is not None :
+            mouth_left = mouth_center - head_right * (0.35 * face_w)
+
+        if mouth_right is not None :
+            mouth_right = mouth_center + head_right * (0.35 * face_w)
+
+        # Calcul de la position du haut de la bouche
         mouth_top = mouth_center - head_up * (0.15 * face_h)
+        # Calcul de la position du bas de la bouche
         mouth_bottom = mouth_center + head_up * (0.15 * face_h)
 
         # =========================
@@ -674,7 +721,9 @@ class Pose:
         points.update({
             "mouth_center": mouth_center,
             "mouth_left_c": mouth_left,
+            "mouth_left" : mouth_left,
             "mouth_right_c": mouth_right,
+            "mouth_right" : mouth_right,
             "mouth_top": mouth_top,
             "mouth_bottom": mouth_bottom,
         })

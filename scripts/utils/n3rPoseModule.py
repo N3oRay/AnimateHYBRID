@@ -190,9 +190,6 @@ ACTOR_LABELS = {
 
 ACTOR_MODEL_SCHEDULE_test = [
     (0, "pause"),
-    (1, "v14"),
-    (5, "v12"),
-    (10, "v8"),
     (15, "v6"),
 
 ]
@@ -203,11 +200,11 @@ ACTOR_MODEL_SCHEDULE = [
     (5,  "v9"),
     (19, "pause"),
     (22, "v3"),
-    (25, "v14"), #25,26
-    (30,  "v12"), #30 a 32
+    (25, "v14"), #OK
+    (30,  "v12"), #OK
     (35, "pause"),
-    (40, "v7"),
-    (45, "v8"),
+    (40, "v7"), #OK
+    (45, "v8"), #OK
     (50, "v6"),
 ]
 
@@ -1332,12 +1329,12 @@ def cinematic_motion_graph_v7(
     head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     upper_ids=(5,6,7,8,9,10),
     hip_ids=(11,12),
-    rotation_strength=1.2,
+    rotation_strength=0.5,
     motion_sensitivity=4.0,
     damping=0.90,
     inertia=0.85,
     head_lag=0.7,
-    max_deg=10.0,
+    max_deg=5.0,
     debug=False
 ):
     B, N, _ = kp.shape
