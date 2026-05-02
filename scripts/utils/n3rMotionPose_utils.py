@@ -663,6 +663,40 @@ def update_keypoints_from_pose(
     head_up = np.array(hair_center) - np.array(left_clavicle)
     head_up = head_up / (np.linalg.norm(head_up) + 1e-6)
 
+    # ============ Bouche =============
+
+    # Vérifier si des coordonnées de la bouche ont été détectées
+    if mouth_coords:
+        # Afficher les coordonnées pour chaque partie de la bouche
+        for key, value in mouth_coords.items():
+            print(f"{key}: {value}")
+
+            """
+            mouth_center: (313, 645)
+            mouth_left: (266, 649)
+            mouth_right: (387, 645)
+            mouth_top_mid_r3: (361, 638)
+            mouth_top_mid_r2: (342, 633)
+            mouth_top_mid_r1: (316, 628)
+            mouth_top_mid: (296, 632)
+            mouth_top_mid_l1: (279, 629)
+            mouth_top_mid_l2: (269, 633)
+            mouth_top_mid_l3: (265, 638)
+            mouth_bot_mid_r3: (369, 661)
+            mouth_bot_mid_r2: (353, 672)
+            mouth_bot_mid_r1: (333, 680)
+            mouth_bot_mid: (312, 681)
+            mouth_bot_mid_l1: (295, 679)
+            mouth_bot_mid_l2: (282, 673)
+            mouth_bot_mid_l3: (273, 663)
+            """
+
+        # Extraire les coordonnées du centre de la bouche
+        mouth_center = mouth_coords.get('mouth_center')
+        print(f"Centre de la bouche: {mouth_center}")
+    else:
+        print("⚠️ Aucune bouche détectée.")
+
 
     # =========================================================
     # 🔥 KNEE ANKLE - GENOU ET CHEVILLE
@@ -800,7 +834,7 @@ def update_keypoints_from_pose(
         16: ("right_ear", right_ear),
         17: ("left_ear", left_ear),
 
-        18: ("mouth", mouth_coords),
+        18: ("mouth", mouth_center),
 
         19: ("right_clavicle", right_clavicle),
         20: ("left_clavicle", left_clavicle),

@@ -56,24 +56,58 @@ def has_valid_coords(face_coords_dict):
 
 
 def sanitize_coords(coords):
+    """
+    Filtre les coordonnées pour s'assurer qu'elles sont valides.
+    Si les coordonnées sont valides (deux valeurs numériques), elles sont ajoutées à la liste valide.
+
+    Args:
+        coords (list/dict): Liste ou dictionnaire de coordonnées.
+
+    Returns:
+        list: Liste des coordonnées valides.
+    """
     valid = []
-    if isinstance(coords, dict) and "center" in coords:
-        coords = [coords["center"]]
-    for p in coords:
-        try:
-            if len(p) != 2:
-                print(f"⚠ Coordonnée ignorée car invalide: {p}")
+
+    # Si c'est un dictionnaire, on itère sur ses valeurs
+    if isinstance(coords, dict):
+        for key, value in coords.items():
+            if isinstance(value, tuple) and len(value) == 2:
+                valid.append(value)
+            else:
+                print(f"⚠️ Coordonnée ignorée pour {key} : {value}")
+    elif isinstance(coords, list):
+        # Si c'est une liste, on applique la logique sur chaque élément
+        for p in coords:
+            try:
+                if len(p) != 2:
+                    print(f"⚠️ Coordonnée ignorée car invalide: {p}")
+                    continue
+                x, y = int(p[0]), int(p[1])
+                valid.append([x, y])
+            except (ValueError, TypeError):
+                print(f"⚠️ Coordonnée ignorée car invalide: {p}")
                 continue
-            x, y = int(p[0]), int(p[1])
-            valid.append([x, y])
-        except (ValueError, TypeError):
-            print(f"⚠ Coordonnée ignorée car invalide: {p}")
-            continue
     return valid
 
-# Convertir toutes les coordonnées en [[x, y]] et sécuriser
+
+
 def process_coords(coords, label="coords"):
+    """
+    Convertit les coordonnées en flottants et les affiche pour débogage.
+    Args:
+        coords (list/dict): Liste ou dictionnaire de coordonnées.
+        label (str): Label pour l'affichage.
+
+    Returns:
+        list: Liste des coordonnées sous forme de [[x, y]].
+    """
     print(f"{label}: {coords}")
+
+    if isinstance(coords, dict):
+        # Si c'est un dictionnaire, on récupère les valeurs (qui sont des tuples ou des listes avec 2 éléments)
+        coords = list(coords.values())
+
+    # S'assure que chaque élément de coords est une paire de coordonnées (x, y)
     return [[float(x), float(y)] for x, y in coords]
 
 
@@ -84,6 +118,20 @@ def prepare_face_coords(
     nose_coords,
     process_coords
 ):
+    """
+    Prépare les coordonnées du visage, les nettoie et les normalise.
+    Les coordonnées sont traitées pour être prêtes à être utilisées ailleurs.
+
+    Args:
+        eye_coords (list): Coordonnées des yeux.
+        mouth_coords (dict): Coordonnées de la bouche sous forme de dictionnaire.
+        ear_coords (list): Coordonnées des oreilles.
+        nose_coords (list): Coordonnées du nez.
+        process_coords (function): Fonction pour le traitement des coordonnées.
+
+    Returns:
+        dict: Dictionnaire des coordonnées du visage.
+    """
     print("🟢 Debug coords:")
 
     # --- Normalisation initiale ---
@@ -97,14 +145,14 @@ def prepare_face_coords(
     eye_coords_list = sanitize_coords(eye_coords)
     print(f"eye_coords sanitize_coords: {eye_coords_list}")
 
-    mouth_coords_list = sanitize_coords(mouth_coords)
-    print(f"mouth_coords_list sanitize_coords: {mouth_coords_list}")
+    mouth_coords_list = sanitize_coords(mouth_coords)  # On passe le dict mouth_coords directement
+    print(f"mouth_coords sanitize_coords: {mouth_coords_list}")
 
     ear_coords_list = sanitize_coords(ear_coords)
-    print(f"ear_coords_list sanitize_coords: {ear_coords_list}")
+    print(f"ear_coords sanitize_coords: {ear_coords_list}")
 
     nose_coords_list = sanitize_coords(nose_coords)
-    print(f"nose_coords_list sanitize_coords: {nose_coords_list}")
+    print(f"nose_coords sanitize_coords: {nose_coords_list}")
 
     # --- Nez dict (conservé pour ailleurs) ---
     nose_coords_dict = nose_coords if nose_coords else None

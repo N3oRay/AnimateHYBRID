@@ -18,7 +18,7 @@ def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
     Convertit des coordonnées de bouche dans l'image originale
     vers l'espace latent correspondant.
 
-    mouth_coords : liste de tuples [(x, y), ...] ou None
+    mouth_coords : liste de tuples [(x, y), ...] ou dictionnaire {key: (x, y), ...} ou None
     img_H, img_W : dimensions de l'image d'origine
     lat_H, lat_W : dimensions du latent
     """
@@ -26,9 +26,15 @@ def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
     if not mouth_coords:
         return None
 
+    # Si mouth_coords est un dictionnaire, récupère les valeurs (les coordonnées)
+    if isinstance(mouth_coords, dict):
+        mouth_coords = list(mouth_coords.values())
+
+    # Calcule les facteurs d'échelle pour x et y
     scale_x = lat_W / img_W
     scale_y = lat_H / img_H
 
+    # Retourne les coordonnées transformées dans l'espace latent
     return [(int(x * scale_x), int(y * scale_y)) for x, y in mouth_coords]
 #----------------------------------------------------------------------------
 
@@ -130,8 +136,6 @@ def get_elbows_coords_pixels(image_pil, H=None, W=None):
     Returns:
         list[[x, y], [x, y]] : [left_elbow, right_elbow] en pixels
     """
-    import numpy as np
-    import mediapipe as mp
 
     mp_pose = mp.solutions.pose
 
@@ -336,7 +340,7 @@ def get_mouth_coords_safe(image_pil, face_mesh, H=None, W=None):
         return None
 
 
-def get_mouth_coords(image_pil, face_mesh):
+def get_mouth_coords_v1(image_pil, face_mesh):
     """
     Détecte les coordonnées de la bouche avec MediaPipe FaceMesh (mode tracking).
 
@@ -363,6 +367,28 @@ def get_mouth_coords(image_pil, face_mesh):
 
     # 🔹 Indices bouche (outer lips)
     MOUTH_OUTER = [61, 291, 0, 17, 37, 267, 78, 308]
+    """
+    MOUTH_LEFT = [61]
+    MOUTH_RIGHT = [291]
+
+    MOUTH_TOP_MID_R3 = [270]
+    MOUTH_TOP_MID_R2 = [269]
+    MOUTH_TOP_MID_R1 = [267]
+    MOUTH_TOP_MID = [0]
+    MOUTH_TOP_MID_L1 = [37]
+    MOUTH_TOP_MID_L2 = [39]
+    MOUTH_TOP_MID_L3 = [40]
+
+
+    MOUTH_BOT_MID_R3 = [321]
+    MOUTH_BOT_MID_R2 = [405]
+    MOUTH_BOT_MID_R1 = [314]
+    MOUTH_BOT_MID = [17]
+    MOUTH_BOT_MID_L1 = [84]
+    MOUTH_BOT_MID_L2 = [181]
+    MOUTH_BOT_MID_L3 = [91]
+    """
+
 
     def get_center(indices):
         xs, ys = [], []
@@ -374,7 +400,92 @@ def get_mouth_coords(image_pil, face_mesh):
 
     mouth_center = get_center(MOUTH_OUTER)
 
+
     return [mouth_center]
+
+
+def get_mouth_coords(image_pil, face_mesh):
+    """
+    Détecte les coordonnées de la bouche avec MediaPipe FaceMesh (mode tracking).
+
+    Args:
+        image_pil (PIL.Image): image d'entrée
+        face_mesh: instance persistante MediaPipe FaceMesh
+
+    Returns:
+        dict: Dictionnaire des coordonnées des points de la bouche.
+    """
+    import numpy as np
+
+    # Convertir l'image PIL en format compatible avec MediaPipe
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    # 🔥 Utilisation de l'instance existante (IMPORTANT)
+    results = face_mesh.process(image)
+
+    if not results.multi_face_landmarks:
+        print("⚠️ No face detected (mouth)")
+        return None
+
+    face_landmarks = results.multi_face_landmarks[0]
+
+    # 🔹 Indices bouche (outer lips)
+    MOUTH_OUTER = [61, 291, 0, 17, 37, 267, 78, 308]
+
+    MOUTH_LEFT = [61]
+    MOUTH_RIGHT = [291]
+
+    MOUTH_TOP_MID_R3 = [270]
+    MOUTH_TOP_MID_R2 = [269]
+    MOUTH_TOP_MID_R1 = [267]
+    MOUTH_TOP_MID = [0]
+    MOUTH_TOP_MID_L1 = [37]
+    MOUTH_TOP_MID_L2 = [39]
+    MOUTH_TOP_MID_L3 = [40]
+
+    MOUTH_BOT_MID_R3 = [321]
+    MOUTH_BOT_MID_R2 = [405]
+    MOUTH_BOT_MID_R1 = [314]
+    MOUTH_BOT_MID = [17]
+    MOUTH_BOT_MID_L1 = [84]
+    MOUTH_BOT_MID_L2 = [181]
+    MOUTH_BOT_MID_L3 = [91]
+
+    def get_center(indices):
+        """Retourne le centre de la bouche pour un ensemble d'indices."""
+        xs, ys = [], []
+        for idx in indices:
+            lm = face_landmarks.landmark[idx]
+            xs.append(lm.x * w)
+            ys.append(lm.y * h)
+        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+
+    # Calcul des coordonnées pour chaque partie de la bouche
+    mouth_coords = {}
+
+    mouth_coords['mouth_center'] = get_center(MOUTH_OUTER)
+
+    mouth_coords['mouth_left'] = get_center(MOUTH_LEFT)
+    mouth_coords['mouth_right'] = get_center(MOUTH_RIGHT)
+
+    mouth_coords['mouth_top_mid_r3'] = get_center(MOUTH_TOP_MID_R3)
+    mouth_coords['mouth_top_mid_r2'] = get_center(MOUTH_TOP_MID_R2)
+    mouth_coords['mouth_top_mid_r1'] = get_center(MOUTH_TOP_MID_R1)
+    mouth_coords['mouth_top_mid'] = get_center(MOUTH_TOP_MID)
+    mouth_coords['mouth_top_mid_l1'] = get_center(MOUTH_TOP_MID_L1)
+    mouth_coords['mouth_top_mid_l2'] = get_center(MOUTH_TOP_MID_L2)
+    mouth_coords['mouth_top_mid_l3'] = get_center(MOUTH_TOP_MID_L3)
+
+    mouth_coords['mouth_bot_mid_r3'] = get_center(MOUTH_BOT_MID_R3)
+    mouth_coords['mouth_bot_mid_r2'] = get_center(MOUTH_BOT_MID_R2)
+    mouth_coords['mouth_bot_mid_r1'] = get_center(MOUTH_BOT_MID_R1)
+    mouth_coords['mouth_bot_mid'] = get_center(MOUTH_BOT_MID)
+    mouth_coords['mouth_bot_mid_l1'] = get_center(MOUTH_BOT_MID_L1)
+    mouth_coords['mouth_bot_mid_l2'] = get_center(MOUTH_BOT_MID_L2)
+    mouth_coords['mouth_bot_mid_l3'] = get_center(MOUTH_BOT_MID_L3)
+
+    return mouth_coords
 
 #--------------------------------------------------------------------------------
 def get_wrists_coords(image_pil, pose_model, H=None, W=None):
