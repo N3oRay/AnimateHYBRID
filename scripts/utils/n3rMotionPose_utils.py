@@ -521,6 +521,48 @@ def extract_keypoints_from_pose(
         [0.0, 0.0, 0.0], # 55
         [0.0, 0.0, 0.0], # 56
 
+        [0.0, 0.0, 0.0], # 57
+        [0.0, 0.0, 0.0], # 58
+        [0.0, 0.0, 0.0], # 59
+
+        [0.0, 0.0, 0.0], # 60
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0], #70
+
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0], #80
+
+
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0], #90
+
+
+
+
     ]
 
     # =========================================================
@@ -654,7 +696,7 @@ def update_keypoints_from_pose(
 
     #💇 Hair detected: [(197, 405), (300, 389), (403, 374)]  #'hair_root': 25, 'hair_left': 26, 'hair_right': 27, 'hair_top': 28,
 
-    hair_left, hair_top_left, mouth_left, nose_left, hair_top, hair_top_right, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, left_top_hair3, nose_right, hair_right, hair_root, front_m, front_left1, front_left2, front_right1, front_right2  = pair(hair_coords, debug=debug)
+    hair_left, hair_top_left, mouth_left_ext, nose_left, hair_top, hair_top_right, mouth_right_ext, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, left_top_hair3, nose_right, hair_right, hair_root, front_m, front_left1, front_left2, front_right1, front_right2  = pair(hair_coords, debug=debug)
 
 
     print(f"Position de hair_root en pixels : {hair_root}")
@@ -667,32 +709,32 @@ def update_keypoints_from_pose(
 
     # Vérifier si des coordonnées de la bouche ont été détectées
     if mouth_coords:
-        # Afficher les coordonnées pour chaque partie de la bouche
-        for key, value in mouth_coords.items():
-            print(f"{key}: {value}")
+        if debug:
+            # Afficher les coordonnées pour chaque partie de la bouche
+            for key, value in mouth_coords.items():
+                print(f"{key}: {value}")
 
-            """
-            mouth_center: (313, 645)
-            mouth_left: (266, 649)
-            mouth_right: (387, 645)
-            mouth_top_mid_r3: (361, 638)
-            mouth_top_mid_r2: (342, 633)
-            mouth_top_mid_r1: (316, 628)
-            mouth_top_mid: (296, 632)
-            mouth_top_mid_l1: (279, 629)
-            mouth_top_mid_l2: (269, 633)
-            mouth_top_mid_l3: (265, 638)
-            mouth_bot_mid_r3: (369, 661)
-            mouth_bot_mid_r2: (353, 672)
-            mouth_bot_mid_r1: (333, 680)
-            mouth_bot_mid: (312, 681)
-            mouth_bot_mid_l1: (295, 679)
-            mouth_bot_mid_l2: (282, 673)
-            mouth_bot_mid_l3: (273, 663)
-            """
 
         # Extraire les coordonnées du centre de la bouche
         mouth_center = mouth_coords.get('mouth_center')
+        mouth_left = mouth_coords.get('mouth_left')
+        mouth_right = mouth_coords.get('mouth_right')
+        mouth_top_mid_r3 = mouth_coords.get('mouth_top_mid_r3')
+        mouth_top_mid_r2 = mouth_coords.get('mouth_top_mid_r2')
+        mouth_top_mid_r1 = mouth_coords.get('mouth_top_mid_r1')
+        mouth_top_mid = mouth_coords.get('mouth_top_mid')
+        mouth_top_mid_l1 = mouth_coords.get('mouth_top_mid_l1')
+        mouth_top_mid_l2 = mouth_coords.get('mouth_top_mid_l2')
+        mouth_top_mid_l3 = mouth_coords.get('mouth_top_mid_l3')
+
+        mouth_bot_mid_r3 = mouth_coords.get('mouth_bot_mid_r3')
+        mouth_bot_mid_r2 = mouth_coords.get('mouth_bot_mid_r2')
+        mouth_bot_mid_r1 = mouth_coords.get('mouth_bot_mid_r1')
+        mouth_bot_mid = mouth_coords.get('mouth_bot_mid')
+        mouth_bot_mid_l1 = mouth_coords.get('mouth_bot_mid_l1')
+        mouth_bot_mid_l2 = mouth_coords.get('mouth_bot_mid_l2')
+        mouth_bot_mid_l3 = mouth_coords.get('mouth_bot_mid_l3')
+
         print(f"Centre de la bouche: {mouth_center}")
     else:
         print("⚠️ Aucune bouche détectée.")
@@ -864,17 +906,41 @@ def update_keypoints_from_pose(
         #38: ("top_hair2", top_hair2), #OK
         #39: ("top_hair3", top_hair3), #OK
 
+        38: ("mouth_left_ext", mouth_left_ext),
+        39: ("mouth_right_ext", mouth_right_ext),
+
         40: ("mouth_left", mouth_left),
         41: ("mouth_right", mouth_right),
 
         42: ("nose_left", nose_left),
         43: ("nose_right", nose_right),
 
+
+
         52: ("front_left_1", front_left1), #OK
         53: ("front_left_2", front_left2), #OK
         54: ("front_m", front_m), #OK
         55: ("front_right_1", front_right1), #OK
         56: ("front_right_2", front_right2), #OK
+
+
+        70: ("mouth_top_mid_r3", mouth_top_mid_r3), #OK
+        71: ("mouth_top_mid_r2", mouth_top_mid_r2), #OK
+        72: ("mouth_top_mid_r1", mouth_top_mid_r1), #OK
+        73: ("mouth_top_mid", mouth_top_mid), #OK
+        74: ("mouth_top_mid_l1", mouth_top_mid_l1), #OK
+        75: ("mouth_top_mid_l2", mouth_top_mid_l2), #OK
+        76: ("mouth_top_mid_l3", mouth_top_mid_l3), #OK
+
+        77: ("mouth_bot_mid_r3", mouth_bot_mid_r3), #OK
+        78: ("mouth_bot_mid_r2", mouth_bot_mid_r2), #OK
+        79: ("mouth_bot_mid_r1", mouth_bot_mid_r1), #OK
+        80: ("mouth_bot_mid", mouth_bot_mid), #OK
+        81: ("mouth_bot_mid_l1", mouth_bot_mid_l1), #OK
+        82: ("mouth_bot_mid_l2", mouth_bot_mid_l2), #OK
+        83: ("mouth_bot_mid_l3", mouth_bot_mid_l3), #OK
+
+
 
 
     }
