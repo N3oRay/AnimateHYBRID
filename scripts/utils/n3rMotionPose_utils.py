@@ -25,6 +25,67 @@ from PIL import Image, ImageDraw
 import traceback
 from torchvision.utils import save_image
 
+
+"""
+alpha_base = 0.92          # un peu plus inertie
+freeze_threshold = 0.0022  # freeze plus actif
+freeze_strength = 0.30     # freeze utile mais pas bloquant
+micro_jitter = 0.00012     # encore plus subtil
+time_scale = 0.45          # ralentit légèrement plus
+max_velocity = 0.008       # 🔥 clé principale (cinematic cap)
+"""
+
+MOTION_PROFILES = {
+    "stable": {
+        "time_scale": 0.4,
+        "camera_lock": 0.95,
+        "max_velocity": 0.004,
+        "rotation_gain": 1.0,
+        "cinematic_start": 25
+    },
+
+    "cinematic": {
+        "time_scale": 0.5,
+        "camera_lock": 0.85,
+        "max_velocity": 0.03,
+        "rotation_gain": 1.2,
+        "cinematic_start": 20
+    },
+
+    "warp": {
+        "time_scale": 0.3,
+        "camera_lock": 0.92,
+        "max_velocity": 0.008,
+        "rotation_gain": 1.2,
+        "cinematic_start": 10
+    },
+
+    "dynamic": {
+        "time_scale": 0.6,
+        "camera_lock": 0.92,
+        "max_velocity": 0.008,
+        "rotation_gain": 1.35,
+        "cinematic_start": 10
+    },
+    # pas d'animation des keypoints casi null'
+    "locked": {
+        "time_scale": 0.3,
+        "camera_lock": 0.98,
+        "max_velocity": 0.001,
+        "rotation_gain": 0.001,
+        "cinematic_start": 9999
+    },
+
+    # optional hint only (NOT authoritative)
+    "acting": {
+        "time_scale": 0.55,
+        "camera_lock": 0.75,
+        "max_velocity": 0.02,
+        "rotation_gain": 1.3,
+        "cinematic_start": 15
+    }
+}
+
 def border_fade_mask_rotate(
     H, W, device,
     fade_ratio=0.1,
@@ -133,7 +194,7 @@ def compensate_latent_shift_dev(
     latent,
     frame_counter,
     shift,
-    global_angle=None,
+    global_angle_z=None,  # Angle axe Z
     prev_latent=None,
     max_shift_ratio=0.5,
     padding_mode="reflection",
@@ -175,13 +236,13 @@ def compensate_latent_shift_dev(
         print(f"[SHIFT] in=({shift[0]:.4f},{shift[1]:.4f}) | gain={gain:.3f} | out=({dx:.4f},{dy:.4f})")
 
     # =========================================================
-    # 2. ANGLE
+    # 2. ANGLE axe Z
     # =========================================================
-    if global_angle is not None:
-        if isinstance(global_angle, torch.Tensor):
-            angle = float(global_angle.mean())
+    if global_angle_z is not None:
+        if isinstance(global_angle_z, torch.Tensor):
+            angle = float(global_angle_z.mean())
         else:
-            angle = float(global_angle)
+            angle = float(global_angle_z)
     else:
         angle = 0.0
 
@@ -194,7 +255,7 @@ def compensate_latent_shift_dev(
     angle = max(-max_angle, min(max_angle, angle))
 
     if debug:
-        print(f"[ANGLE] base={global_angle} | gain={rot_gain:.3f} | final={angle:.5f} rad")
+        print(f"[ANGLE] base={global_angle_z} | gain={rot_gain:.3f} | final={angle:.5f} rad")
 
     # Inverse rotation
     angle = -angle
@@ -249,8 +310,8 @@ def compensate_latent_shift_dev(
     # VALID MASK (SAFE VERSION)
     # =========================================================
 
-    if global_angle is not None:
-        angle_warp = float(global_angle)
+    if global_angle_z is not None:
+        angle_warp = float(global_angle_z)
         valid_mask = border_fade_mask_rotate( H, W, device, fade_ratio=0.1, angle=angle_warp, inverse=True )
     else:
         valid_mask = border_fade_mask(H, W, device, fade_ratio=0.05)
@@ -275,7 +336,7 @@ def compensate_latent_shift_dev(
         print(f"[MASK] kernel_size={kernel_size:.4f}")
 
     # Ajuster la taille du noyau en fonction de l'angle
-    angle_factor = min(abs(float(global_angle)) * 200, 10) if global_angle is not None else 0
+    angle_factor = min(abs(float(global_angle_z)) * 200, 10) if global_angle_z is not None else 0
     kernel_size += int(angle_factor)
 
     if debug:
@@ -2957,65 +3018,6 @@ def compute_time(frame_idx, frame_pause, base_dt=0.03):
 
 
 
-"""
-alpha_base = 0.92          # un peu plus inertie
-freeze_threshold = 0.0022  # freeze plus actif
-freeze_strength = 0.30     # freeze utile mais pas bloquant
-micro_jitter = 0.00012     # encore plus subtil
-time_scale = 0.45          # ralentit légèrement plus
-max_velocity = 0.008       # 🔥 clé principale (cinematic cap)
-"""
-
-MOTION_PROFILES = {
-    "stable": {
-        "time_scale": 0.4,
-        "camera_lock": 0.95,
-        "max_velocity": 0.004,
-        "rotation_gain": 1.0,
-        "cinematic_start": 25
-    },
-
-    "cinematic": {
-        "time_scale": 0.5,
-        "camera_lock": 0.85,
-        "max_velocity": 0.03,
-        "rotation_gain": 1.2,
-        "cinematic_start": 20
-    },
-
-    "warp": {
-        "time_scale": 0.5,
-        "camera_lock": 0.92,
-        "max_velocity": 0.008,
-        "rotation_gain": 1.2,
-        "cinematic_start": 10
-    },
-
-    "dynamic": {
-        "time_scale": 0.7,
-        "camera_lock": 0.90,
-        "max_velocity": 0.012,
-        "rotation_gain": 1.35,
-        "cinematic_start": 10
-    },
-    # pas d'animation des keypoints casi null'
-    "locked": {
-        "time_scale": 0.3,
-        "camera_lock": 0.98,
-        "max_velocity": 0.001,
-        "rotation_gain": 0.001,
-        "cinematic_start": 9999
-    },
-
-    # optional hint only (NOT authoritative)
-    "acting": {
-        "time_scale": 0.55,
-        "camera_lock": 0.75,
-        "max_velocity": 0.02,
-        "rotation_gain": 1.3,
-        "cinematic_start": 15
-    }
-}
 
 
 
@@ -3097,7 +3099,6 @@ def update_sequence_from_keypoints_batch(
     state.setdefault("angle", 0.0)
     state.setdefault("rotation", 0.0)
     state.setdefault("initialized", True)
-    state.setdefault("global_angle", 0.0)
     state.setdefault("global_angle_x", 0.0)
     state.setdefault("global_angle_y", 0.0)
     state.setdefault("global_angle_z", 0.0)
@@ -3186,8 +3187,6 @@ def update_sequence_from_keypoints_batch(
     # =========================================================
     # DRIFT SAFE (VECTOR EMA STABLE)
     # =========================================================
-
-
     if kp_prev is not None and torch.is_tensor(kp_prev):
 
         kp_prev_xy = kp_prev[..., :2]
@@ -3209,9 +3208,6 @@ def update_sequence_from_keypoints_batch(
 
     else:
         drift = torch.zeros((1,1,2), device=kp.device)
-
-
-
 
     # =========================================================
     # CAMERA STABILIZATION
@@ -3247,39 +3243,70 @@ def update_sequence_from_keypoints_batch(
               (kp[..., :2] - kp_prev[..., :2]).abs().mean().item())
 
     # =========================================================
-    # 8. ROTATION SAFE
+    # 8. ROTATION SAFE (X, Y, Z)
     # =========================================================
     if kp_prev is not None:
         center = kp[..., :2].mean(dim=1, keepdim=True)
 
-        #angle = 0.08 * math.sin(frame_idx * 0.05)
-        # priorité à la rotation globale réelle
-        angle_global = state.get("global_angle", 0.0)
+        # Priorité à la rotation globale réelle
+        angle_global_x = state.get("global_angle_x", 0.0)  # Rotation autour de l'axe X
+        angle_global_y = state.get("global_angle_y", 0.0)  # Rotation autour de l'axe Y
+        angle_global_z = state.get("global_angle_z", 0.0)  # Rotation autour de l'axe Z
 
-        # fallback léger si pas dispo
+        # Fallback léger si pas disponible
         angle_fake = 0.02 * math.sin(frame_idx * 0.05)
 
-        # blend safe
-        angle = 0.8 * angle_global + 0.2 * angle_fake
-        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        # Mélange des angles
+        angle_x = 0.5 * angle_global_x + 0.5 * angle_fake
+        angle_y = 0.5 * angle_global_y + 0.5 * angle_fake
+        angle_z = 0.5 * angle_global_z + 0.5 * angle_fake
 
-        rot = torch.tensor(
-            [[cos_a, -sin_a],
-             [sin_a,  cos_a]],
+        # Calcul des matrices de rotation pour chaque axe
+        cos_x, sin_x = math.cos(angle_x), math.sin(angle_x)
+        cos_y, sin_y = math.cos(angle_y), math.sin(angle_y)
+        cos_z, sin_z = math.cos(angle_z), math.sin(angle_z)
+
+        rot_x = torch.tensor(
+            [[1, 0, 0],
+            [0, cos_x, -sin_x],
+            [0, sin_x, cos_x]],
             device=kp.device,
             dtype=kp.dtype
         )
 
+        rot_y = torch.tensor(
+            [[cos_y, 0, sin_y],
+            [0, 1, 0],
+            [-sin_y, 0, cos_y]],
+            device=kp.device,
+            dtype=kp.dtype
+        )
+
+        rot_z = torch.tensor(
+            [[cos_z, -sin_z, 0],
+            [sin_z, cos_z, 0],
+            [0, 0, 1]],
+            device=kp.device,
+            dtype=kp.dtype
+        )
+
+        # Appliquer la rotation sur les trois axes
+        rotation_matrix = torch.matmul(rot_z, torch.matmul(rot_y, rot_x))  # Rotation combinée (Z -> Y -> X)
+
+        # Appliquer la rotation sur les coordonnées
         kp_before = kp.clone()
         xy = kp[..., :2] - center
 
-        kp[..., :2] = torch.einsum('bnc,cd->bnd', xy, rot) + center
+        # Appliquer la transformation de rotation (attention : il faut étendre les coordonnées de 2D à 3D avant)
+        xy_3d = torch.cat([xy, torch.zeros_like(xy[..., :1])], dim=-1)  # Passer de 2D à 3D (en ajoutant un zéro pour Z)
+        kp[..., :2] = torch.einsum('bnc,cd->bnd', xy_3d, rotation_matrix[..., :2]) + center
 
         delta_rot = kp[..., :2] - kp_before[..., :2]
         dist_before = torch.norm(kp_before[..., :2] - center, dim=-1)
 
+        # Affichage du debug des rotations
         print("\n[DEBUG ROTATION]")
-        angle_val = angle
+        angle_val = angle_z
         if torch.is_tensor(angle_val):
             angle_val = angle_val.mean().item()
 
@@ -3289,7 +3316,6 @@ def update_sequence_from_keypoints_batch(
         print(f"delta_rot mean: {delta_rot.abs().mean().item():.6f}")
         print(f"delta_rot max: {delta_rot.abs().max().item():.6f}")
         print(f"radius mean: {dist_before.mean().item():.6f}")
-
     # =========================================================
     # 9. PHYSICS LIMIT
     # =========================================================
@@ -3356,14 +3382,19 @@ def update_sequence_from_keypoints_batch(
     new_state["kp_prev"] = kp.clone()
 
     if "anchor" not in new_state or new_state["anchor"] is None:
-        #new_state["anchor"] = kp.mean(dim=1)
         new_state["anchor"] = kp.mean(dim=1, keepdim=True)
 
     new_state["global_shift"] = state.get("global_shift", None)
-    new_state["global_angle"] = state.get("global_angle", None)
     new_state["global_angle_x"] = state.get("global_angle_x", None)
     new_state["global_angle_y"] = state.get("global_angle_y", None)
     new_state["global_angle_z"] = state.get("global_angle_z", None)
+
+    if debug:
+        print(f"[DEBUG][STATE UPDATE SAFE] global_shift: {state.get('global_shift', None)}")
+        print(f"[DEBUG][STATE UPDATE SAFE] global_angle_x: {state.get('global_angle_x', None)}")
+        print(f"[DEBUG][STATE UPDATE SAFE] global_angle_y: {state.get('global_angle_y', None)}")
+        print(f"[DEBUG][STATE UPDATE SAFE] global_angle_z: {state.get('global_angle_z', None)}")
+
 
     return kp, new_state
 
