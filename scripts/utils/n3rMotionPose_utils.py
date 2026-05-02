@@ -2,9 +2,10 @@
 # n3rOpenPose_utils.py
 #********************************************
 import torch
+import math
 import time
 from diffusers import ControlNetModel
-import math
+
 import torch.nn.functional as F
 from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body, reconstruct_hips
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
@@ -1614,6 +1615,12 @@ def apply_torso_warp(
 
 
 # version corriger
+import torch
+import torch.nn.functional as F
+import math
+import time
+import os
+
 def apply_global_pose(
     latents,
     pose,
@@ -1819,12 +1826,12 @@ def apply_global_pose(
                 os.path.join(debug_dir, "global_pose_debug.png")
             )
 
-    sign = torch.where(torch.abs(cross) < 1e-6, torch.ones_like(cross), torch.sign(cross))
-    angle = angle * sign.unsqueeze(-1)
+    # =========================================================
+    # 🔹 Return values
+    # =========================================================
+    return latents_out, delta_px, grid, grid_norm, warp_shift, angle
 
-    global_angle = angle.mean(dim=1, keepdim=True)  # stable batch-wise
 
-    return latents_out, delta_px, grid, grid_norm, warp_shift, global_angle
 
 
 #------------------------------------------------------------------------------------------
@@ -2093,7 +2100,7 @@ def should_freeze(frame_idx, frame_pause):
 
 def get_breathing_mode(frame_counter, freeze):
     if freeze:
-        return "soft", 0.6
+        return "soft", 0.7
     else:
         return "real", 1.0
 
@@ -2141,46 +2148,43 @@ def apply_pose_world(
     device="cuda",
     breathing=True,
     debug=False,
-    debug_dir=None
+    debug_dir=None,
+    extra_keypoints=None,  # Nouveaux points clés supplémentaires
+    angle_smoothing_factor=0.3,  # Facteur pour lisser les rotations
+    z_rotation_angle=None,  # Nouvel argument pour l'angle de rotation sur l'axe Z
+    y_rotation_angle=None,  # Nouvel argument pour l'angle de rotation sur l'axe Y
+    x_rotation_angle=None   # Nouvel argument pour l'angle de rotation sur l'axe X
 ):
-    #============================================== PARTI WORD ========================================
     B, C, H, W = latents_world.shape
+
     # =========================
     # 🔹 Global pose & stabilisation avancée
     # =========================
-    #if should_freeze(frame_counter, 1): # Pause traitement
     if frame_counter > 1:
         start = time.time()
-        latents_world, global_delta, grid_raw, grid_global, warp_shift, global_angle = apply_global_pose(latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir)
+        latents_world, global_delta, grid_raw, grid_global, warp_shift, global_angle = apply_global_pose(
+            latents_world, pose, prev_pose, H, W, device=device, strength=2.0, debug=debug, debug_dir=debug_dir
+        )
         print("[DEBUG] WARP Shift: ")
-        dx = warp_shift[0,0,0,0].item()
-        dy = warp_shift[0,0,0,1].item()
+        dx = warp_shift[0, 0, 0, 0].item()
+        dy = warp_shift[0, 0, 0, 1].item()
         print(f"[SHIFT FLOAT] dx={dx:.4f}, dy={dy:.4f}")
-        #warp_shift_norm = warp_shift.view(1,2) / [W, H]
-        warp_shift_norm = warp_shift.view(1,2) / torch.tensor([W, H], device=warp_shift.device, dtype=warp_shift.dtype)
+
+        # Mise à jour du décalage global
+        warp_shift_norm = warp_shift.view(1, 2) / torch.tensor([W, H], device=warp_shift.device, dtype=warp_shift.dtype)
         state["global_shift"] = 0.6 * state["global_shift"] + 0.4 * warp_shift_norm
 
-        # =========================
-        # 🔹 GLOBAL ANGLE (NEW)
-        # =========================
-        if torch.is_tensor(global_angle):
-            global_angle = global_angle.mean().item()
+        # Mise à jour des angles avec lissage temporel
+        if "global_angle_x" not in state:
+            state["global_angle_x"] = 0.0
+        if "global_angle_y" not in state:
+            state["global_angle_y"] = 0.0
+        if "global_angle_z" not in state:
+            state["global_angle_z"] = 0.0
 
-        # EMA smoothing (super important)
-        if "global_angle" not in state:
-            state["global_angle"] = global_angle
-        else:
-            state["global_angle"] = (
-                0.7 * state["global_angle"] +
-                0.3 * global_angle
-            )
-
-        # ==========================================================================
-        # 🔹 Global rotation (ANGLE)
-        # ==========================================================================
-        global_angle = torch.zeros((B,1,1), device=device)
-
+        # Calcule les nouvelles rotations sur chaque axe X, Y, Z
         if prev_pose is not None:
+            # Calculate rotation differences between the current pose and the previous pose
             ls_idx = pose.FACIAL_POINT_IDX["left_shoulder"]
             rs_idx = pose.FACIAL_POINT_IDX["right_shoulder"]
 
@@ -2193,35 +2197,123 @@ def apply_pose_world(
             v = rs - ls
             v_prev = rs_prev - ls_prev
 
-            angle = torch.atan2(v[:,1], v[:,0])
-            angle_prev = torch.atan2(v_prev[:,1], v_prev[:,0])
+            # Calculer l'angle de rotation autour de l'axe Z (plan XY)
+            angle_z = torch.atan2(v[:, 1], v[:, 0])  # Calcul de l'angle de rotation sur Z
+            angle_z_prev = torch.atan2(v_prev[:, 1], v_prev[:, 0])
+            delta_angle_z = angle_z - angle_z_prev
+            delta_angle_z = torch.atan2(torch.sin(delta_angle_z), torch.cos(delta_angle_z))  # Wrap the angle
+            delta_angle_z = torch.clamp(delta_angle_z, -0.2, 0.2)
 
-            delta_angle = angle - angle_prev
+            # Calcul des différences d'angles pour Y et X
+            # Angle pour Y (pitch) et X (yaw) basé sur les épaules et hanches
+            # À ajuster en fonction de votre modèle spécifique
+            # Calcul de delta_angle_y (Lacet, rotation autour de Y)
+            # Prenons les épaules comme exemple pour déterminer le mouvement du tronc
 
-            # wrap propre
-            delta_angle = torch.atan2(torch.sin(delta_angle), torch.cos(delta_angle))
+            # Indices des épaules (ajustez selon votre modèle)
+            ls_idx = pose.FACIAL_POINT_IDX["left_shoulder"]
+            rs_idx = pose.FACIAL_POINT_IDX["right_shoulder"]
 
-            # clamp anti-explosion (CRUCIAL)
-            delta_angle = torch.clamp(delta_angle, -0.2, 0.2)
+            # Positions des épaules dans le plan 2D (X, Y)
+            ls = pose.keypoints[:, ls_idx, :2]
+            rs = pose.keypoints[:, rs_idx, :2]
 
-            global_angle = delta_angle.view(B,1,1)
+            ls_prev = prev_pose.keypoints[:, ls_idx, :2]
+            rs_prev = prev_pose.keypoints[:, rs_idx, :2]
 
-        # =============================================================================
-        # 🔹 smoothing temporel
-        # =========================
-        if "global_angle" not in state:
-            state["global_angle"] = global_angle
-        else:
-            state["global_angle"] = 0.7 * state["global_angle"] + 0.3 * global_angle
-        #=============================================================================
+            # Calculer le vecteur directionnel entre les épaules
+            v = rs - ls
+            v_prev = rs_prev - ls_prev
 
-        if prev_pose is not None:
-            key_joints = ['neck','left_shoulder','right_shoulder','left_hip','right_hip']
-            for joint in key_joints:
-                idx = pose.FACIAL_POINT_IDX[joint]
-                diff = keypoints[:,idx,:2] - prev_keypoints[:,idx,:2]
-                diff = torch.clamp(diff, -3.0, 3.0)
-                latents_world += diff.mean() * 0.001
+            # Calculer l'angle de rotation autour de l'axe Y
+            angle_y = torch.atan2(v[:, 1], v[:, 0])  # L'angle dans le plan XY
+            angle_y_prev = torch.atan2(v_prev[:, 1], v_prev[:, 0])
+            delta_angle_y = angle_y - angle_y_prev  # Différence d'angle entre l'angle actuel et le précédent
+            delta_angle_y = torch.atan2(torch.sin(delta_angle_y), torch.cos(delta_angle_y))  # "Wrapped" pour éviter des sauts brusques
+            delta_angle_y = torch.clamp(delta_angle_y, -0.2, 0.2)  # Limiter l'angle pour éviter des rotations trop larges
+
+
+            # Calcul de delta_angle_x (Tangage, rotation autour de X)
+            # Prenons les hanches et les épaules comme exemple pour déterminer le mouvement du tronc
+
+            # Indices des hanches (ajustez selon votre modèle)
+            lh_idx = pose.FACIAL_POINT_IDX["left_hip"]
+            rh_idx = pose.FACIAL_POINT_IDX["right_hip"]
+
+            # Positions des hanches dans le plan 2D (X, Y)
+            lh = pose.keypoints[:, lh_idx, :2]
+            rh = pose.keypoints[:, rh_idx, :2]
+
+            lh_prev = prev_pose.keypoints[:, lh_idx, :2]
+            rh_prev = prev_pose.keypoints[:, rh_idx, :2]
+
+            # Calculer le vecteur directionnel entre les hanches
+            v_hips = rh - lh
+            v_prev = rh_prev - lh_prev
+
+            # Calculer l'angle de rotation autour de l'axe X (tangage)
+            angle_x = torch.atan2(v_hips[:, 1], v_hips[:, 0])  # L'angle dans le plan XY (entre les hanches)
+            angle_x_prev = torch.atan2(v_prev[:, 1], v_prev[:, 0])
+            delta_angle_x = angle_x - angle_x_prev  # Différence d'angle entre l'angle actuel et le précédent
+            delta_angle_x = torch.atan2(torch.sin(delta_angle_x), torch.cos(delta_angle_x))  # "Wrapped" pour éviter des sauts brusques
+            delta_angle_x = torch.clamp(delta_angle_x, -0.2, 0.2)  # Limiter l'angle pour éviter des rotations trop larges
+
+            # Mises à jour des états des angles
+            state["global_angle_x"] = (1 - angle_smoothing_factor) * state["global_angle_x"] + angle_smoothing_factor * delta_angle_x
+            state["global_angle_y"] = (1 - angle_smoothing_factor) * state["global_angle_y"] + angle_smoothing_factor * delta_angle_y
+            state["global_angle_z"] = (1 - angle_smoothing_factor) * state["global_angle_z"] + angle_smoothing_factor * delta_angle_z
+
+            # Récupérer les valeurs finales des angles
+            x_rotation_angle = state["global_angle_x"]
+            y_rotation_angle = state["global_angle_y"]
+            z_rotation_angle = state["global_angle_z"]
+
+
+            # ============================
+            # 🔹 Rotation sur l'axe Z
+            # ============================
+            rotation_matrix_z = torch.tensor([
+                [torch.cos(torch.tensor(z_rotation_angle, device=device)), -torch.sin(torch.tensor(z_rotation_angle, device=device))],
+                [torch.sin(torch.tensor(z_rotation_angle, device=device)), torch.cos(torch.tensor(z_rotation_angle, device=device))]
+            ], device=device)
+
+            # ============================
+            # 🔹 Rotation sur l'axe Y (pitch)
+            # ============================
+            rotation_matrix_y = torch.tensor([
+                [torch.cos(torch.tensor(y_rotation_angle, device=device)), 0, torch.sin(torch.tensor(y_rotation_angle, device=device))],
+                [0, 1, 0],
+                [-torch.sin(torch.tensor(y_rotation_angle, device=device)), 0, torch.cos(torch.tensor(y_rotation_angle, device=device))]
+            ], device=device)
+
+            # ============================
+            # 🔹 Rotation sur l'axe X (yaw)
+            # ============================
+            rotation_matrix_x = torch.tensor([
+                [1, 0, 0],
+                [0, torch.cos(torch.tensor(x_rotation_angle, device=device)), -torch.sin(torch.tensor(x_rotation_angle, device=device))],
+                [0, torch.sin(torch.tensor(x_rotation_angle, device=device)), torch.cos(torch.tensor(x_rotation_angle, device=device))]
+            ], device=device)
+
+
+            # Appliquer la rotation aux keypoints pour chaque axe
+            for i in range(B):
+                for j in range(len(pose.keypoints[i])):
+                    keypoint = pose.keypoints[i, j, :2]
+
+                    # Appliquer la rotation autour de Z
+                    rotated_keypoint_z = torch.matmul(rotation_matrix_z, keypoint)
+
+                    # Appliquer la rotation autour de Y
+                    rotated_keypoint_y = torch.matmul(rotation_matrix_y, torch.cat([rotated_keypoint_z, torch.zeros(1, device=device)]).unsqueeze(0).T).squeeze(1)
+
+                    # Appliquer la rotation autour de X
+                    # Correction : enlever la concaténation d'un 0 supplémentaire et s'assurer que le vecteur a bien 3 dimensions.
+                    rotated_keypoint_x = torch.matmul(rotation_matrix_x, rotated_keypoint_y.unsqueeze(0).T).squeeze(1)
+
+                    # Mise à jour du keypoint
+                    pose.keypoints[i, j, :2] = rotated_keypoint_x[:2]  # Mise à jour des coordonnées X, Y après rotation
+
         timings["GLOBAL"] = time.time() - start
 
         if debug and frame_counter % 4 == 0:
@@ -2230,49 +2322,49 @@ def apply_pose_world(
             print("  - delta max px:", global_delta.abs().max().item())
             save_impact_map(latents_world, latents_base, debug_dir, frame_counter, prefix="torso_global")
 
-
     # =========================
-    # 🔹 Torso
+    # 🔹 Torso - application du mouvement du torse
     # =========================
-    if should_freeze(frame_counter, 1): # Pause traitement
-        t = torch.tensor(frame_counter/10.0, device=device)
+    if should_freeze(frame_counter, 1):  # Pause traitement
+        t = torch.tensor(frame_counter / 10.0, device=device)
         delta_px = pose.delta.clone()
-        delta_px[...,0] *= W
-        delta_px[...,1] *= H
-        delta_px = delta_px.view(B,1,1,2)
-
+        delta_px[..., 0] *= W
+        delta_px[..., 1] *= H
+        delta_px = delta_px.view(B, 1, 1, 2)
 
         start = time.time()
         latents_before = latents_world.clone()
         latents_torso, delta_px = apply_torso_warp(latents_world, pose, mask_torso, grid, H, W, device=device, debug=debug, debug_dir=debug_dir)
         breath_strength = 0.2 + 0.1 * torch.sin(t)
 
-        latents_world = latents_before*(1.0-breath_strength*mask_torso_exp) + latents_torso*(breath_strength*mask_torso_exp)
+        latents_world = latents_before * (1.0 - breath_strength * mask_torso_exp) + latents_torso * (breath_strength * mask_torso_exp)
         timings["TORSO+BREATH"] = time.time() - start
         if debug:
             save_impact_map(latents_world, latents_before, debug_dir, frame_counter, prefix="torso_warp")
-    # =====================================================================
+
+    # =========================
     # 🔹 BREATHING
-    # =====================================================================
+    # =========================
     start = time.time()
     freeze = should_freeze(frame_counter, 1)
     mode, mode_strength = get_breathing_mode(frame_counter, freeze)
     latents_before = latents_world
-    # breathing field (single output)
-    latents_breath = apply_breathing( latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir )
-    # temporal modulation
+    latents_breath = apply_breathing(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
+
+    # Temporal modulation
     t = frame_counter / 10.0
     breath_strength = (0.2 + 0.2 * math.sin(t)) * mode_strength
-    # =========================================================
-    # ✔️ RESIDUAL INJECTION (IMPORTANT CHANGE)
-    # =========================================================
-    mask = mask_torso_exp ** 1.5   # smoother falloff
-    latents_world = latents_before + ( (latents_breath - latents_before) * mask * breath_strength )
+    mask = mask_torso_exp ** 1.5  # Smoothing falloff
+
+    # Residual injection
+    latents_world = latents_before + ((latents_breath - latents_before) * mask * breath_strength)
     timings["breathing"] = time.time() - start
     if debug:
         print(f"[DEBUG] Breathing applied ({mode})")
 
     return latents_world, state, delta_px
+
+
 
 def apply_pose_driven_motion_ultra2(
     latents,
@@ -2901,7 +2993,7 @@ MOTION_PROFILES = {
 
     "dynamic": {
         "time_scale": 0.7,
-        "camera_lock": 0.88,
+        "camera_lock": 0.90,
         "max_velocity": 0.012,
         "rotation_gain": 1.35,
         "cinematic_start": 10
@@ -3006,6 +3098,9 @@ def update_sequence_from_keypoints_batch(
     state.setdefault("rotation", 0.0)
     state.setdefault("initialized", True)
     state.setdefault("global_angle", 0.0)
+    state.setdefault("global_angle_x", 0.0)
+    state.setdefault("global_angle_y", 0.0)
+    state.setdefault("global_angle_z", 0.0)
 
 
     # =========================================================
@@ -3266,259 +3361,13 @@ def update_sequence_from_keypoints_batch(
 
     new_state["global_shift"] = state.get("global_shift", None)
     new_state["global_angle"] = state.get("global_angle", None)
+    new_state["global_angle_x"] = state.get("global_angle_x", None)
+    new_state["global_angle_y"] = state.get("global_angle_y", None)
+    new_state["global_angle_z"] = state.get("global_angle_z", None)
 
     return kp, new_state
 
-def update_sequence_from_keypoints_batch_v1(
-    sequence,
-    frame_idx,
-    prev_keypoints=None,
-    state=None,
-    profile=None,
-    time_scale=0.2,
-    max_velocity=0.05,
-    camera_lock=0.6,
-    debug=False,
-    debug_dir=None,
-    image_size=(1280, 896)
-):
 
-    # =========================================================
-    # 0. STATE SAFE INIT
-    # =========================================================
-    if state is None:
-        state = {}
-
-    def safe_kp(kp):
-        if kp is None:
-            return None
-
-        if not torch.is_tensor(kp):
-            return None
-
-        kp = kp.clone()
-        kp = torch.nan_to_num(kp, nan=0.0)
-
-        # force (B,N,2)
-        if kp.dim() == 3:
-            kp = kp[..., :2]
-
-        return kp
-
-    # =========================================================
-    # REF KP SAFE
-    # =========================================================
-    ref_kp = safe_kp(prev_keypoints)
-
-    if ref_kp is None and len(sequence) > 0:
-        ref_kp = safe_kp(sequence[0])
-
-    if ref_kp is not None:
-        B, N, _ = ref_kp.shape
-
-        state.setdefault("kp_prev", ref_kp.clone())
-        state.setdefault("velocity", torch.zeros((B, N, 2), device=ref_kp.device))
-
-        # 🔹 angular_vel init propre
-        state.setdefault("angular_vel", torch.zeros((B, N, 2), device=ref_kp.device))
-
-        # ✅ FIX CRASH ICI: anchor toujours (B,1,2)
-        state.setdefault(
-            "anchor",
-            ref_kp[..., :2].mean(dim=1, keepdim=True)
-        )
-    else:
-        state.setdefault("kp_prev", None)
-        state.setdefault("velocity", None)
-        state.setdefault("angular_vel", None)  # si pas de ref_kp, None
-        state.setdefault("anchor", torch.zeros((1,1,2)))
-
-    state.setdefault("angle", 0.0)
-    state.setdefault("rotation", 0.0)
-    state.setdefault("initialized", True)
-
-    # =========================================================
-    # 1. PROFILE SAFE
-    # =========================================================
-    motion_model = profile or resolve_motion_model(frame_idx)
-
-    p = MOTION_PROFILES.get(motion_model, {})
-
-    time_scale = p.get("time_scale", time_scale)
-    camera_lock = p.get("camera_lock", camera_lock)
-    max_velocity = p.get("max_velocity", max_velocity)
-    rotation_gain = p.get("rotation_gain", 1.0)
-
-
-    # =========================================================
-    # 2. TIME WARP
-    # =========================================================
-    scaled = frame_idx * time_scale
-    i0 = max(0, min(int(scaled), len(sequence) - 1))
-    i1 = min(i0 + 1, len(sequence) - 1)
-    t = scaled - i0
-
-    kp = (1 - t) * sequence[i0] + t * sequence[i1]
-    kp = torch.nan_to_num(kp, nan=0.0)
-
-    if kp.dim() == 3:
-        kp = kp[..., :2]
-
-    B, N, _ = kp.shape
-
-    # =========================================================
-    # DRIFT SAFE
-    # =========================================================
-    kp_prev = state.get("kp_prev", None)
-
-    if kp_prev is not None and torch.is_tensor(kp_prev):
-
-        kp_prev = kp_prev[..., :2]
-
-        minN = min(kp_prev.shape[1], kp.shape[1])
-
-        kp_xy = kp[:, :minN, :]
-        kp_prev_xy = kp_prev[:, :minN, :]
-
-        drift = torch.norm(kp_xy - kp_prev_xy, dim=-1).mean()
-    else:
-        drift = torch.tensor(0.0, device=kp.device)
-
-
-    # =========================================================
-    # CAMERA STABILIZATION
-    # =========================================================
-    anchor = state.get("anchor", None)
-
-    if anchor is not None and torch.is_tensor(anchor):
-
-        if anchor.dim() == 2:
-            anchor = anchor.unsqueeze(1)  # (B,1,2)
-
-        anchor_xy = anchor[..., :2]
-
-        kp[..., :2] = kp[..., :2] * camera_lock + anchor_xy * (1 - camera_lock)
-
-
-    # =========================================================
-    # 6. ACTOR MODEL SAFE CALL
-    # =========================================================
-    try:
-        kp, new_state = apply_actor_model(
-            kp, state, frame_idx=frame_idx, profile=motion_model
-        )
-    except Exception as e:
-        print(f"[⚠ ACTOR FALLBACK] {e}")
-        new_state = state
-
-    # =========================================================
-    # 7. DEBUG POST GRAPH
-    # =========================================================
-    if kp_prev is not None:
-        print("[DEBUG][POST GRAPH DELTA]",
-              (kp[..., :2] - kp_prev[..., :2]).abs().mean().item())
-
-    # =========================================================
-    # 8. ROTATION SAFE
-    # =========================================================
-    if kp_prev is not None:
-        center = kp[..., :2].mean(dim=1, keepdim=True)
-
-        angle = 0.08 * math.sin(frame_idx * 0.05)
-        cos_a, sin_a = math.cos(angle), math.sin(angle)
-
-        rot = torch.tensor(
-            [[cos_a, -sin_a],
-             [sin_a,  cos_a]],
-            device=kp.device,
-            dtype=kp.dtype
-        )
-
-        kp_before = kp.clone()
-        xy = kp[..., :2] - center
-
-        kp[..., :2] = torch.einsum('bnc,cd->bnd', xy, rot) + center
-
-        delta_rot = kp[..., :2] - kp_before[..., :2]
-        dist_before = torch.norm(kp_before[..., :2] - center, dim=-1)
-
-        print("\n[DEBUG ROTATION]")
-        print(f"angle (rad): {angle:.6f}")
-        print(f"angle (deg): {angle * 57.2958:.2f}")
-        print(f"center mean: {center.mean().item():.6f}")
-        print(f"delta_rot mean: {delta_rot.abs().mean().item():.6f}")
-        print(f"delta_rot max: {delta_rot.abs().max().item():.6f}")
-        print(f"radius mean: {dist_before.mean().item():.6f}")
-
-    # =========================================================
-    # 9. PHYSICS LIMIT
-    # =========================================================
-    if kp_prev is not None:
-        delta = kp[..., :2] - kp_prev[..., :2]
-        speed = torch.norm(delta, dim=-1, keepdim=True)
-
-        speed = torch.where(speed < 1e-6, torch.ones_like(speed), speed)
-
-        scale = torch.clamp(max_velocity / speed, 0.1, 1.0)
-
-        kp[..., :2] = kp_prev[..., :2] + delta * scale
-
-        print("\n[DEBUG PHYSICS LIMIT ***********************]")
-        print(f"delta mean: {delta.abs().mean().item():.6f}")
-        print(f"speed mean: {speed.mean().item():.6f}")
-        print(f"scale mean: {scale.mean().item():.6f}")
-        print(f"scale min/max: {scale.min().item():.6f}/{scale.max().item():.6f}")
-
-    # =========================================================
-    # 10. POST ROTATION GAIN
-    # =========================================================
-
-    if kp_prev is not None:
-        # 'right_shoulder': 2, 'right_elbow': 3, 'right_wrist': 4,'left_shoulder': 5, 'left_elbow': 6, 'left_wrist': 7, 'right_hip': 8, 'left_hip': 11,
-        #upper_ids = [5,6,7,8,9,10,11,12]
-        upper_ids = [2,3,4,5,6,7,8,11]
-
-        upper_ids = [i for i in upper_ids if i < kp.shape[1]]
-
-        rotation_gain = min(rotation_gain, 0.7)
-
-        kp[:, upper_ids, :2] = (
-            kp_prev[:, upper_ids, :2] +
-            (kp[:, upper_ids, :2] - kp_prev[:, upper_ids, :2]) * rotation_gain
-        )
-
-    # =========================================================
-    # 11. DEBUG FINAL
-    # =========================================================
-    if debug:
-        motion = 0.0
-        if kp_prev is not None:
-            motion = (kp[..., :2] - kp_prev[..., :2]).abs().mean()
-
-        print("\n[🎬 MOTION ENGINE V6/V7/V8/V9]")
-        print(f"frame: {frame_idx}")
-        print(f"Motion model: {motion_model}")
-        print(f"motion_mean: {float(motion):.6f}")
-
-        if frame_idx % 2 == 0 and debug_dir is not None:
-            debug_draw_openpose_skeleton(
-                keypoints_tensor=ensure_kp3(kp),
-                debug_dir=debug_dir,
-                frame_counter=frame_idx,
-                image_size=image_size
-            )
-
-    # =========================================================
-    # 12. STATE UPDATE SAFE
-    # =========================================================
-    new_state = new_state or {}
-
-    new_state["kp_prev"] = kp.clone()
-
-    if "anchor" not in new_state or new_state["anchor"] is None:
-        new_state["anchor"] = kp.mean(dim=1)
-
-    return kp, new_state
 
 
 def update_sequence_from_keypoints_batch_stable(

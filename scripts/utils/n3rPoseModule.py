@@ -187,13 +187,13 @@ ACTOR_LABELS = {
 }
 
 
-ACTOR_MODEL_SCHEDULE_test = [
+ACTOR_MODEL_SCHEDULE = [
     (0, "pause"),
-    (15, "v6"),
+    (1, "v12"),
 
 ]
 
-ACTOR_MODEL_SCHEDULE = [
+ACTOR_MODEL_SCHEDULE_gg = [
     (0, "pause"),
     (12,  "base"),
     (15,  "v9"),
@@ -212,10 +212,10 @@ ACTOR_MODEL_SCHEDULE = [
 
 MOTION_MODEL_SCHEDULE = [
     (0,  "locked"),
+    (1, "dynamic"),
     (15, "stable"),
     (20, "cinematic"),
     (30, "locked"),
-    (35, "dynamic"),
     (50, "warp"),
 ]
 
@@ -425,6 +425,156 @@ def fish_eye_distortion(kp, pivot, strength=1.5, max_radius=1.0):
 def cinematic_motion_graph_v12(
     kp,
     state,
+    head_ids=(0, 1, 18, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 40, 41, 42, 43, 52, 53, 54, 55, 56),
+    upper_ids=(5, 6, 7, 8, 9, 10),
+    hip_ids=(11, 12),
+    debug=False,
+    fish_eye_strength=1.5,
+    fish_eye_max_radius=1.0,
+    rotation_strength=1.0,  # Augmenter légèrement la force de la rotation Z
+    motion_sensitivity=4.0,
+    damping=0.90,
+    inertia=0.85,
+    head_lag=0.7,
+    max_deg=11.0,
+    fish_eyes=False,
+    stability=False,
+    apply_head_lag=False,
+    noise_strength=0.0,  # Réduire le bruit pour qu'il soit moins perceptible
+):
+    B, N, _ = kp.shape
+    device = kp.device
+
+    # =========================================================
+    # SAFE INIT (NO SHAPE DRIFT EVER)
+    # =========================================================
+    if state is None:
+        state = {}
+
+    kp_prev = state.get("kp_prev", kp.clone())
+
+    state["energy"] = to_B1(state.get("energy", 0.0), B, device=device)
+    state["inertia"] = state.get("inertia", 0.75)
+    state["intent_vec"] = state.get("intent_vec", None)
+    state.setdefault("angle", torch.zeros((B, 1), device=device))
+    state.setdefault("angle_vel", torch.zeros((B, 1), device=device))
+
+    # =========================================================
+    # 1. MOTION ENERGY (STABLE)
+    # =========================================================
+    delta = kp[..., :2] - kp_prev[..., :2]
+    motion_vec = delta.mean(dim=1, keepdim=True)  # (B,1,2)
+
+    energy_raw = torch.norm(motion_vec, dim=-1, keepdim=True)  # (B,1,1)
+    energy_raw = energy_raw[:, :, 0]  # → (B,1)
+
+    state["energy"] = torch.clamp(
+        state["energy"] * state["inertia"] + energy_raw * (1.0 - state["inertia"]),
+        min=0.0,
+        max=1.0
+    )
+    energy = state["energy"]  # (B,1)
+
+    # =========================================================
+    # 2. INTENT VECTOR (SAFE)
+    # =========================================================
+    if state["intent_vec"] is None:
+        state["intent_vec"] = motion_vec
+    else:
+        alpha_intent = 0.85 + 0.1 * state["energy"]
+        state["intent_vec"] = state["intent_vec"] * alpha_intent + motion_vec * (1.0 - alpha_intent)
+
+    intent = state["intent_vec"]  # (B,1,2)
+
+    # =========================================================
+    # 3. UPDATE ROTATION ANGLES (ONLY UPDATE GLOBAL ANGLES)
+    # =========================================================
+    intent_angle = torch.atan2(
+        intent[..., 1],
+        intent[..., 0] + 1e-6
+    )
+
+    # -----------------------------
+    # ENERGY GAIN (soft, non explosif)
+    # -----------------------------
+    energy = state["energy"].clamp(0.0, 1.0)
+
+    gain = 0.25 + 0.9 * energy   # 🔥 réduit fortement
+
+    target_angle = intent_angle * gain
+
+    # -----------------------------
+    # HARD LIMIT (safe cinematic range)
+    # -----------------------------
+    max_angle = math.radians(11)  # 🔥 réduit de 25 → 11
+    target_angle = torch.clamp(target_angle, -max_angle, max_angle)
+
+    # -----------------------------
+    # ANGLE SMOOTHING (IMPORTANT FIX)
+    # -----------------------------
+    prev_angle = state["angle"]
+
+    # EMA smoothing (critical stability)
+    alpha = 0.95  # Smooth more to avoid large first frame jumps
+    angle = prev_angle * alpha + target_angle * (1.0 - alpha)
+
+    # -----------------------------
+    # ANGULAR VELOCITY CONTROLLED
+    # -----------------------------
+    angle_vel = angle - prev_angle
+
+    # clamp velocity (anti-jerk)
+    angle_vel = torch.clamp(angle_vel, -0.05, 0.05)
+
+    state["angle_vel"] = angle_vel
+    state["angle"] = angle
+
+    # -----------------------------
+    # ROTATION DAMPING PER FRAME
+    # -----------------------------
+    rotation_damping = 0.85  # Réduire le damping pour moins de perte d'angle au fil du temps
+    angle = angle * rotation_damping
+
+    # =========================================================
+    # UPDATE GLOBAL ANGLES (ONLY UPDATE STATE ANGLES)
+    # =========================================================
+    state["global_angle_x"] += angle.mean().item() * rotation_strength
+    state["global_angle_y"] += angle.mean().item() * rotation_strength
+    state["global_angle_z"] += angle.mean().item() * rotation_strength
+
+    # =========================================================
+    # APPLY HEAD LAG (OPTIONAL)
+    # =========================================================
+    if apply_head_lag:
+        kp_out = kp.clone()
+        kp_out[:, head_ids, :2] = (
+            kp_prev[:, head_ids, :2] * head_lag +
+            kp_out[:, head_ids, :2] * (1.0 - head_lag)
+        )
+    else:
+        kp_out = kp.clone()
+
+    # =========================================================
+    # DEBUG
+    # =========================================================
+    if debug:
+        print("\n[🎬 V12 ADVANCED FISHEYE EFFECT WITH NO Y MOVEMENT]")
+        print("energy:", energy.mean().item())
+        print("intent:", intent.norm(dim=-1).mean().item())
+        print("angle:", angle.mean().item())
+        print("motion:", energy_raw.mean().item())
+
+    # =========================================================
+    # 9. UPDATE STATE
+    # =========================================================
+    state["kp_prev"] = kp_out.clone()
+
+    # Return updated keypoints and state
+    return kp_out, state
+
+def cinematic_motion_graph_v12_old(
+    kp,
+    state,
     head_ids=(0,1,18,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,40,41,42,43,52,53,54,55,56),
     upper_ids=(5, 6, 7, 8, 9, 10),
     hip_ids=(11, 12),
@@ -547,8 +697,16 @@ def cinematic_motion_graph_v12(
         kp_out[..., :2] += noise_strength * torch.randn_like(kp_out[..., :2])
 
     # Amplifier la force de la rotation Z pour plus de visibilité
-    pose = Pose(kp_out)
-    pose.apply_rotation_z(angle * rotation_strength)  # Appliquer plus de force à la rotation pour plus de dynamisme
+    #pose = Pose(kp_out)
+    #pose.apply_rotation_z(angle * rotation_strength)  # Appliquer plus de force à la rotation pour plus de dynamisme
+
+    #state["global_angle_x"] += 0.01  # Exemple d'augmentation pour l'animation
+    #state["global_angle_y"] += 0.02
+    angle_z = state["global_angle_z"]
+    state["global_angle_z"] += angle_z * rotation_strength
+
+    # Appliquer la rotation sur les keypoints
+    kp_out = apply_rotation_on_keypoints(kp_out, state, device)
 
     # =========================================================
     # 4. PIVOT (MORE STABLE BODY CENTER)
@@ -1567,9 +1725,6 @@ def cinematic_motion_graph_v6(
     return kp_out, state
 
 
-
-
-
 def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
 
     # =========================
@@ -1603,7 +1758,9 @@ def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
         state = {}
 
     kp_prev = state.get("kp_prev", kp.clone())
-    state.setdefault("global_angle", 0.0)
+    state.setdefault("global_angle_x", 0.0)
+    state.setdefault("global_angle_y", 0.0)
+    state.setdefault("global_angle_z", 0.0)
     state.setdefault("kp_prev", kp_prev)
 
     # FIX: velocity always valid shape (B,N,2)
@@ -1650,7 +1807,9 @@ def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
     else:
         kp_out, new_state = result, state
 
-    global_angle = None
+    global_angle_x = None
+    global_angle_y = None
+    global_angle_z = None
 
     # cas 1 : pipeline renvoie 3 valeurs
     if isinstance(result, tuple) and len(result) == 3:
@@ -1658,24 +1817,35 @@ def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
 
     # cas 2 : angle déjà dans state
     if isinstance(new_state, dict):
-        if "global_angle" in new_state:
-            global_angle = new_state["global_angle"]
+        if "global_angle_x" in new_state:
+            global_angle_x = new_state["global_angle_x"]
+        if "global_angle_y" in new_state:
+            global_angle_y = new_state["global_angle_y"]
+        if "global_angle_z" in new_state:
+            global_angle_z = new_state["global_angle_z"]
 
-    if new_state is None:
-        new_state = {}
+    # cas 3 : si global_angle_x, global_angle_y, global_angle_z sont tous absents
+    if global_angle_x is None or global_angle_y is None or global_angle_z is None:
+        # Calculer les angles de rotation ici, par exemple à partir de la pose actuelle et précédente
+        global_angle_x, global_angle_y, global_angle_z = compute_rotation_angles(kp, state, kp_prev)
 
-    if global_angle is not None:
-        try:
-            ga = float(global_angle)
-            prev = state.get("global_angle", 0.0)
+    # =========================
+    # Apply Temporal Smoothing (EMA) for Each Angle
+    # =========================
+    if global_angle_x is not None:
+        prev_x = state.get("global_angle_x", 0.0)
+        smooth_x = 0.9 * prev_x + 0.1 * global_angle_x
+        new_state["global_angle_x"] = smooth_x
 
-            # EMA smoothing
-            smooth = 0.9 * prev + 0.1 * ga
+    if global_angle_y is not None:
+        prev_y = state.get("global_angle_y", 0.0)
+        smooth_y = 0.9 * prev_y + 0.1 * global_angle_y
+        new_state["global_angle_y"] = smooth_y
 
-            new_state["global_angle"] = smooth
-
-        except Exception:
-            new_state["global_angle"] = state.get("global_angle", 0.0)
+    if global_angle_z is not None:
+        prev_z = state.get("global_angle_z", 0.0)
+        smooth_z = 0.9 * prev_z + 0.1 * global_angle_z
+        new_state["global_angle_z"] = smooth_z
 
     # =========================
     # SAFE STATE UPDATE (IMPORTANT FIX)
@@ -1689,8 +1859,14 @@ def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
     if "angle" not in new_state:
         new_state["angle"] = 0.0
 
-    if "global_angle" not in new_state:
-        new_state["global_angle"] = state.get("global_angle", 0.0)
+    if "global_angle_x" not in new_state:
+        new_state["global_angle_x"] = state.get("global_angle_x", 0.0)
+
+    if "global_angle_y" not in new_state:
+        new_state["global_angle_y"] = state.get("global_angle_y", 0.0)
+
+    if "global_angle_z" not in new_state:
+        new_state["global_angle_z"] = state.get("global_angle_z", 0.0)
 
     # =========================
     # DEBUG MOTION
@@ -1700,8 +1876,6 @@ def apply_actor_model(kp, state, frame_idx, profile=None, debug=True):
         print(f"[DEBUG] motion_delta_mean: {delta:.6f}")
 
     return kp_out, new_state
-
-
 
 
 

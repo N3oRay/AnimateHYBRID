@@ -222,35 +222,24 @@ class Pose:
 
         return rotated + pivot
 
-    def apply_rotation_z_v1(self, angle):
-        """
-        Applique une rotation sur les points du corps (épaules, coudes, poignets) autour du pivot
-        calculé à partir des points du torse et du cou.
+    def apply_rotation_on_keypoints(kp, state, device):
+        # Récupérer les angles de rotation
+        angle_x = state["global_angle_x"]
+        angle_y = state["global_angle_y"]
+        angle_z = state["global_angle_z"]
 
-        angle : angle de rotation en radians
-        """
-        # Indices des points à faire pivoter (épaules, coudes, poignets)
-        upper_ids = [
-            self.FACIAL_POINT_IDX['left_shoulder'],
-            self.FACIAL_POINT_IDX['right_shoulder'],
-            self.FACIAL_POINT_IDX['left_elbow'],
-            self.FACIAL_POINT_IDX['right_elbow'],
-            self.FACIAL_POINT_IDX['left_wrist'],
-            self.FACIAL_POINT_IDX['right_wrist']
-        ]
+        # Calculer la matrice de rotation 3D
+        R = rotation_matrix_3d(angle_x, angle_y, angle_z, device)
 
-        # Calculer le pivot comme la moyenne des points dans la plage spécifiée (ici de 5 à 12)
-        pivot = self.keypoints[:, 5:min(13, self.B), :2].mean(dim=1, keepdim=True)
+        # Appliquer la rotation à chaque keypoint
+        B, N, _ = kp.shape  # B = batch size, N = nombre de keypoints
+        kp_3d = kp  # Assurez-vous que vos keypoints sont en 3D, avec la coordonnée z
 
-        # Adapter la forme de pivot pour qu'il corresponde à celle des points à faire pivoter
-        pivot = pivot.expand(-1, len(upper_ids), -1)
+        # Appliquer la rotation (R est une matrice 3x3, kp est de dimension (B, N, 3))
+        kp_rotated = torch.einsum('bnc,cd->bnd', kp_3d, R)
 
-        # Appliquer la rotation des points autour du pivot
-        self.keypoints[:, upper_ids, :2] = self.rotate_points_around_z_axis(
-            self.keypoints[:, upper_ids, :2],
-            pivot,
-            angle
-        )
+        return kp_rotated
+
 
     def apply_rotation_z(self, angle):
         """
