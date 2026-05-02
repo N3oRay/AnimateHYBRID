@@ -2334,17 +2334,17 @@ def apply_pose_world(
             # 🔹 Rotation sur l'axe Z
             # ============================
             rotation_matrix_z = torch.tensor([
-                [torch.cos(torch.tensor(z_rotation_angle, device=device)), -torch.sin(torch.tensor(z_rotation_angle, device=device))],
-                [torch.sin(torch.tensor(z_rotation_angle, device=device)), torch.cos(torch.tensor(z_rotation_angle, device=device))]
+                [torch.cos(z_rotation_angle.detach().clone()), -torch.sin(z_rotation_angle.detach().clone())],
+                [torch.sin(z_rotation_angle.detach().clone()), torch.cos(z_rotation_angle.detach().clone())]
             ], device=device)
 
             # ============================
             # 🔹 Rotation sur l'axe Y (pitch)
             # ============================
             rotation_matrix_y = torch.tensor([
-                [torch.cos(torch.tensor(y_rotation_angle, device=device)), 0, torch.sin(torch.tensor(y_rotation_angle, device=device))],
+                [torch.cos(y_rotation_angle.detach().clone()), 0, torch.sin(y_rotation_angle.detach().clone())],
                 [0, 1, 0],
-                [-torch.sin(torch.tensor(y_rotation_angle, device=device)), 0, torch.cos(torch.tensor(y_rotation_angle, device=device))]
+                [-torch.sin(y_rotation_angle.detach().clone()), 0, torch.cos(y_rotation_angle.detach().clone())]
             ], device=device)
 
             # ============================
@@ -2352,8 +2352,8 @@ def apply_pose_world(
             # ============================
             rotation_matrix_x = torch.tensor([
                 [1, 0, 0],
-                [0, torch.cos(torch.tensor(x_rotation_angle, device=device)), -torch.sin(torch.tensor(x_rotation_angle, device=device))],
-                [0, torch.sin(torch.tensor(x_rotation_angle, device=device)), torch.cos(torch.tensor(x_rotation_angle, device=device))]
+                [0, torch.cos(x_rotation_angle.detach().clone()), -torch.sin(x_rotation_angle.detach().clone())],
+                [0, torch.sin(x_rotation_angle.detach().clone()), torch.cos(x_rotation_angle.detach().clone())]
             ], device=device)
 
 
@@ -3016,11 +3016,6 @@ def compute_time(frame_idx, frame_pause, base_dt=0.03):
 # --- En DEV: synchroniser ce freeze intelligent avec ton apply_global_pose pour éviter les conflits entre keypoints et warp global.
 
 
-
-
-
-
-
 # =========================================================
 # MAIN ENTRY
 # =========================================================
@@ -3031,70 +3026,92 @@ def ensure_kp3(kp):
         conf = torch.ones_like(kp[..., :1])
         kp = torch.cat([kp, conf], dim=-1)
     return kp
+
+
+
+def safe_kp(kp):
+    """Sécurise les keypoints en gérant les NaN et en forçant une forme (B, N, 2)."""
+    if kp is None:
+        return None
+
+    if not torch.is_tensor(kp):
+        return None
+
+    kp = kp.clone()
+    kp = torch.nan_to_num(kp, nan=0.0)
+
+    # force (B,N,2)
+    if kp.dim() == 3:
+        kp = kp[..., :2]
+
+    return kp
+
+def apply_rotation(kp, center, angle_x, angle_y, angle_z, device):
+    """Applique une rotation 3D autour des axes X, Y et Z."""
+    cos_x, sin_x = math.cos(angle_x), math.sin(angle_x)
+    cos_y, sin_y = math.cos(angle_y), math.sin(angle_y)
+    cos_z, sin_z = math.cos(angle_z), math.sin(angle_z)
+
+    rot_x = torch.tensor(
+        [[1, 0, 0],
+         [0, cos_x, -sin_x],
+         [0, sin_x, cos_x]],
+        device=device, dtype=kp.dtype
+    )
+    rot_y = torch.tensor(
+        [[cos_y, 0, sin_y],
+         [0, 1, 0],
+         [-sin_y, 0, cos_y]],
+        device=device, dtype=kp.dtype
+    )
+    rot_z = torch.tensor(
+        [[cos_z, -sin_z, 0],
+         [sin_z, cos_z, 0],
+         [0, 0, 1]],
+        device=device, dtype=kp.dtype
+    )
+    rotation_matrix = torch.matmul(rot_z, torch.matmul(rot_y, rot_x))  # Rotation combinée (Z -> Y -> X)
+
+    # Appliquer la rotation sur les coordonnées
+    xy = kp[..., :2] - center
+    xy_3d = torch.cat([xy, torch.zeros_like(xy[..., :1])], dim=-1)  # Passer de 2D à 3D (ajouter un zéro pour Z)
+    kp[..., :2] = torch.einsum('bnc,cd->bnd', xy_3d, rotation_matrix[..., :2]) + center
+    return kp
 # ============= FONCTION PRINCIPAL ============================
+
 def update_sequence_from_keypoints_batch(
     sequence,
     frame_idx,
     prev_keypoints=None,
     state=None,
     profile=None,
-    time_scale=0.1, # 0.2
+    time_scale=0.1,  # 0.2
     max_velocity=0.05,
     camera_lock=0.9,
     debug=False,
     debug_dir=None,
     image_size=(1280, 896)
 ):
-
     # =========================================================
     # 0. STATE SAFE INIT
     # =========================================================
     if state is None:
         state = {}
 
-    def safe_kp(kp):
-        if kp is None:
-            return None
-
-        if not torch.is_tensor(kp):
-            return None
-
-        kp = kp.clone()
-        kp = torch.nan_to_num(kp, nan=0.0)
-
-        # force (B,N,2)
-        if kp.dim() == 3:
-            kp = kp[..., :2]
-
-        return kp
-
-    # =========================================================
-    # REF KP SAFE
-    # =========================================================
-    ref_kp = safe_kp(prev_keypoints)
-
-    if ref_kp is None and len(sequence) > 0:
-        ref_kp = safe_kp(sequence[0])
+    # Vérification explicite de la présence de prev_keypoints et de sequence
+    ref_kp = safe_kp(prev_keypoints) if prev_keypoints is not None else safe_kp(sequence[0]) if len(sequence) > 0 else None
 
     if ref_kp is not None:
         B, N, _ = ref_kp.shape
-
         state.setdefault("kp_prev", ref_kp.clone())
         state.setdefault("velocity", torch.zeros((B, N, 2), device=ref_kp.device))
-
-        # 🔹 angular_vel init propre
         state.setdefault("angular_vel", torch.zeros((B, N, 2), device=ref_kp.device))
-
-        # ✅ FIX CRASH ICI: anchor toujours (B,1,2)
-        state.setdefault(
-            "anchor",
-            ref_kp[..., :2].mean(dim=1, keepdim=True)
-        )
+        state.setdefault("anchor", ref_kp[..., :2].mean(dim=1, keepdim=True))
     else:
         state.setdefault("kp_prev", None)
         state.setdefault("velocity", None)
-        state.setdefault("angular_vel", None)  # si pas de ref_kp, None
-        state.setdefault("anchor", torch.zeros((1,1,2)))
+        state.setdefault("angular_vel", None)
+        state.setdefault("anchor", torch.zeros((1, 1, 2)))
 
     state.setdefault("angle", 0.0)
     state.setdefault("rotation", 0.0)
@@ -3108,14 +3125,12 @@ def update_sequence_from_keypoints_batch(
     # 1. PROFILE SAFE
     # =========================================================
     motion_model = profile or resolve_motion_model(frame_idx)
-
     p = MOTION_PROFILES.get(motion_model, {})
 
     time_scale = p.get("time_scale", time_scale)
     camera_lock = p.get("camera_lock", camera_lock)
     max_velocity = p.get("max_velocity", max_velocity)
     rotation_gain = p.get("rotation_gain", 1.0)
-
 
     # =========================================================
     # 2. TIME WARP
@@ -3124,7 +3139,6 @@ def update_sequence_from_keypoints_batch(
     i0 = max(0, min(int(scaled), len(sequence) - 1))
     i1 = min(i0 + 1, len(sequence) - 1)
     t = scaled - i0
-
     kp = (1 - t) * sequence[i0] + t * sequence[i1]
     kp = torch.nan_to_num(kp, nan=0.0)
 
@@ -3136,93 +3150,53 @@ def update_sequence_from_keypoints_batch(
     # =========================================================
     # GLOBAL SHIFT (ROBUST - BODY BASED)
     # =========================================================
+    shift = torch.zeros((1, 2), device=kp.device)
     kp_prev = state.get("kp_prev", None)
 
     if kp_prev is not None and torch.is_tensor(kp_prev):
-
-        # indices stables (torse)
         body_ids = [2, 5, 8, 11]  # shoulders + hips
-
         body_ids = [i for i in body_ids if i < kp.shape[1]]
-
         if len(body_ids) > 0:
-
             kp_body = kp[:, body_ids, :2]
             kp_prev_body = kp_prev[:, body_ids, :2]
-
-            center_now = kp_body.mean(dim=1)      # (B,2)
+            center_now = kp_body.mean(dim=1)
             center_prev = kp_prev_body.mean(dim=1)
-
             shift_raw = center_now - center_prev
-
-            # moyenne batch
             shift_raw = shift_raw.mean(dim=0, keepdim=True)
-
-            # =====================================================
-            # EMA SMOOTH
-            # =====================================================
             if "global_shift" not in state or not torch.is_tensor(state["global_shift"]):
                 state["global_shift"] = torch.zeros_like(shift_raw)
-
             shift = state["global_shift"] * 0.7 + shift_raw * 0.3
-
-            # clamp
             shift = torch.clamp(shift, -0.2, 0.2)
-
             state["global_shift"] = shift
-
-        else:
-            shift = torch.zeros((1, 2), device=kp.device)
-
-    else:
-        shift = torch.zeros((1, 2), device=kp.device)
 
     # =========================================================
     # DRIFT SAFE INIT (CLEAN)
     # =========================================================
     if "drift" not in state or not torch.is_tensor(state["drift"]):
         state["drift"] = torch.zeros((1,1,2), device=kp.device)
-
-
     # =========================================================
     # DRIFT SAFE (VECTOR EMA STABLE)
     # =========================================================
+    drift = torch.zeros((1, 1, 2), device=kp.device)
     if kp_prev is not None and torch.is_tensor(kp_prev):
-
         kp_prev_xy = kp_prev[..., :2]
-
-        minN = min(kp_prev_xy.shape[1], kp.shape[1])
-
-        kp_xy = kp[:, :minN, :]
-        kp_prev_xy = kp_prev_xy[:, :minN, :]
-
+        kp_xy = kp[:, :min(kp_prev_xy.shape[1], kp.shape[1]), :]
         center_now = kp_xy.mean(dim=1, keepdim=True)
         center_prev = kp_prev_xy.mean(dim=1, keepdim=True)
-
         drift_raw = center_now - center_prev
-
         drift = state["drift"] * 0.9 + drift_raw * 0.1
         drift = torch.clamp(drift, -0.05, 0.05)
-
         state["drift"] = drift
-
-    else:
-        drift = torch.zeros((1,1,2), device=kp.device)
 
     # =========================================================
     # CAMERA STABILIZATION
     # =========================================================
     anchor = state.get("anchor", None)
-
     if anchor is not None and torch.is_tensor(anchor):
-
         if anchor.dim() == 2:
-            anchor = anchor.unsqueeze(1)  # (B,1,2)
-
+            anchor = anchor.unsqueeze(1)
         anchor_xy = anchor[..., :2]
-
         kp[..., :2] = kp[..., :2] * camera_lock + anchor_xy * (1 - camera_lock)
-
 
     # =========================================================
     # 6. ACTOR MODEL SAFE CALL
@@ -3236,154 +3210,59 @@ def update_sequence_from_keypoints_batch(
         new_state = state
 
     # =========================================================
-    # 7. DEBUG POST GRAPH
-    # =========================================================
-    if kp_prev is not None:
-        print("[DEBUG][POST GRAPH DELTA]",
-              (kp[..., :2] - kp_prev[..., :2]).abs().mean().item())
-
-    # =========================================================
-    # 8. ROTATION SAFE (X, Y, Z)
+    # ROTATION SAFE (X, Y, Z)
     # =========================================================
     if kp_prev is not None:
         center = kp[..., :2].mean(dim=1, keepdim=True)
-
-        # Priorité à la rotation globale réelle
-        angle_global_x = state.get("global_angle_x", 0.0)  # Rotation autour de l'axe X
-        angle_global_y = state.get("global_angle_y", 0.0)  # Rotation autour de l'axe Y
-        angle_global_z = state.get("global_angle_z", 0.0)  # Rotation autour de l'axe Z
-
-        # Fallback léger si pas disponible
+        angle_global_x = state.get("global_angle_x", 0.0)
+        angle_global_y = state.get("global_angle_y", 0.0)
+        angle_global_z = state.get("global_angle_z", 0.0)
         angle_fake = 0.02 * math.sin(frame_idx * 0.05)
 
-        # Mélange des angles
         angle_x = 0.5 * angle_global_x + 0.5 * angle_fake
         angle_y = 0.5 * angle_global_y + 0.5 * angle_fake
         angle_z = 0.5 * angle_global_z + 0.5 * angle_fake
 
-        # Calcul des matrices de rotation pour chaque axe
-        cos_x, sin_x = math.cos(angle_x), math.sin(angle_x)
-        cos_y, sin_y = math.cos(angle_y), math.sin(angle_y)
-        cos_z, sin_z = math.cos(angle_z), math.sin(angle_z)
+        kp = apply_rotation(kp, center, angle_x, angle_y, angle_z, kp.device)
 
-        rot_x = torch.tensor(
-            [[1, 0, 0],
-            [0, cos_x, -sin_x],
-            [0, sin_x, cos_x]],
-            device=kp.device,
-            dtype=kp.dtype
-        )
-
-        rot_y = torch.tensor(
-            [[cos_y, 0, sin_y],
-            [0, 1, 0],
-            [-sin_y, 0, cos_y]],
-            device=kp.device,
-            dtype=kp.dtype
-        )
-
-        rot_z = torch.tensor(
-            [[cos_z, -sin_z, 0],
-            [sin_z, cos_z, 0],
-            [0, 0, 1]],
-            device=kp.device,
-            dtype=kp.dtype
-        )
-
-        # Appliquer la rotation sur les trois axes
-        rotation_matrix = torch.matmul(rot_z, torch.matmul(rot_y, rot_x))  # Rotation combinée (Z -> Y -> X)
-
-        # Appliquer la rotation sur les coordonnées
-        kp_before = kp.clone()
-        xy = kp[..., :2] - center
-
-        # Appliquer la transformation de rotation (attention : il faut étendre les coordonnées de 2D à 3D avant)
-        xy_3d = torch.cat([xy, torch.zeros_like(xy[..., :1])], dim=-1)  # Passer de 2D à 3D (en ajoutant un zéro pour Z)
-        kp[..., :2] = torch.einsum('bnc,cd->bnd', xy_3d, rotation_matrix[..., :2]) + center
-
-        delta_rot = kp[..., :2] - kp_before[..., :2]
-        dist_before = torch.norm(kp_before[..., :2] - center, dim=-1)
-
-        # Affichage du debug des rotations
-        print("\n[DEBUG ROTATION]")
-        angle_val = angle_z
-        if torch.is_tensor(angle_val):
-            angle_val = angle_val.mean().item()
-
-        print(f"angle (rad): {angle_val:.6f}")
-        print(f"angle (deg): {angle_val * 57.2958:.2f}")
-        print(f"center mean: {center.mean().item():.6f}")
-        print(f"delta_rot mean: {delta_rot.abs().mean().item():.6f}")
-        print(f"delta_rot max: {delta_rot.abs().max().item():.6f}")
-        print(f"radius mean: {dist_before.mean().item():.6f}")
     # =========================================================
-    # 9. PHYSICS LIMIT
+    # PHYSICS LIMIT
     # =========================================================
     if kp_prev is not None:
         delta = kp[..., :2] - kp_prev[..., :2]
         speed = torch.norm(delta, dim=-1, keepdim=True)
-
-        speed = torch.where(speed < 1e-6, torch.ones_like(speed), speed)
-
-        scale = torch.clamp(max_velocity / speed, 0.1, 1.0)
-
+        scale = torch.clamp(max_velocity / torch.where(speed < 1e-6, torch.ones_like(speed), speed), 0.1, 1.0)
         kp[..., :2] = kp_prev[..., :2] + delta * scale
 
-        print("\n[DEBUG PHYSICS LIMIT ***********************]")
-        print(f"delta mean: {delta.abs().mean().item():.6f}")
-        print(f"speed mean: {speed.mean().item():.6f}")
-        print(f"scale mean: {scale.mean().item():.6f}")
-        print(f"scale min/max: {scale.min().item():.6f}/{scale.max().item():.6f}")
-
     # =========================================================
-    # 10. POST ROTATION GAIN
+    # POST ROTATION GAIN
     # =========================================================
-
     if kp_prev is not None:
-        # 'right_shoulder': 2, 'right_elbow': 3, 'right_wrist': 4,'left_shoulder': 5, 'left_elbow': 6, 'left_wrist': 7, 'right_hip': 8, 'left_hip': 11,
-        #upper_ids = [5,6,7,8,9,10,11,12]
-        upper_ids = [2,3,4,5,6,7,8,11]
-
+        upper_ids = [2, 3, 4, 5, 6, 7, 8, 11]
         upper_ids = [i for i in upper_ids if i < kp.shape[1]]
-
         rotation_gain = min(rotation_gain, 0.7)
-
         kp[:, upper_ids, :2] = (
             kp_prev[:, upper_ids, :2] +
             (kp[:, upper_ids, :2] - kp_prev[:, upper_ids, :2]) * rotation_gain
         )
 
     # =========================================================
-    # 12. DEBUG FINAL
+    # DEBUG FINAL
     # =========================================================
     if debug:
-        motion = 0.0
-        if kp_prev is not None:
-            motion = (kp[..., :2] - kp_prev[..., :2]).abs().mean()
-
+        motion = (kp[..., :2] - kp_prev[..., :2]).abs().mean() if kp_prev is not None else 0.0
         print("\n[🎬 MOTION ENGINE V6/V7/V8/V9]")
-        print(f"frame: {frame_idx}")
-        print(f"Motion model: {motion_model}")
-        print(f"motion_mean: {float(motion):.6f}")
+        print(f"frame: {frame_idx}, Motion model: {motion_model}, motion_mean: {motion:.6f}")
 
-        if frame_idx % 2 == 0 and debug_dir is not None:
-            debug_draw_openpose_skeleton(
-                keypoints_tensor=ensure_kp3(kp),
-                debug_dir=debug_dir,
-                frame_counter=frame_idx,
-                image_size=image_size
-            )
+        if frame_idx % 2 == 0 and debug_dir:
+            debug_draw_openpose_skeleton(keypoints_tensor=ensure_kp3(kp), debug_dir=debug_dir, frame_counter=frame_idx, image_size=image_size)
 
     # =========================================================
-    # 13. STATE UPDATE SAFE
+    # STATE UPDATE SAFE
     # =========================================================
     new_state = new_state or {}
-
     new_state["kp_prev"] = kp.clone()
-
-    if "anchor" not in new_state or new_state["anchor"] is None:
-        new_state["anchor"] = kp.mean(dim=1, keepdim=True)
-
+    new_state["anchor"] = new_state.get("anchor", kp.mean(dim=1, keepdim=True))
     new_state["global_shift"] = state.get("global_shift", None)
     new_state["global_angle_x"] = state.get("global_angle_x", None)
     new_state["global_angle_y"] = state.get("global_angle_y", None)
