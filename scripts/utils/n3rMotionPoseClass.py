@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 import cv2
+
+
 import os
 from PIL import Image, ImageDraw
 from .n3rMotionPose_tools import save_debug_mask, feather_inside_strict, feather_mask, feather_mask_fast, feather_outside_only, feather_inside,feather_inside_strict, feather_outside_only_alpha, feather_inside_strict2, feather_outside_only_alpha2, save_debug_mask_scale
@@ -57,7 +59,7 @@ class Pose:
             'left_eye': 15,
             'right_ear': 16,
             'left_ear': 17,
-            'mouth': 18,  # Centre de la couche
+            'mouth': 18,  # Centre de la couche mouth_center
             'chin': 21,
             'left_side_neck': 22,
             'right_side_neck': 23,
@@ -855,6 +857,7 @@ class Pose:
             estimated_points['mouth_top_mid_r2'] = mouth_top_mid_r2  # point réel de la lèvre supérieure
             estimated_points['mouth_top_mid_r1'] = mouth_top_mid_r1  # point réel de la lèvre supérieure
             estimated_points['mouth_top'] = mouth_top  # point réel de la lèvre supérieure
+            estimated_points['mouth_top_mid'] = mouth_top  # point réel de la lèvre supérieure
             estimated_points['mouth_top_mid_l1'] = mouth_top_mid_l1  # point réel de la lèvre supérieure
             estimated_points['mouth_top_mid_l2'] = mouth_top_mid_l2  # point réel de la lèvre supérieure
             estimated_points['mouth_top_mid_l3'] = mouth_top_mid_l3  # point réel de la lèvre supérieure
@@ -864,6 +867,7 @@ class Pose:
             estimated_points['mouth_top_mid_r3'] = mouth_top.clone()
             estimated_points['mouth_top_mid_r2'] = mouth_top.clone()
             estimated_points['mouth_top_mid_r1'] = mouth_top.clone()
+            estimated_points['mouth_top'] = mouth_top.clone()
             estimated_points['mouth_top_mid'] = mouth_top.clone()
             estimated_points['mouth_top_mid_l1'] = mouth_top.clone()
             estimated_points['mouth_top_mid_l2'] = mouth_top.clone()
@@ -883,6 +887,7 @@ class Pose:
             estimated_points['mouth_bot_mid_r2'] = mouth_bot_mid_r2  # point réel de la lèvre inférieure
             estimated_points['mouth_bot_mid_r1'] = mouth_bot_mid_r1  # point réel de la lèvre inférieure
             estimated_points['mouth_bottom'] = mouth_bottom  # point réel de la lèvre inférieure
+            estimated_points['mouth_bot_mid'] = mouth_bottom  # point réel de la lèvre inférieure
             estimated_points['mouth_bot_mid_l1'] = mouth_bot_mid_l1  # point réel de la lèvre inférieure
             estimated_points['mouth_bot_mid_l2'] = mouth_bot_mid_l2  # point réel de la lèvre inférieure
             estimated_points['mouth_bot_mid_l3'] = mouth_bot_mid_l3  # point réel de la lèvre inférieure
@@ -893,6 +898,7 @@ class Pose:
             estimated_points['mouth_bot_mid_r3'] = mouth_bottom.clone()
             estimated_points['mouth_bot_mid_r2'] = mouth_bottom.clone()
             estimated_points['mouth_bot_mid_r1'] = mouth_bottom.clone()
+            estimated_points['mouth_bottom'] = mouth_bottom.clone()
             estimated_points['mouth_bot_mid'] = mouth_bottom.clone()
             estimated_points['mouth_bot_mid_l1'] = mouth_bottom.clone()
             estimated_points['mouth_bot_mid_l2'] = mouth_bottom.clone()
@@ -924,6 +930,9 @@ class Pose:
         self.angles = angle
         return angle
     # ----------------- Masque Bouche -----------------
+
+
+
     def get_mouth_region(
             self,
             H: int,
@@ -936,11 +945,12 @@ class Pose:
             min_area=120,
             temporal_smooth=0.8,
             profile_strength=0.08,
+            scale=8
         ):
 
         # Valeurs par défaut dynamiques
-        expand_w = self.get_bouche_expand_w() # 0.60
-        expand_h = self.get_bouche_expand_h() # 0.30
+        expand_w = self.get_bouche_expand_w()  # 0.60
+        expand_h = self.get_bouche_expand_h()  # 0.30
 
         if device is None:
             device = self.device
@@ -954,153 +964,117 @@ class Pose:
             print(f"[WARN] mouth_region: estimation failed → fallback empty ({e})")
             return mask
 
-        required_keys = ['mouth_left_c', 'mouth_right_c', 'mouth_top', 'mouth_bottom']
+        required_keys = [
+            'mouth_left', 'mouth_right', 'mouth_center',
+            'mouth_top_mid_r3', 'mouth_top_mid_r2', 'mouth_top_mid_r1',
+            'mouth_top_mid', 'mouth_top_mid_l1', 'mouth_top_mid_l2', 'mouth_top_mid_l3',
+            'mouth_bot_mid_r3', 'mouth_bot_mid_r2', 'mouth_bot_mid_r1', 'mouth_bot_mid',
+            'mouth_bot_mid_l1', 'mouth_bot_mid_l2', 'mouth_bot_mid_l3',
+        ]
+
         if not all(k in points_dict for k in required_keys):
+            print(f"[ERROR] Missing required points in points_dict. Available keys: {list(points_dict.keys())}")
             return mask
 
-        ml = points_dict['mouth_left_c']
-        mr = points_dict['mouth_right_c']
-        mt = points_dict['mouth_top']
-        mb = points_dict['mouth_bottom']
+        # Extraction des points de lèvres
+        mouth_center = points_dict['mouth_center']
+        mouth_left = points_dict['mouth_left']
+        mouth_right = points_dict['mouth_right']
 
+        # Lèvres du haut
+        mouth_top_mid_r3 = points_dict['mouth_top_mid_r3']
+        mouth_top_mid_r2 = points_dict['mouth_top_mid_r2']
+        mouth_top_mid_r1 = points_dict['mouth_top_mid_r1']
+        mouth_top_mid = points_dict['mouth_top_mid']
+        mouth_top_mid_l1 = points_dict['mouth_top_mid_l1']
+        mouth_top_mid_l2 = points_dict['mouth_top_mid_l2']
+        mouth_top_mid_l3 = points_dict['mouth_top_mid_l3']
+
+        # Lèvres du bas
+        mouth_bot_mid_r3 = points_dict['mouth_bot_mid_r3']
+        mouth_bot_mid_r2 = points_dict['mouth_bot_mid_r2']
+        mouth_bot_mid_r1 = points_dict['mouth_bot_mid_r1']
+        mouth_bot_mid = points_dict['mouth_bot_mid']
+        mouth_bot_mid_l1 = points_dict['mouth_bot_mid_l1']
+        mouth_bot_mid_l2 = points_dict['mouth_bot_mid_l2']
+        mouth_bot_mid_l3 = points_dict['mouth_bot_mid_l3']
+
+        # -----------------------------------------------------
+        # Pour la partie inférieure de la bouche (bas)
+        # -----------------------------------------------------
+        lower_points = [
+            mouth_right, mouth_bot_mid_r3, mouth_bot_mid_r2, mouth_bot_mid_r1, mouth_bot_mid,
+            mouth_bot_mid_l1, mouth_bot_mid_l2, mouth_bot_mid_l3, mouth_left
+        ]
+
+        # -----------------------------------------------------
+        # Pour la partie supérieure de la bouche (haut)
+        # -----------------------------------------------------
+        upper_points = [
+            mouth_right, mouth_top_mid_r3, mouth_top_mid_r2, mouth_top_mid_r1, mouth_top_mid,
+            mouth_top_mid_l1, mouth_top_mid_l2, mouth_top_mid_l3, mouth_left
+        ]
+
+        # Combine les points du bas et du haut
+        all_points = lower_points + upper_points
+
+        # Si des points sont NaN, ignorer l'image
+        pts = torch.stack(all_points)
+        if torch.isnan(pts).any():
+            print(f"[ERROR] NaN values detected in the points. Skipping this batch.")
+            return mask
+
+        # Initialisation de l'état de la bouche
         if not hasattr(self, "_mouth_state"):
             self._mouth_state = {}
 
         for b in range(B):
+            # Convertir les points en format numpy pour OpenCV
+            # Mise à l'échelle correcte : chaque coordonnée est multipliée par H ou W
+            points_np = np.array([
+                [int(p[b, 0] * W), int(p[b, 1] * H)] for p in all_points
+            ], dtype=np.int32)
 
-            pts = torch.stack([ml[b], mr[b], mt[b], mb[b]])
-            if torch.isnan(pts).any():
-                continue
+            # Créer un masque vide
+            img_mask = np.zeros((H, W), dtype=np.uint8)
 
-            # =========================================================
-            # CENTER BASE
-            # =========================================================
-            cx = (ml[b,0] + mr[b,0]) * 0.5
-            cy = (mt[b,1] + mb[b,1]) * 0.5
-            center = torch.stack([cx, cy])
+            # Dessiner le polygone sur le masque (remplissage)
+            cv2.fillPoly(img_mask, [points_np], color=1)
 
-            # =========================================================
-            # PROFILE CORRECTION (fusion stable)
-            # =========================================================
-            shift = torch.zeros_like(center)
-            weight = 0.0
+            # Convertir en tensor et ajouter à notre masque final
+            mask[b, 0] = torch.tensor(img_mask, device=device, dtype=torch.float32)
 
-            def apply_axis(left, right):
-                nonlocal shift, weight
-
-                mid = (left + right) * 0.5
-                dir_vec = center - mid
-                norm = torch.norm(dir_vec) + 1e-6
-                dir_unit = dir_vec / norm
-
-                asym = torch.norm(right - left)
-                asym = torch.clamp(asym, 0.0, 1.0)
-
-                shift += dir_unit * asym
-                weight += 1.0
-
-            # 👁 yeux
-            if 'left_eye_outer' in points_dict and 'right_eye_outer' in points_dict:
-                if debug:
-                    print(f"[DEBUG][MOUTH] 👄 Position des 👁  pris en compte")
-                el = points_dict['left_eye_outer'][b]
-                er = points_dict['right_eye_outer'][b]
-                apply_axis(el, er)
-
-            # 👂 oreilles
-            if 'left_ear' in points_dict and 'right_ear' in points_dict:
-                if debug:
-                    print(f"[DEBUG][MOUTH] 👄 Position des 👂 pris en compte")
-                el = points_dict['left_ear'][b]
-                er = points_dict['right_ear'][b]
-                apply_axis(el, er)
-
-            # normalisation finale (évite double correction)
-            if weight > 0:
-                shift = shift / weight
-                shift = torch.clamp(shift, -1.0, 1.0)  # anti dérive
-                center = center + shift * profile_strength
-
-            # =========================================================
-            # TEMPORAL SMOOTHING
-            # =========================================================
-            if b in self._mouth_state:
-                prev = self._mouth_state[b]["center"]
-                center = temporal_smooth * prev + (1 - temporal_smooth) * center
-
-            # =========================================================
-            # DIMENSIONS
-            # =========================================================
-            width  = torch.abs(mr[b,0] - ml[b,0])
-            height = torch.abs(mb[b,1] - mt[b,1])
-
-            if width < 1e-4 or height < 1e-4:
-                width  = torch.tensor(0.08, device=device)
-                height = torch.tensor(0.06, device=device)
-
-            width  *= (1 + expand_w)
-            height *= (1 + expand_h)
-
-            area = width * height
-            if area < min_area / (H * W):
-                scale = (min_area / (H * W) / (area + 1e-6)) ** 0.5
-                width  *= scale
-                height *= scale
-
-            # =========================================================
-            # PIXEL SPACE
-            # =========================================================
-            cx_px = center[0] * (W - 1)
-            cy_px = center[1] * (H - 1)
-
-            rx = max(min_size, int(width  * W * 0.5))
-            ry = max(min_size, int(height * H * 0.5))
-
-            # =========================================================
-            # ELLIPSE MASK
-            # =========================================================
-            Y, X = torch.meshgrid(
-                torch.arange(H, device=device),
-                torch.arange(W, device=device),
-                indexing="ij"
-            )
-
-            dist = ((X - cx_px)**2) / (rx**2 + 1e-6) + ((Y - cy_px)**2) / (ry**2 + 1e-6)
-            ellipse = torch.exp(-dist * 2.5)
-
-            mask[b, 0] = torch.maximum(mask[b, 0], ellipse)
-
-            # =========================================================
-            # SAVE STATE
-            # =========================================================
-            self._mouth_state[b] = {
-                "center": center.detach(),
-                "width": width.detach(),
-                "height": height.detach()
-            }
-
-            # =========================================================
-            # DEBUG
-            # =========================================================
+            # -----------------------------------------------------
+            # Débogage des points et du masque
             if debug:
-                print(f"[DEBUG][MOUTH]")
-                print(f" center: {center.tolist()}")
-                print(f" shift: {shift.tolist() if weight > 0 else None}")
-                print(f" width/height: {width.item():.4f} / {height.item():.4f}")
-                print(f" rx/ry px: {rx} / {ry}")
+                print(f"[DEBUG][MOUTH][FRAME {frame_counter}] Points de la bouche pour la frame {b}:")
+                for name, point in zip(
+                    ["mouth_right", "mouth_bot_mid_r3", "mouth_bot_mid_r2", "mouth_bot_mid_r1", "mouth_bot_mid",
+                    "mouth_bot_mid_l1", "mouth_bot_mid_l2", "mouth_bot_mid_l3", "mouth_left", "mouth_top_mid_r3",
+                    "mouth_top_mid_r2", "mouth_top_mid_r1", "mouth_top_mid", "mouth_top_mid_l1", "mouth_top_mid_l2",
+                    "mouth_top_mid_l3"], all_points):
+                    print(f"{name}: {point[b].tolist()}")
+
+                print(f"[DEBUG][MOUTH][FRAME {frame_counter}] Mask preview:")
+                print(img_mask)
+
+            # -----------------------------------------------------
+            # Sauvegarder l'état de la bouche pour lissage temporel
+            self._mouth_state[b] = {
+                "center": mouth_center[b].detach(),
+                "width": (mouth_right[b, 0] - mouth_left[b, 0]).detach(),
+                "height": (mouth_bot_mid[b, 1] - mouth_top_mid[b, 1]).detach()
+            }
 
         mask = mask.clamp(0, 1)
 
+        # Sauvegarder le masque en mode debug
         if debug and debug_dir is not None:
-            save_debug_mask_scale(
-                mask=mask,
-                debug_dir=debug_dir,
-                frame_counter=frame_counter,
-                name="mouth_region_mask",
-                scale=4
-            )
+            save_debug_mask_scale( mask=mask, debug_dir=debug_dir, frame_counter=frame_counter, name="mouth_region_mask", scale=scale )
 
         return mask
+
+
 
 
     def compute_mouth_delta(
@@ -2074,6 +2048,7 @@ class Pose:
         debug=False,
         debug_dir=None,
         frame_counter=0,
+        scale=8
     ):
 
         # Valeurs par défaut dynamiques
@@ -2150,8 +2125,8 @@ class Pose:
         # 🔹 3. FEATHER FINAL (léger uniquement)
         # =========================================================
         try:
-            mask = feather_inside_strict(mask, radius=2, blur_kernel=3, sigma=0.8)
-            mask = feather_outside_only_alpha(mask, radius=3, sigma=1.2)
+            mask = feather_inside_strict(mask, radius=1, blur_kernel=3, sigma=0.8) #R 2 ->
+            mask = feather_outside_only_alpha(mask, radius=1, sigma=1.2) #R 3 -> 1
         except Exception as e:
             print(f"[WARN] create_mouth_mask: feather failed ({e})")
 
@@ -2159,14 +2134,9 @@ class Pose:
         # 🔹 4. DEBUG VISUEL
         # =========================================================
         if debug and debug_dir is not None and frame_counter == 0:
-            os.makedirs(debug_dir, exist_ok=True)
+            save_debug_mask_scale( mask=mask, debug_dir=debug_dir, frame_counter=frame_counter, name="mouth_mask", scale=scale)
 
-            mask_img = (mask[0,0].detach().cpu().numpy() * 255).astype(np.uint8)
 
-            save_path = os.path.join(debug_dir, f"mouth_mask_{frame_counter:05d}.png")
-            Image.fromarray(mask_img).save(save_path)
-
-            print(f"[DEBUG] Mouth mask saved: {save_path}")
 
         return mask.clamp(0,1), mouth_points_batch
     #-----------------------------------------------------------------------------------------------------------------------------------
