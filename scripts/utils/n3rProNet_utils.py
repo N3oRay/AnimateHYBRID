@@ -11,6 +11,11 @@ from torchvision.transforms.functional import to_pil_image
 import matplotlib.pyplot as plt
 import mediapipe as mp
 
+import torch
+import torch.nn as nn
+
+
+
 
 
 def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
@@ -3066,6 +3071,58 @@ def detect_eyes_auto(frame_pil):
 
 
 
+import torch
+import torch.nn as nn
+
+# TEST création de model !
+class DenoisingAutoencoder(nn.Module):
+    def __init__(self):
+        super(DenoisingAutoencoder, self).__init__()
+
+        # Encodeur
+        self.encoder = nn.Sequential(
+            nn.Conv2d(4, 64, kernel_size=3, stride=2, padding=1),  # Accepter 4 canaux d'entrée
+            nn.ReLU(True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(True),
+        )
+
+        # Décodeur
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(64, 4, kernel_size=3, stride=2, padding=1, output_padding=1),  # 4 canaux en sortie
+            nn.Sigmoid(),  # Sortie entre 0 et 1 (pour des images normalisées entre [0,1])
+        )
+
+    def forward(self, x):
+        # Passer par l'encodeur et le décodeur
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+# Créer le modèle de débruitage avec 3 canaux en entrée
+denoising_model = DenoisingAutoencoder().to(device="cuda")
+
+
+def denoise_latents(latents, denoising_model, device="cuda"):
+    """
+    Applique un Denoising Autoencoder aux latents.
+    """
+    latents = latents.to(device).to(torch.float32)  # Convertir en float32 avant de passer au modèle
+
+    # Passer les latents dans le Denoising Autoencoder
+    latents = denoising_model(latents)
+    return latents
+
 
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
@@ -3086,6 +3143,9 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
+
+     # Appliquer le denoising autoencoder sur les latents
+    #latents = denoise_latents(latents, denoising_model, device=device)
 
     out_H, out_W = H * 8, W * 8
     output_rgb = torch.zeros(B, 3, out_H, out_W, device=device, dtype=torch.float32)
