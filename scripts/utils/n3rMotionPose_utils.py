@@ -37,7 +37,7 @@ max_velocity = 0.008       # 🔥 clé principale (cinematic cap)
 
 MOTION_PROFILES = {
     "stable": {
-        "time_scale": 0.4,
+        "time_scale": 0.35,
         "camera_lock": 0.95,
         "max_velocity": 0.004,
         "rotation_gain": 1.0,
@@ -45,7 +45,7 @@ MOTION_PROFILES = {
     },
 
     "cinematic": {
-        "time_scale": 0.5,
+        "time_scale": 0.4,
         "camera_lock": 0.85,
         "max_velocity": 0.03,
         "rotation_gain": 1.2,
@@ -61,10 +61,10 @@ MOTION_PROFILES = {
     },
 
     "dynamic": {
-        "time_scale": 0.6,
-        "camera_lock": 0.92,
-        "max_velocity": 0.008,
-        "rotation_gain": 1.35,
+        "time_scale": 0.45,
+        "camera_lock": 0.95,
+        "max_velocity": 0.003,
+        "rotation_gain": 1.3,
         "cinematic_start": 10
     },
     # pas d'animation des keypoints casi null'
@@ -1699,7 +1699,7 @@ def apply_torso_warp(
     W,
     device,
     prev_delta_px=None,
-    strength=0.3,   # 🔥 NEW: 0.3
+    strength=0.2,   # 🔥 NEW: 0.3
     debug=False,
     debug_dir=None
 ):
@@ -2031,7 +2031,7 @@ def apply_face_warp(
     debug_dir=None,
     smooth=0.85,
     prev_grid=None,
-    strength=1.0,
+    strength=0.3,
     paused=False  # Paramètre pour activer/désactiver l'effet
 ):
     if device is None:

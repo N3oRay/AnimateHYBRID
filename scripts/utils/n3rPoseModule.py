@@ -187,13 +187,13 @@ ACTOR_LABELS = {
 }
 
 
-ACTOR_MODEL_SCHEDULE = [
+ACTOR_MODEL_SCHEDULE_test = [
     (0, "pause"),
     (1, "v12"),
 
 ]
 
-ACTOR_MODEL_SCHEDULE_gg = [
+ACTOR_MODEL_SCHEDULE = [
     (0, "pause"),
     (12,  "base"),
     (15,  "v9"),
@@ -212,10 +212,10 @@ ACTOR_MODEL_SCHEDULE_gg = [
 
 MOTION_MODEL_SCHEDULE = [
     (0,  "locked"),
-    (1, "dynamic"),
     (15, "stable"),
     (20, "cinematic"),
     (30, "locked"),
+    (35, "dynamic"),
     (50, "warp"),
 ]
 
@@ -431,7 +431,7 @@ def cinematic_motion_graph_v12(
     debug=False,
     fish_eye_strength=1.5,
     fish_eye_max_radius=1.0,
-    rotation_strength=1.0,  # Augmenter légèrement la force de la rotation Z
+    rotation_strength=0.5,  # Augmenter légèrement la force de la rotation Z
     motion_sensitivity=4.0,
     damping=0.90,
     inertia=0.85,
