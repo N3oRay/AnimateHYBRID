@@ -39,8 +39,15 @@ n3rRealControl.py - Description and Options
 
 The n3rRealControl.py script enables the generation of animated videos and images from diffusion models with advanced adjustments. It provides maximum flexibility through customization options for quality, speed, and VRAM usage.
 
-<img src="__assets__/animations/output.gif">
-<img src="__assets__/animations/output2.gif">
+<table class="center">
+    <tr>
+    <td><img src="__assets__/animations/output.gif"></td>
+    <td><img src="__assets__/animations/output2.gif"></td>
+    </tr>
+</table>
+
+
+
 n3rRealControl: Allows animation via Openpose, and skeleton
 
 ```
