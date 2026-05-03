@@ -3064,9 +3064,9 @@ def detect_eyes_auto(frame_pil):
         right_eye = np.mean([(lm[i].y*h, lm[i].x*w) for i in [362, 263]], axis=0)
         return [(int(left_eye[0]), int(left_eye[1])), (int(right_eye[0]), int(right_eye[1]))]
 
-# Decode avec blending optimise :
-#
-# ---------------------------------------------------------------------------------------------
+
+
+
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
     block_size=32, overlap=16,
@@ -3077,7 +3077,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     sharpen_mode="both",              # None, "tanh", "edges", "both"
     sharpen_strength=0.015,
     sharpen_edges_strength=0.02,
-    gamma_boost=1.03,                  # légèrement plus de punch naturel
+    gamma_boost=1.00,                  # légèrement plus de punch naturel
     scale=4
 ):
 
@@ -3165,11 +3165,12 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         output_rgb = output_rgb.clamp(-1.0, 1.0)
 
     # ---------------- Gamma adaptatif ----------------
-    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
-    luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
-    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))
-    output_rgb_gamma = output_rgb_gamma ** adapt_gamma
-    output_rgb = output_rgb_gamma * 2 - 1
+    if gamma_boost > 1.0:
+        output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
+        luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
+        adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))
+        output_rgb_gamma = output_rgb_gamma ** adapt_gamma
+        output_rgb = output_rgb_gamma * 2 - 1
 
     # ---------------- Micro-boost couleur ----------------
     mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
