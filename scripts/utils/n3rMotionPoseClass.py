@@ -57,7 +57,7 @@ class Pose:
             'left_eye': 15,
             'right_ear': 16,
             'left_ear': 17,
-            'mouth': 18,
+            'mouth': 18,  # Centre de la couche
             'chin': 21,
             'left_side_neck': 22,
             'right_side_neck': 23,
@@ -76,6 +76,10 @@ class Pose:
             'right_top_hair1': 34,
             'right_top_hair2': 35,
             'right_top_hair3': 36,
+
+
+            'mouth_left_ext': 38, # coin extérieur à la bouche
+            'mouth_right_ext':39, # coin extérieur à la bouche
 
             'mouth_left': 40,    # coin gauche des lèvres supérieures upper_ids=(5,6,7,8,9,10),
             'mouth_right': 41,   # coin droit des lèvres supérieures
@@ -98,6 +102,22 @@ class Pose:
             'front_m': 54, # front milleu
             'front_right_1': 55, # front droit 1
             'front_right_2': 56, # front droit 2
+            # Lèvre du haut
+            'mouth_top_mid_r3': 70,
+            'mouth_top_mid_r2': 71,
+            'mouth_top_mid_r1': 72,
+            'mouth_top_mid': 73,
+            'mouth_top_mid_l1': 74,
+            'mouth_top_mid_l2': 75,
+            'mouth_top_mid_l3': 76,
+            # Lèvre du bas
+            'mouth_bot_mid_r3': 77,
+            'mouth_bot_mid_r2': 78,
+            'mouth_bot_mid_r1': 79,
+            'mouth_bot_mid': 80,
+            'mouth_bot_mid_l1': 81,
+            'mouth_bot_mid_l2': 82,
+            'mouth_bot_mid_l3': 83,
 
         }
 
@@ -735,6 +755,21 @@ class Pose:
         return points
 
     # ----------------- Calcul des points de la bouche -----------------
+    def _calculate_mouth_width(self, right_ear, left_ear, right_eye, left_eye):
+        """
+        Calcule la largeur estimée de la bouche en fonction des points disponibles.
+        """
+        if right_ear is not None and left_ear is not None:
+            return (left_ear[:, 0] - right_ear[:, 0]) * 0.4  # proportionnelle à la largeur de la tête
+        elif right_eye is not None and left_eye is not None:
+            return (left_eye[:, 0] - right_eye[:, 0]) * 0.5
+        return torch.tensor(0.12, device=self.device).expand(self.B)  # fallback
+
+    def _calculate_mouth_height(self, mouth_width):
+        """
+        Calcule la hauteur estimée de la bouche basée sur sa largeur.
+        """
+        return mouth_width * 0.25
     def estimate_missing_facial_points(self):
         """
         Estime les points manquants du visage (bouche, coins de lèvres, coins des yeux)
@@ -747,74 +782,129 @@ class Pose:
         device = self.device
 
         # ----------------- Points de base -----------------
-        nose = self.keypoints[:, 0, :2]       # point 0 = nez
+        nose = self.keypoints[:, 0, :2]  # point 0 = nez
 
-        mouth_detected = self.keypoints[:, 18, :2]  # point 18 = bouche
-        mouth_detected_left = self.keypoints[:, 40, :2] if self.keypoints.shape[1] > 40 else None # point 40 = bouche left
-        mouth_detected_rigth = self.keypoints[:, 41, :2] if self.keypoints.shape[1] > 41 else None # point 41 = bouche right
+        # BOUCHE : points détectés
+        mouth_center = self.get_point(18)  # centre de la bouche (point 18)
+        mouth_left = self.get_point(40)  # coin gauche de la bouche (point 40)
+        mouth_right = self.get_point(41)  # coin droit de la bouche (point 41)
 
-        # Yeux
-        right_eye = self.keypoints[:, 14, :2] if self.keypoints.shape[1] > 14 else None
-        left_eye = self.keypoints[:, 15, :2] if self.keypoints.shape[1] > 15 else None
+        mouth_left_ext = self.get_point(38)  # coin gauche de la bouche (point 38)
+        mouth_right_ext = self.get_point(39)  # coin droit de la bouche (point 39)
 
-        # Oreilles
-        right_ear = self.keypoints[:, 16, :2] if self.keypoints.shape[1] > 16 else None
-        left_ear  = self.keypoints[:, 17, :2] if self.keypoints.shape[1] > 17 else None
+        # YEUX : points détectés
+        right_eye = self.get_point(14)  # œil droit (point 14)
+        left_eye = self.get_point(15)   # œil gauche (point 15)
 
-        # ----------------- BOUCHE -----------------
-        # Si bouche détectée, centre = point détecté
-        mouth_center = mouth_detected.clone()
-        mouth_d_left = mouth_detected_left.clone()
-        mouth_d_right = mouth_detected_rigth.clone()
+        # OREILLES : points détectés
+        right_ear = self.get_point(16)  # oreille droite (point 16)
+        left_ear = self.get_point(17)   # oreille gauche (point 17)
 
+        # Lèvre du haut
+        mouth_top_mid_r3 = self.get_point(70)  #
+        mouth_top_mid_r2 = self.get_point(71)  #
+        mouth_top_mid_r1 = self.get_point(72)  #
+        mouth_top = self.get_point(73)  # 'mouth_top_mid' (point 73) comme centre de la lèvre supérieure
+        mouth_top_mid_l1 = self.get_point(74)  #
+        mouth_top_mid_l2 = self.get_point(75)  #
+        mouth_top_mid_l3 = self.get_point(76)  #
 
-        # Largeur de la bouche : si oreilles connues, sinon distance yeux
-        if right_ear is not None and left_ear is not None:
-            mouth_width = (left_ear[:,0] - right_ear[:,0]) * 0.4  # proportionnelle à la largeur de la tête
-        elif right_eye is not None and left_eye is not None:
-            mouth_width = (left_eye[:,0] - right_eye[:,0]) * 0.5
+        # Lèvre du bas
+        mouth_bot_mid_r3 = self.get_point(77)  #
+        mouth_bot_mid_r2 = self.get_point(78)  #
+        mouth_bot_mid_r1 = self.get_point(79)  #
+        mouth_bottom = self.get_point(80)  # 'mouth_bot_mid' (point 80) comme centre de la lèvre inférieure
+        mouth_bot_mid_l1 = self.get_point(81)  #
+        mouth_bot_mid_l2 = self.get_point(82)  #
+        mouth_bot_mid_l3 = self.get_point(83)  #
+
+        # ----------------- Largeur et Hauteur de la bouche -----------------
+        mouth_width = self._calculate_mouth_width(right_ear, left_ear, right_eye, left_eye)
+        mouth_height = self._calculate_mouth_height(mouth_width)
+
+        # ----------------- LÈVRE DU HAUT ET DU BAS -----------------
+        # Utilisation des points spécifiques 'mouth_top_mid' et 'mouth_bot_mid'
+
+        if mouth_top is None or mouth_bottom is None:
+            raise ValueError("Les points 'mouth_top_mid' ou 'mouth_bot_mid' sont manquants !")
+
+        # Estimation des coins gauche/droit de la bouche
+        mouth_left_corner = mouth_center.clone()
+        mouth_left_corner[:, 0] -= mouth_width / 2
+
+        mouth_right_corner = mouth_center.clone()
+        mouth_right_corner[:, 0] += mouth_width / 2
+
+        # Calcul des points intermédiaires pour les lèvres supérieures et inférieures
+        estimated_points['mouth_center'] = mouth_center
+        if mouth_left is not None and mouth_right is not None:
+            estimated_points['mouth_left'] = mouth_left
+            estimated_points['mouth_right'] = mouth_right
+
+        # ----------------- Calcul des autres points de la lèvre supérieure -----------------
+        if mouth_left_ext is not None and mouth_right_ext is not None:
+            estimated_points['mouth_left_c'] = mouth_left_ext
+            estimated_points['mouth_right_c'] = mouth_right_ext
         else:
-            mouth_width = torch.tensor(0.12, device=device).expand(B)  # fallback
+            estimated_points['mouth_left_c'] = mouth_left_corner
+            estimated_points['mouth_right_c'] = mouth_right_corner
 
-        # Hauteur approximative de la bouche
-        mouth_height = mouth_width * 0.25
+        # ----------------- LÈVRE DU HAUT -----------------
+        if mouth_top is not None:
+            estimated_points['mouth_top_mid_r3'] = mouth_top_mid_r3  # point réel de la lèvre supérieure
+            estimated_points['mouth_top_mid_r2'] = mouth_top_mid_r2  # point réel de la lèvre supérieure
+            estimated_points['mouth_top_mid_r1'] = mouth_top_mid_r1  # point réel de la lèvre supérieure
+            estimated_points['mouth_top'] = mouth_top  # point réel de la lèvre supérieure
+            estimated_points['mouth_top_mid_l1'] = mouth_top_mid_l1  # point réel de la lèvre supérieure
+            estimated_points['mouth_top_mid_l2'] = mouth_top_mid_l2  # point réel de la lèvre supérieure
+            estimated_points['mouth_top_mid_l3'] = mouth_top_mid_l3  # point réel de la lèvre supérieure
+        else:
+            # Ajustement des positions verticales pour la lèvre supérieure
+            mouth_top_height = mouth_height * 0.25  # Ajustement basé sur la hauteur estimée de la bouche
+            estimated_points['mouth_top_mid_r3'] = mouth_top.clone()
+            estimated_points['mouth_top_mid_r2'] = mouth_top.clone()
+            estimated_points['mouth_top_mid_r1'] = mouth_top.clone()
+            estimated_points['mouth_top_mid'] = mouth_top.clone()
+            estimated_points['mouth_top_mid_l1'] = mouth_top.clone()
+            estimated_points['mouth_top_mid_l2'] = mouth_top.clone()
+            estimated_points['mouth_top_mid_l3'] = mouth_top.clone()
 
-        # Coins gauche/droite
-        mouth_left = mouth_center.clone()
-        mouth_left[:,0] -= mouth_width / 2
-        mouth_right = mouth_center.clone()
-        mouth_right[:,0] += mouth_width / 2
+            estimated_points['mouth_top_mid_r3'][:, 1] -= mouth_top_height
+            estimated_points['mouth_top_mid_r2'][:, 1] -= mouth_top_height * 0.75
+            estimated_points['mouth_top_mid_r1'][:, 1] -= mouth_top_height * 0.5
+            estimated_points['mouth_top_mid'][:, 1] -= mouth_top_height * 0.25
+            estimated_points['mouth_top_mid_l1'][:, 1] += mouth_top_height * 0.25
+            estimated_points['mouth_top_mid_l2'][:, 1] += mouth_top_height * 0.5
+            estimated_points['mouth_top_mid_l3'][:, 1] += mouth_top_height * 0.75
 
-        # Haut/bas
-        mouth_top = mouth_center.clone()
-        mouth_top[:,1] -= mouth_height / 2
-        mouth_bottom = mouth_center.clone()
-        mouth_bottom[:,1] += mouth_height / 2
+        # Lèvre du bas
+        if mouth_bottom is not None:
+            estimated_points['mouth_bot_mid_r3'] = mouth_bot_mid_r3  # point réel de la lèvre inférieure
+            estimated_points['mouth_bot_mid_r2'] = mouth_bot_mid_r2  # point réel de la lèvre inférieure
+            estimated_points['mouth_bot_mid_r1'] = mouth_bot_mid_r1  # point réel de la lèvre inférieure
+            estimated_points['mouth_bottom'] = mouth_bottom  # point réel de la lèvre inférieure
+            estimated_points['mouth_bot_mid_l1'] = mouth_bot_mid_l1  # point réel de la lèvre inférieure
+            estimated_points['mouth_bot_mid_l2'] = mouth_bot_mid_l2  # point réel de la lèvre inférieure
+            estimated_points['mouth_bot_mid_l3'] = mouth_bot_mid_l3  # point réel de la lèvre inférieure
+        else:
+            # ----------------- LÈVRE DU BAS -----------------
+            # Ajustement des positions verticales pour la lèvre inférieure
+            mouth_bottom_height = mouth_height * 0.25  # Ajustement basé sur la hauteur estimée de la bouche
+            estimated_points['mouth_bot_mid_r3'] = mouth_bottom.clone()
+            estimated_points['mouth_bot_mid_r2'] = mouth_bottom.clone()
+            estimated_points['mouth_bot_mid_r1'] = mouth_bottom.clone()
+            estimated_points['mouth_bot_mid'] = mouth_bottom.clone()
+            estimated_points['mouth_bot_mid_l1'] = mouth_bottom.clone()
+            estimated_points['mouth_bot_mid_l2'] = mouth_bottom.clone()
+            estimated_points['mouth_bot_mid_l3'] = mouth_bottom.clone()
 
-        estimated_points['mouth_center'] = mouth_center # point réel
-        if mouth_d_left is not None and mouth_d_right is not None:
-            estimated_points['mouth_left'] = mouth_d_left # point réel
-            estimated_points['mouth_right'] = mouth_d_right # point réel
-
-        estimated_points['mouth_left_c'] = mouth_left #calculé
-        estimated_points['mouth_right_c'] = mouth_right #calculé
-        estimated_points['mouth_top'] = mouth_top
-        estimated_points['mouth_bottom'] = mouth_bottom
-
-        # ----------------- COINS DES YEUX (optionnel) -----------------
-        if right_eye is not None and left_eye is not None:
-            eye_width = (left_eye[:,0] - right_eye[:,0])
-            eye_height = 0.1 * eye_width
-
-            estimated_points['right_eye_inner'] = right_eye.clone()
-            estimated_points['right_eye_outer'] = right_eye.clone()
-            estimated_points['right_eye_outer'][:,0] += 0.5*eye_width
-            estimated_points['right_eye_inner'][:,0] -= 0.2*eye_width
-
-            estimated_points['left_eye_inner'] = left_eye.clone()
-            estimated_points['left_eye_outer'] = left_eye.clone()
-            estimated_points['left_eye_outer'][:,0] -= 0.5*eye_width
-            estimated_points['left_eye_inner'][:,0] += 0.2*eye_width
+            estimated_points['mouth_bot_mid_r3'][:, 1] -= mouth_bottom_height
+            estimated_points['mouth_bot_mid_r2'][:, 1] -= mouth_bottom_height * 0.75
+            estimated_points['mouth_bot_mid_r1'][:, 1] -= mouth_bottom_height * 0.5
+            estimated_points['mouth_bot_mid'][:, 1] -= mouth_bottom_height * 0.25
+            estimated_points['mouth_bot_mid_l1'][:, 1] += mouth_bottom_height * 0.25
+            estimated_points['mouth_bot_mid_l2'][:, 1] += mouth_bottom_height * 0.5
+            estimated_points['mouth_bot_mid_l3'][:, 1] += mouth_bottom_height * 0.75
 
         return estimated_points
 
@@ -1006,7 +1096,7 @@ class Pose:
                 mask=mask,
                 debug_dir=debug_dir,
                 frame_counter=frame_counter,
-                name="mouth_mask",
+                name="mouth_region_mask",
                 scale=4
             )
 
