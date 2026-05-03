@@ -33,47 +33,44 @@ freeze_strength = 0.30     # freeze utile mais pas bloquant
 micro_jitter = 0.00012     # encore plus subtil
 time_scale = 0.45          # ralentit légèrement plus
 max_velocity = 0.008       # 🔥 clé principale (cinematic cap)
+
+
 """
 
 MOTION_PROFILES = {
     "stable": {
-        "time_scale": 0.35,
+        "time_scale": 0.3,
         "camera_lock": 0.95,
-        "max_velocity": 0.004,
-        "rotation_gain": 1.0,
-        "cinematic_start": 25
+        "max_velocity": 0.002,
+        "rotation_gain": 0.7
     },
 
     "cinematic": {
         "time_scale": 0.4,
         "camera_lock": 0.85,
-        "max_velocity": 0.03,
-        "rotation_gain": 1.2,
-        "cinematic_start": 20
+        "max_velocity": 0.005, #Max 0.03 ou 0.01
+        "rotation_gain": 1.2
     },
 
     "warp": {
         "time_scale": 0.3,
         "camera_lock": 0.92,
         "max_velocity": 0.008,
-        "rotation_gain": 1.2,
-        "cinematic_start": 10
+        "rotation_gain": 1.2
     },
 
     "dynamic": {
         "time_scale": 0.45,
         "camera_lock": 0.95,
         "max_velocity": 0.003,
-        "rotation_gain": 1.3,
-        "cinematic_start": 10
+        "rotation_gain": 1.3
     },
     # pas d'animation des keypoints casi null'
     "locked": {
-        "time_scale": 0.3,
+        "time_scale": 0.2,
         "camera_lock": 0.98,
         "max_velocity": 0.001,
-        "rotation_gain": 0.001,
-        "cinematic_start": 9999
+        "rotation_gain": 0.001
     },
 
     # optional hint only (NOT authoritative)
@@ -81,8 +78,7 @@ MOTION_PROFILES = {
         "time_scale": 0.55,
         "camera_lock": 0.75,
         "max_velocity": 0.02,
-        "rotation_gain": 1.3,
-        "cinematic_start": 15
+        "rotation_gain": 1.3
     }
 }
 
@@ -645,7 +641,8 @@ def update_keypoints_from_pose(
     image_size=(1280, 896),
     device="cuda",
     frame_counter=0,
-    debug=False,
+    debug: bool = False,
+    verbose: bool = False,
     debug_dir=None
 ):
     """
@@ -698,8 +695,8 @@ def update_keypoints_from_pose(
 
     hair_left, hair_top_left, mouth_left_ext, nose_left, hair_top, hair_top_right, mouth_right_ext, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, left_top_hair3, nose_right, hair_right, hair_root, front_m, front_left1, front_left2, front_right1, front_right2  = pair(hair_coords, debug=debug)
 
-
-    print(f"Position de hair_root en pixels : {hair_root}")
+    if verbose:
+        print(f"Position de hair_root en pixels : {hair_root}")
     hair_center = np.mean([hair_left, hair_right], axis=0)
     # vecteur tête → cheveux -> Pose.get_head_up()
     head_up = np.array(hair_center) - np.array(left_clavicle)
@@ -734,8 +731,8 @@ def update_keypoints_from_pose(
         mouth_bot_mid_l1 = mouth_coords.get('mouth_bot_mid_l1')
         mouth_bot_mid_l2 = mouth_coords.get('mouth_bot_mid_l2')
         mouth_bot_mid_l3 = mouth_coords.get('mouth_bot_mid_l3')
-
-        print(f"Centre de la bouche: {mouth_center}")
+        if verbose:
+            print(f"Centre de la bouche: {mouth_center}")
     else:
         print("⚠️ Aucune bouche détectée.")
 

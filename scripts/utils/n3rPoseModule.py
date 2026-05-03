@@ -183,13 +183,14 @@ ACTOR_LABELS = {
     "v9": "[V9 FULL ACTOR SYSTEM]",
     "pause": "[V10 PAUSE INTER]",
     "v14": "[V14 ROTATION Z]",
-    "v12": "[V12 FISH EYES]",
+    "v12": "[V12 SMALL ROTATION]",
 }
 
 
 ACTOR_MODEL_SCHEDULE_test = [
     (0, "pause"),
     (1, "v12"),
+    (15, "v14"),
 
 ]
 
@@ -203,7 +204,7 @@ ACTOR_MODEL_SCHEDULE = [
     (35, "pause"),
     (40, "v7"), #OK
     (45, "v8"), #OK
-    (50, "v6"),
+    (50, "v6"), # a verifier
 ]
 
 # =========================================================
@@ -420,8 +421,6 @@ def fish_eye_distortion(kp, pivot, strength=1.5, max_radius=1.0):
     return kp_out
 
 
-
-
 def cinematic_motion_graph_v12(
     kp,
     state,
@@ -429,18 +428,13 @@ def cinematic_motion_graph_v12(
     upper_ids=(5, 6, 7, 8, 9, 10),
     hip_ids=(11, 12),
     debug=False,
-    fish_eye_strength=1.5,
-    fish_eye_max_radius=1.0,
     rotation_strength=0.5,  # Augmenter légèrement la force de la rotation Z
     motion_sensitivity=4.0,
-    damping=0.90,
+    rotation_damping=0.85,  # Réduire le damping pour moins de perte d'angle au fil du temps
     inertia=0.85,
-    head_lag=0.7,
-    max_deg=11.0,
-    fish_eyes=False,
-    stability=False,
-    apply_head_lag=False,
-    noise_strength=0.0,  # Réduire le bruit pour qu'il soit moins perceptible
+    head_lag=0.7, #OK
+    max_deg=1.0, #"OK"
+    apply_head_lag=True
 ):
     B, N, _ = kp.shape
     device = kp.device
@@ -506,7 +500,7 @@ def cinematic_motion_graph_v12(
     # -----------------------------
     # HARD LIMIT (safe cinematic range)
     # -----------------------------
-    max_angle = math.radians(11)  # 🔥 réduit de 25 → 11
+    max_angle = math.radians(max_deg)  # Utilisation de max_deg ici
     target_angle = torch.clamp(target_angle, -max_angle, max_angle)
 
     # -----------------------------
@@ -532,7 +526,6 @@ def cinematic_motion_graph_v12(
     # -----------------------------
     # ROTATION DAMPING PER FRAME
     # -----------------------------
-    rotation_damping = 0.85  # Réduire le damping pour moins de perte d'angle au fil du temps
     angle = angle * rotation_damping
 
     # =========================================================
@@ -558,7 +551,7 @@ def cinematic_motion_graph_v12(
     # DEBUG
     # =========================================================
     if debug:
-        print("\n[🎬 V12 ADVANCED FISHEYE EFFECT WITH NO Y MOVEMENT]")
+        print("\n[🎬 V12 ADVANCED MOVEMENT]")
         print("energy:", energy.mean().item())
         print("intent:", intent.norm(dim=-1).mean().item())
         print("angle:", angle.mean().item())
@@ -586,17 +579,17 @@ def cinematic_motion_graph_v14(
     # =========================
     # TOGGLES
     # =========================
-    enable_rotation=False,
+    enable_rotation=True,
     enable_inertia=True,
     enable_handheld=True,
-    enable_breathing=False,
+    enable_breathing=True,
     enable_overshoot=True,
 
     # =========================
     # PARAMETERS
     # =========================
-    max_deg=6.0,
-    rotation_strength=1.2,
+    max_deg=1.0,
+    rotation_strength=0.5,
     motion_sensitivity=2.5,
 
     inertia=0.80,

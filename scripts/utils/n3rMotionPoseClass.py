@@ -939,6 +939,7 @@ class Pose:
             W: int,
             device=None,
             debug: bool = False,
+            verbose: bool = False,
             debug_dir: str = None,
             frame_counter: int = 0,
             min_size=8,
@@ -1046,7 +1047,7 @@ class Pose:
 
             # -----------------------------------------------------
             # Débogage des points et du masque
-            if debug:
+            if verbose:
                 print(f"[DEBUG][MOUTH][FRAME {frame_counter}] Points de la bouche pour la frame {b}:")
                 for name, point in zip(
                     ["mouth_right", "mouth_bot_mid_r3", "mouth_bot_mid_r2", "mouth_bot_mid_r1", "mouth_bot_mid",
@@ -1069,7 +1070,7 @@ class Pose:
         mask = mask.clamp(0, 1)
 
         # Sauvegarder le masque en mode debug
-        if debug and debug_dir is not None:
+        if debug and debug_dir is not None and frame_counter == 0:
             save_debug_mask_scale( mask=mask, debug_dir=debug_dir, frame_counter=frame_counter, name="mouth_region_mask", scale=scale )
 
         return mask
