@@ -121,7 +121,62 @@ def make_trainable(tensor):
 import torch
 from torch.optim import Adam
 
-def denoise_latents(latents, denoising_model, optimizer=None, criterion=None, device="cuda", train=True):
+def denoise_latents_vao_load(latents, denoising_model, optimizer=None, criterion=None, device="cuda", train=True):
+    """
+    Denoise latents avec entraînement possible, training-safe même si le VAE est offloadé.
+    """
+    import torch
+
+    if latents is None:
+        raise ValueError("Latents is None, cannot proceed with denoising.")
+
+    # Normaliser les latents
+    latents = latents.clamp(-1.0, 1.0)
+
+    # Mettre latents sur le device
+    latents = latents.to(device=device, dtype=torch.float32)
+
+    if train:
+        # Mode entraînement
+        denoising_model.train()
+        # Forcer les paramètres à require_grad
+        for param in denoising_model.parameters():
+            param.requires_grad_(True)
+
+        optimizer.zero_grad()
+
+        # Forward avec graph pour grad_fn
+        decoded_latents = denoising_model(latents)
+        if criterion is not None:
+            loss = criterion(decoded_latents, latents)
+        else:
+            # Loss fictive pour éviter None
+            loss = torch.mean(decoded_latents ** 2)
+
+        # Backward et update
+        loss.backward()
+        if optimizer is not None:
+            optimizer.step()
+
+        print(f"[DENoise TRAIN] Latents max: {latents.max():.4f}, min: {latents.min():.4f}")
+        print(f"[DENoise TRAIN] Decoded max: {decoded_latents.max():.4f}, min: {decoded_latents.min():.4f}")
+        print(f"[DENoise TRAIN] Loss: {loss.item():.4f}")
+
+        return decoded_latents, loss.item()
+
+    else:
+        # Mode évaluation, no grad
+        denoising_model.eval()
+        with torch.no_grad():
+            decoded_latents = denoising_model(latents)
+
+        print(f"[DENoise EVAL] Latents max: {latents.max():.4f}, min: {latents.min():.4f}")
+        print(f"[DENoise EVAL] Decoded max: {decoded_latents.max():.4f}, min: {decoded_latents.min():.4f}")
+
+        return decoded_latents, None
+
+
+def denoise_latents_test(latents, denoising_model, optimizer=None, criterion=None, device="cuda", train=True):
     """
     Denoise latents using a model without relying on gradients (no grad_fn).
     Args:
@@ -164,7 +219,7 @@ def denoise_latents(latents, denoising_model, optimizer=None, criterion=None, de
 
     return decoded, loss
 
-def denoise_latents_v2(latents, denoising_model, optimizer=None, criterion=None, device="cuda", train=True):
+def denoise_latents(latents, denoising_model, optimizer=None, criterion=None, device="cuda", train=True):
     """
     Denoise latents de façon training-safe sans backward, compatible --vae-offload.
     Si train=True, le modèle peut s'adapter progressivement via une mise à jour heuristique.
@@ -210,7 +265,7 @@ def denoise_latents_v2(latents, denoising_model, optimizer=None, criterion=None,
 
     return decoded_latents, loss_val.item() if loss_val is not None else None
 
-def denoise_latents_v1(latents, denoising_model, optimizer, criterion, device="cuda", train=True):
+def denoise_latents_v1(latents, denoising_model, optimizer, criterion, device="cpu", train=True):
     """
     Applique un Denoising Autoencoder sur les latents avec possibilité d'entraîner le modèle.
     """
@@ -264,7 +319,7 @@ def denoise_latents_v1(latents, denoising_model, optimizer, criterion, device="c
             # Vérification de la perte
             print(f"Loss requires_grad: {loss.requires_grad}")
             print(f"Loss: {loss.item()}")
-            #loss.backward() # new code
+            loss.backward() # new code
             # Mettre à jour les poids
             optimizer.step()
 
