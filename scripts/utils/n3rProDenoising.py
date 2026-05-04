@@ -1,38 +1,38 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.init as init
+import traceback
 
-# TEST création de model !
+# Classe du modèle DenoisingAutoencoder
 class DenoisingAutoencoder(nn.Module):
     def __init__(self):
         super(DenoisingAutoencoder, self).__init__()
 
         # Encodeur
         self.encoder = nn.Sequential(
-            nn.Conv2d(4, 64, kernel_size=3, stride=2, padding=1),  # Accepter 4 canaux d'entrée
-            nn.ReLU(True),
+            nn.Conv2d(4, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(True),
+            nn.ReLU(),
             nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(True),
+            nn.ReLU(),
             nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(True),
+            nn.ReLU(),
         )
 
         # Décodeur
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(True),
+            nn.ReLU(),
             nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(True),
+            nn.ReLU(),
             nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(64, 4, kernel_size=3, stride=2, padding=1, output_padding=1),  # 4 canaux en sortie
-            nn.Sigmoid(),  # Sortie entre 0 et 1 (pour des images normalisées entre [0,1])
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 4, kernel_size=3, stride=2, padding=1, output_padding=1),
         )
 
     def forward(self, x):
-        # Passer par l'encodeur et le décodeur
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
         return decoded
@@ -44,19 +44,118 @@ def weights_init(m):
         if m.bias is not None:
             init.zeros_(m.bias)
 
-# Créer le modèle de débruitage avec 3 canaux en entrée
-denoising_model = DenoisingAutoencoder().to(device="cuda")
-# Appliquer l'initialisation des poids
+# Créer le modèle de débruitage avec 4 canaux en entrée
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+denoising_model = DenoisingAutoencoder().to(device)
 denoising_model.apply(weights_init)
 
+# Optimiseur et fonction de perte
+optimizer = optim.Adam(denoising_model.parameters(), lr=1e-5, weight_decay=1e-5)
+criterion = nn.MSELoss()  # Fonction de perte pour la reconstruction d'image
 
-def denoise_latents(latents, denoising_model, device="cuda"):
+# Fonction de débruitage et d'entraînement intégré avec contrôle de `Loss requires_grad`
+def denoise_latents(latents, denoising_model, optimizer, criterion, device="cuda", train=True):
     """
-    Applique un Denoising Autoencoder aux latents.
+    Applique un Denoising Autoencoder sur les latents avec possibilité d'entraîner le modèle.
     """
-    latents = latents.to(device).to(torch.float32)  # Convertir en float32 avant de passer au modèle
+    # Vérification explicite que latents n'est pas None
+    if latents is None:
+        raise ValueError("Latents is None, cannot proceed with denoising.")
 
-    # Passer les latents dans le Denoising Autoencoder
-    latents = denoising_model(latents)
-    return latents
+    # Conversion des latents en float32 avant de les passer au modèle
+    latents = latents.to(device=device, dtype=torch.float32).clone()
 
+    # Vérification du type des latents
+    print(f"Latents dtype before model: {latents.dtype}")
+
+    latents.requires_grad_()  # Activation explicite des gradients sur les latents
+    print(f"Latents requires_grad before model: {latents.requires_grad}")
+
+    if train:
+        # Mode entraînement : mettre le modèle en mode entraînement
+        denoising_model.train()
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        try:
+            # Passer les latents dans le Denoising Autoencoder
+            decoded_latents = denoising_model(latents)
+
+            # Vérification des gradients de la sortie du modèle
+            print(f"Decoded latents shape: {decoded_latents.shape}")
+            print(f"Decoded latents requires_grad: {decoded_latents.requires_grad}")
+
+            # Activation explicite des gradients sur la sortie du modèle
+            decoded_latents.requires_grad_()  # Forcer les gradients sur decoded_latents
+            print(f"Decoded latents requires_grad (after force): {decoded_latents.requires_grad}")
+
+            # Calcul de la perte
+            loss = criterion(decoded_latents, latents)  # Comparaison avec l'entrée (image bruitée et image cible)
+
+            # Vérification de la perte
+            print(f"Loss requires_grad: {loss.requires_grad}")
+            print(f"Loss: {loss.item()}")
+
+            # Forcer les gradients sur la perte si nécessaire
+            loss.requires_grad_()  # Activation explicite des gradients sur la perte
+            print(f"Loss requires_grad (after force): {loss.requires_grad}")
+
+            # Assurer que la perte a des gradients avant de procéder à la rétropropagation
+            if loss.requires_grad:
+                print("Loss has gradients, proceeding with backward pass.")
+                loss.backward()  # Calcul de la rétropropagation
+            else:
+                raise ValueError("Loss does not have gradients, cannot perform backward pass.")
+
+            # Mettre à jour les poids
+            optimizer.step()
+
+            return decoded_latents, loss.item()  # Retourner les latents débruités et la perte pour suivre l'entraînement
+
+        except Exception as e:
+            print(f"Error during training step: {str(e)}")
+            print("Stacktrace:")
+            traceback.print_exc()  # Afficher la stacktrace pour plus de détails
+            return None, None
+
+    else:
+        # Mode évaluation, pas de rétropropagation
+        denoising_model.eval()
+        with torch.no_grad():
+            decoded_latents = denoising_model(latents)
+
+        # Assurez-vous que les gradients sont activés avant de retourner les latents décryptés
+        decoded_latents.requires_grad_()  # On active les gradients ici aussi si nécessaire
+
+        return decoded_latents
+
+# Fonction principale pour entraîner et tester avec plus de contrôle
+def train_model(num_epochs, latents_train, denoising_model, optimizer, criterion, device="cuda"):
+    """
+    Fonction pour entraîner le modèle avec les latents et afficher les pertes.
+    """
+    for epoch in range(num_epochs):
+        print(f"Epoch [{epoch + 1}/{num_epochs}]")
+
+        # Vérification de la validité des latents avant de procéder au débruitage
+        if latents_train is None:
+            print("Latents is None, skipping this epoch.")
+            continue
+
+        # Denoising des latents
+        decoded_latents, loss = denoise_latents(latents_train, denoising_model, optimizer, criterion, device, train=True)
+
+        # Affichage de la perte
+        if loss is not None:
+            print(f"Loss: {loss:.4f}")
+        else:
+            print("Loss was not computed due to an error.")
+
+# Exemple d'utilisation avec des données aléatoires
+if __name__ == "__main__":
+    # Dimensions de latents (exemple)
+    latents_train = torch.randn(1, 4, 160, 112)  # Exemple de tensor de latents (format [batch, channels, height, width])
+
+    # Entraîner le modèle pendant 10 époques
+    train_model(num_epochs=10, latents_train=latents_train, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, device=device)
