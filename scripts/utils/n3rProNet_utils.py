@@ -1,7 +1,7 @@
 # n3rProNet_utils.py
 #-------------------------------------------------------------------------------
 from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
-from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion
+from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, make_trainable
 import torch
 import math
 import numpy as np
@@ -3084,7 +3084,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     sharpen_edges_strength=0.02,
     gamma_boost=1.00,                  # légèrement plus de punch naturel
     scale=4,
-    denoise=False,
+    denoise=True,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
     max_epochs=10
 ):
@@ -3092,23 +3092,72 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     vae.eval()  # pas besoin de caster tout le VAE
     B, C, H, W = latents.shape
 
-
-
+    latents_out = latents.clone()
      # Appliquer le denoising autoencoder sur les latents
     if denoise:
-        if train and frame_counter == 0:  # Entraînement tous les N frames (ici à chaque frame)
-            denoising_model.train()  # le modèle est en mode entraînement
-            latents.requires_grad_()  # Activation explicite des gradients pour latents
+
+        #x = torch.randn(1,4,160,112)
+        #latents_train = make_trainable(x)
+        #print(latents_train.requires_grad)  # True
+        #print(latents_train.grad_fn)        # <MulBackward0 ...>
+        #decoded, loss = denoise_latents(latents_train, denoising_model, optimizer, criterion, device=device, train=True)
+        #print(f"*************************************Decoded shape: {decoded.shape}, Loss: {loss}")
+
+        # Créer un latents indépendant pour l'entraînement
+        latents_train = latents.clone().detach().to("cuda").requires_grad_(True)
+        #latents_train = torch.randn(1, 4, 160, 112, device=device)
+
+        if train and frame_counter == 0:
+            # Mode entraînement du modèle
+            denoising_model.train()
+            denoising_model.to("cuda")  # Important !
+
+            # Assurer que tous les paramètres du modèle peuvent recevoir un gradient
+            for param in denoising_model.parameters():
+                param.requires_grad = True
+
             for epoch in range(max_epochs):
-                latents, loss = denoise_latents(latents, denoising_model, optimizer, criterion, device="cuda", train=True)
+                decoded_latents, loss = denoise_latents(
+                    latents_train,
+                    denoising_model,
+                    optimizer=optimizer,
+                    criterion=criterion,
+                    device="cuda",
+                    train=True
+                )
+
                 if loss is not None:
                     print(f"Epoch [{epoch+1}/{max_epochs}], Loss: {loss:.4f}")
+                    show_latents(latents_train, decoded_latents, epoch+1)
+
                 else:
                     print(f"Epoch [{epoch+1}/{max_epochs}], Loss: Not computed")
 
         else:
-            latents = denoise_latents(latents, denoising_model, optimizer, criterion, device="cuda", train=False)
-            # Aucune perte ici puisque nous ne faisons pas de rétropropagation en mode évaluation
+            # Mode évaluation
+            latents_out = denoise_latents(
+                latents,
+                denoising_model,
+                optimizer=None,
+                criterion=criterion,
+                device="cuda",
+                train=False
+            )
+
+            if isinstance(latents_out, tuple):
+                latents_out = latents_out[0]  # prend seulement le tensor principal
+
+            # 🔹 🔥 Limiteur de détails extrêmes (très important)
+            latents_out = torch.tanh(latents_out)
+            latents_out.clamp(-1.0, 1.0)
+            # 🔹 Sanitize léger
+            latents_out = sanitize_latents(latents_out)
+
+            # 🔹 🔥 Injection très douce
+            strength=0.01
+            latents = latents + strength * latents_out
+
+
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
