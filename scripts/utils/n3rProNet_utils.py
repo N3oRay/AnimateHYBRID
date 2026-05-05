@@ -3071,6 +3071,56 @@ def detect_eyes_auto(frame_pil):
 
 
 
+from collections import deque
+
+class HighFreqNoiseHistory:
+    """
+    Historise les niveaux de bruit high-frequency pour détecter les frames réellement bruitées.
+    """
+
+    def __init__(self, history_len=5, threshold_sigma=1.0):
+        """
+        Args:
+            history_len (int): Nombre de frames à garder dans l'historique.
+            threshold_sigma (float): Nombre d'écarts-types au-dessus de la moyenne pour considérer une frame bruitée.
+        """
+        self.history_len = history_len
+        self.threshold_sigma = threshold_sigma
+        self.history = deque(maxlen=history_len)
+
+    def compute_high_freq_std(self, latents):
+        """
+        Calcule le niveau de bruit high-frequency d'une frame.
+        """
+        high_freq = latents - torch.nn.functional.avg_pool2d(latents, kernel_size=3, stride=1, padding=1)
+        return high_freq.std().item()
+
+    def update(self, latents):
+        """
+        Met à jour l'historique et détecte si la frame est réellement bruitée.
+
+        Args:
+            latents (torch.Tensor): Latents de la frame actuelle.
+
+        Returns:
+            noise_level (float): High-frequency std de la frame actuelle.
+            avg_noise (float): Moyenne des noise_level historiques.
+            std_noise (float): Écart-type des noise_level historiques.
+            is_noisy (bool): True si la frame est considérée bruitée.
+        """
+        noise_level = self.compute_high_freq_std(latents)
+        self.history.append(noise_level)
+
+        avg_noise = sum(self.history) / len(self.history)
+        std_noise = (sum((x - avg_noise) ** 2 for x in self.history) / len(self.history)) ** 0.5
+
+        is_noisy = noise_level > avg_noise + self.threshold_sigma * std_noise
+        return noise_level, avg_noise, std_noise, is_noisy
+
+# Initialisation (une seule fois)
+hf_history = HighFreqNoiseHistory(history_len=5, threshold_sigma=1.0)
+
+
 def apply_denoising(
     latents,
     denoising_model,
@@ -3102,6 +3152,8 @@ def apply_denoising(
         torch.Tensor: Latents après denoising/injection.
     """
 
+
+
     latents_train = latents.clone().detach().to("cuda").requires_grad_(True)
     model_exists = os.path.exists(model_path)
 
@@ -3111,6 +3163,10 @@ def apply_denoising(
     high_freq = latents - torch.nn.functional.avg_pool2d(latents, kernel_size=3, stride=1, padding=1)
     noise_level = high_freq.std()
     print(f"Noise_level - high_freq: [{noise_level}], on start...🔥 ")
+
+    # Dans la boucle de traitement des frames
+    noise_level, avg_noise, std_noise, is_noisy = hf_history.update(latents)
+    print(f"Noise_level - high_freq: [{noise_level}], avg_noise: [{avg_noise}],  std_noise: [{std_noise}],  std_noise: [{is_noisy}],  on start...🔥 ")
 
     # ----- Entraînement -----
     #if train and frame_counter % 2 == 0:
