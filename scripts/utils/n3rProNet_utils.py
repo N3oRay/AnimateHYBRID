@@ -3086,7 +3086,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     scale=4,
     denoise=True,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
-    max_epochs=10
+    max_epochs=10,
+    debug=False
 ):
 
     vae.eval()  # pas besoin de caster tout le VAE
@@ -3095,17 +3096,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     latents_out = latents.clone()
      # Appliquer le denoising autoencoder sur les latents
     if denoise:
-
-        #x = torch.randn(1,4,160,112)
-        #latents_train = make_trainable(x)
-        #print(latents_train.requires_grad)  # True
-        #print(latents_train.grad_fn)        # <MulBackward0 ...>
-        #decoded, loss = denoise_latents(latents_train, denoising_model, optimizer, criterion, device=device, train=True)
-        #print(f"*************************************Decoded shape: {decoded.shape}, Loss: {loss}")
-
         # Créer un latents indépendant pour l'entraînement
         latents_train = latents.clone().detach().to("cuda").requires_grad_(True)
-        #latents_train = torch.randn(1, 4, 160, 112, device=device)
 
         if train and frame_counter == 0:
             # Mode entraînement du modèle
@@ -3128,14 +3120,15 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
                 if loss is not None:
                     print(f"Epoch [{epoch+1}/{max_epochs}], Loss: {loss:.4f}")
-                    show_latents(latents_train, decoded_latents, epoch+1)
+                    if debug:
+                        show_latents(latents_train, decoded_latents, epoch+1)
 
                 else:
                     print(f"Epoch [{epoch+1}/{max_epochs}], Loss: Not computed")
 
         else:
             # Mode évaluation
-            latents_out = denoise_latents(
+            latents_out, loss = denoise_latents(
                 latents,
                 denoising_model,
                 optimizer=None,
@@ -3154,8 +3147,12 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
             latents_out = sanitize_latents(latents_out)
 
             # 🔹 🔥 Injection très douce
-            strength=0.01
-            latents = latents + strength * latents_out
+            if loss is not None:
+                strength = 0.01 + 0.05 * (1 - loss)
+                print(f"Strength [{strength}], Loss:  [{loss}]")
+                latents = latents + strength * latents_out
+            else:
+                latents = 0.9 * latents + 0.1 * latents_out
 
 
 
