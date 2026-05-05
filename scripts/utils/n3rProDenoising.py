@@ -5,6 +5,8 @@ import torch.nn.init as init
 import traceback
 from .tools_utils import sanitize_latents_for_train
 import matplotlib.pyplot as plt
+import torch
+from torch.optim import Adam
 
 def show_latents(latents, decoded_latents, epoch):
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
@@ -15,6 +17,72 @@ def show_latents(latents, decoded_latents, epoch):
     plt.show()
 
 # Classe du modèle DenoisingAutoencoder
+
+# ----------------------
+# U-Net léger pour débruitage
+# ----------------------
+class DenoiseUNet(nn.Module):
+    def __init__(self, in_channels=4, base_channels=32):
+        super().__init__()
+
+        # Encodeur
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 3, stride=1, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels*2, 3, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels*2),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(base_channels*2, base_channels*4, 3, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels*4),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(base_channels*4, base_channels*4, 3, padding=1),
+            nn.BatchNorm2d(base_channels*4),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        # Décodeur
+        self.dec3 = nn.Sequential(
+            nn.ConvTranspose2d(base_channels*4, base_channels*2, 4, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels*2),
+            nn.ReLU(inplace=True)
+        )
+        self.dec2 = nn.Sequential(
+            nn.ConvTranspose2d(base_channels*4, base_channels, 4, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_channels*2, in_channels, 3, padding=1),
+            nn.Tanh()  # pour limiter la sortie entre -1 et 1
+        )
+
+    def forward(self, x):
+        # Encodeur
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+
+        # Bottleneck
+        b = self.bottleneck(e3)
+
+        # Décodeur avec skip connections
+        d3 = self.dec3(b)
+        d3 = torch.cat([d3, e2], dim=1)  # skip connection
+
+        d2 = self.dec2(d3)
+        d2 = torch.cat([d2, e1], dim=1)  # skip connection
+
+        out = self.dec1(d2)
+        return out
 # Modèle simple
 class SimpleAE(nn.Module):
     def __init__(self):
@@ -33,6 +101,84 @@ class SimpleAE(nn.Module):
 
     def forward(self, x):
         return self.decoder(self.encoder(x))
+
+class SimpleAE_Optimized(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(32, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 4, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Tanh()  # limite la sortie à [-1,1]
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+class SimpleAE32(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # Encodeur : légère montée en filtres pour block_size=32
+        self.encoder = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=3, stride=2, padding=1),  # downscale par 2
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # downscale par 2
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),  # garde spatial size
+            nn.ReLU(),
+        )
+
+        # Décodeur : remonte à la taille d'origine
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 4, kernel_size=3, stride=2, padding=1, output_padding=1),
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+class SimpleAEIntermediate(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Encodeur avec plus de canaux et stride pour downsampling
+        self.encoder = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=3, stride=2, padding=1),  # [H/2, W/2]
+            nn.ReLU(),
+            nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1), # [H/4, W/4]
+            nn.ReLU()
+        )
+        # Décodeur symétrique avec ConvTranspose2d
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(16, 32, kernel_size=3, stride=2, padding=1, output_padding=1),  # [H/2, W/2]
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 4, kernel_size=3, stride=2, padding=1, output_padding=1),   # [H, W]
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
 
 class DenoisingAutoencoder(nn.Module):
     def __init__(self):
@@ -66,6 +212,64 @@ class DenoisingAutoencoder(nn.Module):
         decoded = self.decoder(encoded)
         return decoded
 
+class IntermediateAE(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # Encodeur : légèrement plus large que SimpleAE mais pas trop profond
+        self.encoder = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=3, stride=2, padding=1),  # downsample x2
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # downsample x2
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),  # garder la résolution
+            nn.ReLU()
+        )
+
+        # Décodeur : symétrique à l'encodeur pour restaurer amplitude
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(32, 64, kernel_size=3, stride=1, padding=1),  # résolution inchangée
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),  # upsample x2
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 4, kernel_size=3, stride=2, padding=1, output_padding=1),  # upsample x2
+            nn.Tanh()  # contraint les sorties à [-1,1], ce qui améliore le Loss
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+class DenoisingAE32(nn.Module):
+    def __init__(self):
+        super(DenoisingAE32, self).__init__()
+
+        # Encodeur
+        self.encoder = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=3, stride=2, padding=1),  # 4→32
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # 32→64
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # 64→128
+            nn.ReLU(),
+        )
+
+        # Décodeur
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 4, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Tanh()  # Normalisation des sorties entre -1 et 1
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
 def print_latents(latents, debug=True):
     if debug:
         print(f"Latents max: {latents.max():.4f}, min: {latents.min():.4f}")
@@ -88,19 +292,23 @@ def weights_init(m):
 
 # Créer le modèle de débruitage avec 4 canaux en entrée
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-denoising_model = SimpleAE().to(device)
+# *****************************************************************************************************************************
+denoising_model = DenoiseUNet().to(device)
 denoising_model.apply(weights_init)
 
 # Optimiseur et fonction de perte
 #optimizer = optim.Adam(denoising_model.parameters(), lr=1e-5, weight_decay=1e-5) # apprentissage faible
-optimizer = optim.Adam(denoising_model.parameters(), lr=1e-4, weight_decay=1e-5) # apprentissage moyen
+#optimizer = optim.Adam(denoising_model.parameters(), lr=1e-4, weight_decay=1e-5) # apprentissage moyen
 #optimizer = optim.Adam(denoising_model.parameters(), lr=1e-3, weight_decay=0) # apprentissage elevé
 #optimizer = optim.Adam(denoising_model.parameters(), lr=1e-3, weight_decay=1e-4)
 #optimizer = optim.Adam(denoising_model.parameters(), lr=1e-4, weight_decay=1e-5)
-criterion = nn.MSELoss()  # Fonction de perte pour la reconstruction d'image
-#criterion = nn.L1Loss()  # Essayer la L1Loss
+#criterion = nn.MSELoss()  # Fonction de perte pour la reconstruction d'image
+criterion = nn.L1Loss()  # Essayer la L1Loss
 #criterion = nn.SmoothL1Loss()
 #criterion = nn.MSELoss()  # Fonction de perte alternative
+
+optimizer = optim.Adam(denoising_model.parameters(), lr=1e-4, weight_decay=1e-5)
+#criterion = nn.MSELoss()  # ou SmoothL1Loss si tu veux plus de robustesse
 
 # Fonction de débruitage et d'entraînement intégré avec contrôle de `Loss requires_grad`
 def sanitize_latents_for_train_grad(latents, debug=True):
@@ -118,8 +326,7 @@ def make_trainable(tensor):
     return tensor
 
 
-import torch
-from torch.optim import Adam
+
 
 def denoise_latents_vao_load(latents, denoising_model, optimizer=None, criterion=None, device="cuda", train=True):
     """
@@ -219,6 +426,24 @@ def denoise_latents_test(latents, denoising_model, optimizer=None, criterion=Non
 
     return decoded, loss
 
+
+def denoise_latents_simple(latents, denoising_model, device="cuda"):
+    if latents is None:
+        raise ValueError("Latents is None")
+
+    # Normalisation simple
+    latents = (latents - latents.mean()) / (latents.std() + 1e-5)
+    latents = latents.to(device=device, dtype=torch.float32)
+    denoising_model = denoising_model.to(device=device).eval()
+
+    with torch.no_grad():
+        decoded_latents = denoising_model(latents)
+
+    # Clamp optionnel pour garder les valeurs dans [-1, 1]
+    decoded_latents = decoded_latents.clamp(-1.0, 1.0)
+
+    return decoded_latents
+
 def denoise_latents(latents, denoising_model, optimizer=None, criterion=None, device="cuda", train=True):
     """
     Denoise latents de façon training-safe sans backward, compatible --vae-offload.
@@ -229,7 +454,13 @@ def denoise_latents(latents, denoising_model, optimizer=None, criterion=None, de
         raise ValueError("Latents is None, cannot proceed.")
 
     # Normalisation simple des latents
-    latents = latents.clamp(-1.0, 1.0)
+    #latents = latents.clamp(-1.0, 1.0)
+    latents = (latents - latents.mean()) / (latents.std() + 1e-5)
+
+    # Utilisation avant de passer au modèle ou dans le processus d'entraînement
+    print_latents(latents, debug=True)
+    latents = sanitize_latents_for_train_grad(latents, debug=True)
+    print_latents(latents, debug=True)
 
     # Forcer le modèle et les latents sur le même device
     latents = latents.to(device=device, dtype=torch.float32)
