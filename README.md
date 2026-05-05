@@ -1,6 +1,61 @@
+
+
 # AnimateHYBRID
 
 Mini-Guide: AnimateDiff <4 GB VRAM with N3R 
+
+# RealControl – Stable Latents Animation Pipeline
+
+![Python](https://img.shields.io/badge/python-3.10-blue)
+![PyTorch](https://img.shields.io/badge/pytorch-%3E%3D2.0-orange)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+**RealControl** est un pipeline avancé pour la génération d’animations réalistes à partir de latents. Il produit des mouvements fluides et cohérents tout en conservant les détails du visage, des cheveux et du corps, grâce à un module de **denoise adaptatif** qui stabilise les latents pendant la séquence.
+
+---
+
+## 🧠 Fonctionnalités principales
+
+### 1. Skeleton & Pose Tracking
+- Détection 2D/3D avec OpenPose ou équivalent.
+- Reconstruction des points clés manquants pour toutes les articulations.
+- Gestion robuste des coordonnées invalides (`x=0, y=0`) avec fallback automatique.
+
+### 2. Motion Engine
+- Modèles de mouvement configurable : `cinematic`, `realistic`, etc.
+- Application de deltas globaux et locaux pour un mouvement fluide.
+- Micro boost adaptatif pour affiner subtilement les mouvements (`torso`, `hair`, `face`, `mouth`, `eyes`).
+
+### 3. Latents Denoise (clé de la stabilité)
+- Stabilisation des latents au fil de la génération.
+- Injection adaptative proportionnelle au bruit détecté dans les latents.
+- Limitation des extrêmes via `tanh` et `clamp(-1, 1)`.
+- Support du mode **train** et **évaluation**.
+
+### 4. Perceptual Fusion
+- Fusion douce des détails yeux, bouche et volumétrique.
+- Préservation des micro-mouvements et de l’expression.
+- Décor et cheveux traités avec masques adaptatifs pour éviter les artefacts.
+
+### 5. Debug & Logging
+- Logs détaillés pour chaque étape : positions articulaires, latents, micro-boost, motion engine.
+- Affichage des statistiques des latents avant/après Denoise.
+- Sauvegarde d’images intermédiaires pour le contrôle qualité (`skeleton`, `decor_mask`, `torso_wind_mask`).
+
+---
+
+## ⚙️ Pipeline général
+
+1. **Pose Detection** – Détection 2D/3D des keypoints.
+2. **Skeleton Reconstruction** – Remplissage automatique des points manquants.
+3. **Motion Engine** – Calcul des deltas et application des mouvements globaux et locaux.
+4. **Micro Motion** – Injection de micro-deltas pour réalisme subtil.
+5. **Latents Denoise** – Stabilisation adaptative des latents.
+6. **Perceptual Fusion** – Fusion des détails visage, bouche, yeux, cheveux et décor.
+7. **Export** – Sauvegarde des frames ou séquences complètes.
+
+
+
 1️⃣ Pick the Right Model
 
 N3RModelOptimized → ~3.6 GB VRAM, full features, stable.
