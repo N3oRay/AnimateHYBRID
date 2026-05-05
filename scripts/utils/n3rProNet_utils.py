@@ -11,7 +11,7 @@ from pathlib import Path
 from torchvision.transforms.functional import to_pil_image
 import matplotlib.pyplot as plt
 import mediapipe as mp
-
+import os
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -3080,8 +3080,7 @@ def apply_denoising(
     frame_counter=0,
     max_epochs=3,
     model_path="models/denoise.pt",
-    debug=False,
-    denoise=True
+    debug=False
 ):
     """
     Applique un denoising autoencoder sur les latents avec entraînement optionnel.
@@ -3100,8 +3099,6 @@ def apply_denoising(
     Returns:
         torch.Tensor: Latents après denoising/injection.
     """
-    if not denoise:
-        return latents
 
     latents_train = latents.clone().detach().to("cuda").requires_grad_(True)
     model_exists = os.path.exists(model_path)
@@ -3142,7 +3139,7 @@ def apply_denoising(
     else:
         if model_exists:
             denoising_model, checkpoint = load_denoising_model(
-                MyDenoiser,
+                type(denoising_model),  # récupère la classe de ton modèle MyDenoiser,
                 path=model_path,
                 optimizer=optimizer
             )
@@ -3201,6 +3198,13 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     B, C, H, W = latents.shape
 
     latents_out = latents.clone()
+    if denoise:
+        # Créer un latents indépendant pour l'entraînement
+        latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
+                            max_epochs=10, model_path="models/denoise.pt", debug=False)
+
+    """
+    latents_out = latents.clone()
      # Appliquer le denoising autoencoder sur les latents
     if denoise:
         # Créer un latents indépendant pour l'entraînement
@@ -3258,7 +3262,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
             else:
                 latents = 0.9 * latents + 0.1 * latents_out
 
-
+    """
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
