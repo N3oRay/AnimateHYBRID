@@ -1,7 +1,7 @@
 # n3rProNet_utils.py
 #-------------------------------------------------------------------------------
 from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
-from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, make_trainable
+from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents
 import torch
 import math
 import numpy as np
