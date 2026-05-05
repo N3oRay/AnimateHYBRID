@@ -3148,8 +3148,18 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
             # 🔹 🔥 Injection très douce
             if loss is not None:
-                strength = 0.01 + 0.05 * (1 - loss)
-                print(f"Strength [{strength}], Loss:  [{loss}]")
+
+                #strength = min(max(0.02, 0.02 + 0.1 * (1 - loss)), 0.1)
+                #print(f"Strength [{strength}], Loss:  [{loss}]")
+
+
+                # Estimation du "bruit" dans les latents
+                noise_level = latents.std()
+                # Force adaptative proportionnelle au bruit, bornée
+                strength = min(max(0.02, 0.05 * noise_level), 0.2)
+                print(f"Strength [{strength}], Noise_level:  [{noise_level}] , Loss:  [{loss}]")
+
+                # Injection douce
                 latents = latents + strength * latents_out
             else:
                 latents = 0.9 * latents + 0.1 * latents_out

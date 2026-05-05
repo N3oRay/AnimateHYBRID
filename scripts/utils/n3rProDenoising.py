@@ -315,19 +315,6 @@ def sanitize_latents_for_train_grad(latents, debug=True):
     # Normalisation simple
     return latents.clamp(-1.0, 1.0)  # renvoie un tensor PyTorch, non détaché
 
-
-def make_trainable(tensor):
-    """
-    Retourne un tensor avec grad_fn pour backprop, même si c'était un input.
-    """
-    tensor = tensor.clone().detach().requires_grad_(True)
-    # Une opération simple pour générer grad_fn
-    tensor = tensor * 1.0
-    return tensor
-
-
-
-
 def denoise_latents_vao_load(latents, denoising_model, optimizer=None, criterion=None, device="cuda", train=True):
     """
     Denoise latents avec entraînement possible, training-safe même si le VAE est offloadé.
