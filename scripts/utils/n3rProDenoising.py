@@ -5,11 +5,61 @@ import torch.nn.init as init
 import traceback
 from .tools_utils import sanitize_latents_for_train
 import matplotlib.pyplot as plt
-import torch
+
 from torch.optim import Adam
 import os
+import datetime
 
-def save_denoising_model(model, optimizer=None, epoch=None, loss=None, path="models/denoise.pt"):
+def save_denoising_model(model, optimizer=None, epoch=None, loss=None,
+                         path="models/denoise.pt", latest_path="models/denoise_latest.pt"):
+    """
+    Sauvegarde le modèle denoising en version stable et dernière version.
+    Ajoute le timestamp directement dans le checkpoint.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    checkpoint = {
+        "model_state": model.state_dict(),
+        "model_config": getattr(model, "config", None),
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+
+    if optimizer is not None:
+        checkpoint["optimizer_state"] = optimizer.state_dict()
+    if epoch is not None:
+        checkpoint["epoch"] = epoch
+    if loss is not None:
+        checkpoint["loss"] = loss
+
+    # Sauvegarde principale (stable)
+    torch.save(checkpoint, path)
+
+    # Sauvegarde du dernier checkpoint
+    torch.save(checkpoint, latest_path)
+
+    print(f"[INFO] Model saved to {path} (latest: {latest_path}), timestamp: {checkpoint['timestamp']}")
+
+def load_denoising_model(model_class, path="models/denoise_latest.pt", optimizer=None):
+    """
+    Charge le dernier modèle denoising.
+    Si aucun checkpoint n'existe, renvoie un modèle non entraîné.
+    """
+    if os.path.exists(path):
+        checkpoint = torch.load(path, map_location="cuda")
+        config = checkpoint.get("model_config") or {}
+        model = model_class(**config) if config else model_class()
+        model.load_state_dict(checkpoint["model_state"])
+
+        if optimizer is not None and "optimizer_state" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+        print(f"[INFO] Loaded latest model, timestamp: {checkpoint.get('timestamp')}, loss: {checkpoint.get('loss')}")
+        return model, checkpoint
+    else:
+        print("[WARN] No latest model found, using untrained model.")
+        return model_class(), None
+
+
+def save_denoising_model_old(model, optimizer=None, epoch=None, loss=None, path="models/denoise.pt"):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     checkpoint = {
         "model_state": model.state_dict(),
@@ -25,7 +75,8 @@ def save_denoising_model(model, optimizer=None, epoch=None, loss=None, path="mod
     torch.save(checkpoint, path)
     print(f"[INFO] Denoising model saved to {path}")
 
-def load_denoising_model(model_class, path="models/denoise.pt", optimizer=None, device="cuda"):
+
+def load_denoising_model_old(model_class, path="models/denoise.pt", optimizer=None, device="cuda"):
     checkpoint = torch.load(path, map_location=device)
 
     model = model_class().to(device)

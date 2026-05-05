@@ -3079,8 +3079,10 @@ def apply_denoising(
     train=False,
     frame_counter=0,
     max_epochs=3,
-    model_path="models/denoise.pt",
-    debug=False
+    model_path="models/denoise_latest.pt",
+    debug=False,
+    ema_prev_latents=None,
+    ema_alpha=0.3
 ):
     """
     Applique un denoising autoencoder sur les latents avec entraînement optionnel.
@@ -3131,8 +3133,7 @@ def apply_denoising(
             denoising_model,
             optimizer=optimizer,
             epoch=max_epochs,
-            loss=loss if loss is not None else 0.0,
-            path=model_path
+            loss=loss if loss is not None else 0.0
         )
 
     # ----- Évaluation / Chargement -----
@@ -3140,7 +3141,6 @@ def apply_denoising(
         if model_exists:
             denoising_model, checkpoint = load_denoising_model(
                 type(denoising_model),  # récupère la classe de ton modèle MyDenoiser,
-                path=model_path,
                 optimizer=optimizer
             )
             print("Last saved loss:", checkpoint.get("loss"))
@@ -3173,6 +3173,10 @@ def apply_denoising(
         else:
             latents = 0.9 * latents + 0.1 * latents_out
 
+        # 🔹 EMA pour lisser les transitions
+        if ema_prev_latents is not None:
+            latents = ema_alpha * latents + (1 - ema_alpha) * ema_prev_latents
+
     return latents
 
 
@@ -3201,69 +3205,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     if denoise:
         # Créer un latents indépendant pour l'entraînement
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
-                            max_epochs=10, model_path="models/denoise.pt", debug=False)
-
-    """
-    latents_out = latents.clone()
-     # Appliquer le denoising autoencoder sur les latents
-    if denoise:
-        # Créer un latents indépendant pour l'entraînement
-        latents_train = latents.clone().detach().to("cuda").requires_grad_(True)
-
-        #if train and frame_counter == 0:
-        if train and frame_counter %2 == 0:
-            # Mode entraînement du modèle
-            denoising_model.train()
-            denoising_model.to("cuda")  # Important !
-
-            # Assurer que tous les paramètres du modèle peuvent recevoir un gradient
-            for param in denoising_model.parameters():
-                param.requires_grad = True
-
-            for epoch in range(max_epochs):
-                decoded_latents, loss = denoise_latents( latents_train, denoising_model, optimizer=optimizer, criterion=criterion, device="cuda", train=True )
-
-                if loss is not None:
-                    print(f"Epoch [{epoch+1}/{max_epochs}], Loss: {loss:.4f}")
-                    if debug:
-                        show_latents(latents_train, decoded_latents, epoch+1)
-
-                else:
-                    print(f"Epoch [{epoch+1}/{max_epochs}], Loss: Not computed")
-
-        else:
-            # Mode évaluation
-            latents_out, loss = denoise_latents( latents, denoising_model, optimizer=None, criterion=criterion, device="cuda", train=False )
-
-            if isinstance(latents_out, tuple):
-                latents_out = latents_out[0]  # prend seulement le tensor principal
-
-            # 🔹 🔥 Limiteur de détails extrêmes (très important)
-            latents_out = torch.tanh(latents_out)
-            latents_out.clamp(-1.0, 1.0)
-            # 🔹 Sanitize léger
-            latents_out = sanitize_latents(latents_out)
-
-            # 🔹 🔥 Injection très douce
-            if loss is not None:
-
-                #strength = min(max(0.02, 0.02 + 0.1 * (1 - loss)), 0.1)
-                #print(f"Strength [{strength}], Loss:  [{loss}]")
-
-
-                # Estimation du "bruit" dans les latents
-                noise_level = latents.std()
-                # Force adaptative proportionnelle au bruit, bornée
-                strength = min(max(0.02, 0.05 * noise_level), 0.2)
-                print(f"Strength [{strength}], Noise_level:  [{noise_level}] , Loss:  [{loss}]")
-
-                # Injection douce
-                latents = latents + strength * latents_out
-            else:
-                latents = 0.9 * latents + 0.1 * latents_out
-
-    """
-
+                            max_epochs=10, model_path="models/denoise_latest.pt", debug=False)
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
@@ -3362,127 +3304,6 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
     return frames[0] if B == 1 else frames
 
-def decode_latents_ultrasafe_blockwise_ultranatural_test(
-    latents, vae,
-    block_size=32, overlap=16,
-    device="cuda",
-    frame_counter=0,
-    latent_scale_boost=1.0,
-    scale=4,                         # 🔹 facteur de scaling
-    use_hann=True,
-    sharpen_mode="both",              # None, "tanh", "edges", "both"
-    sharpen_strength=0.015,
-    sharpen_edges_strength=0.02,
-    gamma_boost=1.03                  # légèrement plus de punch naturel
-):
-
-
-    vae.eval()
-    B, C, H, W = latents.shape
-
-    # ⚡ Conversion et scale latents
-    latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
-
-    out_H, out_W = H * scale, W * scale
-    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device, dtype=torch.float32)
-    weight = torch.zeros_like(output_rgb)
-
-    stride = block_size - overlap
-    y_positions = list(range(0, H, stride))
-    x_positions = list(range(0, W, stride))
-
-    # ---------------- Feather ----------------
-    def create_feather(h, w):
-        if use_hann:
-            wy = torch.hann_window(h, device=device, dtype=torch.float32)
-            wx = torch.hann_window(w, device=device, dtype=torch.float32)
-            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
-        else:
-            y = torch.linspace(0, 1, h, device=device, dtype=torch.float32)
-            x = torch.linspace(0, 1, w, device=device, dtype=torch.float32)
-            wy = 1 - torch.abs(y - 0.5) * 2
-            wx = 1 - torch.abs(x - 0.5) * 2
-            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
-
-    # ---------------- Decode patch par patch ----------------
-    for y in y_positions:
-        for x in x_positions:
-            y1 = min(y + block_size, H)
-            x1 = min(x + block_size, W)
-
-            patch = latents[:, :, y:y1, x:x1]
-            patch = torch.nan_to_num(patch, nan=0.0)
-
-            with torch.no_grad():
-                decoded = vae.decode(patch.to(torch.float32)).sample
-                decoded = decoded.to(torch.float32)
-
-            fh, fw = decoded.shape[2], decoded.shape[3]
-            feather = create_feather(fh, fw).unsqueeze(0).unsqueeze(0)
-
-            # position dans l'image finale
-            iy0, ix0 = y * scale, x * scale
-            iy1 = min(iy0 + fh, out_H)
-            ix1 = min(ix0 + fw, out_W)
-
-            # 🔹 Ajuster patch et feather si dépassement bord
-            fh_crop = iy1 - iy0
-            fw_crop = ix1 - ix0
-            if fh_crop != fh or fw_crop != fw:
-                decoded = F.interpolate(decoded, size=(fh_crop, fw_crop), mode='bilinear', align_corners=False)
-                feather = F.interpolate(feather, size=(fh_crop, fw_crop), mode='bilinear', align_corners=False)
-
-            # fusion avec feather
-            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
-            weight[:, :, iy0:iy1, ix0:ix1] += feather
-
-            del patch, decoded, feather
-            torch.cuda.empty_cache()
-
-    # ---------------- Normalisation ----------------
-    weight = torch.clamp(weight, min=1e-3)
-    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
-
-    # ---------------- Sharp adaptatif ----------------
-    if sharpen_mode is not None:
-        if sharpen_mode in ["tanh", "both"]:
-            mean = output_rgb.mean(dim=[2,3], keepdim=True)
-            detail = output_rgb - mean
-            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
-            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
-            output_rgb = output_rgb + adapt_strength * torch.tanh(detail)
-
-        if sharpen_mode in ["edges", "both"]:
-            B, C, Hf, Wf = output_rgb.shape
-            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype)
-            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype)
-            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
-            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
-
-            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
-            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
-            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
-            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
-            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
-            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
-
-        output_rgb = output_rgb.clamp(-1.0, 1.0)
-
-    # ---------------- Gamma adaptatif ----------------
-    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
-    luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
-    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))
-    output_rgb_gamma = output_rgb_gamma ** adapt_gamma
-    output_rgb = output_rgb_gamma * 2 - 1
-
-    # ---------------- Micro-boost couleur ----------------
-    mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
-    color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
-    output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
-
-    # ---------------- Conversion PIL ----------------
-    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
-    return frames[0] if B == 1 else frames
 
 def decode_latents_ultrasafe_blockwise_ultranatural_optimized(
     latents, vae,
