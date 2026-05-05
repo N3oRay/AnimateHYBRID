@@ -3105,24 +3105,29 @@ def apply_denoising(
     latents_train = latents.clone().detach().to("cuda").requires_grad_(True)
     model_exists = os.path.exists(model_path)
 
+    # detection du bruit
+    noise_level = latents.std()
+    print(f"Noise_level - latents.std: [{noise_level}], on start...🔥 ")
+    high_freq = latents - torch.nn.functional.avg_pool2d(latents, kernel_size=3, stride=1, padding=1)
+    noise_level = high_freq.std()
+    print(f"Noise_level - high_freq: [{noise_level}], on start...🔥 ")
+
     # ----- Entraînement -----
     #if train and frame_counter % 2 == 0:
     if train:
         denoising_model.train()
         denoising_model.to("cuda")
 
-        # detection du bruit
-        noise_level = latents.std()
         min_epochs = 1
         max_epochs_cap = max_epochs_up  # pour éviter des epochs trop longues
         # max_epochs (int): Nombre d'epochs pour l'entraînement.
-        max_epochs = int(min_epochs + (max_epochs_cap - min_epochs) * noise_level / 3.0)
+        max_epochs = int(min_epochs + (max_epochs_cap - min_epochs) * noise_level / 2.0)
 
         for param in denoising_model.parameters():
             param.requires_grad = True
 
         for epoch in range(max_epochs):
-            decoded_latents, loss = denoise_latents(
+            latents_out, loss = denoise_latents(
                 latents_train,
                 denoising_model,
                 optimizer=optimizer,
@@ -3134,7 +3139,7 @@ def apply_denoising(
             if loss is not None:
                 print(f"Epoch [{epoch+1}/{max_epochs}], Loss: {loss:.4f}")
                 if debug:
-                    show_latents(latents_train, decoded_latents, epoch+1)
+                    show_latents(latents_train, latents_out, epoch+1)
             else:
                 print(f"Epoch [{epoch+1}/{max_epochs}], Loss: Not computed")
 
@@ -3157,35 +3162,33 @@ def apply_denoising(
             print("[WARN] Denoising model not found, using untrained model.")
 
         denoising_model.eval()
-        latents_out, loss = denoise_latents(
-            latents,
-            denoising_model,
-            optimizer=None,
-            criterion=criterion,
-            device="cuda",
-            train=False
-        )
+        latents_out, loss = denoise_latents( latents, denoising_model, optimizer=None, criterion=criterion, device="cuda", train=False )
 
-        if isinstance(latents_out, tuple):
-            latents_out = latents_out[0]
+    if isinstance(latents_out, tuple):
+        latents_out = latents_out[0]
 
-        # 🔹 Limiter les valeurs extrêmes et sanitize
-        latents_out = torch.tanh(latents_out).clamp(-1.0, 1.0)
-        latents_out = sanitize_latents(latents_out)
+    # 🔹 Limiter les valeurs extrêmes et sanitize
+    latents_out = torch.tanh(latents_out).clamp(-1.0, 1.0)
+    latents_out = sanitize_latents(latents_out)
 
-        # 🔹 Injection douce adaptative
-        if loss is not None:
-            noise_level = latents.std()
-            #strength = min(max(0.02, 0.05 * noise_level), 0.2)
-            strength = min(max(0.05, 0.1 * noise_level), 0.3)
-            print(f"Strength [{strength}], Noise_level: [{noise_level}], Loss: [{loss}]")
-            latents = latents + strength * latents_out
-        else:
-            latents = 0.9 * latents + 0.1 * latents_out
+    # 🔹 Injection douce adaptative
+    if loss is not None:
+        strength = min(max(0.05, 0.1 * noise_level), 0.3)
+        print(f"Strength [{strength}], Noise_level: [{noise_level}], Loss: [{loss}]")
+        latents = latents + strength * latents_out
+    else:
+        latents = 0.9 * latents + 0.1 * latents_out
 
-        # 🔹 EMA pour lisser les transitions
-        if ema_prev_latents is not None:
-            latents = ema_alpha * latents + (1 - ema_alpha) * ema_prev_latents
+    # 🔹 EMA pour lisser les transitions
+    if ema_prev_latents is not None:
+        latents = ema_alpha * latents + (1 - ema_alpha) * ema_prev_latents
+
+    noise_level = latents.std()
+    print(f"Noise_level - latents.std: [{noise_level}], after denoising... 🔥 ")
+    high_freq = latents - torch.nn.functional.avg_pool2d(latents, kernel_size=3, stride=1, padding=1)
+    noise_level = high_freq.std()
+    print(f"Noise_level - high_freq: [{noise_level}], after denoising... 🔥 ")
+
 
     return latents
 
