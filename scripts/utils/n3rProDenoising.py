@@ -7,6 +7,36 @@ from .tools_utils import sanitize_latents_for_train
 import matplotlib.pyplot as plt
 import torch
 from torch.optim import Adam
+import os
+
+def save_denoising_model(model, optimizer=None, epoch=None, loss=None, path="models/denoise.pt"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    checkpoint = {
+        "model_state": model.state_dict(),
+    }
+
+    if optimizer is not None:
+        checkpoint["optimizer_state"] = optimizer.state_dict()
+    if epoch is not None:
+        checkpoint["epoch"] = epoch
+    if loss is not None:
+        checkpoint["loss"] = loss
+
+    torch.save(checkpoint, path)
+    print(f"[INFO] Denoising model saved to {path}")
+
+def load_denoising_model(model_class, path="models/denoise.pt", optimizer=None, device="cuda"):
+    checkpoint = torch.load(path, map_location=device)
+
+    model = model_class().to(device)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()  # par défaut en mode évaluation
+
+    if optimizer is not None and "optimizer_state" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+
+    print(f"[INFO] Denoising model loaded from {path}")
+    return model, checkpoint
 
 def show_latents(latents, decoded_latents, epoch):
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))

@@ -1,7 +1,7 @@
 # n3rProNet_utils.py
 #-------------------------------------------------------------------------------
 from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
-from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents
+from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, save_denoising_model, load_denoising_model
 import torch
 import math
 import numpy as np
@@ -3071,6 +3071,113 @@ def detect_eyes_auto(frame_pil):
 
 
 
+def apply_denoising(
+    latents,
+    denoising_model,
+    optimizer=None,
+    criterion=None,
+    train=False,
+    frame_counter=0,
+    max_epochs=3,
+    model_path="models/denoise.pt",
+    debug=False,
+    denoise=True
+):
+    """
+    Applique un denoising autoencoder sur les latents avec entraînement optionnel.
+
+    Args:
+        latents (torch.Tensor): Latents d'entrée.
+        denoising_model (torch.nn.Module): Le modèle de denoising.
+        optimizer (torch.optim.Optimizer, optional): Optimizer pour l'entraînement.
+        criterion (callable, optional): Fonction de perte.
+        train (bool): Mode entraînement si True.
+        frame_counter (int): Numéro de frame actuel.
+        max_epochs (int): Nombre d'epochs pour l'entraînement.
+        model_path (str): Chemin pour sauvegarde/chargement du modèle.
+        debug (bool): Activer affichage debug.
+        denoise (bool): Appliquer le denoising si True.
+    Returns:
+        torch.Tensor: Latents après denoising/injection.
+    """
+    if not denoise:
+        return latents
+
+    latents_train = latents.clone().detach().to("cuda").requires_grad_(True)
+    model_exists = os.path.exists(model_path)
+
+    # ----- Entraînement -----
+    if train and frame_counter % 2 == 0:
+        denoising_model.train()
+        denoising_model.to("cuda")
+        for param in denoising_model.parameters():
+            param.requires_grad = True
+
+        for epoch in range(max_epochs):
+            decoded_latents, loss = denoise_latents(
+                latents_train,
+                denoising_model,
+                optimizer=optimizer,
+                criterion=criterion,
+                device="cuda",
+                train=True
+            )
+
+            if loss is not None:
+                print(f"Epoch [{epoch+1}/{max_epochs}], Loss: {loss:.4f}")
+                if debug:
+                    show_latents(latents_train, decoded_latents, epoch+1)
+            else:
+                print(f"Epoch [{epoch+1}/{max_epochs}], Loss: Not computed")
+
+        save_denoising_model(
+            denoising_model,
+            optimizer=optimizer,
+            epoch=max_epochs,
+            loss=loss if loss is not None else 0.0,
+            path=model_path
+        )
+
+    # ----- Évaluation / Chargement -----
+    else:
+        if model_exists:
+            denoising_model, checkpoint = load_denoising_model(
+                MyDenoiser,
+                path=model_path,
+                optimizer=optimizer
+            )
+            print("Last saved loss:", checkpoint.get("loss"))
+        else:
+            print("[WARN] Denoising model not found, using untrained model.")
+
+        denoising_model.eval()
+        latents_out, loss = denoise_latents(
+            latents,
+            denoising_model,
+            optimizer=None,
+            criterion=criterion,
+            device="cuda",
+            train=False
+        )
+
+        if isinstance(latents_out, tuple):
+            latents_out = latents_out[0]
+
+        # 🔹 Limiter les valeurs extrêmes et sanitize
+        latents_out = torch.tanh(latents_out).clamp(-1.0, 1.0)
+        latents_out = sanitize_latents(latents_out)
+
+        # 🔹 Injection douce adaptative
+        if loss is not None:
+            noise_level = latents.std()
+            strength = min(max(0.02, 0.05 * noise_level), 0.2)
+            print(f"Strength [{strength}], Noise_level: [{noise_level}], Loss: [{loss}]")
+            latents = latents + strength * latents_out
+        else:
+            latents = 0.9 * latents + 0.1 * latents_out
+
+    return latents
+
 
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
@@ -3099,7 +3206,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         # Créer un latents indépendant pour l'entraînement
         latents_train = latents.clone().detach().to("cuda").requires_grad_(True)
 
-        if train and frame_counter == 0:
+        #if train and frame_counter == 0:
+        if train and frame_counter %2 == 0:
             # Mode entraînement du modèle
             denoising_model.train()
             denoising_model.to("cuda")  # Important !
@@ -3109,14 +3217,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
                 param.requires_grad = True
 
             for epoch in range(max_epochs):
-                decoded_latents, loss = denoise_latents(
-                    latents_train,
-                    denoising_model,
-                    optimizer=optimizer,
-                    criterion=criterion,
-                    device="cuda",
-                    train=True
-                )
+                decoded_latents, loss = denoise_latents( latents_train, denoising_model, optimizer=optimizer, criterion=criterion, device="cuda", train=True )
 
                 if loss is not None:
                     print(f"Epoch [{epoch+1}/{max_epochs}], Loss: {loss:.4f}")
@@ -3128,14 +3229,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
         else:
             # Mode évaluation
-            latents_out, loss = denoise_latents(
-                latents,
-                denoising_model,
-                optimizer=None,
-                criterion=criterion,
-                device="cuda",
-                train=False
-            )
+            latents_out, loss = denoise_latents( latents, denoising_model, optimizer=None, criterion=criterion, device="cuda", train=False )
 
             if isinstance(latents_out, tuple):
                 latents_out = latents_out[0]  # prend seulement le tensor principal
