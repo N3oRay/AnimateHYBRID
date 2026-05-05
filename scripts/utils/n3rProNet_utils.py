@@ -3078,7 +3078,7 @@ def apply_denoising(
     criterion=None,
     train=False,
     frame_counter=0,
-    max_epochs=3,
+    max_epochs_up=10,
     model_path="models/denoise_latest.pt",
     debug=False,
     ema_prev_latents=None,
@@ -3106,9 +3106,18 @@ def apply_denoising(
     model_exists = os.path.exists(model_path)
 
     # ----- Entraînement -----
-    if train and frame_counter % 2 == 0:
+    #if train and frame_counter % 2 == 0:
+    if train:
         denoising_model.train()
         denoising_model.to("cuda")
+
+        # detection du bruit
+        noise_level = latents.std()
+        min_epochs = 1
+        max_epochs_cap = max_epochs_up  # pour éviter des epochs trop longues
+        # max_epochs (int): Nombre d'epochs pour l'entraînement.
+        max_epochs = int(min_epochs + (max_epochs_cap - min_epochs) * noise_level / 3.0)
+
         for param in denoising_model.parameters():
             param.requires_grad = True
 
@@ -3167,7 +3176,8 @@ def apply_denoising(
         # 🔹 Injection douce adaptative
         if loss is not None:
             noise_level = latents.std()
-            strength = min(max(0.02, 0.05 * noise_level), 0.2)
+            #strength = min(max(0.02, 0.05 * noise_level), 0.2)
+            strength = min(max(0.05, 0.1 * noise_level), 0.3)
             print(f"Strength [{strength}], Noise_level: [{noise_level}], Loss: [{loss}]")
             latents = latents + strength * latents_out
         else:
@@ -3194,7 +3204,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     scale=4,
     denoise=True,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
-    max_epochs=10,
+    max_epochs_up=10,
     debug=False
 ):
 
@@ -3205,7 +3215,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     if denoise:
         # Créer un latents indépendant pour l'entraînement
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
-                            max_epochs=10, model_path="models/denoise_latest.pt", debug=False)
+                            max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False)
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
