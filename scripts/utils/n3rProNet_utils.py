@@ -3823,51 +3823,6 @@ def decode_latents_ultrasafe_blockwise(latents, vae,
     return frames[0] if B == 1 else frames
 
 
-def apply_intelligent_glow_pro(
-    frame_pil,
-    strength=0.18,
-    edge_weight=0.6,
-    luminance_weight=0.8,
-    blur_radius=1.2
-):
-
-
-    if frame_pil.mode != "RGB":
-        frame_pil = frame_pil.convert("RGB")
-
-    arr = np.array(frame_pil).astype(np.float32) / 255.0
-
-    # ---------------- Luminance ----------------
-    lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
-    lum_mask = np.clip((lum - 0.6) / 0.4, 0, 1)
-    lum_mask = np.power(lum_mask, 1.5)
-
-    # ---------------- Edge ----------------
-    gray = (lum * 255).astype(np.uint8)
-    edge = Image.fromarray(gray).filter(ImageFilter.FIND_EDGES)
-    edge = np.array(edge).astype(np.float32) / 255.0
-    edge = np.clip(edge * 1.2, 0, 1)
-    edge = np.power(edge, 1.3)
-
-    # ---------------- Mask combiné ----------------
-    combined_mask = np.clip(luminance_weight * lum_mask + edge_weight * edge, 0, 1)
-
-    # ---------------- Glow ----------------
-    glow_img = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    glow_arr = np.array(glow_img).astype(np.float32) / 255.0
-
-    # ---------------- Appliquer glow seulement sur la luminance ----------------
-    glow_lum = 0.299 * glow_arr[:, :, 0] + 0.587 * glow_arr[:, :, 1] + 0.114 * glow_arr[:, :, 2]
-
-    # mixer luminance glow + couleur originale
-    result = arr.copy()
-    for c in range(3):
-        # conserver la teinte originale mais injecter glow sur la luminosité
-        result[:, :, c] = arr[:, :, c] + (glow_lum - lum) * combined_mask * strength
-
-    result = np.clip(result, 0, 1)
-    return Image.fromarray((result * 255).astype(np.uint8))
-
 
 def apply_intelligent_glow_froid(
     frame_pil,
@@ -5094,8 +5049,61 @@ def apply_n3r_pro_net1(latents, model=None, strength=0.3, sanitize_fn=None):
         return latents
 
 
+# ------------------------- Glow intelligent pro avec mémoire -------------------------
+class IntelligentGlowPro:
+    def __init__(self, strength=0.18, edge_weight=0.6, luminance_weight=0.8, blur_radius=1.2):
+        self.strength = strength
+        self.edge_weight = edge_weight
+        self.luminance_weight = luminance_weight
+        self.blur_radius = blur_radius
+        self.global_lum_mask = None  # Pour stocker l'effet luminance pré-calculé
 
+    def __call__(self, frame_pil: Image.Image, frame_counter: int):
+        if frame_pil.mode != "RGB":
+            frame_pil = frame_pil.convert("RGB")
 
+        arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+        # ---------------- Luminance ----------------
+        lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+
+        # ---------------- Pré-calcul du mask sur les 2 premières frames ----------------
+        if frame_counter < 2 or self.global_lum_mask is None:
+            lum_mask = np.clip((lum - 0.6) / 0.4, 0, 1)
+            lum_mask = np.power(lum_mask, 1.5)
+
+            # ---------------- Edge ----------------
+            gray = (lum * 255).astype(np.uint8)
+            edge = Image.fromarray(gray).filter(ImageFilter.FIND_EDGES)
+            edge = np.array(edge).astype(np.float32) / 255.0
+            edge = np.clip(edge * 1.2, 0, 1)
+            edge = np.power(edge, 1.3)
+
+            # ---------------- Mask combiné ----------------
+            self.global_lum_mask = np.clip(self.luminance_weight * lum_mask + self.edge_weight * edge, 0, 1)
+
+        combined_mask = self.global_lum_mask
+
+        # ---------------- Glow ----------------
+        if frame_counter < 2:
+            glow_img = frame_pil.filter(ImageFilter.GaussianBlur(radius=self.blur_radius))
+            glow_arr = np.array(glow_img).astype(np.float32) / 255.0
+            glow_lum = 0.299 * glow_arr[:, :, 0] + 0.587 * glow_arr[:, :, 1] + 0.114 * glow_arr[:, :, 2]
+            # Stocker glow_lum pour usage futur si besoin
+            self.glow_lum = glow_lum
+        else:
+            glow_lum = self.glow_lum  # Réutilisation du glow des 2 premières frames
+
+        # ---------------- Appliquer glow seulement sur la luminance ----------------
+        result = arr.copy()
+        for c in range(3):
+            result[:, :, c] = arr[:, :, c] + (glow_lum - lum) * combined_mask * self.strength
+
+        result = np.clip(result, 0, 1)
+        return Image.fromarray((result * 255).astype(np.uint8))
+
+# Initialiser le glow
+glow_processor = IntelligentGlowPro(strength=0.18)
 
 def full_frame_postprocess(
     frame_pil: Image.Image,
@@ -5149,9 +5157,9 @@ def full_frame_postprocess(
 
     # ---------------- 7️⃣ Glow intelligent (rééquilibré) ----------------
     # 🔥 strength = moins agressif edge_weight=0.6 # 🔥 edge_weight = priorise edges luminance_weight=0.8 # 🔥 luminance_weight = glow sur zones lumineuses
-    if frame_counter < 2:
-        frame_pil = apply_intelligent_glow_pro( frame_pil, strength=0.18)
+    frame_pil = glow_processor(frame_pil, frame_counter)
     # ---------------- 8️⃣ Mini post-denoise léger ----------------
+    # 🔹 Légère réduction de micro-bruit sur frames initiales
     if frame_counter < 2:
         frame_pil = post_denoise_light(frame_pil, radius=0.5, strength=0.25)
 
