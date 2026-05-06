@@ -5,7 +5,7 @@ from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criter
 import torch
 import math
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageChops, ImageEnhance
 import torch.nn.functional as F
 from pathlib import Path
 from torchvision.transforms.functional import to_pil_image
@@ -15,6 +15,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.init as init
+
 
 
 
@@ -3120,6 +3121,61 @@ class EMADeltaRebound:
 hf_rebound = EMADeltaRebound()
 
 # Version very parfaite final !
+#        ┌─────────────────────────────┐
+#        │      Frame courante         │
+#        └─────────────┬──────────────┘
+#                      │
+#                      ▼
+#         ┌─────────────────────────┐
+#         │  EMA_prev_latents existe? │
+#         └───────┬───────────────┘
+#                 │ Oui
+#                 ▼
+#       ┌─────────────────────┐
+#       │  Calcul high-freq   │
+#       │  & Noise_level      │
+#       └───────┬─────────────┘
+#               │
+#               ▼
+#           ┌─────────────┐
+#           │ is_noisy?   │
+#           └─────┬───────┘
+#          Oui     Non
+#           │       │
+#           ▼       ▼
+#  ┌─────────────────────┐        ┌─────────────────────────────┐
+#  │  Frames bruitées     │       │ Frames calmes (non bruitées) │
+#  │  → max_epochs_up     │       │  → max_epochs minimal ou 0  │
+#  │  → injection forte   │       │  → injection douce          │
+#  └─────────┬───────────┘        └─────────────┬────────────────┘
+#            │                                 │
+#            ▼                                 ▼
+#      ┌─────────────┐                  ┌─────────────┐
+#      │ Entraînement │                  │ Pas d'entraînement
+#      │ dynamique    │                  │ ou injection minimale
+#      └─────┬───────┘                  └─────┬───────┘
+#            │                                │
+#            ▼                                ▼
+#    ┌──────────────────┐            ┌─────────────────┐
+#    │  Denoising       │            │  Denoising      │
+#    │  latents_out     │            │  latents_out    │
+#    └─────────┬────────┘            └─────────┬──────┘
+#              │                               │
+#              ▼                               ▼
+#      ┌─────────────────────┐         ┌─────────────────────────┐
+#      │ Injection adaptative │         │ Injection adaptative │
+#      │ strength ↑ si bruit  │         │ strength ↓ si calme  │
+#      └─────────┬───────────┘         └─────────┬───────────────┘
+#                │                               │
+#                ▼                               ▼
+#         ┌─────────────┐                 ┌─────────────┐
+#         │  EMA smooth │                 │  EMA smooth │
+#         │  latents    │                 │  latents    │
+#         └─────────────┘                 └─────────────┘
+#                │                               │
+#                ▼                               ▼
+#           Latents finaux après denoising
+
 def apply_denoising(
     latents,
     denoising_model,
@@ -3134,7 +3190,13 @@ def apply_denoising(
     ema_alpha=0.3
 ):
     """
-    Applique un denoising autoencoder sur les latents avec entraînement optionnel.
+    Applique un denoising autoencoder sur les latents avec entraînement optionnel et dynamique.
+
+    Logique dynamique:
+    1. Detection du bruit via EMA (high_freq + std)
+    2. Frames bruitées → entraînement plus long + injection forte
+    3. Frames calmes → entraînement minimal ou nul + injection douce
+    4. EMA finale pour lisser les transitions
 
     Args:
         latents (torch.Tensor): Latents d'entrée.
@@ -3400,358 +3462,6 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
     return frames[0] if B == 1 else frames
 
-
-def decode_latents_ultrasafe_blockwise_ultranatural_optimized(
-    latents, vae,
-    block_size=32, overlap=16,
-    device="cuda",
-    frame_counter=0,
-    latent_scale_boost=1.0,
-    use_hann=True,
-    sharpen_mode="both",
-    sharpen_strength=0.015,
-    sharpen_edges_strength=0.02,
-    gamma_boost=1.03
-):
-
-    vae = vae.to(device=device, dtype=torch.float32)
-    vae.eval()
-
-    B, C, H, W = latents.shape
-    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
-
-    out_H, out_W = H * 8, W * 8
-    # accumulation directement sur CPU
-    output_rgb = torch.zeros(B, 3, out_H, out_W, dtype=torch.float32, device="cpu")
-    weight = torch.zeros_like(output_rgb)
-
-    stride = block_size - overlap
-    y_positions = list(range(0, H, stride))
-    x_positions = list(range(0, W, stride))
-
-    # Feather patch
-    def create_feather(h, w):
-        if use_hann:
-            wy = torch.hann_window(h, device=device)
-            wx = torch.hann_window(w, device=device)
-            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
-        else:
-            y = torch.linspace(0, 1, h, device=device)
-            x = torch.linspace(0, 1, w, device=device)
-            wy = 1 - torch.abs(y - 0.5) * 2
-            wx = 1 - torch.abs(x - 0.5) * 2
-            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
-
-    for y in y_positions:
-        for x in x_positions:
-            y1 = min(y + block_size, H)
-            x1 = min(x + block_size, W)
-
-            patch = latents[:, :, y:y1, x:x1]
-            patch = torch.nan_to_num(patch, nan=0.0)
-
-            # Decode sur GPU
-            with torch.no_grad():
-                decoded = vae.decode(patch).sample.to(torch.float32)
-
-            # feather
-            fh, fw = decoded.shape[2], decoded.shape[3]
-            feather = create_feather(fh, fw).unsqueeze(0).unsqueeze(0)
-
-            # Move decoded sur CPU immédiatement
-            decoded_cpu = (decoded * feather).to("cpu")
-            iy0, ix0 = y*8, x*8
-            iy1, ix1 = iy0 + fh, ix0 + fw
-            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded_cpu
-            weight[:, :, iy0:iy1, ix0:ix1] += feather.to("cpu")
-
-            # Libération VRAM
-            del patch, decoded, feather, decoded_cpu
-            torch.cuda.empty_cache()
-
-    # Normalisation
-    weight = torch.clamp(weight, min=1e-3)
-    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
-    del weight
-    torch.cuda.empty_cache()
-
-    # 🔥 Sharpen adaptatif (CPU)
-    if sharpen_mode is not None:
-        output_rgb = output_rgb.clone()  # pour sécurité
-
-        if sharpen_mode in ["tanh", "both"]:
-            mean = output_rgb.mean(dim=[2,3], keepdim=True)
-            detail = output_rgb - mean
-            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
-            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
-            output_rgb += adapt_strength * torch.tanh(detail)
-
-        if sharpen_mode in ["edges", "both"]:
-            B, C, H, W = output_rgb.shape
-            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32)
-            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32)
-            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
-            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
-            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
-            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
-            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
-            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
-            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
-            output_rgb += sharpen_edges_strength * edges * edge_mask
-
-        output_rgb = output_rgb.clamp(-1.0, 1.0)
-
-    # Gamma adaptatif (CPU)
-    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
-    luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
-    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))
-    output_rgb_gamma = output_rgb_gamma ** adapt_gamma
-    output_rgb = output_rgb_gamma * 2 - 1
-    del output_rgb_gamma, luminance, adapt_gamma
-
-    # Micro-boost couleur
-    mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
-    color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
-    output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
-    del mean_c, color_boost
-
-    # Conversion PIL frame par frame
-    frames = [to_pil_image((output_rgb[i]+1)/2) for i in range(B)]
-    del output_rgb
-    torch.cuda.empty_cache()
-    return frames[0] if B==1 else frames
-
-def decode_latents_ultrasafe_blockwise_ultranatural_stable(
-    latents, vae,
-    block_size=32, overlap=16,
-    device="cuda",
-    frame_counter=0,
-    latent_scale_boost=1.0,
-    use_hann=True,
-    sharpen_mode="both",              # None, "tanh", "edges", "both"
-    sharpen_strength=0.015,
-    sharpen_edges_strength=0.02,
-    gamma_boost=1.03                  # légèrement plus de punch naturel
-):
-
-    vae = vae.to(device=device, dtype=torch.float32)
-    vae.eval()
-
-    B, C, H, W = latents.shape
-    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
-
-    out_H, out_W = H * 8, W * 8
-    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device, dtype=torch.float32)
-    weight = torch.zeros_like(output_rgb)
-
-    stride = block_size - overlap
-    y_positions = list(range(0, H, stride))
-    x_positions = list(range(0, W, stride))
-
-    # ---------------- Feather ----------------
-    def create_feather(h, w):
-        if use_hann:
-            wy = torch.hann_window(h, device=device)
-            wx = torch.hann_window(w, device=device)
-            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
-        else:
-            y = torch.linspace(0, 1, h, device=device)
-            x = torch.linspace(0, 1, w, device=device)
-            wy = 1 - torch.abs(y - 0.5) * 2
-            wx = 1 - torch.abs(x - 0.5) * 2
-            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
-
-    # ---------------- Decode ----------------
-    for y in y_positions:
-        for x in x_positions:
-            y1 = min(y + block_size, H)
-            x1 = min(x + block_size, W)
-
-            patch = latents[:, :, y:y1, x:x1]
-            patch = torch.nan_to_num(patch, nan=0.0)
-
-            with torch.no_grad():
-                decoded = vae.decode(patch).sample.to(torch.float32)
-
-            fh, fw = decoded.shape[2], decoded.shape[3]
-
-            feather = create_feather(fh, fw)
-            feather = feather.unsqueeze(0).unsqueeze(0)
-
-            iy0, ix0 = y*8, x*8
-            iy1, ix1 = iy0 + fh, ix0 + fw
-
-            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
-            weight[:, :, iy0:iy1, ix0:ix1] += feather
-
-            # ⚡ Libération VRAM patch
-            del patch, decoded, feather
-            torch.cuda.empty_cache()
-
-    # ---------------- Normalisation ----------------
-    weight = torch.clamp(weight, min=1e-3)
-    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
-    del weight
-    torch.cuda.empty_cache()
-
-    # =========================================================
-    # 🔥 SHARPEN ADAPTATIF
-    # =========================================================
-    if sharpen_mode is not None:
-        if sharpen_mode in ["tanh", "both"]:
-            mean = output_rgb.mean(dim=[2,3], keepdim=True)
-            detail = output_rgb - mean
-            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
-            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
-            output_rgb = output_rgb + adapt_strength * torch.tanh(detail)
-
-        if sharpen_mode in ["edges", "both"]:
-            B, C, H, W = output_rgb.shape
-            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype)
-            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype)
-            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
-            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
-
-            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
-            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
-            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
-            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
-            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
-            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
-
-        output_rgb = output_rgb.clamp(-1.0, 1.0)
-
-    # ---------------- Gamma adaptatif ----------------
-    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)
-    luminance = output_rgb_gamma.mean(dim=1, keepdim=True)
-    adapt_gamma = gamma_boost * (1.0 + 0.1*(0.5-luminance))
-    output_rgb_gamma = output_rgb_gamma ** adapt_gamma
-    output_rgb = output_rgb_gamma * 2 - 1
-    del output_rgb_gamma, luminance, adapt_gamma
-    torch.cuda.empty_cache()
-
-    # ---------------- Micro-boost couleur ----------------
-    mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
-    color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
-    output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
-    del mean_c, color_boost
-    torch.cuda.empty_cache()
-
-    # ---------------- To PIL ----------------
-    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
-    del output_rgb
-    torch.cuda.empty_cache()
-    return frames[0] if B == 1 else frames
-
-
-def decode_latents_ultrasafe_blockwise_natural(
-    latents, vae,
-    block_size=32, overlap=16,
-    device="cuda",
-    frame_counter=0,
-    latent_scale_boost=1.0,
-    use_hann=True,
-    sharpen_mode="both",              # None, "tanh", "edges", "both"
-    sharpen_strength=0.02,
-    sharpen_edges_strength=0.02,
-    gamma_boost=1.10                  # 12% plus de punch naturel
-):
-
-    vae = vae.to(device=device, dtype=torch.float32)
-    vae.eval()
-
-    B, C, H, W = latents.shape
-    latents = latents.to(device=device, dtype=torch.float32) * latent_scale_boost
-
-    out_H, out_W = H * 8, W * 8
-    output_rgb = torch.zeros(B, 3, out_H, out_W, device=device)
-    weight = torch.zeros_like(output_rgb)
-
-    stride = block_size - overlap
-    y_positions = list(range(0, H, stride))
-    x_positions = list(range(0, W, stride))
-
-    # ---------------- Feather ----------------
-    def create_feather(h, w):
-        if use_hann:
-            wy = torch.hann_window(h, device=device)
-            wx = torch.hann_window(w, device=device)
-            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
-        else:
-            y = torch.linspace(0, 1, h, device=device)
-            x = torch.linspace(0, 1, w, device=device)
-            wy = 1 - torch.abs(y - 0.5) * 2
-            wx = 1 - torch.abs(x - 0.5) * 2
-            return (wy[:, None] * wx[None, :]).clamp(min=1e-3)
-
-    # ---------------- Decode ----------------
-    for y in y_positions:
-        for x in x_positions:
-            y1 = min(y + block_size, H)
-            x1 = min(x + block_size, W)
-
-            patch = latents[:, :, y:y1, x:x1]
-            patch = torch.nan_to_num(patch, nan=0.0)
-
-            with torch.no_grad():
-                decoded = vae.decode(patch).sample.to(torch.float32)
-
-            fh, fw = decoded.shape[2], decoded.shape[3]
-
-            feather = create_feather(fh, fw)
-            feather = feather.unsqueeze(0).unsqueeze(0)
-
-            iy0, ix0 = y*8, x*8
-            iy1, ix1 = iy0 + fh, ix0 + fw
-
-            output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
-            weight[:, :, iy0:iy1, ix0:ix1] += feather
-
-    # ---------------- Normalisation ----------------
-    weight = torch.clamp(weight, min=1e-3)
-    output_rgb = (output_rgb / weight).clamp(-1.0, 1.0)
-
-    # =========================================================
-    # 🔥 SHARPEN SECTION ADAPTATIVE
-    # =========================================================
-    if sharpen_mode is not None:
-
-        # ---- 1. Tanh sharpen (détails globaux adaptatifs)
-        if sharpen_mode in ["tanh", "both"]:
-            mean = output_rgb.mean(dim=[2,3], keepdim=True)
-            detail = output_rgb - mean
-            # facteur adaptatif selon contraste local
-            local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
-            adapt_strength = sharpen_strength / (1 + 5*(1-local_std))
-            output_rgb = output_rgb + adapt_strength * torch.tanh(detail)
-
-        # ---- 2. Edge sharpen adaptatif
-        if sharpen_mode in ["edges", "both"]:
-            B, C, H, W = output_rgb.shape
-
-            kernel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype)
-            kernel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype)
-            kernel_x = kernel_x.view(1,1,3,3).repeat(C,1,1,1)
-            kernel_y = kernel_y.view(1,1,3,3).repeat(C,1,1,1)
-
-            grad_x = F.conv2d(output_rgb, kernel_x, padding=1, groups=C)
-            grad_y = F.conv2d(output_rgb, kernel_y, padding=1, groups=C)
-
-            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
-            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
-            edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
-            output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
-
-        output_rgb = output_rgb.clamp(-1.0, 1.0)
-
-    # ---------------- Gamma adaptatif ----------------
-    output_rgb_gamma = ((output_rgb + 1) / 2.0).clamp(0,1)  # [0,1]
-    output_rgb_gamma = output_rgb_gamma ** gamma_boost
-    output_rgb = output_rgb_gamma * 2 - 1
-
-    # ---------------- To PIL ----------------
-    frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
-    return frames[0] if B == 1 else frames
 
 
 def decode_latents_ultrasafe_blockwise_sharp(
@@ -4120,8 +3830,7 @@ def apply_intelligent_glow_pro(
     luminance_weight=0.8,
     blur_radius=1.2
 ):
-    from PIL import Image, ImageFilter
-    import numpy as np
+
 
     if frame_pil.mode != "RGB":
         frame_pil = frame_pil.convert("RGB")
@@ -4167,8 +3876,7 @@ def apply_intelligent_glow_froid(
     luminance_weight=0.8,
     blur_radius=1.2
 ):
-    from PIL import Image, ImageFilter, ImageEnhance
-    import numpy as np
+
 
     # ---------------- Base ----------------
     if frame_pil.mode != "RGB":
@@ -4216,6 +3924,7 @@ def apply_intelligent_glow_froid(
 # Version final !
 def apply_post_processing_adaptive(
     frame_pil,
+    frame_counter=0,
     blur_radius=0.01,
     denoise_strength=0.03,
     detail_strength=0.5,
@@ -4228,8 +3937,9 @@ def apply_post_processing_adaptive(
     if frame_pil.mode != "RGB":
         frame_pil = frame_pil.convert("RGB")
     # ---------------- 1️⃣ MICRO BLUR ----------------
-    if blur_radius > 0:
-        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    if frame_counter < 2:
+        if blur_radius > 0:
+            frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
     arr = np.array(frame_pil).astype(np.float32) / 255.0
 
@@ -4305,75 +4015,9 @@ def apply_post_processing_adaptive(
 
     return Image.fromarray((arr * 255).astype(np.uint8))
 
-# version précédente !
-def apply_post_processing_adaptive_old(
-    frame_pil,
-    blur_radius=0.03,
-    vibrance_strength=0.25,
-    shadow_lift=0.5,        # ⭐ NEW : récupère les détails sombres
-    shadow_threshold=0.35,   # zone considérée "ombre"
-    clamp_r=True
-):
-
-    if frame_pil.mode != "RGB":
-        frame_pil = frame_pil.convert("RGB")
-    # ---------------- 1️⃣ Micro blur ----------------
-    if blur_radius > 0:
-        frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-
-    # ---------------- 3️⃣ Vibrance + Shadow preservation ----------------
-    if vibrance_strength > 0 or shadow_lift > 0:
-        try:
-            arr = np.array(frame_pil).astype(np.float32) / 255.0
-
-            r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-
-            max_rgb = np.max(arr, axis=2)
-            min_rgb = np.min(arr, axis=2)
-            sat = (max_rgb - min_rgb)
-
-            # ---------------- Vibrance (zones peu saturées uniquement)
-            vibrance_boost = 1.0 + vibrance_strength * (1.0 - sat)
-
-            # ---------------- Shadows mask (zones sombres)
-            luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            shadow_mask = np.clip((shadow_threshold - luminance) / shadow_threshold, 0, 1)
-
-            # 👉 lift shadows sans casser les couleurs
-            shadow_boost = 1.0 + shadow_lift * shadow_mask
-
-            # combinaison propre
-            arr *= vibrance_boost[..., None]
-            arr *= shadow_boost[..., None]
-
-            frame_pil = Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8))
-
-        except Exception as e:
-            print(f"[WARNING] vibrance/shadows skipped: {e}")
-
-    # ---------------- 4️⃣ Clamp rouge ----------------
-    if clamp_r:
-        try:
-            arr = np.array(frame_pil).astype(np.float32)
-
-            r = arr[:, :, 0]
-            r_mean = r.mean()
-
-            if r_mean > 160:
-                factor = 160 / (r_mean + 1e-6)
-                arr[:, :, 0] *= factor
-
-            frame_pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-
-        except Exception as e:
-            print(f"[WARNING] clamp rouge skipped: {e}")
-
-    return frame_pil
 
 
 def smooth_edges(frame_pil, strength=0.4, blur_radius=1.2):
-    from PIL import ImageFilter, ImageChops
-    import numpy as np
 
     # 1️⃣ edges
     edges = frame_pil.convert("L").filter(ImageFilter.FIND_EDGES)
@@ -4405,8 +4049,7 @@ def apply_post_processing_unreal_cinematic(
     brightness_adj=0.90,   # 🔻 -5%
     contrast_adj=1.65      # 🔺 +65%
 ):
-    from PIL import Image, ImageEnhance, ImageFilter, ImageChops
-    import numpy as np
+
 
     # 🔥 1. Base (sans toucher contraste global)
     arr = np.array(frame_pil).astype(np.float32) / 255.0
@@ -4470,8 +4113,7 @@ def apply_post_processing_minimal(
     sharpen_threshold=2,
     clamp_r=True
 ):
-    from PIL import Image, ImageFilter, ImageEnhance
-    import numpy as np
+
 
     if frame_pil.mode != "RGB":
         frame_pil = frame_pil.convert("RGB")
@@ -4540,8 +4182,6 @@ def apply_intelligent_glow(frame_pil,
     - évite effet flou global
     - boost détails lumineux uniquement
     """
-    from PIL import Image, ImageFilter, ImageEnhance, ImageChops
-    import numpy as np
 
     # -----------------------
     # 1️⃣ Base numpy
@@ -4612,8 +4252,7 @@ def apply_chromatic_soft_glow(frame_pil,
     - Zones sombres préservées
     - Détails conservés
     """
-    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
-    import numpy as np
+
 
     arr = np.array(frame_pil).astype(np.float32) / 255.0
     arr = np.clip(arr * exposure, 0, 1)
@@ -4667,8 +4306,6 @@ def apply_localized_soft_glow(frame_pil,
     - Effet subtil, préserve les zones sombres
     - Maintien des détails
     """
-    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
-    import numpy as np
 
     # -----------------------
     # 1️⃣ Convertir en float + exposure
@@ -4720,8 +4357,6 @@ def apply_soft_glow(frame_pil,
     - Glow léger et subtil
     - Maintien des détails et textures
     """
-    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
-    import numpy as np
 
     # -----------------------
     # 1️⃣ Convertir en float + exposure léger
@@ -4765,8 +4400,7 @@ def apply_cinematic_neon_glow(frame_pil,
     - Couleurs saturées style néon / cinématographique
     - Bords légèrement lumineux type sketch
     """
-    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
-    import numpy as np
+
 
     # -----------------------
     # 1️⃣ Convertir en float
@@ -4827,8 +4461,7 @@ def apply_post_processing_sketch(frame_pil, edge_strength=0.2, blur_radius=0.3, 
     - Lisse les pixels isolés
     - Ne dénature pas les couleurs de base
     """
-    from PIL import Image, ImageFilter, ImageChops, ImageEnhance
-    import numpy as np
+
 
     # -----------------------
     # 1️⃣ Edge detection doux
@@ -4883,9 +4516,6 @@ def apply_post_processing_drawing(frame_pil,
     Simplifie les couleurs, ajoute des contours au crayon blanc,
     supprime les points noirs et garde un rendu net.
     """
-
-    from PIL import Image, ImageFilter, ImageEnhance, ImageChops
-    import numpy as np
 
     # -----------------------
     # 1️⃣ Color simplification douce
@@ -5155,6 +4785,27 @@ def kelvin_to_rgb(temperature):
         b = 255
 
     return np.clip([r, g, b], 0, 255)
+
+
+
+def post_denoise_light(frame_pil: Image.Image, radius: float = 0.5, strength: float = 0.25) -> Image.Image:
+    """
+    Applique un léger denoising sur l'image PIL pour réduire micro-bruit/banding.
+
+    Args:
+        frame_pil (PIL.Image.Image): Image d'entrée.
+        radius (float): Rayon du filtre flou léger.
+        strength (float): Poids du blending (0 = pas de denoise, 1 = full denoise).
+
+    Returns:
+        PIL.Image.Image: Image post-denoise légère.
+    """
+    # 🔹 Filtre flou très léger
+    blurred = frame_pil.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    # 🔹 Blending subtil pour garder détails
+    frame_pil = ImageChops.blend(frame_pil, blurred, strength)
+    return frame_pil
 
 def adjust_color_temperature(
     image,
@@ -5445,83 +5096,6 @@ def apply_n3r_pro_net1(latents, model=None, strength=0.3, sanitize_fn=None):
 
 
 
-def full_frame_postprocess_add( frame_pil: Image.Image, output_dir: Path, frame_counter: int, target_temp: int = 7800, reference_temp: int = 6500, temp_strength: float = 0.22, blur_radius: float = 0.03, contrast: float = 1.10, saturation: float = 1.0, sharpen_percent: int = 90, psave: bool = True, unreal: bool = False, cartoon: bool = False , glow: bool = False) -> Image.Image:
-    """
-    Returns:
-        frame_pil final traité
-    """
-    removewhite = False
-    minimal = False
-
-    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="01", psave=psave)
-    # 🔥 1. Température
-    frame_pil = adjust_color_temperature(frame_pil, adaptive=True, debug=True)
-    #frame_pil = adjust_color_temperature( frame_pil, target_temp=target_temp, reference_temp=reference_temp, strength=temp_strength )
-
-    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="02", psave=psave)
-
-    # 🔥 2. Neutralisation de la dominante
-    frame_pil = neutralize_color_cast(frame_pil)
-    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="03", psave=psave)
-
-    # 🔥 3. Tone mapping
-    frame_pil = soft_tone_map(frame_pil)
-    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="04", psave=psave)
-
-    # 🔥 4. Post-traitement adaptatif
-    if minimal:
-        frame_pil = apply_post_processing_minimal(
-            frame_pil,
-            blur_radius=blur_radius,
-            contrast=contrast,
-            vibrance_base=1.0,
-            vibrance_max=1.1,
-            sharpen=True,
-            sharpen_radius=1,
-            sharpen_percent=sharpen_percent,
-            sharpen_threshold=2
-        )
-    else:
-        frame_pil = apply_post_processing_adaptive(
-            frame_pil,
-            blur_radius=0.03,
-            vibrance_strength=0.05   # 🔥 contrôle simple (0 → off, 0.3 = doux)
-        )
-    save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="05", psave=psave)
-
-
-    # 🔥 5. clean white Style
-    if removewhite:
-        frame_pil = remove_white_noise(frame_pil)
-        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="06", psave=psave)
-
-    # 🔥 6. Unreal Style
-    if unreal:
-        frame_pil = apply_post_processing_unreal_cinematic(frame_pil)
-        frame_pil = smooth_edges(frame_pil, strength=0.35, blur_radius=1.0)
-        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="07", psave=psave)
-
-    elif cartoon:
-        # 🔥 6. Cartoon Style
-        frame_pil = apply_post_processing_sketch(frame_pil)
-        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="08", psave=psave)
-
-    # 🔥 7. Glow Style
-    if glow:
-        # Glow forcé pour le style
-        frame_pil = apply_chromatic_soft_glow(frame_pil)
-        frame_pil = apply_localized_soft_glow(frame_pil)
-        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
-    else:
-        # Glow intelligent
-        frame_pil = apply_intelligent_glow( frame_pil )
-        from PIL import ImageEnhance
-        frame_pil = ImageEnhance.Contrast(frame_pil).enhance(1.04)
-        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
-
-    return frame_pil
-
-
 
 def full_frame_postprocess(
     frame_pil: Image.Image,
@@ -5559,35 +5133,29 @@ def full_frame_postprocess(
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="04", psave=psave)
 
     # ---------------- 5️⃣ Adaptive (nettoyage + micro boost) ----------------
-    frame_pil = apply_post_processing_adaptive(
-        frame_pil,
-        blur_radius=blur_radius,
-        vibrance_strength=0.22   # 🔥 légèrement réduit
-    )
+    frame_pil = apply_post_processing_adaptive( frame_pil, frame_counter, blur_radius=blur_radius, vibrance_strength=0.22 )
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="05", psave=psave)
 
     # ---------------- 6️⃣ Stylisation ----------------
-    if unreal:
-        frame_pil = apply_post_processing_unreal_cinematic(frame_pil)
-        frame_pil = smooth_edges(frame_pil, strength=0.30, blur_radius=0.8)  # 🔥 moins destructif
-        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="06", psave=psave)
+    if frame_counter < 2:
+        if unreal:
+            frame_pil = apply_post_processing_unreal_cinematic(frame_pil)
+            frame_pil = smooth_edges(frame_pil, strength=0.30, blur_radius=0.8)  # 🔥 moins destructif
+            save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="06", psave=psave)
 
-    elif cartoon:
-        frame_pil = apply_post_processing_sketch(frame_pil)
-        save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="07", psave=psave)
+        elif cartoon:
+            frame_pil = apply_post_processing_sketch(frame_pil)
+            save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="07", psave=psave)
 
     # ---------------- 7️⃣ Glow intelligent (rééquilibré) ----------------
-   # strength=0.15 edge_weight=0.5 luminance_weight=0.8
-
-    frame_pil = apply_intelligent_glow_pro(
-        frame_pil,
-        strength=0.18,              # 🔥 moins agressif
-        edge_weight=0.6,            # 🔥 priorise edges
-        luminance_weight=0.8        # 🔥 glow sur zones lumineuses
-    )
+    # 🔥 strength = moins agressif edge_weight=0.6 # 🔥 edge_weight = priorise edges luminance_weight=0.8 # 🔥 luminance_weight = glow sur zones lumineuses
+    if frame_counter < 2:
+        frame_pil = apply_intelligent_glow_pro( frame_pil, strength=0.18)
+    # ---------------- 8️⃣ Mini post-denoise léger ----------------
+    if frame_counter < 2:
+        frame_pil = post_denoise_light(frame_pil, radius=0.5, strength=0.25)
 
     # 🔥 micro contraste FINAL (après glow → très important)
-    from PIL import ImageEnhance
     frame_pil = ImageEnhance.Contrast(frame_pil).enhance(1.04)
 
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="09", psave=psave)
