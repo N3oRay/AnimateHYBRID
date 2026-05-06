@@ -353,8 +353,7 @@ class DenoisingAE32(nn.Module):
 
 def print_latents(latents, debug=True):
     if debug:
-        print(f"Latents max: {latents.max():.4f}, min: {latents.min():.4f}")
-        print(f"Latents mean: {latents.mean():.4f}, std: {latents.std():.4f}")
+        print(f"Latents max: {latents.max():.4f}, min: {latents.min():.4f}, Latents mean: {latents.mean():.4f}, std: {latents.std():.4f}")
         if torch.isnan(latents).any():
             print("WARNING: NaN detected in latents")
         if torch.isinf(latents).any():
@@ -572,7 +571,7 @@ def denoise_latents(latents, denoising_model, optimizer=None, criterion=None, de
         if debug:
             print(f"[DENoise] Latents max: {latents.max():.4f}, min: {latents.min():.4f}")
             print(f"[DENoise] Decoded max: {decoded_latents.max():.4f}, min: {decoded_latents.min():.4f}")
-            print(f"[DENoise] Loss: {loss_val.item():.4f}")
+            #print(f"[DENoise] Loss: {loss_val.item():.4f}")
 
     # Mise à jour heuristique des paramètres si training
     if train and optimizer is not None:
