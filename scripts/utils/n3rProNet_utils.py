@@ -3119,7 +3119,7 @@ class EMADeltaRebound:
 # Initialisation (une seule fois)
 hf_rebound = EMADeltaRebound()
 
-# Version parfaite final !
+# Version very parfaite final !
 def apply_denoising(
     latents,
     denoising_model,
@@ -3201,7 +3201,7 @@ def apply_denoising(
                 optimizer=optimizer,
                 criterion=criterion,
                 device="cuda",
-                train=True
+                train=train
             )
 
             if loss is not None:
