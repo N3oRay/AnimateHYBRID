@@ -3119,7 +3119,7 @@ class EMADeltaRebound:
 # Initialisation (une seule fois)
 hf_rebound = EMADeltaRebound()
 
-
+# Version parfaite final !
 def apply_denoising(
     latents,
     denoising_model,
@@ -3180,12 +3180,16 @@ def apply_denoising(
                 max_epochs = max_epochs_up
             else:
                 # On augmente l'apprentissage en cas de pics !'
-                max_epochs = max_epochs_up +10
+                max_epochs = max_epochs_up +20
         else:
             min_epochs = 1
             max_epochs_cap = max_epochs_up  # pour éviter des epochs trop longues
             # max_epochs (int): Nombre d'epochs pour l'entraînement.
             max_epochs = int(min_epochs + (max_epochs_cap - min_epochs) * noise_level / 2.0)
+
+        if max_epochs ==1:
+            # Ne pas entrainé dans ce cas ! 🔥
+            train=False
 
         for param in denoising_model.parameters():
             param.requires_grad = True
