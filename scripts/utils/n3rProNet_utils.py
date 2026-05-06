@@ -3171,6 +3171,7 @@ def apply_denoising(
     # ----- Entraînement -----
     #if train and frame_counter % 2 == 0:
     if train:
+        print(f"Mode Denoise - Entraînement dynamique")
         denoising_model.train()
         denoising_model.to("cuda")
 
@@ -3220,6 +3221,7 @@ def apply_denoising(
 
     # ----- Évaluation / Chargement -----
     else:
+        print(f"Mode simple - Denoise sans Entraînement")
         if model_exists:
             denoising_model, checkpoint = load_denoising_model(
                 type(denoising_model),  # récupère la classe de ton modèle MyDenoiser,
