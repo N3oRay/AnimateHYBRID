@@ -36,12 +36,12 @@ from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_po
 from scripts.utils.vae_utils import safe_load_unet
 from scripts.utils.n3rModelFast4Go import N3RModelFast4GB, N3RModelLazyCPU, N3RModelOptimized
 from scripts.utils.n3rProNet import N3RProNet
-from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, get_nose_coords_safe, get_shoulders_coords_safe, get_clavicules_coords_safe, get_neck_coords_safe, get_elbows_coords_safe, get_wrists_coords_safe, get_hips_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth, get_ear_coords_safe, release_mediapipe_models, init_mediapipe_models, get_face_mesh
+from scripts.utils.n3rProNet_utils import apply_n3r_pro_net, save_frame_verbose, full_frame_postprocess, decode_latents_ultrasafe_blockwise, get_eye_coords_safe, create_volumetrique_mask, create_eye_mask, tensor_to_pil, apply_pro_net_volumetrique, apply_pro_net_with_eyes, get_eye_coords_safe, scale_eye_coords_to_latents, get_coords, get_coords_safe, decode_latents_ultrasafe_blockwise_pro, decode_latents_ultrasafe_blockwise_sharp, decode_latents_ultrasafe_blockwise_natural, decode_latents_ultrasafe_blockwise_ultranatural, create_mouth_mask, get_mouth_coords_safe, get_nose_coords_safe, get_shoulders_coords_safe, get_clavicules_coords_safe, get_neck_coords_safe, get_elbows_coords_safe, get_wrists_coords_safe, get_hips_coords_safe, scale_mouth_coords_to_latents, apply_pro_net_with_mouth, get_ear_coords_safe, release_mediapipe_models, init_mediapipe_models, get_face_mesh, get_hair_coords_safe
 
 from scripts.utils.n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from scripts.utils.n3rOpenPose_utils import generate_pose_sequence, load_controlnet_openpose, load_controlnet_openpose_local, match_latent_size, control_to_latent_safe, build_control_latent_debug, convert_json_to_pose_sequence, debug_pose_visual, save_debug_pose_image, fix_pose_sequence, prepare_controlnet, log_frame_error, apply_openpose_tilewise, controlnet_tile_fn, apply_openpose_tilewise_safe, gaussian_blur
 
-from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_from_keypoints_batch, update_keypoints_from_pose, update_sequence_from_keypoints_batch, compensate_latent_shift, compensate_latent_shift_dev
+from scripts.utils.n3rMotionPose_utils import apply_pose_driven_motion_stable, apply_pose_driven_motion_ultra2, extract_keypoints_from_pose, save_debug_pose_image_with_skeleton, update_pose_from_keypoints_batch, update_keypoints_from_pose, update_sequence_from_keypoints_batch, compensate_latent_shift_dev
 
 LATENT_SCALE = 0.18215
 stop_generation = False
@@ -218,8 +218,7 @@ def main(args):
 
     # ---------------- Frames principales avec interpolation prompts ----------------
     external_embeddings = None
-    # Charger latent externe avant la génération
-    external_path = "/mnt/62G/huggingface/cyber-fp16/pt/KnxCOmiXNeg.safetensors"
+    external_path = "/mnt/62G/huggingface/cyber-fp16/pt/KnxCOmiXNeg.safetensors" # Charger latent externe avant la génération
     external_latent = load_external_embedding_as_latent( external_path, (1, 4, cfg["H"]//facteur, cfg["W"]//facteur) ).to(device)
 
     pose_model, face_mesh = init_mediapipe_models() # initialisation
@@ -260,11 +259,11 @@ def main(args):
             clavicules_coords = get_clavicules_coords_safe(input_pil, pose_model, face_mesh)
             elbow_coords = get_elbows_coords_safe(input_pil, pose_model)  # 6 left_elbow / coude gauche # 3 right_elbow / coude droit
             wrists_coords = get_wrists_coords_safe(input_pil, pose_model, face_mesh)   # 7 left_wrist / poignet gauche # 4 right_wrist / poignet droit
-            hips_coords = get_hips_coords_safe(input_pil)  # 11 left_hip / hanche gauche # 8 right_hip / hanche droite
-            # 9 right_knee (absent) # 10 right_ankle (absent) # 12 left_knee (absent) # 13 left_ankle (absent)
+            hips_coords = get_hips_coords_safe(input_pil)  # 11 left_hip / hanche gauche # 8 right_hip / hanche droite # 9 right_knee # 10 right_ankle  # 12 left_knee  # 13 left_ankle
             eye_coords = get_eye_coords_safe(input_pil, face_mesh) # 15 left_eye / œil gauche # 14 right_eye / œil droit - 👁 Eyes detected
             ear_coords = get_ear_coords_safe(input_pil, face_mesh) # 17 left_ear / oreille gauche # 16 right_ear / oreille droite
             mouth_coords = get_mouth_coords_safe(input_pil, face_mesh)
+            hair_coords = get_hair_coords_safe(input_pil, face_mesh)
 
             # coordonner globale
             coords_v = get_coords_safe( input_pil, H=cfg["H"], W=cfg["W"] )
@@ -305,8 +304,8 @@ def main(args):
                 current_latent_single = generate_latents_robuste_4D(
                     latents=current_latent_single.to(device), pos_embeds=pos_embeds, neg_embeds=neg_embeds, unet=unet, scheduler=scheduler,
                     motion_module=None, device=device, dtype=dtype, guidance_scale=current_guidance_scale,
-                    init_image_scale=current_init_image_scale, #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
-                    creative_noise=current_creative_noise, seed=seed  # 42, 1234, 2026, 5555
+                    init_image_scale=current_init_image_scale,
+                    creative_noise=current_creative_noise, seed=seed  #seed: 42, 1234, 2026, 5555 #init_image_scale: 0.85  # presque tout le signal de l'image d'origine
                 )
 
                 # 🔥 FIX NaN / stabilité
@@ -359,7 +358,7 @@ def main(args):
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         print(f"Dimention frame inter: Shape de latent_interp :", latent_interp.shape)
-                        frame_pil = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost )
+                        frame_pil = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single )
 
                         #Post Traitement
                         frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
@@ -464,9 +463,8 @@ def main(args):
 
                                 # 🔹 Extraction / update des keypoints complexe 23 points -------------- STABLE VERSION ---------------------------
                                 current_keypoints = extract_keypoints_from_pose( debug=True, debug_dir=output_dir, frame_counter=frame_counter, image_size=image_size)
-                                # 🔹 Update des keypoints avec Mediapipe
-
-                                current_keypoints = update_keypoints_from_pose(current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, image_size=image_size, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
+                                # 🔹 Update des keypoints avec Mediapipes
+                                current_keypoints = update_keypoints_from_pose(current_keypoints, nose_coords, neck_coords, shoulders_coords, clavicules_coords, elbow_coords, wrists_coords, hips_coords, eye_coords, ear_coords, mouth_coords, hair_coords, image_size=image_size, device=device, debug=True, debug_dir=output_dir, frame_counter=frame_counter )
 
                                 sequence = generate_pose_sequence_keypoints(base_keypoints=current_keypoints, num_frames=total_frames, fps=fps, breathing_strength=0.4, sway_strength=0.4, device=device, debug=verbose)
 
@@ -490,7 +488,7 @@ def main(args):
                                 )
 
                                 # compensation du mouvement :
-                                latents = compensate_latent_shift_dev( latents, frame_counter=frame_counter, shift = state["global_shift"], global_angle=state["global_angle"], prev_latent=prev_latent, image_size=image_size, debug=True, debug_dir=output_dir )
+                                latents = compensate_latent_shift_dev( latents, frame_counter=frame_counter, shift = state["global_shift"], global_angle_z=state["global_angle_z"], prev_latent=prev_latent, image_size=image_size, debug=verbose, debug_dir=output_dir )
 
                                 # 🔹 Stocker les keypoints pour la frame suivante
                                 prev_keypoints = current_keypoints.clone()
@@ -525,18 +523,14 @@ def main(args):
                         latents = apply_pro_net_volumetrique(latents, coords_v, n3r_pro_net, n3r_pro_strength, sanitize_latents, debug=False)
                         debug_latents("Après ProNet volumetrique", latents)
 
-                        eye_coords_latent = scale_eye_coords_to_latents(eye_coords, img_H=cfg["H"], img_W=cfg["W"],
-                                                                        lat_H=latents.shape[-2], lat_W=latents.shape[-1])
+                        eye_coords_latent = scale_eye_coords_to_latents(eye_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latents.shape[-2], lat_W=latents.shape[-1])
                         if eye_coords_latent:
-                            latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength,
-                                                            sanitize_fn=sanitize_latents)
+                            latents = apply_pro_net_with_eyes(latents, eye_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
                             debug_latents("Après ProNet yeux", latents)
 
-                        mouth_coords_latent = scale_mouth_coords_to_latents(mouth_coords, img_H=cfg["H"], img_W=cfg["W"],
-                                                                        lat_H=latents.shape[-2], lat_W=latents.shape[-1])
+                        mouth_coords_latent = scale_mouth_coords_to_latents(mouth_coords, img_H=cfg["H"], img_W=cfg["W"], lat_H=latents.shape[-2], lat_W=latents.shape[-1])
                         if mouth_coords_latent:
-                            latents = apply_pro_net_with_mouth(latents, mouth_coords_latent, n3r_pro_net, n3r_pro_strength,
-                                                            sanitize_fn=sanitize_latents)
+                            latents = apply_pro_net_with_mouth(latents, mouth_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
                             debug_latents("Après ProNet Bouche", latents)
                         latents = sanitize_latents(latents)
                     # ---------------- Décodage final ----------------
@@ -544,7 +538,7 @@ def main(args):
                     latents = latents / LATENT_SCALE
                     print(f"Dimention : Shape de latents :", latents.shape)
                     frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device,
-                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur
+                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single
                     )
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
                                                     blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
