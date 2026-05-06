@@ -3073,52 +3073,51 @@ def detect_eyes_auto(frame_pil):
 
 from collections import deque
 
-class HighFreqNoiseHistory:
+class EMADeltaRebound:
     """
-    Historise les niveaux de bruit high-frequency pour détecter les frames réellement bruitées.
+    Détecte une frame bruitée si la variation par rapport à la dernière EMA dépasse le dernier pic bruité.
     """
 
-    def __init__(self, history_len=5, threshold_sigma=1.0):
-        """
-        Args:
-            history_len (int): Nombre de frames à garder dans l'historique.
-            threshold_sigma (float): Nombre d'écarts-types au-dessus de la moyenne pour considérer une frame bruitée.
-        """
-        self.history_len = history_len
-        self.threshold_sigma = threshold_sigma
-        self.history = deque(maxlen=history_len)
+    def __init__(self):
+        self.last_noisy_level = None  # Niveau de delta de la dernière frame bruitée
 
-    def compute_high_freq_std(self, latents):
+    def compute_delta_std(self, latents, ema_prev_latents):
         """
-        Calcule le niveau de bruit high-frequency d'une frame.
+        Calcule l'écart-type de la différence entre la frame actuelle et l'EMA précédente.
         """
-        high_freq = latents - torch.nn.functional.avg_pool2d(latents, kernel_size=3, stride=1, padding=1)
-        return high_freq.std().item()
+        delta = latents - ema_prev_latents
+        return delta.std().item()
 
-    def update(self, latents):
+    def update(self, latents, ema_prev_latents):
         """
-        Met à jour l'historique et détecte si la frame est réellement bruitée.
-
         Args:
             latents (torch.Tensor): Latents de la frame actuelle.
+            ema_prev_latents (torch.Tensor): EMA des latents précédents.
 
         Returns:
-            noise_level (float): High-frequency std de la frame actuelle.
-            avg_noise (float): Moyenne des noise_level historiques.
-            std_noise (float): Écart-type des noise_level historiques.
-            is_noisy (bool): True si la frame est considérée bruitée.
+            noise_level (float): Niveau de delta actuel.
+            is_noisy (bool): True si la frame est plus bruyante que le dernier pic.
         """
-        noise_level = self.compute_high_freq_std(latents)
-        self.history.append(noise_level)
+        # Assurer que les deux tensors sont sur le même device
+        if ema_prev_latents.device != latents.device:
+            ema_prev_latents = ema_prev_latents.to(latents.device)
 
-        avg_noise = sum(self.history) / len(self.history)
-        std_noise = (sum((x - avg_noise) ** 2 for x in self.history) / len(self.history)) ** 0.5
+        noise_level = self.compute_delta_std(latents, ema_prev_latents)
 
-        is_noisy = noise_level > avg_noise + self.threshold_sigma * std_noise
-        return noise_level, avg_noise, std_noise, is_noisy
+        # Détection basée sur le rebond
+        if self.last_noisy_level is None:
+            is_noisy = True  # Première frame considérée bruitée
+        else:
+            is_noisy = noise_level > self.last_noisy_level
+
+        # Mise à jour systématique du dernier niveau high_freq
+        self.last_noisy_level = noise_level
+
+
+        return noise_level, is_noisy
 
 # Initialisation (une seule fois)
-hf_history = HighFreqNoiseHistory(history_len=5, threshold_sigma=1.0)
+hf_rebound = EMADeltaRebound()
 
 
 def apply_denoising(
@@ -3151,22 +3150,23 @@ def apply_denoising(
     Returns:
         torch.Tensor: Latents après denoising/injection.
     """
-
-
+    is_noisy = False
+    if ema_prev_latents is not None:
+        # delta entre la frame courante et l'EMA précédente
+        # Test noise frames
+        noise_level, is_noisy = hf_rebound.update(latents, ema_prev_latents)
+        print(f"Noise_level EMA - high_freq: [{noise_level}], is_noisy: [{is_noisy}],  on start...🔥 ")
+    else:
+        is_noisy = True
+        # detection du bruit
+        noise_level = latents.std()
+        print(f"Noise_level - latents.std: [{noise_level}], on start...🔥 ")
+        high_freq = latents - torch.nn.functional.avg_pool2d(latents, kernel_size=3, stride=1, padding=1)
+        noise_level = high_freq.std()
+        print(f"Noise_level - high_freq: [{noise_level}], on start...🔥 , is_noisy: [{is_noisy}]")
 
     latents_train = latents.clone().detach().to("cuda").requires_grad_(True)
     model_exists = os.path.exists(model_path)
-
-    # detection du bruit
-    noise_level = latents.std()
-    print(f"Noise_level - latents.std: [{noise_level}], on start...🔥 ")
-    high_freq = latents - torch.nn.functional.avg_pool2d(latents, kernel_size=3, stride=1, padding=1)
-    noise_level = high_freq.std()
-    print(f"Noise_level - high_freq: [{noise_level}], on start...🔥 ")
-
-    # Dans la boucle de traitement des frames
-    noise_level, avg_noise, std_noise, is_noisy = hf_history.update(latents)
-    print(f"Noise_level - high_freq: [{noise_level}], avg_noise: [{avg_noise}],  std_noise: [{std_noise}],  std_noise: [{is_noisy}],  on start...🔥 ")
 
     # ----- Entraînement -----
     #if train and frame_counter % 2 == 0:
@@ -3174,10 +3174,13 @@ def apply_denoising(
         denoising_model.train()
         denoising_model.to("cuda")
 
-        min_epochs = 1
-        max_epochs_cap = max_epochs_up  # pour éviter des epochs trop longues
-        # max_epochs (int): Nombre d'epochs pour l'entraînement.
-        max_epochs = int(min_epochs + (max_epochs_cap - min_epochs) * noise_level / 2.0)
+        if is_noisy:
+            max_epochs = max_epochs_up
+        else:
+            min_epochs = 1
+            max_epochs_cap = max_epochs_up  # pour éviter des epochs trop longues
+            # max_epochs (int): Nombre d'epochs pour l'entraînement.
+            max_epochs = int(min_epochs + (max_epochs_cap - min_epochs) * noise_level / 2.0)
 
         for param in denoising_model.parameters():
             param.requires_grad = True
@@ -3229,7 +3232,11 @@ def apply_denoising(
 
     # 🔹 Injection douce adaptative
     if loss is not None:
-        strength = min(max(0.05, 0.1 * noise_level), 0.3)
+        if is_noisy:
+            strength = min(max(0.05, 0.15 * noise_level), 0.4)  # plus agressif si bruit réel
+        else:
+            strength = min(max(0.05, 0.1 * noise_level), 0.2)   # sinon injection plus douce
+
         print(f"Strength [{strength}], Noise_level: [{noise_level}], Loss: [{loss}]")
         latents = latents + strength * latents_out
     else:
@@ -3237,7 +3244,13 @@ def apply_denoising(
 
     # 🔹 EMA pour lisser les transitions
     if ema_prev_latents is not None:
+        # Assurer que ema_prev_latents est sur le même device que latents
+        print(f"ema_prev_latents ... 🔥 ")
+        if ema_prev_latents.device != latents.device:
+            ema_prev_latents = ema_prev_latents.to(latents.device)
         latents = ema_alpha * latents + (1 - ema_alpha) * ema_prev_latents
+
+
 
     noise_level = latents.std()
     print(f"Noise_level - latents.std: [{noise_level}], after denoising... 🔥 ")
@@ -3264,6 +3277,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     denoise=True,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
     max_epochs_up=10,
+    ema_prev_latents=None,
     debug=False
 ):
 
@@ -3274,7 +3288,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     if denoise:
         # Créer un latents indépendant pour l'entraînement
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
-                            max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False)
+                            max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
