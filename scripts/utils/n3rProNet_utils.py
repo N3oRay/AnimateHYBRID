@@ -3070,7 +3070,7 @@ def detect_eyes_auto(frame_pil):
         return [(int(left_eye[0]), int(left_eye[1])), (int(right_eye[0]), int(right_eye[1]))]
 
 
-
+# ************************************************************************************************************************
 from collections import deque
 
 class EMADeltaRebound:
@@ -3262,7 +3262,7 @@ def apply_denoising(
         latents = ema_alpha * latents + (1 - ema_alpha) * ema_prev_latents
 
 
-
+    # Dection final pour vérification
     noise_level = latents.std()
     print(f"Noise_level - latents.std: [{noise_level}], after denoising... 🔥 ")
     high_freq = latents - torch.nn.functional.avg_pool2d(latents, kernel_size=3, stride=1, padding=1)
