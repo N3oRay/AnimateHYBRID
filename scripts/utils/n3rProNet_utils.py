@@ -3175,7 +3175,12 @@ def apply_denoising(
         denoising_model.to("cuda")
 
         if is_noisy:
-            max_epochs = max_epochs_up
+            if frame_counter==0:
+                # Apprentissage normal pour la frame init
+                max_epochs = max_epochs_up
+            else:
+                # On augmente l'apprentissage en cas de pics !'
+                max_epochs = max_epochs_up +10
         else:
             min_epochs = 1
             max_epochs_cap = max_epochs_up  # pour éviter des epochs trop longues
@@ -3233,7 +3238,9 @@ def apply_denoising(
     # 🔹 Injection douce adaptative
     if loss is not None:
         if is_noisy:
-            strength = min(max(0.05, 0.15 * noise_level), 0.4)  # plus agressif si bruit réel
+            #strength = min(max(0.05, 0.15 * noise_level), 0.4)  # plus agressif si bruit réel
+            # Boost pour bruit intense
+            strength = min(0.05 + 0.3 * noise_level**0.5, 0.8)
         else:
             strength = min(max(0.05, 0.1 * noise_level), 0.2)   # sinon injection plus douce
 
