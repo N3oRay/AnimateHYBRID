@@ -1,7 +1,7 @@
 # n3rProNet_utils.py
 #-------------------------------------------------------------------------------
 from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
-from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, save_denoising_model, load_denoising_model
+from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, save_denoising_model, load_denoising_model, debug_tensor, train_denoiser
 from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_model
 from torch.optim import Adam
 import torch
@@ -3727,32 +3727,7 @@ hf_rebound = EMADeltaRebound()
 #                │                               │
 #                ▼                               ▼
 #           Latents finaux après denoising
-def train_denoiser(latents, model, optimizer, criterion, max_epochs, device, debug=False):
 
-    model.train().to(device)
-    latents = latents.to(device)
-
-    for epoch in range(max_epochs):
-
-        optimizer.zero_grad(set_to_none=True)
-
-        pred = model(latents)
-
-        loss = criterion(pred, latents)
-
-        if not torch.isfinite(loss):
-            print("[WARN] invalid loss")
-            continue
-
-        print(f"Epoch {epoch+1}: {loss.item():.4f}")
-
-        if debug:
-            show_latents(latents, pred, epoch)
-
-        loss.backward()
-        optimizer.step()
-
-    return model, loss
 
 def apply_denoising(
     latents,
@@ -3834,7 +3809,7 @@ def apply_denoising(
 
         for param in denoising_model.parameters():
             param.requires_grad = True
-
+        """
         for epoch in range(max_epochs):
             latents_out, loss = denoise_latents(
                 latents_train,
@@ -3853,20 +3828,22 @@ def apply_denoising(
                 print(f"Epoch [{epoch+1}/{max_epochs}], Loss: Not computed")
         """
 
-        denoising_model, loss = train_denoiser(
-            latents=latents_train,
-            model=denoising_model,
-            optimizer=optimizer,
-            criterion=criterion,
-            max_epochs=max_epochs,
-            device="cuda"
-        )
-        """
+        with torch.enable_grad():
+            print(f"[AUTOCLAVE] grad enabled = {torch.is_grad_enabled()}")
+            denoising_model, latents_out, loss = train_denoiser(
+                                                    latents=latents_train,
+                                                    model=denoising_model,
+                                                    optimizer=optimizer,
+                                                    criterion=criterion,
+                                                    max_epochs=max_epochs,
+                                                    device="cuda"
+                                                )
+
         save_denoising_model(
             denoising_model,
             optimizer=optimizer,
             epoch=max_epochs,
-            loss=loss if loss is not None else 0.0
+            loss=loss.item() if loss is not None else 0.0
         )
 
     # ----- Évaluation / Chargement -----

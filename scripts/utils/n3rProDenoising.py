@@ -365,9 +365,132 @@ def sanitize_latents_for_train_grad(latents, debug=True):
     # Normalisation simple
     return latents.clamp(-1.0, 1.0)  # renvoie un tensor PyTorch, non détaché
 
-def denoise_latents(latents, denoising_model, optimizer=None, criterion=None, device="cuda", train=True, debug=True):
+def train_denoiser(
+    latents,
+    model,
+    optimizer,
+    criterion,
+    max_epochs,
+    device,
+    debug=False
+):
+
+    model.train().to(device)
+
+    latents_train = latents.to(device)
+
+    final_loss = None
+    final_pred = None
+
+    for epoch in range(max_epochs):
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.enable_grad():
+
+            pred, loss = denoise_latents(
+                latents_train,
+                model,
+                optimizer=None,
+                criterion=criterion,
+                device=device,
+                train=True
+            )
+
+            if loss is None:
+                print(f"Epoch [{epoch+1}/{max_epochs}] Loss: None")
+                continue
+
+            if not torch.isfinite(loss):
+                print("[WARN] Non finite loss")
+                continue
+
+            final_loss = loss
+            final_pred = pred
+
+            print(f"Epoch {epoch+1}: {loss.item():.4f}")
+
+            if debug:
+                show_latents(latents_train, pred, epoch+1)
+
+            loss.backward()
+
+            optimizer.step()
+
+    return model, final_pred, final_loss
+
+def train_denoiser_v1(latents, model, optimizer, criterion, max_epochs, device, debug=False):
+
+    model.train().to(device)
+    latents = latents.to(device)
+
+    for epoch in range(max_epochs):
+
+        optimizer.zero_grad(set_to_none=True)
+
+        pred = model(latents)
+
+        loss = criterion(pred, latents)
+
+        if not torch.isfinite(loss):
+            print("[WARN] invalid loss")
+            continue
+
+        print(f"Epoch {epoch+1}: {loss.item():.4f}")
+
+        if debug:
+            show_latents(latents, pred, epoch)
+
+        loss.backward()
+        optimizer.step()
+
+    return model, loss
+
+
+def debug_tensor(name, tensor, debug=False):
+    if debug:
+        if tensor is None:
+            print(f"[DEBUG] {name}: None")
+            return
+
+        print(
+            f"[DEBUG] {name} | "
+            f"shape={tuple(tensor.shape)} | "
+            f"dtype={tensor.dtype} | "
+            f"device={tensor.device} | "
+            f"requires_grad={tensor.requires_grad} | "
+            f"is_leaf={tensor.is_leaf} | "
+            f"grad_fn={tensor.grad_fn}"
+        )
+
+def denoise_latents(
+    latents,
+    denoising_model,
+    optimizer=None,
+    criterion=None,
+    device="cuda",
+    train=True,
+    debug=True
+):
+
+    if latents is None:
+        raise ValueError("Latents is None")
+
+    debug_tensor("latents_input_before", latents)
+
+    latents = (latents - latents.mean()) / (latents.std() + 1e-5)
+    latents = latents.clamp(-1.0, 1.0)
+
+    debug_tensor("latents_after_norm", latents)
+
+    latents = sanitize_latents_for_train_grad(latents, debug=True)
+
+    debug_tensor("latents_after_sanitize", latents)
 
     latents = latents.to(device=device, dtype=torch.float32)
+
+    debug_tensor("latents_after_to", latents)
+
     denoising_model = denoising_model.to(device)
 
     if train:
@@ -375,12 +498,28 @@ def denoise_latents(latents, denoising_model, optimizer=None, criterion=None, de
     else:
         denoising_model.eval()
 
+    # DEBUG paramètres modèle
+    first_param = next(denoising_model.parameters())
+
+    print(
+        f"[DEBUG MODEL] requires_grad={first_param.requires_grad} | "
+        f"is_leaf={first_param.is_leaf} | "
+        f"grad_fn={first_param.grad_fn}"
+    )
+
     decoded_latents = denoising_model(latents)
+
+    debug_tensor("decoded_latents", decoded_latents)
+
+    loss_val = None
 
     if criterion is not None:
         loss_val = criterion(decoded_latents, latents)
-    else:
-        loss_val = None
+
+        debug_tensor("loss_val", loss_val)
+
+        if debug:
+            print(f"[DENoise] Loss: {loss_val.item():.6f}")
 
     return decoded_latents, loss_val
 
