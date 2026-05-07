@@ -2,6 +2,8 @@
 #-------------------------------------------------------------------------------
 from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
 from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, save_denoising_model, load_denoising_model
+from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_model
+from torch.optim import Adam
 import torch
 import math
 import numpy as np
@@ -2173,6 +2175,169 @@ def apply_pro_net_volumetrique_good(
     return latents_out
 
 #----- Amplification des détails des yeux - version optimisé
+def apply_pro_net_with_eyes_v2(
+    latents,
+    eye_coords,
+    n3r_pro_net,
+    n3r_pro_strength,
+    sanitize_fn,
+    iris_radius_ratio=0.04,
+    mask_blur_kernel=13,
+    shade_strength=0.04,
+    light_strength=0.025,
+    blend_strength=0.6,
+    preserve_detail=0.5,
+    train=False,
+    frame_counter=0,
+    ema_prev_latents=None,
+    ema_alpha=0.3,
+    debug=False
+):
+    """
+    Eyes enhancement module compatible Stable Diffusion latent space.
+
+    Logique:
+    1. Détection de bruit (EMA + high freq)
+    2. Option training dynamique (future extension model-based)
+    3. ProNet base enhancement
+    4. Iris mask soft spatial weighting
+    5. Detail injection (high freq preservation)
+    6. EMA temporal smoothing
+    """
+
+    if latents is None:
+        raise ValueError("latents is None")
+
+    device = latents.device
+
+    # =========================================================
+    # 🔹 1. Noise estimation (comme ton denoise pipeline)
+    # =========================================================
+    if ema_prev_latents is not None:
+        diff = latents - ema_prev_latents
+        noise_level = diff.std()
+        is_noisy = noise_level > 0.08
+    else:
+        high_freq = latents - F.avg_pool2d(latents, 3, 1, 1)
+        noise_level = high_freq.std()
+        is_noisy = True
+
+    if debug:
+        print(f"[Eyes] noise_level={noise_level:.5f}, is_noisy={is_noisy}")
+
+    # =========================================================
+    # 🔹 2. ProNet base enhancement (global latent refinement)
+    # =========================================================
+    with torch.no_grad():
+        latents_base = n3r_pro_net(
+            latents,
+            strength=n3r_pro_strength
+        )
+
+    latents_base = sanitize_fn(latents_base)
+
+    # =========================================================
+    # 🔹 3. Iris mask (soft spatial attention)
+    # =========================================================
+    B, C, H, W = latents.shape
+
+    Y, X = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing="ij"
+    )
+
+    iris_mask = torch.zeros((1, 1, H, W), device=device, dtype=latents.dtype)
+
+    for (x, y) in eye_coords:
+        rx = max(1, int(W * iris_radius_ratio))
+        ry = max(1, int(H * iris_radius_ratio))
+
+        dist = ((X - x) ** 2) / (rx ** 2 + 1e-6) + ((Y - y) ** 2) / (ry ** 2 + 1e-6)
+        iris_mask += (dist <= 1).float()
+
+    iris_mask = iris_mask.clamp(0, 1)
+
+    if mask_blur_kernel > 1:
+        iris_mask = F.avg_pool2d(
+            iris_mask,
+            kernel_size=mask_blur_kernel,
+            stride=1,
+            padding=mask_blur_kernel // 2
+        ).clamp(0, 1)
+
+    # =========================================================
+    # 🔹 4. Low / High frequency separation
+    # =========================================================
+    smooth = F.avg_pool2d(latents_base, 5, 1, 2)
+
+    shadow = (smooth - latents_base) * shade_strength
+    light = F.relu(latents_base - smooth) * light_strength
+
+    iris_effect = shadow + light
+
+    # =========================================================
+    # 🔹 5. Non-linear stabilization (avoid oversharpen)
+    # =========================================================
+    iris_effect = torch.tanh(iris_effect * 2.0) * 0.5
+
+    # =========================================================
+    # 🔹 6. Detail preservation (important for eyes realism)
+    # =========================================================
+    high_freq = latents_base - smooth
+    iris_effect = (
+        iris_effect * (1.0 - preserve_detail)
+        + high_freq * preserve_detail * 0.35
+    )
+
+    # =========================================================
+    # 🔹 7. Adaptive blending mask
+    # =========================================================
+    blend_mask = iris_mask * blend_strength
+
+    if is_noisy:
+        blend_mask = blend_mask * 1.2  # stronger correction on noisy frames
+
+    latents_out = (
+        latents_base * (1.0 - blend_mask)
+        + (latents_base + iris_effect) * blend_mask
+    )
+
+    # =========================================================
+    # 🔹 8. Safe normalization (Stable Diffusion friendly)
+    # =========================================================
+    latents_out = torch.tanh(latents_out).clamp(-1.0, 1.0)
+    latents_out = sanitize_fn(latents_out)
+
+    # =========================================================
+    # 🔹 9. Adaptive injection (same philosophy as denoise pipeline)
+    # =========================================================
+    if is_noisy:
+        strength = min(0.05 + 0.25 * noise_level, 0.8)
+    else:
+        strength = min(0.05 + 0.1 * noise_level, 0.2)
+
+    latents = latents + strength * (latents_out - latents)
+
+    if debug:
+        print(f"[Eyes] strength={strength:.4f}")
+
+    # =========================================================
+    # 🔹 10. Temporal EMA smoothing
+    # =========================================================
+    if ema_prev_latents is not None:
+        ema_prev_latents = ema_prev_latents.to(device)
+        latents = ema_alpha * latents + (1 - ema_alpha) * ema_prev_latents
+
+    # =========================================================
+    # 🔹 11. Final diagnostics
+    # =========================================================
+    if debug:
+        hf = latents - F.avg_pool2d(latents, 3, 1, 1)
+        print(f"[Eyes] final_std={latents.std():.5f} hf_std={hf.std():.5f}")
+
+    return latents
+
 def apply_pro_net_with_eyes(
     latents,
     eye_coords,
@@ -3072,6 +3237,390 @@ def detect_eyes_auto(frame_pil):
 
 
 # ************************************************************************************************************************
+
+
+temporal_model = TemporalResidualNet(
+    channels=4,
+    hidden=64,
+    num_blocks=4
+).to(device="cuda")
+
+optimizer_temporal = torch.optim.AdamW(
+    temporal_model.parameters(),
+    lr=1e-4,
+    weight_decay=1e-4
+)
+
+# Initialisation des poids
+def weights_temporal_init(m):
+    if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            init.zeros_(m.bias)
+    elif isinstance(m, nn.Linear):
+        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            init.zeros_(m.bias)
+
+temporal_model.apply(weights_temporal_init)
+
+criterion_temporal = TemporalLoss()
+
+# =========================================================
+# TEMPORAL APPLY PIPELINE
+# =========================================================
+
+def apply_temporal_consistency(
+    prev_latents,
+    current_latents,
+    temporal_model,
+    optimizer=None,
+    criterion=None,
+    train=False,
+    frame_counter=0,
+    max_epochs_up=10,
+    model_path="models/temporal_latest.pt",
+    debug=False,
+    ema_prev_latents=None,
+    ema_alpha=0.3
+):
+    """
+    Applique une cohérence temporelle entre prev/current latents.
+
+    Pipeline:
+    1. Détection du mouvement temporel
+    2. Adaptation dynamique du training
+    3. Prediction du latent suivant
+    4. Injection temporelle douce
+    5. EMA smoothing
+
+    Args:
+        prev_latents (Tensor):
+            Latents frame N-1
+
+        current_latents (Tensor):
+            Latents frame N
+
+        temporal_model (nn.Module):
+            Modèle temporel
+
+        optimizer:
+            Optimizer PyTorch
+
+        criterion:
+            Fonction de perte
+
+        train (bool):
+            Active entraînement dynamique
+
+        frame_counter (int):
+            Numéro de frame
+
+        max_epochs_up (int):
+            Epochs max d'entraînement
+
+        model_path (str):
+            Checkpoint path
+
+        debug (bool):
+            Affichage debug
+
+        ema_prev_latents (Tensor):
+            EMA latents précédente
+
+        ema_alpha (float):
+            EMA smoothing
+
+    Returns:
+        Tensor:
+            Latents temporellement stabilisés
+    """
+
+    device = current_latents.device
+    print(f"[Temporal] device={device}")
+
+    # =====================================================
+    # TEMPORAL MOTION DETECTION
+    # =====================================================
+    if (prev_latents.device != current_latents.device):
+        print(f"[Temporal] prev_latents :device={device} ")
+
+        prev_latents= prev_latents.clone().detach().to(device)
+
+
+    temporal_delta = current_latents - prev_latents
+
+    motion_level = temporal_delta.abs().mean()
+
+    high_freq_motion = (
+        temporal_delta -
+        F.avg_pool2d(
+            temporal_delta,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+    )
+
+    motion_noise = high_freq_motion.std()
+
+    is_motion_heavy = motion_noise > 0.15
+
+    print(
+        f"[Temporal] "
+        f"motion_level={motion_level:.4f} | "
+        f"motion_noise={motion_noise:.4f} | "
+        f"is_motion_heavy={is_motion_heavy}"
+    )
+
+    # =====================================================
+    # PREPARE LATENTS
+    # =====================================================
+    prev_train = prev_latents.clone().detach().to(device)
+    current_train = current_latents.clone().detach().to(device)
+
+
+    prev_train.requires_grad_(False)
+    current_train.requires_grad_(False)
+
+    model_exists = os.path.exists(model_path)
+
+    # =====================================================
+    # TRAIN MODE
+    # =====================================================
+
+    if train:
+
+        print("[Temporal] Dynamic temporal training")
+
+        temporal_model.train()
+
+        temporal_model.to(device)
+
+        # -------------------------------------------------
+        # DYNAMIC EPOCHS
+        # -------------------------------------------------
+
+        if is_motion_heavy:
+
+            if frame_counter == 0:
+                max_epochs = max_epochs_up
+            else:
+                max_epochs = max_epochs_up + 15
+
+        else:
+
+            min_epochs = 1
+            max_epochs_cap = max_epochs_up
+
+            max_epochs = int(
+                min_epochs +
+                (max_epochs_cap - min_epochs)
+                * motion_noise.item()
+            )
+
+        max_epochs = max(1, max_epochs)
+
+        print(f"[Temporal] max_epochs={max_epochs}")
+
+        # -------------------------------------------------
+        # SKIP TRAIN
+        # -------------------------------------------------
+
+        if max_epochs == 1:
+
+            print("[Temporal] Training skipped")
+
+            train = False
+
+        # -------------------------------------------------
+        # ENABLE GRAD
+        # -------------------------------------------------
+
+        for param in temporal_model.parameters():
+            param.requires_grad = True
+
+        # -------------------------------------------------
+        # TRAIN LOOP
+        # -------------------------------------------------
+
+        if train:
+
+            for epoch in range(max_epochs):
+
+                optimizer.zero_grad()
+
+                with torch.enable_grad():
+
+                    pred_next = temporal_model(
+                        prev_train,
+                        current_train
+                    )
+
+                    target = current_train
+
+                    loss = criterion(
+                        pred_next,
+                        target
+                    )
+
+                print(pred_next.requires_grad)
+                print(loss.requires_grad)
+                print(loss.grad_fn)
+
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(
+                    temporal_model.parameters(),
+                    max_norm=1.0
+                )
+
+                optimizer.step()
+
+                print(
+                    f"[Temporal] "
+                    f"Epoch [{epoch+1}/{max_epochs}] "
+                    f"Loss={loss.item():.6f}"
+                )
+
+                if debug:
+
+                    print(
+                        f"[Temporal DEBUG] "
+                        f"pred min={pred_next.min():.4f} "
+                        f"max={pred_next.max():.4f}"
+                    )
+
+            save_temporal_model(
+                temporal_model,
+                optimizer=optimizer,
+                epoch=max_epochs,
+                loss=loss.item()
+            )
+
+    # =====================================================
+    # EVAL MODE
+    # =====================================================
+
+    else:
+
+        print("[Temporal] Eval mode")
+
+        if model_exists:
+
+            temporal_model, checkpoint = load_temporal_model(
+                type(temporal_model),
+                optimizer=optimizer
+            )
+
+            print(
+                f"[Temporal] "
+                f"Last loss={checkpoint.get('loss')}"
+            )
+
+        else:
+
+            print(
+                "[WARN] Temporal model not found, "
+                "using untrained model."
+            )
+
+        temporal_model.eval()
+
+    # =====================================================
+    # FINAL INFERENCE
+    # =====================================================
+
+    with torch.no_grad():
+
+        pred_next = temporal_model(
+            prev_train,
+            current_train
+        )
+
+    # =====================================================
+    # SANITIZE
+    # =====================================================
+
+    pred_next = torch.tanh(pred_next)
+
+    pred_next = pred_next.clamp(-1.0, 1.0)
+
+    pred_next = sanitize_latents(pred_next)
+
+    # =====================================================
+    # ADAPTIVE TEMPORAL INJECTION
+    # =====================================================
+
+    if is_motion_heavy:
+
+        strength = min(
+            0.05 + 0.35 * motion_noise.item() ** 0.5,
+            0.85
+        )
+
+    else:
+
+        strength = min(
+            max(0.03, 0.1 * motion_noise.item()),
+            0.25
+        )
+
+    print(
+        f"[Temporal] "
+        f"strength={strength:.4f}"
+    )
+
+    temporal_latents = (
+        current_latents +
+        strength * pred_next
+    )
+
+    # =====================================================
+    # EMA SMOOTHING
+    # =====================================================
+
+    if ema_prev_latents is not None:
+
+        if ema_prev_latents.device != temporal_latents.device:
+
+            ema_prev_latents = ema_prev_latents.to(
+                temporal_latents.device
+            )
+
+        temporal_latents = (
+            ema_alpha * temporal_latents +
+            (1.0 - ema_alpha) * ema_prev_latents
+        )
+
+        print("[Temporal] EMA smoothing applied")
+
+    # =====================================================
+    # FINAL DEBUG
+    # =====================================================
+
+    final_std = temporal_latents.std()
+
+    final_hf = (
+        temporal_latents -
+        F.avg_pool2d(
+            temporal_latents,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+    ).std()
+
+    print(
+        f"[Temporal FINAL] "
+        f"std={final_std:.4f} | "
+        f"high_freq={final_hf:.4f}"
+    )
+
+    return temporal_latents
+
+# ************************************************************************************************************************
+
 from collections import deque
 
 class EMADeltaRebound:
@@ -3350,6 +3899,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     gamma_boost=1.00,                  # légèrement plus de punch naturel
     scale=4,
     denoise=True,
+    temporal_consistency=True,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
     max_epochs_up=10,
     ema_prev_latents=None,
@@ -3360,10 +3910,18 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     B, C, H, W = latents.shape
 
     latents_out = latents.clone()
+    if temporal_consistency:
+        # Temporal class
+        if ema_prev_latents is None:
+            ema_prev_latents = latents_out
+        latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents_out, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
+        train=True, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha=0.3 )
+
     if denoise:
         # Créer un latents indépendant pour l'entraînement
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
                             max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
+
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
@@ -3875,101 +4433,6 @@ def apply_intelligent_glow_froid(
     result = np.clip(result, 0, 1)
 
     return Image.fromarray((result * 255).astype(np.uint8))
-
-# Version final !
-def apply_post_processing_adaptive(
-    frame_pil,
-    frame_counter=0,
-    blur_radius=0.01,
-    denoise_strength=0.03,
-    detail_strength=0.5,
-    contrast_strength=1.22,
-    vibrance_strength=0.25,
-    shadow_lift=0.25,
-    shadow_threshold=0.35,
-):
-
-    if frame_pil.mode != "RGB":
-        frame_pil = frame_pil.convert("RGB")
-    # ---------------- 1️⃣ MICRO BLUR ----------------
-    if frame_counter < 2:
-        if blur_radius > 0:
-            frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-
-    arr = np.array(frame_pil).astype(np.float32) / 255.0
-
-    # ---------------- 2️⃣ DENOISE (léger, préserver texture) ----------------
-    if denoise_strength > 0:
-        mean = np.mean(arr, axis=(0, 1))
-        arr = arr * (1.0 - denoise_strength) + mean * denoise_strength
-
-    # ---------------- 3️⃣ LOCAL CONTRAST (volume) ----------------
-    mean_lum = np.mean(arr, axis=2, keepdims=True)
-    arr = mean_lum + contrast_strength * (arr - mean_lum)
-
-    # ---------------- 4️⃣ DETAIL BOOST ----------------
-    blurred = np.zeros_like(arr)
-
-    for c in range(3):
-        channel = Image.fromarray((arr[..., c] * 255).astype(np.uint8))
-        blurred[..., c] = np.array(
-            channel.filter(ImageFilter.GaussianBlur(radius=0.6))
-        ).astype(np.float32) / 255.0
-
-    arr = arr + detail_strength * (arr - blurred)
-
-    # ---------------- 5️⃣ VIBRANCE ----------------
-    max_rgb = np.max(arr, axis=2)
-    min_rgb = np.min(arr, axis=2)
-    sat = np.clip(max_rgb - min_rgb, 0, 1)
-
-    arr *= (1.0 + vibrance_strength * (1.0 - sat))[..., None]
-    # ⭐ stabilisation noirs (évite haze sans écraser)
-    luma = (
-        0.2126 * arr[..., 0] +
-        0.7152 * arr[..., 1] +
-        0.0722 * arr[..., 2]
-    )
-
-    # 🎯 masque shadows (on évite noirs purs)
-    shadow_mask = np.clip((0.35 - luma) / 0.35, 0, 1)
-    shadow_mask = shadow_mask ** 2.0
-
-    # ---------------- 1. dominante globale (midtones only) ----------------
-    mid_mask = np.clip((luma - 0.15) / 0.6, 0, 1) * np.clip((0.9 - luma) / 0.6, 0, 1)
-    mid_mask = mid_mask / (np.max(mid_mask) + 1e-6)
-
-    mean_color = np.sum(arr * mid_mask[..., None], axis=(0, 1))
-    norm = np.sum(mid_mask) + 1e-6
-    mean_color = mean_color / norm
-    # ---------------- 2. neutralisation ----------------
-    neutral = np.mean(arr, axis=(0,1))
-    tint_direction = (mean_color - neutral) * 0.6
-    # ---------------- 3. shadows mask safe ----------------
-    shadow_mask_final = np.clip((0.35 - luma) / 0.35, 0, 1) ** 2.0
-    black_protect = np.clip(luma / 0.10, 0, 1) ** 2.0
-
-    # ---------------- 4. apply ----------------
-    arr = arr + tint_direction * shadow_mask_final[..., None] * black_protect[..., None] * 0.25
-
-    anchor = np.clip(0.07 - luma, 0, 0.07) / 0.07
-    arr = arr * (1.0 - 0.02 * anchor[..., None])
-
-    # ---------------- 7️⃣ FINAL TOUCHE CINÉ (léger, propre) ----------------
-    arr = np.clip(arr, 0, 1)
-
-    # ⭐ très léger ajustement exposition (évite perte de luminosité globale)
-    exposure = 0.90
-    arr = arr * exposure
-
-    # ⭐ gamma très doux (corrige velour sans casser ton look)
-    gamma = 1.03
-    arr = np.power(arr, gamma)
-    arr = np.clip(arr, 0, 1)
-    arr = arr ** 1.01
-
-    return Image.fromarray((arr * 255).astype(np.uint8))
-
 
 
 def smooth_edges(frame_pil, strength=0.4, blur_radius=1.2):
@@ -5102,8 +5565,120 @@ class IntelligentGlowPro:
         result = np.clip(result, 0, 1)
         return Image.fromarray((result * 255).astype(np.uint8))
 
+"""
+adaptive_processor = AdaptivePostProcessor(
+    blur_radius=0.025,          # micro-blur léger
+    denoise_strength=0.03,      # denoise très léger
+    detail_strength=0.5,        # boost détails
+    contrast_strength=1.08,     # léger contraste global
+    vibrance_strength=0.22,     # micro vibrance
+    shadow_lift=0.25,           # ajustement shadow
+    shadow_threshold=0.35       # seuil mask shadows
+)
+"""
+class AdaptivePostProcessor:
+    def __init__(
+        self,
+        blur_radius=0.01,
+        denoise_strength=0.03,
+        detail_strength=0.5,
+        contrast_strength=1.22,
+        vibrance_strength=0.25,
+        shadow_lift=0.25,
+        shadow_threshold=0.35,
+    ):
+        self.blur_radius = blur_radius
+        self.denoise_strength = denoise_strength
+        self.detail_strength = detail_strength
+        self.contrast_strength = contrast_strength
+        self.vibrance_strength = vibrance_strength
+        self.shadow_lift = shadow_lift
+        self.shadow_threshold = shadow_threshold
+
+        # Buffers pour caches calculs intensifs
+        self.prev_frame_shape = None
+        self.shadow_mask = None
+        self.mid_mask = None
+        self.luma_cache = None  # 🔹 ajouter cache luma
+
+    def _prepare_masks(self, arr):
+        """Pré-calcule les masques globaux une seule fois si forme de frame identique"""
+        H, W, _ = arr.shape
+        if self.prev_frame_shape != (H, W):
+            # recalculer luma
+            self.luma_cache = 0.2126 * arr[..., 0] + 0.7152 * arr[..., 1] + 0.0722 * arr[..., 2]
+
+            # Shadows mask
+            self.shadow_mask = np.clip((self.shadow_threshold - self.luma_cache) / self.shadow_threshold, 0, 1) ** 2.0
+
+            # Midtones mask pour dominante globale
+            mid_mask = np.clip((self.luma_cache - 0.15) / 0.6, 0, 1) * np.clip((0.9 - self.luma_cache) / 0.6, 0, 1)
+            self.mid_mask = mid_mask / (np.max(mid_mask) + 1e-6)
+
+            self.prev_frame_shape = (H, W)
+
+        return self.luma_cache  # 🔹 toujours retourner luma
+
+    def process(self, frame_pil, frame_counter=0):
+        if frame_pil.mode != "RGB":
+            frame_pil = frame_pil.convert("RGB")
+
+        # ---------------- 1️⃣ MICRO BLUR ----------------
+        if frame_counter < 2 and self.blur_radius > 0:
+            frame_pil = frame_pil.filter(ImageFilter.GaussianBlur(radius=self.blur_radius))
+
+        arr = np.array(frame_pil).astype(np.float32) / 255.0
+
+        # ---------------- 2️⃣ DENOISE ----------------
+        if self.denoise_strength > 0:
+            mean = np.mean(arr, axis=(0, 1))
+            arr = arr * (1.0 - self.denoise_strength) + mean * self.denoise_strength
+
+        # ---------------- 3️⃣ LOCAL CONTRAST ----------------
+        mean_lum = np.mean(arr, axis=2, keepdims=True)
+        arr = mean_lum + self.contrast_strength * (arr - mean_lum)
+
+        # ---------------- 4️⃣ DETAIL BOOST ----------------
+        blurred = np.zeros_like(arr)
+        for c in range(3):
+            channel = Image.fromarray((arr[..., c] * 255).astype(np.uint8))
+            blurred[..., c] = np.array(channel.filter(ImageFilter.GaussianBlur(radius=0.6))).astype(np.float32) / 255.0
+        arr = arr + self.detail_strength * (arr - blurred)
+
+        # ---------------- 5️⃣ VIBRANCE ----------------
+        max_rgb = np.max(arr, axis=2)
+        min_rgb = np.min(arr, axis=2)
+        sat = np.clip(max_rgb - min_rgb, 0, 1)
+        arr *= (1.0 + self.vibrance_strength * (1.0 - sat))[..., None]
+
+        # ---------------- 6️⃣ Masks et corrections globales ----------------
+        luma = self._prepare_masks(arr)
+
+        # Dominante globale midtones
+        mean_color = np.sum(arr * self.mid_mask[..., None], axis=(0, 1))
+        norm = np.sum(self.mid_mask) + 1e-6
+        mean_color /= norm
+        neutral = np.mean(arr, axis=(0,1))
+        tint_direction = (mean_color - neutral) * 0.6
+
+        black_protect = np.clip(luma / 0.10, 0, 1) ** 2.0
+        arr = arr + tint_direction * self.shadow_mask[..., None] * black_protect[..., None] * 0.25
+
+        # Anchor léger pour noirs
+        anchor = np.clip(0.07 - luma, 0, 0.07) / 0.07
+        arr = arr * (1.0 - 0.02 * anchor[..., None])
+
+        # ---------------- 7️⃣ Final touche ----------------
+        arr = np.clip(arr, 0, 1)
+        arr *= 0.90  # exposure léger
+        arr = np.power(arr, 1.03) ** 1.01  # gamma doux
+
+        return Image.fromarray((arr * 255).astype(np.uint8))
+
 # Initialiser le glow
 glow_processor = IntelligentGlowPro(strength=0.18)
+adaptive_processor = AdaptivePostProcessor(blur_radius=0.025, denoise_strength=0.03, detail_strength=0.5, contrast_strength=1.22, vibrance_strength=0.22, shadow_lift=0.25, shadow_threshold=0.35)
+
 
 def full_frame_postprocess(
     frame_pil: Image.Image,
@@ -5141,7 +5716,7 @@ def full_frame_postprocess(
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="04", psave=psave)
 
     # ---------------- 5️⃣ Adaptive (nettoyage + micro boost) ----------------
-    frame_pil = apply_post_processing_adaptive( frame_pil, frame_counter, blur_radius=blur_radius, vibrance_strength=0.22 )
+    frame_pil = adaptive_processor.process(frame_pil, frame_counter=frame_counter)
     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="05", psave=psave)
 
     # ---------------- 6️⃣ Stylisation ----------------
