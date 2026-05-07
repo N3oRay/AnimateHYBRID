@@ -3913,6 +3913,12 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     B, C, H, W = latents.shape
 
     latents_out = latents.clone()
+    raw_latents = latents_out
+
+    low = F.avg_pool2d(raw_latents, 3, 1, 1)
+    high_freq = raw_latents - low
+
+    motion_noise = high_freq.abs().mean() / (raw_latents.abs().mean() + 1e-6)
 
 
     if denoise:
@@ -3920,18 +3926,19 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
                             max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
     if temporal_consistency:
-        # Temporal class
+
         if ema_prev_latents is None:
             ema_prev_latents = latents_out if denoise else latents
+        # Temporal class
         latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
-        train=True, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha=0.3 )
+        train=True, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
 
         # -------------------------
         # UPDATE EMA (CRUCIAL)
         # -------------------------
         ema_prev_latents = (
-            0.3 * latents.detach().to(device) +
-            0.7 * ema_prev_latents.detach().to(device)
+            0.5 * latents.detach().to(device) +
+            0.5 * ema_prev_latents.detach().to(device)
         )
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
