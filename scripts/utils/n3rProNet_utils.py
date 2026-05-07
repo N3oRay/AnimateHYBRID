@@ -3464,9 +3464,12 @@ def apply_temporal_consistency(
                         target
                     )
 
-                print(pred_next.requires_grad)
-                print(loss.requires_grad)
-                print(loss.grad_fn)
+                print(
+                    f"[Temporal DEBUG] "
+                    f"pred_grad={pred_next.requires_grad} | "
+                    f"loss_grad={loss.requires_grad} | "
+                    f"grad_fn={type(loss.grad_fn).__name__}"
+                )
 
                 loss.backward()
 
@@ -3910,18 +3913,26 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     B, C, H, W = latents.shape
 
     latents_out = latents.clone()
-    if temporal_consistency:
-        # Temporal class
-        if ema_prev_latents is None:
-            ema_prev_latents = latents_out
-        latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents_out, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
-        train=True, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha=0.3 )
+
 
     if denoise:
         # Créer un latents indépendant pour l'entraînement
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
                             max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
+    if temporal_consistency:
+        # Temporal class
+        if ema_prev_latents is None:
+            ema_prev_latents = latents_out if denoise else latents
+        latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
+        train=True, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha=0.3 )
 
+        # -------------------------
+        # UPDATE EMA (CRUCIAL)
+        # -------------------------
+        ema_prev_latents = (
+            0.3 * latents.detach().to(device) +
+            0.7 * ema_prev_latents.detach().to(device)
+        )
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
