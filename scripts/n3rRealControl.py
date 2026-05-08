@@ -164,6 +164,8 @@ def main(args):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(f"./outputs/RealControl{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    #------------ Face generation --------------
+    generate_animateface = False
 
 
     # ---------------- load_controlnet_openpose ----------------
@@ -274,14 +276,15 @@ def main(args):
                 initframe = frame_counter
             save_input_frame( input_image, output_dir, initframe, pbar=pbar, blur_radius=blur_radius, contrast=contrast, saturation=1.0, apply_post=False, prefix=True)
 
-            # --- Normalisation sécurisée des coordonnées ---
             face_coords_dict, nose_coords_dict, eye_coords_list, mouth_coords_list, ear_coords_list, nose_coords_list = prepare_face_coords( eye_coords, mouth_coords, ear_coords, nose_coords, process_coords)
-
-            if not has_valid_coords(face_coords_dict):
+            generate_animateface = has_valid_coords(face_coords_dict)
+            if generate_animateface == False:
                 print("🟢  Aucune coordonnée de visage valide détectée ! On passe en full HD")
                 current_latent_single = encode_images_to_latents_hybrid(input_image, vae, device=device, latent_scale=LATENT_SCALE)
             else:
                 print("🟢  Visage valide détectée !")
+                # --- Normalisation sécurisée des coordonnées ---
+
                 current_latent_single = encode_images_to_latents_hybrid_pro( input_image, vae,
                                         eye_coords=eye_coords_list, mouth_coords=mouth_coords_list, ear_coords=ear_coords_list,       # liste de tuples
                                         nose_coords=nose_coords_list, device=device, latent_scale=LATENT_SCALE,
@@ -433,7 +436,7 @@ def main(args):
 
                     # ---------------- ControlNet OpenPose ----------------------------------------------------------
                     # 🔹 Si motion_module est None, injecter un léger bruit temporel
-                    if use_openpose:
+                    if use_openpose and generate_animateface:
                         try:
                             # ------------------- Backup latents -------------------
                             latents_before_openpose = latents.clone()
