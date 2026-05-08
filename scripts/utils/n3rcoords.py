@@ -48,11 +48,22 @@ def prepare_pose_tensor(pose_full, device, target_dtype):
     return pose_full
 
 # --- Vérifier que les listes ne sont pas vides avant l'appel ---
-def has_valid_coords(face_coords_dict):
+def has_valid_coords_v1(face_coords_dict):
     for k, coords in face_coords_dict.items():
         if coords and all(isinstance(c, (list, tuple)) and len(c) == 2 for c in coords):
             return True
         return False
+
+def has_valid_coords(face_coords_dict):
+    """
+    Vérifie si au moins une des listes de coordonnées contient des points valides.
+    """
+    if face_coords_dict is None:
+        return False
+    for coords in face_coords_dict.values():
+        if coords and all(isinstance(c, (list, tuple)) and len(c) == 2 for c in coords):
+            return True
+    return False
 
 
 def sanitize_coords(coords):
@@ -61,32 +72,43 @@ def sanitize_coords(coords):
     Si les coordonnées sont valides (deux valeurs numériques), elles sont ajoutées à la liste valide.
 
     Args:
-        coords (list/dict): Liste ou dictionnaire de coordonnées.
+        coords (list/dict/None): Liste ou dictionnaire de coordonnées.
 
     Returns:
         list: Liste des coordonnées valides.
     """
     valid = []
 
+    if coords is None:
+        print("⚠️ Coordonnées None reçues, retour d'une liste vide")
+        return valid
+
     # Si c'est un dictionnaire, on itère sur ses valeurs
     if isinstance(coords, dict):
         for key, value in coords.items():
-            if isinstance(value, tuple) and len(value) == 2:
-                valid.append(value)
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                try:
+                    x, y = float(value[0]), float(value[1])
+                    valid.append([x, y])
+                except (ValueError, TypeError):
+                    print(f"⚠️ Coordonnée ignorée pour {key} : {value}")
             else:
                 print(f"⚠️ Coordonnée ignorée pour {key} : {value}")
     elif isinstance(coords, list):
         # Si c'est une liste, on applique la logique sur chaque élément
         for p in coords:
+            if not isinstance(p, (list, tuple)) or len(p) != 2:
+                print(f"⚠️ Coordonnée ignorée car invalide: {p}")
+                continue
             try:
-                if len(p) != 2:
-                    print(f"⚠️ Coordonnée ignorée car invalide: {p}")
-                    continue
-                x, y = int(p[0]), int(p[1])
+                x, y = float(p[0]), float(p[1])
                 valid.append([x, y])
             except (ValueError, TypeError):
                 print(f"⚠️ Coordonnée ignorée car invalide: {p}")
                 continue
+    else:
+        print(f"⚠️ Type de coordonnées non supporté: {type(coords)}")
+
     return valid
 
 
@@ -101,7 +123,10 @@ def process_coords(coords, label="coords"):
     Returns:
         list: Liste des coordonnées sous forme de [[x, y]].
     """
-    print(f"{label}: {coords}")
+    if coords is not None:
+        print(f"{label}: {coords}")
+    else:
+        return None
 
     if isinstance(coords, dict):
         # Si c'est un dictionnaire, on récupère les valeurs (qui sont des tuples ou des listes avec 2 éléments)
@@ -122,52 +147,50 @@ def prepare_face_coords(
     Prépare les coordonnées du visage, les nettoie et les normalise.
     Les coordonnées sont traitées pour être prêtes à être utilisées ailleurs.
 
-    Args:
-        eye_coords (list): Coordonnées des yeux.
-        mouth_coords (dict): Coordonnées de la bouche sous forme de dictionnaire.
-        ear_coords (list): Coordonnées des oreilles.
-        nose_coords (list): Coordonnées du nez.
-        process_coords (function): Fonction pour le traitement des coordonnées.
-
-    Returns:
-        dict: Dictionnaire des coordonnées du visage.
+    Patch minimal : si une liste est vide, toutes les valeurs deviennent None.
     """
-    print("🟢 Debug coords:")
+    if eye_coords is not None and mouth_coords is not None and ear_coords is not None and nose_coords is not None and process_coords is not None:
+        print("🟢 Debug coords:")
 
-    # --- Normalisation initiale ---
-    process_coords(eye_coords, "eye_coords")
-    process_coords(mouth_coords, "mouth_coords")
-    process_coords(ear_coords, "ear_coords")
+        # --- Normalisation initiale ---
+        process_coords(eye_coords, "eye_coords")
+        process_coords(mouth_coords, "mouth_coords")
+        process_coords(ear_coords, "ear_coords")
 
-    print(f"nose_coords: {nose_coords}")
+        print(f"nose_coords: {nose_coords}")
 
-    # --- Sanitize ---
-    eye_coords_list = sanitize_coords(eye_coords)
-    print(f"eye_coords sanitize_coords: {eye_coords_list}")
+        # --- Sanitize ---
+        eye_coords_list = sanitize_coords(eye_coords)
+        mouth_coords_list = sanitize_coords(mouth_coords)
+        ear_coords_list = sanitize_coords(ear_coords)
+        nose_coords_list = sanitize_coords(nose_coords)
 
-    mouth_coords_list = sanitize_coords(mouth_coords)  # On passe le dict mouth_coords directement
-    print(f"mouth_coords sanitize_coords: {mouth_coords_list}")
+        print(f"eye_coords sanitize_coords: {eye_coords_list}")
+        print(f"mouth_coords sanitize_coords: {mouth_coords_list}")
+        print(f"ear_coords sanitize_coords: {ear_coords_list}")
+        print(f"nose_coords sanitize_coords: {nose_coords_list}")
 
-    ear_coords_list = sanitize_coords(ear_coords)
-    print(f"ear_coords sanitize_coords: {ear_coords_list}")
+        # --- Patch minimal : si une liste est vide, on met tout à None ---
+        if any(len(lst) == 0 for lst in [eye_coords_list, mouth_coords_list, ear_coords_list, nose_coords_list]):
+            print("⚠️ Une des listes de coordonnées est vide, retour de None pour toutes")
+            return None, None, None, None, None, None
 
-    nose_coords_list = sanitize_coords(nose_coords)
-    print(f"nose_coords sanitize_coords: {nose_coords_list}")
+        # --- Nez dict (conservé pour ailleurs) ---
+        nose_coords_dict = nose_coords if nose_coords else None
 
-    # --- Nez dict (conservé pour ailleurs) ---
-    nose_coords_dict = nose_coords if nose_coords else None
+        # --- Dict global ---
+        face_coords_dict = {
+            "eyes": eye_coords_list,
+            "mouth": mouth_coords_list,
+            "ears": ear_coords_list,
+            "nose": nose_coords_list,
+        }
 
-    # --- Dict global ---
-    face_coords_dict = {
-        "eyes": eye_coords_list,
-        "mouth": mouth_coords_list,
-        "ears": ear_coords_list,
-        "nose": nose_coords_list,
-    }
+        print(f"Face coords dict: {face_coords_dict}")
 
-    print(f"Face coords dict: {face_coords_dict}")
-
-    return face_coords_dict, nose_coords_dict, eye_coords_list, mouth_coords_list, ear_coords_list, nose_coords_list
+        return face_coords_dict, nose_coords_dict, eye_coords_list, mouth_coords_list, ear_coords_list, nose_coords_list
+    else:
+        return None, None, None, None, None, None
 
 # =========================
 # 🔹 NORMALISATION INPUTS
