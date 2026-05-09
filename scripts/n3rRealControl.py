@@ -215,6 +215,7 @@ def main(args):
         print("✅ N3RProNet activé")
 
     previous_latent_single = None
+    new_image = False
     frame_counter = 0
     pbar = tqdm(total=total_frames, ncols=120)
 
@@ -233,7 +234,7 @@ def main(args):
 
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
-            previous_latent_single = None # On réinit Image précédente en cas de changement d'image charger'
+            new_image = True
             # ---------------- Pose sequence ---------------------------------------------
             start_pose = input_image.to(device=device, dtype=dtype) # start_pose = tensor 4D BCHW directement
             # Pose sequence
@@ -381,6 +382,7 @@ def main(args):
             prev_keypoints = None # motion Open Pose
             current_keypoints = None # init None
             state = None
+            new_image = True
             for f in range(num_fraps_per_image):
                 if stop_generation:
                     break
@@ -545,7 +547,8 @@ def main(args):
                     # 🔥 SANITY AVANT DECODE
                     latents = latents / LATENT_SCALE
                     print(f"Dimention : Shape de latents :", latents.shape)
-                    frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device,
+
+                    frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device, new_image=new_image,
                         frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list
                     )
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
@@ -562,7 +565,8 @@ def main(args):
                             del locals()[var]
                     torch.cuda.empty_cache()
 
-            print(f"Image -f:", f)
+                print(f"Image -f:", f)
+                new_image = False
             previous_latent_single = current_latent_single
 
 
