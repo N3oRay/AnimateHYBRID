@@ -73,7 +73,7 @@ def main(args):
     creative_noise, creative_noise_end = cfg.get("creative_noise", 0.0), cfg.get("creative_noise_end", 0.08)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 20)  # nombre de frames par prompt
-    contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.15), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
+    contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.20), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
     H, W = cfg.get("H", 512), cfg.get("W", 512)
     image_size=(H, W) # taille original de l'image'
     block_size = cfg.get("block_size", 64)  # block_size auto selon résolution 64
@@ -233,6 +233,7 @@ def main(args):
 
             # Charger et encoder l'image sur GPU
             input_image = load_images_test([img_path], W=cfg["W"], H=cfg["H"], device=device, dtype=dtype)
+            previous_latent_single = None # On réinit Image précédente en cas de changement d'image charger'
             # ---------------- Pose sequence ---------------------------------------------
             start_pose = input_image.to(device=device, dtype=dtype) # start_pose = tensor 4D BCHW directement
             # Pose sequence
@@ -547,8 +548,10 @@ def main(args):
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
                                                     blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
                     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
-
-                    previous_latent_single = latents.detach().cpu()
+                    if f < num_fraps_per_image -1 : # En cas de changement d'image. on conserve pas le previous_latent_single
+                        previous_latent_single = latents.detach().cpu()
+                    else:
+                        previous_latent_single = None
                     frame_counter += 1
                     pbar.update(1)
                     for var in ["latents", "latents_frame", "cf_embeds", "n3r_latents"]:
@@ -556,8 +559,9 @@ def main(args):
                             del locals()[var]
                     torch.cuda.empty_cache()
 
-
+            print(f"Image -f:", f)
             previous_latent_single = current_latent_single
+
 
         except Exception as e:
             log_frame_error(img_path, e)
