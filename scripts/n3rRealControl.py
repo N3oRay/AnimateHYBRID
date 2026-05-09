@@ -256,20 +256,20 @@ def main(args):
             control_latent = sanitize_latents(control_latent)
             # -----------------------------------------------------------------------------------------
             face_mesh = get_face_mesh()
-            nose_coords = get_nose_coords_safe(input_pil, face_mesh)# 0 nose / nez
-            if nose_coords is None:
-                print("[WARN] Nécessaire de réessayer get_nose_coords_safe")
-                nose_coords = get_nose_coords_safe(input_pil, face_mesh)
+            nose_coords = get_nose_coords_safe(input_pil, face_mesh) # 0 nose / nez
             neck_coords = get_neck_coords_safe(input_pil, face_mesh) # 1 neck / cou
             shoulders_coords = get_shoulders_coords_safe(input_pil, pose_model, face_mesh) # 5 left_shoulder / épaule gauche # 2 right_shoulder / épaule droite
             clavicules_coords = get_clavicules_coords_safe(input_pil, pose_model, face_mesh)
             elbow_coords = get_elbows_coords_safe(input_pil, pose_model)  # 6 left_elbow / coude gauche # 3 right_elbow / coude droit
             wrists_coords = get_wrists_coords_safe(input_pil, pose_model, face_mesh)   # 7 left_wrist / poignet gauche # 4 right_wrist / poignet droit
-            hips_coords = get_hips_coords_safe(input_pil)  # 11 left_hip / hanche gauche # 8 right_hip / hanche droite # 9 right_knee # 10 right_ankle  # 12 left_knee  # 13 left_ankle
+            hips_coords = get_hips_coords_safe(input_pil, pose_model)  # 11 left_hip / hanche gauche # 8 right_hip / hanche droite # 9 right_knee # 10 right_ankle  # 12 left_knee  # 13 left_ankle
             eye_coords = get_eye_coords_safe(input_pil, face_mesh) # 15 left_eye / œil gauche # 14 right_eye / œil droit - 👁 Eyes detected
             ear_coords = get_ear_coords_safe(input_pil, face_mesh) # 17 left_ear / oreille gauche # 16 right_ear / oreille droite
             mouth_coords = get_mouth_coords_safe(input_pil, face_mesh)
             hair_coords = get_hair_coords_safe(input_pil, face_mesh)
+            if nose_coords is None:
+                print("[WARN] Nécessaire de réessayer get_nose_coords_safe")
+                nose_coords = get_nose_coords_safe(input_pil, face_mesh)
 
             # coordonner globale
             coords_v = get_coords_safe( input_pil, H=cfg["H"], W=cfg["W"] )
