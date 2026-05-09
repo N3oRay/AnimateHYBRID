@@ -47,14 +47,14 @@ def scale_mouth_coords_to_latents(mouth_coords, img_H, img_W, lat_H, lat_W):
     return [(int(x * scale_x), int(y * scale_y)) for x, y in mouth_coords]
 #----------------------------------------------------------------------------
 
-def get_hips_coords_safe(image_pil, H=None, W=None):
+def get_hips_coords_safe(image_pil, pose_model=None, H=None, W=None):
     """
     Détecte les coudes (left/right) de manière sécurisée.
     Si MediaPipe ne détecte pas les hanches.
     Retourne les coordonnées normalisées [0,1] pour x et y.
     """
     try:
-        coords = get_hips_coords_pixels(image_pil, H, W)
+        coords = get_hips_coords_pixels(image_pil, pose_model, H, W)
         if coords is None:
             print("⚠ Aucune hanche détecté.")
         return coords
@@ -62,7 +62,64 @@ def get_hips_coords_safe(image_pil, H=None, W=None):
         print(f"[Hips detection ERROR] {e}")
         return None
 
-def get_hips_coords_pixels(image_pil, H=None, W=None):
+
+def get_hips_coords_pixels(image_pil, pose_model=None, H=None, W=None):
+    """
+    Détecte les hanches de manière robuste :
+    1️⃣ Priorité : Pose via pose_model si fourni
+    2️⃣ Fallback proportionnel via épaules
+    """
+
+    import numpy as np
+
+    img_width, img_height = image_pil.size
+    if W is None: W = img_width
+    if H is None: H = img_height
+
+    image = np.array(image_pil.convert("RGB"))
+
+    # =========================
+    # 🔹 1. POSE (prioritaire)
+    # =========================
+    if pose_model is not None:
+        try:
+            results = pose_model.process(image)
+            if results.pose_landmarks:
+                lm = results.pose_landmarks.landmark
+                LEFT_HIP = 23
+                RIGHT_HIP = 24
+
+                left_hip = (int(round(lm[LEFT_HIP].x * W)),
+                            int(round(lm[LEFT_HIP].y * H)))
+                right_hip = (int(round(lm[RIGHT_HIP].x * W)),
+                             int(round(lm[RIGHT_HIP].y * H)))
+
+                print(f"🦿📍 Hips detected (Pose): left={left_hip}, right={right_hip}")
+                return [left_hip, right_hip]
+
+        except Exception as e:
+            print(f"[Pose ERROR] {e}")
+
+    # =========================
+    # 🔹 2. FALLBACK via épaules
+    # =========================
+    shoulders = get_shoulders_coords(image_pil, pose_model, face_mesh=None)
+    if shoulders is None:
+        print("⚠ 🦿📍 Hips hanches non détectées, fallback impossible")
+        return None
+
+    left_shoulder, right_shoulder = shoulders
+    vertical_offset = int(0.4 * H)
+
+    left_hip = (int(round(left_shoulder[0])),
+                int(round(left_shoulder[1] + vertical_offset)))
+    right_hip = (int(round(right_shoulder[0])),
+                 int(round(right_shoulder[1] + vertical_offset)))
+
+    print(f"⚠ 🦿📍 Aucune hanche détectée, fallback proportionnel utilisé: left={left_hip}, right={right_hip}")
+    return [left_hip, right_hip]
+
+def get_hips_coords_pixels_v1(image_pil, H=None, W=None):
 
 
     img_width, img_height = image_pil.size
