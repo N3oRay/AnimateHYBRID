@@ -11,6 +11,18 @@ import torch.nn.init as init
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+# Initialisation des poids
+def weights_temporal_init(m):
+    if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            init.zeros_(m.bias)
+    elif isinstance(m, nn.Linear):
+        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            init.zeros_(m.bias)
+
 # =========================================================
 # SAVE / LOAD
 # =========================================================

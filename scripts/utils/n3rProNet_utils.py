@@ -2,7 +2,8 @@
 #-------------------------------------------------------------------------------
 from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
 from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, save_denoising_model, load_denoising_model, debug_tensor, train_denoiser
-from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_model
+from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_model, weights_temporal_init
+from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_model
 from torch.optim import Adam
 import torch
 import math
@@ -3251,20 +3252,139 @@ optimizer_temporal = torch.optim.AdamW(
     weight_decay=1e-4
 )
 
-# Initialisation des poids
-def weights_temporal_init(m):
-    if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        if m.bias is not None:
-            init.zeros_(m.bias)
-    elif isinstance(m, nn.Linear):
-        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        if m.bias is not None:
-            init.zeros_(m.bias)
-
 temporal_model.apply(weights_temporal_init)
 
 criterion_temporal = TemporalLoss()
+
+#-----------------------------------------------------------------------
+
+
+
+# Exemple d'initialisation du StyleInjector
+latent_channels = 4  # correspond au nombre de canaux de tes latents (ex: 4)
+hidden = 64          # taille interne, peut être ajustée
+num_blocks = 4       # nombre de ResidualBlocks
+prompt_dim = 768     # dimension de ton embedding de prompt
+
+# Instanciation du modèle
+style_model = StyleInjector(
+    latent_channels=latent_channels,
+    hidden=hidden,
+    num_blocks=num_blocks,
+    prompt_dim=prompt_dim
+).to(device="cuda")
+
+
+# Initialisation des poids
+style_model.apply(weights_init)
+
+
+# --- Critère pour StyleInjector ---
+criterion_style = StyleLoss(reduction="mean")  # ou "sum" si tu préfères
+
+# --- Hyperparamètres ---
+learning_rate = 1e-4  # à ajuster selon ton entraînement
+weight_decay = 1e-5   # régularisation optionnelle
+
+# --- Création de l'optimizer ---
+optimizer_style = torch.optim.Adam(
+    style_model.parameters(),
+    lr=learning_rate,
+    betas=(0.9, 0.999),
+    weight_decay=weight_decay
+)
+
+import torch
+import torch.nn.functional as F
+import os
+
+def apply_style_injection(
+    latents,
+    style_prompt_embedding,
+    style_model,
+    optimizer=None,
+    criterion=None,
+    train=False,
+    frame_counter=0,
+    max_epochs_up=5,
+    model_path="models/style_injector_latest.pt",
+    debug=True,
+    ema_prev_latents=None,
+    ema_alpha=0.3
+):
+    device = latents.device
+    style_model.to(device)
+    latents_train = latents.clone().detach().to(device)
+    B, C, H, W = latents_train.shape
+
+    # ----- Préparer le prompt -----
+    if style_prompt_embedding is None:
+        style_embedding_train = torch.zeros(B, style_model.prompt_proj.in_features, device=device)
+    else:
+        style_embedding_train = style_prompt_embedding.clone().detach().to(device)
+        if style_embedding_train.dim() == 3:  # (B, seq_len, dim)
+            style_embedding_train = style_embedding_train[:, 0, :]  # CLS token
+
+    model_exists = os.path.exists(model_path)
+
+    # =====================================================
+    # TRAIN MODE
+    # =====================================================
+    if train and optimizer is not None and criterion is not None:
+        style_model.train()
+        max_epochs = max(1, max_epochs_up)
+
+        for epoch in range(max_epochs):
+            optimizer.zero_grad()
+            with torch.enable_grad():
+                pred_latents = style_model(latents_train, style_embedding_train)
+                loss = criterion(pred_latents, latents_train)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(style_model.parameters(), 1.0)
+            optimizer.step()
+            if debug:
+                print(f"[StyleInjection] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}")
+
+        save_style_model(style_model, optimizer=optimizer, epoch=max_epochs, loss=loss.item())
+    else:
+        style_model.eval()
+        if model_exists:
+            style_model, checkpoint = load_style_model(type(style_model), optimizer=optimizer)
+            if debug:
+                print(f"[StyleInjection] Loaded checkpoint | Last loss={checkpoint.get('loss')}")
+
+    # =====================================================
+    # FORWARD FINAL
+    # =====================================================
+    with torch.no_grad():
+        stylized_latents = style_model(latents_train, style_embedding_train)
+
+    # =====================================================
+    # TANH + SANITIZE
+    # =====================================================
+    stylized_latents = torch.tanh(stylized_latents)
+    stylized_latents = stylized_latents.clamp(-1.0, 1.0)
+    stylized_latents = sanitize_latents(stylized_latents)
+
+    # =====================================================
+    # EMA SMOOTHING
+    # =====================================================
+    if ema_prev_latents is not None:
+        if ema_prev_latents.device != stylized_latents.device:
+            ema_prev_latents = ema_prev_latents.to(stylized_latents.device)
+        stylized_latents = ema_alpha * stylized_latents + (1.0 - ema_alpha) * ema_prev_latents
+        if debug:
+            print("[StyleInjection] EMA smoothing applied")
+
+    # =====================================================
+    # DEBUG STATS
+    # =====================================================
+    if debug:
+        final_std = stylized_latents.std()
+        final_hf = (stylized_latents - F.avg_pool2d(stylized_latents, kernel_size=3, stride=1, padding=1)).std()
+        print(f"[StyleInjection FINAL] std={final_std:.4f} | high_freq={final_hf:.4f}")
+
+    return stylized_latents
 
 # =========================================================
 # TEMPORAL APPLY PIPELINE
@@ -3622,8 +3742,14 @@ def apply_temporal_consistency(
 
     return temporal_latents
 
+# ***********************************************NOTE *************************************************************************
+#GlobalStateTracker
+#DriftController
+#AnchorLoss module
+#Style model = injecte une transformation créative contrôlée par prompt - Style Injection Network
+# “Video diffusion system with controllable temporal motion + adaptive denoising + prompt-driven stylistic rendering”
+# ton style model doit être un “injecteur léger”, pas un second générateur
 # ************************************************************************************************************************
-
 from collections import deque
 
 class EMADeltaRebound:
@@ -3810,22 +3936,7 @@ def apply_denoising(
         for param in denoising_model.parameters():
             param.requires_grad = True
         """
-        for epoch in range(max_epochs):
-            latents_out, loss = denoise_latents(
-                latents_train,
-                denoising_model,
-                optimizer=optimizer,
-                criterion=criterion,
-                device="cuda",
-                train=train
-            )
-
-            if loss is not None:
-                print(f"Epoch [{epoch+1}/{max_epochs}], Loss: {loss:.4f}")
-                if debug:
-                    show_latents(latents_train, latents_out, epoch+1)
-            else:
-                print(f"Epoch [{epoch+1}/{max_epochs}], Loss: Not computed")
+        Trainning !
         """
 
         with torch.enable_grad():
@@ -3916,6 +4027,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     scale=4,
     denoise=True,
     temporal_consistency=True,
+    style_injection=True,
+    pos_embeds_list=None,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
     max_epochs_up=10,
     ema_prev_latents=None,
@@ -3949,6 +4062,38 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         # -------------------------
         # UPDATE EMA (CRUCIAL)
         # -------------------------
+        ema_prev_latents = (
+            0.5 * latents.detach().to(device) +
+            0.5 * ema_prev_latents.detach().to(device)
+        )
+
+    if style_injection:
+        style_prompt_embedding = torch.randn(B, prompt_dim, device=device, dtype=latents.dtype)
+        # Exemple avec le premier prompt positif
+        if pos_embeds_list is not None:
+            style_prompt_embedding = pos_embeds_list[0].to(device).to(dtype=latents.dtype)  # forme [B, prompt_dim]
+
+
+        # EMA précédent pour style, on peut réutiliser ema_prev_latents ou créer un séparé
+        ema_style_prev = ema_prev_latents if ema_prev_latents is not None else latents
+
+        # Appliquer le StyleInjector
+        latents = apply_style_injection(
+            latents=latents,
+            style_prompt_embedding=style_prompt_embedding,  # ton embedding prompt
+            style_model=style_model,
+            optimizer=optimizer_style,  # optionnel si fine-tuning dynamique
+            criterion=criterion_style,  # StyleLoss
+            train=True,  # si tu veux fine-tuner à la volée
+            frame_counter=frame_counter,
+            max_epochs_up=5,
+            model_path="models/style_injector_latest.pt",
+            debug=True,
+            ema_prev_latents=ema_style_prev,
+            ema_alpha=0.2 + 0.3 * motion_noise  # tu peux adapter la force EMA
+        )
+
+        # Mettre à jour l’EMA pour le style
         ema_prev_latents = (
             0.5 * latents.detach().to(device) +
             0.5 * ema_prev_latents.detach().to(device)
