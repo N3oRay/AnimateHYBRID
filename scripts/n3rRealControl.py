@@ -73,7 +73,7 @@ def main(args):
     creative_noise, creative_noise_end = cfg.get("creative_noise", 0.0), cfg.get("creative_noise_end", 0.08)
     latent_scale_boost = cfg.get("latent_scale_boost", 1.0)
     frames_per_prompt = cfg.get("frames_per_prompt", 20)  # nombre de frames par prompt
-    contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.20), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
+    contrast, blur_radius, sharpen_percent = cfg.get("contrast", 1.15), cfg.get("blur_radius", 0.03), cfg.get("sharpen_percent", 90)  # Post Traitement
     H, W = cfg.get("H", 512), cfg.get("W", 512)
     image_size=(H, W) # taille original de l'image'
     block_size = cfg.get("block_size", 64)  # block_size auto selon résolution 64
@@ -257,6 +257,9 @@ def main(args):
             # -----------------------------------------------------------------------------------------
             face_mesh = get_face_mesh()
             nose_coords = get_nose_coords_safe(input_pil, face_mesh)# 0 nose / nez
+            if nose_coords is None:
+                print("[WARN] Nécessaire de réessayer get_nose_coords_safe")
+                nose_coords = get_nose_coords_safe(input_pil, face_mesh)
             neck_coords = get_neck_coords_safe(input_pil, face_mesh) # 1 neck / cou
             shoulders_coords = get_shoulders_coords_safe(input_pil, pose_model, face_mesh) # 5 left_shoulder / épaule gauche # 2 right_shoulder / épaule droite
             clavicules_coords = get_clavicules_coords_safe(input_pil, pose_model, face_mesh)
