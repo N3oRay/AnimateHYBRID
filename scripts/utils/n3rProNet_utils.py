@@ -4286,47 +4286,45 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     motion_noise = high_freq.abs().mean() / (raw_latents.abs().mean() + 1e-6)
 
-    if new_image:
-       print(f"[decode_latents_ultrasafe] Nouvelle image.")
     if ema_prev_latents is None:
         ema_prev_latents = latents_out
 
+    if new_image:
+        print(f"🔥 [decode_latents_ultrasafe] Nouvelle image. réinitialisation de ema_prev_latents.")
+        ema_prev_latents = None   # IMPORTANT: reset total
 
-    if denoise:
+
+    if denoise and ema_prev_latents is not None:
         # Créer un latents indépendant pour l'entraînement
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
                             max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
 
-    if style_injection:
+    if style_injection and ema_prev_latents is not None:
         style_prompt_embedding = torch.randn(B, prompt_dim, device=device, dtype=latents.dtype)
         # Exemple avec le premier prompt positif
         if pos_embeds_list is not None:
             style_prompt_embedding = pos_embeds_list[0].to(device).to(dtype=latents.dtype)  # forme [B, prompt_dim]
 
-        if new_image:
-            print(f"[decode_latents_ultrasafe] Nouvelle image. réinitialisation de ema_prev_latents.")
-            ema_prev_latents = latents_out
-
         # Appliquer le StyleInjector
         latents = apply_style_injection(
-            latents=latents,
-            style_prompt_embedding=style_prompt_embedding,  # ton embedding prompt
-            style_model=style_model,
-            optimizer=optimizer_style,  # optionnel si fine-tuning dynamique
-            criterion=criterion_style,  # StyleLoss
-            train=True,  # si tu veux fine-tuner à la volée
-            new_image=new_image,
-            frame_counter=frame_counter,
-            max_epochs_up=5,
-            model_path="models/style_injector_latest.pt",
-            debug=True,
-            ema_prev_latents=ema_prev_latents,
-            ema_alpha=0.2
-            #ema_alpha=0.2 + 0.3 * motion_noise  # tu peux adapter la force EMA
+                latents=latents,
+                style_prompt_embedding=style_prompt_embedding,  # ton embedding prompt
+                style_model=style_model,
+                optimizer=optimizer_style,  # optionnel si fine-tuning dynamique
+                criterion=criterion_style,  # StyleLoss
+                train=True,  # si tu veux fine-tuner à la volée
+                new_image=new_image,
+                frame_counter=frame_counter,
+                max_epochs_up=5,
+                model_path="models/style_injector_latest.pt",
+                debug=True,
+                ema_prev_latents=ema_prev_latents,
+                ema_alpha=0.2
+                #ema_alpha=0.2 + 0.3 * motion_noise  # tu peux adapter la force EMA
         )
 
 
-    if temporal_consistency:
+    if temporal_consistency and ema_prev_latents is not None:
 
         # Temporal class
         latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
