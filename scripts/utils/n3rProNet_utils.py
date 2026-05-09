@@ -288,9 +288,178 @@ def get_nose_coords_safe(image_pil, face_mesh):
         print(f"[Nose detection ERROR] {e}")
         return None
 
+def get_nose_coords_full(image_pil, face_mesh, debug=True):
 
 
-def get_nose_coords_full(image_pil, face_mesh):
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+    results = face_mesh.process(image)
+
+    if not results.multi_face_landmarks:
+        if debug:
+            print("[NoseDetection] Aucun visage détecté !")
+        return None
+
+    face_landmarks = results.multi_face_landmarks[0]
+
+    # Points clés du nez
+    NOSE_TIP_POINTS = [1, 2, 98, 327]
+    NOSE_TOP_POINTS = [168, 6, 197]
+    NOSE_LEFT_POINTS = [98, 97, 2]
+    NOSE_RIGHT_POINTS = [327, 326, 2]
+    NOSE_BOTTOM_POINTS = [2, 5]
+
+    def get_point(idx):
+        lm = face_landmarks.landmark[idx]
+        return np.array([lm.x * w, lm.y * h], dtype=np.float32)
+
+    def average_points(indices, name=""):
+        try:
+            pts = np.array([get_point(i) for i in indices])
+            return np.mean(pts, axis=0)
+        except Exception as e:
+            if debug:
+                print(f"[NoseDetection ERROR] Impossible de calculer {name}: {e}")
+            raise
+
+    try:
+        tip = average_points(NOSE_TIP_POINTS, "tip")
+        top = average_points(NOSE_TOP_POINTS, "top")
+        left = average_points(NOSE_LEFT_POINTS, "left")
+        right = average_points(NOSE_RIGHT_POINTS, "right")
+        bottom = average_points(NOSE_BOTTOM_POINTS, "bottom")
+    except Exception:
+        if debug:
+            print("[NoseDetection] Fallback proportionnel activé")
+        # Fallback proportionnel basé sur les yeux et la bouche
+        eyes = [(lm.x * w, lm.y * h) for lm in face_landmarks.landmark[33:263]]  # approx
+        eyes = np.array(eyes)
+        tip = np.mean(eyes, axis=0)
+        top = tip - np.array([0, 20])
+        left = tip - np.array([10, 0])
+        right = tip + np.array([10, 0])
+        bottom = tip + np.array([0, 20])
+
+    # Centre horizontal
+    center_x = (left[0] + right[0]) * 0.5
+    # Centre vertical pondéré
+    center_y = (top[1] * 0.3 + tip[1] * 0.45 + bottom[1] * 0.25)
+
+    center = (int(center_x), int(center_y))
+
+    if debug:
+        print(f"[NoseDetection] tip={tip}, top={top}, left={left}, right={right}, bottom={bottom}")
+        print(f"[NoseDetection] center={center}")
+
+    return {
+        "center": center,
+        "tip": tuple(tip.astype(int)),
+        "top": tuple(top.astype(int)),
+        "left": tuple(left.astype(int)),
+        "right": tuple(right.astype(int)),
+        "bottom": tuple(bottom.astype(int))
+    }
+
+def get_nose_coords_full_v14(image_pil, face_mesh):
+
+    image = np.array(image_pil.convert("RGB"))
+    h, w, _ = image.shape
+
+    results = face_mesh.process(image)
+
+    if not results.multi_face_landmarks:
+        return None
+
+    face_landmarks = results.multi_face_landmarks[0]
+
+    # =====================================================
+    # LANDMARKS ROBUSTES + MOYENNÉS
+    # =====================================================
+
+    NOSE_TIP_POINTS = [1, 2, 98, 327]
+    NOSE_TOP_POINTS = [168, 6, 197]
+    NOSE_LEFT_POINTS = [98, 97, 2]
+    NOSE_RIGHT_POINTS = [327, 326, 2]
+    NOSE_BOTTOM_POINTS = [2, 5]
+
+    # =====================================================
+    # GET POINT
+    # =====================================================
+
+    def get_point(idx):
+        lm = face_landmarks.landmark[idx]
+
+        return np.array([
+            lm.x * w,
+            lm.y * h
+        ], dtype=np.float32)
+
+    # =====================================================
+    # MOYENNE DES POINTS
+    # =====================================================
+
+    def average_points(indices):
+
+        pts = np.array([
+            get_point(i)
+            for i in indices
+        ])
+
+        return np.mean(pts, axis=0)
+
+    # =====================================================
+    # POINTS STABLES
+    # =====================================================
+
+    tip = average_points(NOSE_TIP_POINTS)
+
+    top = average_points(NOSE_TOP_POINTS)
+
+    left = average_points(NOSE_LEFT_POINTS)
+
+    right = average_points(NOSE_RIGHT_POINTS)
+
+    bottom = average_points(NOSE_BOTTOM_POINTS)
+
+    # =====================================================
+    # CENTRE ROBUSTE
+    # =====================================================
+
+    center_x = (
+        left[0] +
+        right[0]
+    ) * 0.5
+
+    # pondération verticale plus stable
+    center_y = (
+        top[1] * 0.30 +
+        tip[1] * 0.45 +
+        bottom[1] * 0.25
+    )
+
+    center = (
+        int(center_x),
+        int(center_y)
+    )
+
+    # =====================================================
+    # RETURN
+    # =====================================================
+
+    return {
+
+        "center": center,
+
+        "tip": tuple(tip.astype(int)),
+        "top": tuple(top.astype(int)),
+        "left": tuple(left.astype(int)),
+        "right": tuple(right.astype(int)),
+        "bottom": tuple(bottom.astype(int))
+    }
+
+
+
+def get_nose_coords_full_v1(image_pil, face_mesh):
 
 
     image = np.array(image_pil.convert("RGB"))
@@ -3310,7 +3479,7 @@ def apply_style_injection(
     model_path="models/style_injector_latest.pt",
     debug=True,
     ema_prev_latents=None,
-    ema_alpha=0.3
+    ema_alpha=0.2
 ):
     device = latents.device
     style_model.to(device)
@@ -3358,7 +3527,7 @@ def apply_style_injection(
     # =====================================================
     with torch.no_grad():
         stylized_latents = style_model(latents_train, style_embedding_train)
-
+    """
     # =====================================================
     # TANH + SANITIZE
     # =====================================================
@@ -3369,6 +3538,7 @@ def apply_style_injection(
     # =====================================================
     # EMA SMOOTHING
     # =====================================================
+
     if ema_prev_latents is not None:
         if ema_prev_latents.device != stylized_latents.device:
             ema_prev_latents = ema_prev_latents.to(stylized_latents.device)
@@ -3376,6 +3546,46 @@ def apply_style_injection(
         if debug:
             print("[StyleInjection] EMA smoothing applied")
 
+    # =====================================================
+    # SANITIZE
+    # =====================================================
+    stylized_latents = torch.tanh(stylized_latents)
+    stylized_latents = stylized_latents.clamp(-1.0, 1.0)
+    stylized_latents = sanitize_latents(stylized_latents)
+    """
+    # =====================================================
+    # ADAPTIVE TEMPORAL BLENDING (REMPLACE EMA BRUTE)
+    # =====================================================
+    if ema_prev_latents is not None:
+
+        if ema_prev_latents.device != stylized_latents.device:
+            ema_prev_latents = ema_prev_latents.to(stylized_latents.device)
+
+        # -------------------------------------------------
+        # Motion estimation (simple mais efficace)
+        # -------------------------------------------------
+        motion = (stylized_latents - ema_prev_latents).abs().mean()
+
+        # alpha adaptatif :
+        # - peu de mouvement → plus stable
+        # - beaucoup de mouvement → plus libre
+        alpha = ema_alpha + 0.35 * torch.tanh(motion)
+
+        alpha = torch.clamp(alpha, 0.1, 0.6)
+
+        # -------------------------------------------------
+        # Residual blending (plus propre que EMA classique)
+        # -------------------------------------------------
+        stylized_latents = (
+            ema_prev_latents +
+            alpha * (stylized_latents - ema_prev_latents)
+        )
+
+        if debug:
+            print(
+                f"[StyleInjection] Adaptive blend | "
+                f"motion={motion:.4f} | alpha={alpha:.4f}"
+            )
     # =====================================================
     # DEBUG STATS
     # =====================================================
