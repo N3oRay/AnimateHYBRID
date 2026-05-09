@@ -119,58 +119,7 @@ def get_hips_coords_pixels(image_pil, pose_model=None, H=None, W=None):
     print(f"⚠ 🦿📍 Aucune hanche détectée, fallback proportionnel utilisé: left={left_hip}, right={right_hip}")
     return [left_hip, right_hip]
 
-def get_hips_coords_pixels_v1(image_pil, H=None, W=None):
 
-
-    img_width, img_height = image_pil.size
-    if W is None: W = img_width
-    if H is None: H = img_height
-
-    image = np.array(image_pil.convert("RGB"))
-
-    mp_pose = mp.solutions.pose
-    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.3) as pose:
-        results = pose.process(image)
-
-        if results.pose_landmarks:
-            lm = results.pose_landmarks.landmark
-            LEFT_HIP = 23
-            RIGHT_HIP = 24
-
-            left_hip = (
-                int(round(lm[LEFT_HIP].x * W)),
-                int(round(lm[LEFT_HIP].y * H))
-            )
-            right_hip = (
-                int(round(lm[RIGHT_HIP].x * W)),
-                int(round(lm[RIGHT_HIP].y * H))
-            )
-
-            print(f"🦿📍 Hips hanches detected: left={left_hip}, right={right_hip}")
-            return [left_hip, right_hip]
-        else:
-            print("🦿📍 Hips MediaPipe n'a pas détecté de pose")
-
-    # -------------------- Fallback --------------------
-    shoulders = get_shoulders_coords(image_pil, H, W)
-    if shoulders is None:
-        print("🦿📍 Hips hanches non détectées, fallback impossible")
-        return None
-
-    left_shoulder, right_shoulder = shoulders
-    vertical_offset = int(0.4 * H)
-
-    left_hip = (
-        int(round(left_shoulder[0])),
-        int(round(left_shoulder[1] + vertical_offset))
-    )
-    right_hip = (
-        int(round(right_shoulder[0])),
-        int(round(right_shoulder[1] + vertical_offset))
-    )
-
-    print(f"⚠ 🦿📍 Aucune hanche détectée, fallback proportionnel utilisé: left={left_hip}, right={right_hip}")
-    return [left_hip, right_hip]
 
 #----------------------------------------------------------------------------------
 def get_elbows_coords_safe(image_pil, H=None, W=None):
@@ -3531,6 +3480,7 @@ def apply_style_injection(
     optimizer=None,
     criterion=None,
     train=False,
+    new_image=False,
     frame_counter=0,
     max_epochs_up=5,
     model_path="models/style_injector_latest.pt",
@@ -3542,6 +3492,9 @@ def apply_style_injection(
     style_model.to(device)
     latents_train = latents.clone().detach().to(device)
     B, C, H, W = latents_train.shape
+
+
+
 
     # ----- Préparer le prompt -----
     if style_prompt_embedding is None:
@@ -3584,32 +3537,18 @@ def apply_style_injection(
     # =====================================================
     with torch.no_grad():
         stylized_latents = style_model(latents_train, style_embedding_train)
-    """
-    # =====================================================
-    # TANH + SANITIZE
-    # =====================================================
-    stylized_latents = torch.tanh(stylized_latents)
-    stylized_latents = stylized_latents.clamp(-1.0, 1.0)
-    stylized_latents = sanitize_latents(stylized_latents)
+
 
     # =====================================================
-    # EMA SMOOTHING
+    # NEW IMAGE HANDLING (reset EMA avant motion)
     # =====================================================
+    if new_image:
+        print("🟢 nouvelle image → reset latents et EMA")
+        stylized_latents = latents.clone()
+        ema_prev_latents = stylized_latents.clone()
+        # On retourne stylized_latents normal, pas de blending
+        return stylized_latents
 
-    if ema_prev_latents is not None:
-        if ema_prev_latents.device != stylized_latents.device:
-            ema_prev_latents = ema_prev_latents.to(stylized_latents.device)
-        stylized_latents = ema_alpha * stylized_latents + (1.0 - ema_alpha) * ema_prev_latents
-        if debug:
-            print("[StyleInjection] EMA smoothing applied")
-
-    # =====================================================
-    # SANITIZE
-    # =====================================================
-    stylized_latents = torch.tanh(stylized_latents)
-    stylized_latents = stylized_latents.clamp(-1.0, 1.0)
-    stylized_latents = sanitize_latents(stylized_latents)
-    """
     # =====================================================
     # ADAPTIVE TEMPORAL BLENDING (REMPLACE EMA BRUTE)
     # =====================================================
@@ -3617,11 +3556,25 @@ def apply_style_injection(
 
         if ema_prev_latents.device != stylized_latents.device:
             ema_prev_latents = ema_prev_latents.to(stylized_latents.device)
-
         # -------------------------------------------------
         # Motion estimation (simple mais efficace)
         # -------------------------------------------------
         motion = (stylized_latents - ema_prev_latents).abs().mean()
+        lmotion = (stylized_latents - latents).abs().mean()
+
+        # -------------------------------------------------
+        # NEW IMAGE HANDLING (doit être traité AVANT motion)
+        # -------------------------------------------------
+        """"
+        if new_image:
+            print("🟢 démarrer propre (reset latents + EMA)")
+
+            stylized_latents = latents.clone()
+            ema_prev_latents = latents.clone()
+
+            # skip blending cette frame
+            return stylized_latents
+        """
 
         # alpha adaptatif :
         # - peu de mouvement → plus stable
@@ -3629,6 +3582,7 @@ def apply_style_injection(
         alpha = ema_alpha + 0.35 * torch.tanh(motion)
 
         alpha = torch.clamp(alpha, 0.1, 0.6)
+        print(f"lmotion={lmotion:.4f} ")
 
         # -------------------------------------------------
         # Residual blending (plus propre que EMA classique)
@@ -4301,6 +4255,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
     block_size=32, overlap=16,
     device="cuda",
+    new_image=False,
     frame_counter=0,
     latent_scale_boost=1.0,
     use_hann=True,
@@ -4331,7 +4286,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     motion_noise = high_freq.abs().mean() / (raw_latents.abs().mean() + 1e-6)
 
-
+    if new_image:
+       print(f"[decode_latents_ultrasafe] Nouvelle image.")
     if ema_prev_latents is None:
         ema_prev_latents = latents_out
 
@@ -4347,6 +4303,9 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         if pos_embeds_list is not None:
             style_prompt_embedding = pos_embeds_list[0].to(device).to(dtype=latents.dtype)  # forme [B, prompt_dim]
 
+        if new_image:
+            print(f"[decode_latents_ultrasafe] Nouvelle image. réinitialisation de ema_prev_latents.")
+            ema_prev_latents = latents_out
 
         # Appliquer le StyleInjector
         latents = apply_style_injection(
@@ -4356,6 +4315,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
             optimizer=optimizer_style,  # optionnel si fine-tuning dynamique
             criterion=criterion_style,  # StyleLoss
             train=True,  # si tu veux fine-tuner à la volée
+            new_image=new_image,
             frame_counter=frame_counter,
             max_epochs_up=5,
             model_path="models/style_injector_latest.pt",
