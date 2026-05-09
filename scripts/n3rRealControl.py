@@ -554,7 +554,7 @@ def main(args):
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
                                                     blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
                     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
-                    if f < num_fraps_per_image -1 : # En cas de changement d'image. on conserve pas le previous_latent_single
+                    if new_image : # En cas de changement d'image. on conserve pas le previous_latent_single
                         previous_latent_single = latents.detach().cpu()
                     else:
                         previous_latent_single = None
