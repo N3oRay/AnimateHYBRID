@@ -135,7 +135,7 @@ def main(args):
     # ---------------- VAE ----------------
     vae_path = cfg.get("vae_path")
     vae, vae_type, latent_channels, LATENT_SCALE = load_vae(vae_path, device=device, dtype=dtype)
-    # ---------------- Embeddings ----------------
+    # ---------------- Embeddings ----------------------------------------------------
     embeddings = []
     prompts = cfg.get("prompt", [])
     negative_prompts = cfg.get("n_prompt", [])
@@ -361,7 +361,8 @@ def main(args):
                         # Décodage streaming
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         print(f"Dimention frame inter: Shape de latent_interp :", latent_interp.shape)
-                        frame_pil = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single )
+
+                        frame_pil = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list )
 
                         #Post Traitement
                         frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
@@ -541,7 +542,7 @@ def main(args):
                     latents = latents / LATENT_SCALE
                     print(f"Dimention : Shape de latents :", latents.shape)
                     frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device,
-                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single
+                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list
                     )
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
                                                     blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
