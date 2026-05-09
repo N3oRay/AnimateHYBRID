@@ -1,17 +1,28 @@
-import torch
-import torch.nn as nn
-import torch.nn.init as init
 import os
 import datetime
 
+import torch
+import torch.nn as nn
+import torch.nn.init as init
 import torch.nn.functional as F
 
-
+# =========================================================
+# DEVICE
+# =========================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # =========================================================
-# SAVE / LOAD POUR STYLE INJECTOR
+# SEED
+# =========================================================
+
+torch.manual_seed(42)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
+# =========================================================
+# SAVE / LOAD
 # =========================================================
 
 def save_style_model(
@@ -22,7 +33,10 @@ def save_style_model(
     path="models/style_injector.pt",
     latest_path="models/style_injector_latest.pt"
 ):
-    """Sauvegarde le modèle StyleInjector avec son optimiseur et métriques."""
+    """
+    Sauvegarde du modèle StyleInjector.
+    """
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     checkpoint = {
@@ -52,10 +66,14 @@ def load_style_model(
     optimizer=None,
     device=device
 ):
-    """Charge le modèle StyleInjector à partir d'un checkpoint."""
+    """
+    Chargement du modèle StyleInjector.
+    """
+
     if not os.path.exists(path):
         print("[WARN] No checkpoint found.")
-        return model_class().to(device), None
+        model = model_class().to(device)
+        return model, None
 
     checkpoint = torch.load(path, map_location=device)
 
@@ -77,44 +95,51 @@ def load_style_model(
     return model, checkpoint
 
 # =========================================================
-# WEIGHTS INIT
+# WEIGHT INIT
 # =========================================================
 
 def weights_init(m):
     """
-    Initialisation des poids pour les couches du réseau.
-
-    Conv2d / ConvTranspose2d : He/Kaiming normal
-    Linear : Xavier normal
-    Bias : initialisé à 0
+    Initialisation des poids.
     """
-    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-        # He/Kaiming normal pour les convolutions
-        init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='linear')
-        if m.bias is not None:
-            init.zeros_(m.bias)
-    elif isinstance(m, nn.Linear):
-        # Xavier normal pour les fully connected
-        init.xavier_normal_(m.weight)
-        if m.bias is not None:
-            init.zeros_(m.bias)
-    elif isinstance(m, nn.BatchNorm2d):
-        # BatchNorm : gamma=1, beta=0
-        init.ones_(m.weight)
-        init.zeros_(m.bias)
 
-
-def weights_init_v1(m):
     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-        init.kaiming_normal_(m.weight, nonlinearity="linear")
+        init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
+
         if m.bias is not None:
             init.zeros_(m.bias)
+
     elif isinstance(m, nn.Linear):
         init.xavier_normal_(m.weight)
+
         if m.bias is not None:
             init.zeros_(m.bias)
 
+    elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+        if m.weight is not None:
+            init.ones_(m.weight)
 
+        if m.bias is not None:
+            init.zeros_(m.bias)
+
+# =========================================================
+# LATENT SANITIZE
+# =========================================================
+
+def sanitize_latents(latents):
+    """
+    Normalisation par sample.
+    """
+
+    latents = latents.float()
+
+    mean = latents.mean(dim=(1, 2, 3), keepdim=True)
+    std = latents.std(dim=(1, 2, 3), keepdim=True)
+
+    latents = (latents - mean) / (std + 1e-6)
+    latents = latents.clamp(-4.0, 4.0)
+
+    return latents
 
 # =========================================================
 # STYLE LOSS
@@ -122,56 +147,92 @@ def weights_init_v1(m):
 
 class StyleLoss(nn.Module):
     """
-    Critère pour l'entraînement du StyleInjector.
-    Compare les latents injectés aux latents cibles stylisés.
+    Loss principale pour l'entraînement.
     """
-    def __init__(self, reduction="mean"):
-        super().__init__()
-        self.l1 = nn.L1Loss(reduction=reduction)
-        # Optionnel : tu peux ajouter d'autres composants de perte ici
-        # ex: perceptual loss, cosine similarity, etc.
 
-    def forward(self, pred_latents, target_latents):
+    def __init__(
+        self,
+        l1_weight=1.0,
+        reduction="mean"
+    ):
+        super().__init__()
+
+        self.l1 = nn.L1Loss(reduction=reduction)
+
+        self.l1_weight = l1_weight
+
+    def forward(
+        self,
+        pred_latents,
+        target_latents
+    ):
         """
         Args:
-            pred_latents (Tensor): latents stylisés par le modèle
-            target_latents (Tensor): latents cibles
-        Returns:
-            Tensor: valeur de la perte
+            pred_latents: latents prédits
+            target_latents: latents cibles stylisés
         """
-        loss = self.l1(pred_latents, target_latents)
-        return loss
+
+        l1_loss = self.l1(pred_latents, target_latents)
+
+        total_loss = self.l1_weight * l1_loss
+
+        return total_loss
 
 # =========================================================
 # RESIDUAL BLOCK
 # =========================================================
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class ResidualBlock(nn.Module):
-    """Bloc résiduel simple pour StyleInjector"""
+    """
+    Bloc résiduel stable.
+    """
+
     def __init__(self, channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.act = nn.SiLU()
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+
+        self.block = nn.Sequential(
+            nn.GroupNorm(8, channels),
+            nn.SiLU(),
+
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.GroupNorm(8, channels),
+            nn.SiLU(),
+
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1
+            )
+        )
 
     def forward(self, x):
-        identity = x
-        out = self.conv1(x)
-        out = self.act(out)
-        out = self.conv2(out)
-        return identity + out
+        return x + self.block(x)
+
+# =========================================================
+# STYLE INJECTOR
+# =========================================================
 
 class StyleInjector(nn.Module):
     """
-    Injecteur de style léger pour transformer des latents existants.
+    Injecteur de style latent.
     """
-    def __init__(self, latent_channels=4, hidden=64, num_blocks=4, prompt_dim=768):
+
+    def __init__(
+        self,
+        latent_channels=4,
+        hidden=64,
+        num_blocks=4,
+        prompt_dim=768
+    ):
         super().__init__()
 
-         # ⚠️ Réintégrer config pour compatibilité sauvegarde
         self.config = {
             "latent_channels": latent_channels,
             "hidden": hidden,
@@ -184,64 +245,122 @@ class StyleInjector(nn.Module):
         self.prompt_dim = prompt_dim
         self.num_blocks = num_blocks
 
-        # input_proj sera créé dynamiquement lors du premier forward
-        self.input_proj = None
+        # =====================================================
+        # Prompt projection
+        # =====================================================
 
-        # Bloc résiduel
-        self.resblocks = nn.Sequential(
-            *[ResidualBlock(hidden) for _ in range(num_blocks)]
+        self.prompt_proj = nn.Sequential(
+            nn.Linear(prompt_dim, hidden),
+            nn.SiLU()
         )
 
-        # Projection du style prompt → hidden
-        self.prompt_proj = nn.Linear(prompt_dim, hidden)
+        # =====================================================
+        # Input projection
+        # FIX IMPORTANT :
+        # plus de création dynamique dans forward()
+        # =====================================================
 
-        # Projection finale
-        self.output_proj = nn.Conv2d(hidden, latent_channels, 3, padding=1)
+        self.input_proj = nn.Sequential(
+            nn.Conv2d(
+                latent_channels + hidden,
+                hidden,
+                kernel_size=3,
+                padding=1
+            ),
 
-    def forward(self, latents, style_prompt_embedding):
+            nn.GroupNorm(8, hidden),
+            nn.SiLU()
+        )
+
+        # =====================================================
+        # Residual backbone
+        # =====================================================
+
+        self.resblocks = nn.Sequential(
+            *[
+                ResidualBlock(hidden)
+                for _ in range(num_blocks)
+            ]
+        )
+
+        # =====================================================
+        # Output projection
+        # =====================================================
+
+        self.output_proj = nn.Sequential(
+            nn.GroupNorm(8, hidden),
+            nn.SiLU(),
+
+            nn.Conv2d(
+                hidden,
+                latent_channels,
+                kernel_size=3,
+                padding=1
+            )
+        )
+
+    def forward(
+        self,
+        latents,
+        style_prompt_embedding
+    ):
         """
         Args:
-            latents (Tensor): (B, C, H, W)
-            style_prompt_embedding (Tensor): (B, prompt_dim)
+            latents: (B, C, H, W)
+            style_prompt_embedding: (B, prompt_dim)
+
         Returns:
-            Tensor: latents transformés
+            Tensor stylisé
         """
+
         B, C, H, W = latents.shape
 
-        # Projection du prompt → style_feat (B, hidden, H, W)
+        # =====================================================
+        # Prompt -> feature map
+        # =====================================================
+
         style_feat = self.prompt_proj(style_prompt_embedding)
-        style_feat = style_feat.view(B, -1, 1, 1).expand(-1, -1, H, W)
 
-        # Concaténation latents + style_feat
-        x = torch.cat([latents, style_feat], dim=1)
+        style_feat = style_feat.view(
+            B,
+            self.hidden,
+            1,
+            1
+        )
 
-        # Création dynamique de input_proj si nécessaire
-        if self.input_proj is None:
-            in_channels = x.shape[1]  # latents + style_feat
-            self.input_proj = nn.Sequential(
-                nn.Conv2d(in_channels, self.hidden, 3, padding=1),
-                nn.SiLU()
-            ).to(x.device)
+        style_feat = style_feat.expand(
+            -1,
+            -1,
+            H,
+            W
+        )
+
+        # =====================================================
+        # Concat latent + style
+        # =====================================================
+
+        x = torch.cat(
+            [latents, style_feat],
+            dim=1
+        )
+
+        # =====================================================
+        # Backbone
+        # =====================================================
 
         x = self.input_proj(x)
+
         x = self.resblocks(x)
+
         delta = self.output_proj(x)
 
-        # Injection résiduelle
+        # =====================================================
+        # Residual injection
+        # =====================================================
+
         out_latents = latents + delta
+
         return out_latents
-
-
-
-# =========================================================
-# SANITIZE LATENTS
-# =========================================================
-
-def sanitize_latents(latents):
-    latents = latents.float()
-    latents = (latents - latents.mean()) / (latents.std() + 1e-6)
-    latents = latents.clamp(-4.0, 4.0)
-    return latents
 
 # =========================================================
 # TRAIN STEP
@@ -255,29 +374,48 @@ def style_train_step(
     style_prompt_embedding,
     target_latents,
     device=device,
+    grad_clip=1.0,
     debug=False
 ):
     """
-    Passe d'entrainement pour le StyleInjector.
+    Une étape d'entraînement.
     """
+
     model.train()
 
     latents = sanitize_latents(latents).to(device)
-    target_latents = sanitize_latents(target_latents).to(device)
-    style_prompt_embedding = style_prompt_embedding.to(device)
+
+    target_latents = sanitize_latents(
+        target_latents
+    ).to(device)
+
+    style_prompt_embedding = (
+        style_prompt_embedding.to(device)
+    )
 
     optimizer.zero_grad()
 
-    pred_latents = model(latents, style_prompt_embedding)
+    pred_latents = model(
+        latents,
+        style_prompt_embedding
+    )
 
-    loss = criterion(pred_latents, target_latents)
+    loss = criterion(
+        pred_latents,
+        target_latents
+    )
+
     loss.backward()
 
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_norm=grad_clip
+    )
+
     optimizer.step()
 
     if debug:
-        print(f"Step loss: {loss.item():.6f}")
+        print(f"[DEBUG] Loss={loss.item():.6f}")
 
     return pred_latents.detach(), loss.item()
 
@@ -295,18 +433,26 @@ def train_style_model(
     save_every=1
 ):
     """
-    Boucle d'entrainement pour StyleInjector.
-    style_dataset doit retourner un dict avec :
-        - "latents": Tensor des latents actuels
-        - "prompt": Tensor embedding du prompt de style
-        - "target": Tensor des latents stylisés cibles
+    Boucle d'entraînement principale.
+
+    Dataset format:
+    {
+        "latents": Tensor,
+        "prompt": Tensor,
+        "target": Tensor
+    }
     """
+
     for epoch in range(epochs):
+
         epoch_loss = 0.0
 
         for step, batch in enumerate(style_dataset):
+
             latents = batch["latents"]
+
             prompt_embedding = batch["prompt"]
+
             target_latents = batch["target"]
 
             _, loss = style_train_step(
@@ -321,12 +467,21 @@ def train_style_model(
 
             epoch_loss += loss
 
-            print(f"[Epoch {epoch+1}] [Step {step+1}] Loss={loss:.6f}")
+            print(
+                f"[Epoch {epoch+1}] "
+                f"[Step {step+1}] "
+                f"Loss={loss:.6f}"
+            )
 
         avg_loss = epoch_loss / len(style_dataset)
-        print(f"\n[Epoch {epoch+1}] Average Loss={avg_loss:.6f}\n")
+
+        print(
+            f"\n[Epoch {epoch+1}] "
+            f"Average Loss={avg_loss:.6f}\n"
+        )
 
         if (epoch + 1) % save_every == 0:
+
             save_style_model(
                 model=model,
                 optimizer=optimizer,
@@ -334,23 +489,54 @@ def train_style_model(
                 loss=avg_loss
             )
 
-
-
-
-
-
-
 # =========================================================
-# UTILISATION
+# TEST
 # =========================================================
 
 if __name__ == "__main__":
-    B, C, H, W = 1, 4, 64, 64
-    latent = torch.randn(B, C, H, W)
+
+    B, C, H, W = 2, 4, 64, 64
+
+    latents = torch.randn(B, C, H, W)
+
     prompt_embedding = torch.randn(B, 768)
 
-    style_model = StyleInjector(latent_channels=C).to(latent.device)
-    style_model.apply(weights_init)
+    model = StyleInjector(
+        latent_channels=C,
+        hidden=64,
+        num_blocks=4,
+        prompt_dim=768
+    ).to(device)
 
-    out = style_model(latent, prompt_embedding)
-    print("Latents après injection de style:", out.shape)
+    model.apply(weights_init)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-4,
+        weight_decay=1e-4
+    )
+
+    criterion = StyleLoss()
+
+    out = model(
+        latents.to(device),
+        prompt_embedding.to(device)
+    )
+
+    print("Input shape :", latents.shape)
+    print("Output shape:", out.shape)
+
+    total_params = sum(
+        p.numel()
+        for p in model.parameters()
+    )
+
+    trainable_params = sum(
+        p.numel()
+        for p in model.parameters()
+        if p.requires_grad
+    )
+
+    print(f"\nTotal params: {total_params:,}")
+    print(f"Trainable params: {trainable_params:,}")
+

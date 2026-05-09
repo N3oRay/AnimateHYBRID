@@ -3865,8 +3865,7 @@ def apply_denoising(
     max_epochs_up=10,
     model_path="models/denoise_latest.pt",
     debug=False,
-    ema_prev_latents=None,
-    ema_alpha=0.3
+    ema_prev_latents=None
 ):
     """
     Applique un denoising autoencoder sur les latents avec entraînement optionnel et dynamique.
@@ -3993,14 +3992,6 @@ def apply_denoising(
     else:
         latents = 0.9 * latents + 0.1 * latents_out
 
-    # 🔹 EMA pour lisser les transitions
-    if ema_prev_latents is not None:
-        # Assurer que ema_prev_latents est sur le même device que latents
-        print(f"ema_prev_latents ... 🔥 ")
-        if ema_prev_latents.device != latents.device:
-            ema_prev_latents = ema_prev_latents.to(latents.device)
-        latents = ema_alpha * latents + (1 - ema_alpha) * ema_prev_latents
-
 
     # Dection final pour vérification
     noise_level = latents.std()
@@ -4010,6 +4001,32 @@ def apply_denoising(
     print(f"Noise_level - high_freq: [{noise_level}], after denoising... 🔥 ")
 
 
+    return latents
+
+
+def update_ema(latents, ema_prev_latents, alpha=0.5, device="cuda"):
+    if ema_prev_latents is None:
+        return latents
+
+    return (
+        alpha * latents.detach().to(device)
+        + (1 - alpha) * ema_prev_latents.detach().to(device)
+    )
+
+
+def get_ema_style_prev(latents, train_on_image, ema_prev_latents=None, debug=False):
+    if train_on_image:
+        if debug:
+            print("[StyleEMA] image training → no temporal coherence 🔥")
+        return latents
+
+    if ema_prev_latents is not None:
+        if debug:
+            print(f"[StyleEMA] video → using ema_prev_latents {ema_prev_latents.shape} 🔥")
+        return ema_prev_latents
+
+    if debug:
+        print("[StyleEMA] video → fallback to latents 🔥")
     return latents
 
 
@@ -4030,6 +4047,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     style_injection=True,
     pos_embeds_list=None,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
+    train_on_image=True,
     max_epochs_up=10,
     ema_prev_latents=None,
     debug=False
@@ -4047,25 +4065,14 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     motion_noise = high_freq.abs().mean() / (raw_latents.abs().mean() + 1e-6)
 
 
+    if ema_prev_latents is None:
+        ema_prev_latents = latents_out
+
+
     if denoise:
         # Créer un latents indépendant pour l'entraînement
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
                             max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
-    if temporal_consistency:
-
-        if ema_prev_latents is None:
-            ema_prev_latents = latents_out if denoise else latents
-        # Temporal class
-        latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
-        train=True, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
-
-        # -------------------------
-        # UPDATE EMA (CRUCIAL)
-        # -------------------------
-        ema_prev_latents = (
-            0.5 * latents.detach().to(device) +
-            0.5 * ema_prev_latents.detach().to(device)
-        )
 
     if style_injection:
         style_prompt_embedding = torch.randn(B, prompt_dim, device=device, dtype=latents.dtype)
@@ -4073,9 +4080,6 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         if pos_embeds_list is not None:
             style_prompt_embedding = pos_embeds_list[0].to(device).to(dtype=latents.dtype)  # forme [B, prompt_dim]
 
-
-        # EMA précédent pour style, on peut réutiliser ema_prev_latents ou créer un séparé
-        ema_style_prev = ema_prev_latents if ema_prev_latents is not None else latents
 
         # Appliquer le StyleInjector
         latents = apply_style_injection(
@@ -4089,15 +4093,25 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
             max_epochs_up=5,
             model_path="models/style_injector_latest.pt",
             debug=True,
-            ema_prev_latents=ema_style_prev,
-            ema_alpha=0.2 + 0.3 * motion_noise  # tu peux adapter la force EMA
+            ema_prev_latents=ema_prev_latents,
+            ema_alpha=0.2
+            #ema_alpha=0.2 + 0.3 * motion_noise  # tu peux adapter la force EMA
         )
 
-        # Mettre à jour l’EMA pour le style
-        ema_prev_latents = (
-            0.5 * latents.detach().to(device) +
-            0.5 * ema_prev_latents.detach().to(device)
-        )
+
+    if temporal_consistency:
+
+        # Temporal class
+        latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
+        train=True, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
+
+
+    # -------------------------
+    # UPDATE EMA (CRUCIAL)
+    # -------------------------
+    if train == False: # On traite l'EMA uniquement dans le cas on est pas en train'
+        ema_prev_latents = get_ema_style_prev(latents, train_on_image, ema_prev_latents=ema_prev_latents, debug=True)
+        ema_prev_latents = update_ema( latents, ema_prev_latents, alpha=0.5, device=device )
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
