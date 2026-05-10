@@ -80,7 +80,7 @@ def main(args):
     overlap = compute_overlap(cfg["W"], cfg["H"], block_size) #overlap = 32 #32
     print(f"Dimention : overlap :", overlap)
 
-    use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", True)
+    use_n3r_model, use_n3r_pro_net  = cfg.get("use_n3r_model", False), cfg.get("use_n3r_pro_net", False)
     use_openpose = cfg.get("use_openpose", True)
     open_pose_dev = cfg.get("open_pose_dev", False)
 
@@ -367,7 +367,7 @@ def main(args):
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         print(f"Dimention frame inter: Shape de latent_interp :", latent_interp.shape)
 
-                        frame_pil = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list )
+                        frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list )
 
                         #Post Traitement
                         frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
@@ -548,16 +548,12 @@ def main(args):
                     latents = latents / LATENT_SCALE
                     print(f"Dimention : Shape de latents :", latents.shape)
 
-                    frame_pil = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device, new_image=new_image,
+                    frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device, new_image=new_image,
                         frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list
                     )
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
                                                     blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
                     save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0f", psave=True)
-                    if new_image : # En cas de changement d'image. on conserve pas le previous_latent_single
-                        previous_latent_single = latents.detach().cpu()
-                    else:
-                        previous_latent_single = None
                     frame_counter += 1
                     pbar.update(1)
                     for var in ["latents", "latents_frame", "cf_embeds", "n3r_latents"]:
@@ -567,6 +563,8 @@ def main(args):
 
                 print(f"Image -f:", f)
                 new_image = False
+
+            print(f"previous_latent_single: current_latent_single")
             previous_latent_single = current_latent_single
 
 
