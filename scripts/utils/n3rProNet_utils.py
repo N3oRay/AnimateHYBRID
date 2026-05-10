@@ -3146,6 +3146,7 @@ def apply_style_injection(
     max_epochs_up=5,
     model_path="models/style_injector_latest.pt",
     debug=True,
+    ema=False,
     ema_prev_latents=None,
     ema_alpha=0.2
 ):
@@ -3174,6 +3175,9 @@ def apply_style_injection(
         style_model.train()
         max_epochs = max(1, max_epochs_up)
 
+        early_stop_threshold = 0.25  # seuil d'early stop
+        epoch_done = 0  # nombre réel d'epochs effectués
+
         for epoch in range(max_epochs):
             optimizer.zero_grad()
             with torch.enable_grad():
@@ -3182,10 +3186,19 @@ def apply_style_injection(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(style_model.parameters(), 1.0)
             optimizer.step()
-            if debug:
-                print(f"[StyleInjection] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}")
 
-        save_style_model(style_model, optimizer=optimizer, epoch=max_epochs, loss=loss.item())
+            epoch_done = epoch + 1
+
+            if debug:
+                print(f"[StyleInjection] Epoch {epoch_done}/{max_epochs} | Loss={loss.item():.6f}")
+
+            # 🔥 EARLY STOP
+            if loss.item() < early_stop_threshold:
+                if debug:
+                    print(f"🟢 Early stop triggered (loss={loss.item():.4f})")
+                break
+
+        save_style_model(style_model, optimizer=optimizer, epoch=epoch_done, loss=loss.item())
     else:
         style_model.eval()
         if model_exists:
@@ -3213,40 +3226,43 @@ def apply_style_injection(
     # =====================================================
     # ADAPTIVE TEMPORAL BLENDING (REMPLACE EMA BRUTE)
     # =====================================================
-    if ema_prev_latents is not None and new_image == False:
-        print(f"🔥 [apply_style_injection] EMA.")
-        if ema_prev_latents.device != stylized_latents.device:
-            ema_prev_latents = ema_prev_latents.to(stylized_latents.device)
-        # -------------------------------------------------
-        # Motion estimation (simple mais efficace)
-        # -------------------------------------------------
-        motion = (stylized_latents - ema_prev_latents).abs().mean()
-        lmotion = (stylized_latents - latents).abs().mean()
-
-        # -------------------------------------------------
-        # NEW IMAGE HANDLING (doit être traité AVANT motion)
-        # -------------------------------------------------
-
-        # alpha adaptatif :
-        # - peu de mouvement → plus stable
-        # - beaucoup de mouvement → plus libre
-        alpha = ema_alpha + 0.35 * torch.tanh(motion)
-
-        alpha = torch.clamp(alpha, 0.1, 0.6)
-        print(f"lmotion={lmotion:.4f} ")
-
-        # -------------------------------------------------
-        # Residual blending (plus propre que EMA classique)
-        # -------------------------------------------------
-        stylized_latents = (
-            ema_prev_latents +
-            alpha * (stylized_latents - ema_prev_latents)
-        )
+    if ema and ema_prev_latents is not None and not new_image:
 
         if debug:
+            print("🔥 [apply_style_injection] EMA.")
+
+        # -----------------------------
+        # Device safety
+        # -----------------------------
+        if ema_prev_latents.device != stylized_latents.device:
+            ema_prev_latents = ema_prev_latents.to(stylized_latents.device)
+
+        # -----------------------------
+        # Motion stats
+        # -----------------------------
+        motion = (stylized_latents - ema_prev_latents).abs().mean()
+        lmotion = (stylized_latents - latents).abs().mean().clamp(0, 1)
+
+        # -----------------------------
+        # Adaptive alpha
+        # -----------------------------
+        alpha = ema_alpha * (1.0 + 2.0 * lmotion)
+        alpha = alpha.clamp(0.02, 0.12)
+
+        # -----------------------------
+        # Blend
+        # -----------------------------
+        stylized_latents = ema_prev_latents + alpha * (stylized_latents - ema_prev_latents)
+
+        # -----------------------------
+        # Logs (debug only)
+        # -----------------------------
+        if debug:
             print(
-                f"[StyleInjection] Adaptive blend | "
-                f"motion={motion:.4f} | alpha={alpha:.4f}"
+                f"[StyleInjection][EMA] "
+                f"motion={motion:.4f} | "
+                f"lmotion={lmotion:.4f} | "
+                f"alpha={alpha:.4f}"
             )
     # =====================================================
     # DEBUG STATS
@@ -3438,24 +3454,18 @@ def apply_temporal_consistency(
         # -------------------------------------------------
 
         if train:
+            temporal_model.train()
+            early_stop_threshold = 0.025  # exemple, à ajuster selon tes observations
+            patience = 2  # nombre d'epochs supplémentaires avant d'arrêter
+            patience_counter = 0
 
             for epoch in range(max_epochs):
-
                 optimizer.zero_grad()
 
                 with torch.enable_grad():
-
-                    pred_next = temporal_model(
-                        prev_train,
-                        current_train
-                    )
-
+                    pred_next = temporal_model(prev_train, current_train)
                     target = current_train
-
-                    loss = criterion(
-                        pred_next,
-                        target
-                    )
+                    loss = criterion(pred_next, target)
 
                 print(
                     f"[Temporal DEBUG] "
@@ -3465,34 +3475,24 @@ def apply_temporal_consistency(
                 )
 
                 loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(
-                    temporal_model.parameters(),
-                    max_norm=1.0
-                )
-
+                torch.nn.utils.clip_grad_norm_(temporal_model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-                print(
-                    f"[Temporal] "
-                    f"Epoch [{epoch+1}/{max_epochs}] "
-                    f"Loss={loss.item():.6f}"
-                )
+                print(f"[Temporal] Epoch [{epoch+1}/{max_epochs}] Loss={loss.item():.6f}")
 
                 if debug:
+                    print(f"[Temporal DEBUG] pred min={pred_next.min():.4f} max={pred_next.max():.4f}")
 
-                    print(
-                        f"[Temporal DEBUG] "
-                        f"pred min={pred_next.min():.4f} "
-                        f"max={pred_next.max():.4f}"
-                    )
+                # 🔥 EARLY STOP AVEC PATIENCE
+                if loss.item() < early_stop_threshold:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print(f"🟢 Early stop triggered at epoch {epoch+1} (loss={loss.item():.4f})")
+                        break
+                else:
+                    patience_counter = 0  # reset si loss remonte
 
-            save_temporal_model(
-                temporal_model,
-                optimizer=optimizer,
-                epoch=max_epochs,
-                loss=loss.item()
-            )
+            save_temporal_model(temporal_model, optimizer=optimizer, epoch=epoch+1, loss=loss.item())
 
     # =====================================================
     # EVAL MODE
@@ -3728,6 +3728,11 @@ hf_rebound = EMADeltaRebound()
 #           Latents finaux après denoising
 
 
+def dynamic_max_epochs(loss, threshold=0.03, max_epochs=25):
+    if loss < threshold:
+        return 1
+    return max_epochs
+
 def apply_denoising(
     latents,
     denoising_model,
@@ -3903,6 +3908,8 @@ def get_ema_style_prev(latents, train_on_image, ema_prev_latents=None, debug=Fal
     return latents
 
 
+
+
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
     block_size=32, overlap=16,
@@ -3922,7 +3929,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     pos_embeds_list=None,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
     train_on_image=True,
-    max_epochs_up=10,
+    max_epochs_up=5,
     ema_prev_latents=None,
     debug=False
 ):
@@ -3963,7 +3970,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     if denoise and ema_prev_latents is not None:
         # Créer un latents indépendant pour l'entraînement
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=train, frame_counter=frame_counter,
-                            max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
+                            max_epochs_up=max_epochs_up, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
 
     if style_injection and ema_prev_latents is not None:
         style_prompt_embedding = torch.randn(B, prompt_dim, device=device, dtype=latents.dtype)
@@ -3981,7 +3988,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
                 train=train,  # si tu veux fine-tuner à la volée
                 new_image=new_image,
                 frame_counter=frame_counter,
-                max_epochs_up=5,
+                max_epochs_up=max_epochs_up,
                 model_path="models/style_injector_latest.pt",
                 debug=True,
                 ema_prev_latents=ema_prev_latents,
@@ -3994,7 +4001,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
         # Temporal class
         latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
-        train=train, new_image=new_image, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
+        train=train, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
 
 
     # -------------------------
