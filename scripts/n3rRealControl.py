@@ -158,7 +158,8 @@ def main(args):
 
     # ---------- Input image -----------------------------------
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
-    total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
+    #total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
+    total_frames = len(input_paths) * num_fraps_per_image
 
     # ---------------- Input  ----------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -564,8 +565,8 @@ def main(args):
                 print(f"Image -f:", f)
                 new_image = False
 
-            print(f"previous_latent_single: current_latent_single")
-            previous_latent_single = current_latent_single
+            #print(f"previous_latent_single: current_latent_single")
+            #previous_latent_single = current_latent_single
 
 
         except Exception as e:
