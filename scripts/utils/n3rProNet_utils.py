@@ -18,7 +18,8 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-
+from mediapipe.python.solutions import face_mesh as mp_face_mesh
+from collections import deque
 
 
 
@@ -69,8 +70,6 @@ def get_hips_coords_pixels(image_pil, pose_model=None, H=None, W=None):
     1️⃣ Priorité : Pose via pose_model si fourni
     2️⃣ Fallback proportionnel via épaules
     """
-
-    import numpy as np
 
     img_width, img_height = image_pil.size
     if W is None: W = img_width
@@ -366,145 +365,6 @@ def get_nose_coords_full(image_pil, face_mesh, debug=True):
         "bottom": tuple(bottom.astype(int))
     }
 
-def get_nose_coords_full_v14(image_pil, face_mesh):
-
-    image = np.array(image_pil.convert("RGB"))
-    h, w, _ = image.shape
-
-    results = face_mesh.process(image)
-
-    if not results.multi_face_landmarks:
-        return None
-
-    face_landmarks = results.multi_face_landmarks[0]
-
-    # =====================================================
-    # LANDMARKS ROBUSTES + MOYENNÉS
-    # =====================================================
-
-    NOSE_TIP_POINTS = [1, 2, 98, 327]
-    NOSE_TOP_POINTS = [168, 6, 197]
-    NOSE_LEFT_POINTS = [98, 97, 2]
-    NOSE_RIGHT_POINTS = [327, 326, 2]
-    NOSE_BOTTOM_POINTS = [2, 5]
-
-    # =====================================================
-    # GET POINT
-    # =====================================================
-
-    def get_point(idx):
-        lm = face_landmarks.landmark[idx]
-
-        return np.array([
-            lm.x * w,
-            lm.y * h
-        ], dtype=np.float32)
-
-    # =====================================================
-    # MOYENNE DES POINTS
-    # =====================================================
-
-    def average_points(indices):
-
-        pts = np.array([
-            get_point(i)
-            for i in indices
-        ])
-
-        return np.mean(pts, axis=0)
-
-    # =====================================================
-    # POINTS STABLES
-    # =====================================================
-
-    tip = average_points(NOSE_TIP_POINTS)
-
-    top = average_points(NOSE_TOP_POINTS)
-
-    left = average_points(NOSE_LEFT_POINTS)
-
-    right = average_points(NOSE_RIGHT_POINTS)
-
-    bottom = average_points(NOSE_BOTTOM_POINTS)
-
-    # =====================================================
-    # CENTRE ROBUSTE
-    # =====================================================
-
-    center_x = (
-        left[0] +
-        right[0]
-    ) * 0.5
-
-    # pondération verticale plus stable
-    center_y = (
-        top[1] * 0.30 +
-        tip[1] * 0.45 +
-        bottom[1] * 0.25
-    )
-
-    center = (
-        int(center_x),
-        int(center_y)
-    )
-
-    # =====================================================
-    # RETURN
-    # =====================================================
-
-    return {
-
-        "center": center,
-
-        "tip": tuple(tip.astype(int)),
-        "top": tuple(top.astype(int)),
-        "left": tuple(left.astype(int)),
-        "right": tuple(right.astype(int)),
-        "bottom": tuple(bottom.astype(int))
-    }
-
-
-
-def get_nose_coords_full_v1(image_pil, face_mesh):
-
-
-    image = np.array(image_pil.convert("RGB"))
-    h, w, _ = image.shape
-
-    results = face_mesh.process(image)
-
-    if not results.multi_face_landmarks:
-        return None
-
-    face_landmarks = results.multi_face_landmarks[0]
-
-    # Points clés nez
-    NOSE_TIP    = 1
-    NOSE_TOP    = 168
-    NOSE_LEFT   = 98
-    NOSE_RIGHT  = 327
-
-    def get_point(idx):
-        lm = face_landmarks.landmark[idx]
-        return int(lm.x * w), int(lm.y * h)
-
-    tip   = get_point(NOSE_TIP)
-    top   = get_point(NOSE_TOP)
-    left  = get_point(NOSE_LEFT)
-    right = get_point(NOSE_RIGHT)
-
-    center = (
-        int((left[0] + right[0]) / 2),
-        int((top[1] + tip[1]) / 2)
-    )
-
-    return {
-        "center": center,
-        "tip": tip,
-        "top": top,
-        "left": left,
-        "right": right
-    }
 
 
 def get_mouth_coords_safe(image_pil, face_mesh, H=None, W=None):
@@ -524,70 +384,6 @@ def get_mouth_coords_safe(image_pil, face_mesh, H=None, W=None):
         return None
 
 
-def get_mouth_coords_v1(image_pil, face_mesh):
-    """
-    Détecte les coordonnées de la bouche avec MediaPipe FaceMesh (mode tracking).
-
-    Args:
-        image_pil (PIL.Image): image d'entrée
-        face_mesh: instance persistante MediaPipe FaceMesh
-
-    Returns:
-        list[(x, y)]: centre de la bouche
-    """
-    import numpy as np
-
-    image = np.array(image_pil.convert("RGB"))
-    h, w, _ = image.shape
-
-    # 🔥 Utilisation de l'instance existante (IMPORTANT)
-    results = face_mesh.process(image)
-
-    if not results.multi_face_landmarks:
-        print("⚠️ No face detected (mouth)")
-        return None
-
-    face_landmarks = results.multi_face_landmarks[0]
-
-    # 🔹 Indices bouche (outer lips)
-    MOUTH_OUTER = [61, 291, 0, 17, 37, 267, 78, 308]
-    """
-    MOUTH_LEFT = [61]
-    MOUTH_RIGHT = [291]
-
-    MOUTH_TOP_MID_R3 = [270]
-    MOUTH_TOP_MID_R2 = [269]
-    MOUTH_TOP_MID_R1 = [267]
-    MOUTH_TOP_MID = [0]
-    MOUTH_TOP_MID_L1 = [37]
-    MOUTH_TOP_MID_L2 = [39]
-    MOUTH_TOP_MID_L3 = [40]
-
-
-    MOUTH_BOT_MID_R3 = [321]
-    MOUTH_BOT_MID_R2 = [405]
-    MOUTH_BOT_MID_R1 = [314]
-    MOUTH_BOT_MID = [17]
-    MOUTH_BOT_MID_L1 = [84]
-    MOUTH_BOT_MID_L2 = [181]
-    MOUTH_BOT_MID_L3 = [91]
-    """
-
-
-    def get_center(indices):
-        xs, ys = [], []
-        for idx in indices:
-            lm = face_landmarks.landmark[idx]
-            xs.append(lm.x * w)
-            ys.append(lm.y * h)
-        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
-
-    mouth_center = get_center(MOUTH_OUTER)
-
-
-    return [mouth_center]
-
-
 def get_mouth_coords(image_pil, face_mesh):
     """
     Détecte les coordonnées de la bouche avec MediaPipe FaceMesh (mode tracking).
@@ -599,13 +395,12 @@ def get_mouth_coords(image_pil, face_mesh):
     Returns:
         dict: Dictionnaire des coordonnées des points de la bouche.
     """
-    import numpy as np
 
     # Convertir l'image PIL en format compatible avec MediaPipe
     image = np.array(image_pil.convert("RGB"))
     h, w, _ = image.shape
 
-    # 🔥 Utilisation de l'instance existante (IMPORTANT)
+    # 🔥 Utilisation de l'instance existante
     results = face_mesh.process(image)
 
     if not results.multi_face_landmarks:
@@ -685,7 +480,6 @@ def get_wrists_coords(image_pil, pose_model, H=None, W=None):
     Returns:
         list[(x, y)] ou None: [left_wrist, right_wrist]
     """
-    import numpy as np
 
     if pose_model is None:
         print("⚠️ Pose model non initialisé")
@@ -749,7 +543,7 @@ def get_wrists_coords_pixels(image_pil, pose_model, face_mesh, H=None, W=None):
     Retourne les coordonnées des poignets en pixels.
     Fallback proportionnel si MediaPipe échoue.
     """
-    import numpy as np
+
 
     # --- Taille de l'image ---
     img_width, img_height = image_pil.size
@@ -884,7 +678,6 @@ def get_shoulders_coords(image_pil, pose_model, face_mesh=None):
     2. Fallback via clavicules (si dispo)
     """
 
-    import numpy as np
 
     if pose_model is None:
         print("⚠️ Pose model non initialisé")
@@ -1057,7 +850,6 @@ def get_shoulders_coords_old(image_pil, H=None, W=None):
     Returns:
         list[(x, y)] ou None: gauche et droite des épaules
     """
-    import numpy as np
 
     # --- Récupère les clavicules ---
     clav_coords = get_clavicules_coords(image_pil, H, W)
@@ -1098,7 +890,7 @@ def get_shoulders_coords_old(image_pil, H=None, W=None):
     return [left_shoulder, right_shoulder]
 #-------------------------------------- oreilles ----------
 
-import mediapipe as mp
+
 
 def release_mediapipe_models():
     if hasattr(init_mediapipe_models, "pose_model"):
@@ -1277,56 +1069,6 @@ def get_hair_coords(image_pil, face_mesh):
     return [left_hair, left_top_hair, mouth_left, nose_left, hair_top, right_top_hair, mouth_right, right_top_hair1, right_top_hair2, right_top_hair3, left_top_hair1, left_top_hair2, left_top_hair3, nose_right, right_hair, (center_x, center_y), front_m, front_left1, front_left2, front_right1, front_right2]
 
 
-
-def get_hair_coords_v1(image_pil, face_mesh):
-    # Convertir l'image PIL en un tableau numpy et obtenir la hauteur et la largeur
-    image = np.array(image_pil.convert("RGB"))
-    h, w, _ = image.shape
-
-    # Traiter l'image pour obtenir les landmarks du visage
-    results = face_mesh.process(image)
-
-    if not results.multi_face_landmarks:
-        return None
-
-    face_landmarks = results.multi_face_landmarks[0]
-
-    # =========================
-    # HAIR PROXY POINTS (MediaPipe FaceMesh)
-    # =========================
-    HAIR_LEFT = [70, 63, 105, 66, 107]  # Points sur le côté gauche des cheveux
-    HAIR_RIGHT = [300, 293, 334, 296, 336]  # Points sur le côté droit des cheveux
-
-    # Points supplémentaires pour les nouveaux repères
-    HAIR_LEFT_TOP = [104, 105, 106]  # Points vers le sommet des cheveux (gauche)
-    HAIR_RIGHT_TOP = [333, 334, 335]  # Points vers le sommet des cheveux (droit)
-    HAIR_TOP = [176, 175, 174]  # Points sur le sommet des cheveux (entre les deux côtés)
-
-    # Fonction pour calculer le centre des points de repère
-    def get_center(indices):
-        xs, ys = [], []
-        for idx in indices:
-            lm = face_landmarks.landmark[idx]
-            xs.append(lm.x * w)  # Convertir en pixels
-            ys.append(lm.y * h)  # Convertir en pixels
-        return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
-
-    # Calculer les centres des points pour les différentes régions des cheveux
-    left_hair = get_center(HAIR_LEFT)
-    right_hair = get_center(HAIR_RIGHT)
-
-    # Calculer le centre du sommet des cheveux
-    left_top_hair = get_center(HAIR_LEFT_TOP)
-    right_top_hair = get_center(HAIR_RIGHT_TOP)
-    top_hair = get_center(HAIR_TOP)
-
-    # Centre du front (base des cheveux)
-    center_x = (left_hair[0] + right_hair[0]) // 2
-    center_y = (left_hair[1] + right_hair[1]) // 2
-
-    # Retourner les points calculés
-    return [left_hair, left_top_hair, top_hair, right_top_hair, right_hair, (center_x, center_y)]
-
 # ---------- detection des oreilles ----------
 
 def get_ear_coords_safe(image_pil, face_mesh, H=None, W=None):
@@ -1375,7 +1117,6 @@ def get_ear_coords(image_pil, face_mesh):
 
 
 def init_mediapipe_models():
-    import mediapipe as mp
 
     if not hasattr(init_mediapipe_models, "_initialized"):
 
@@ -1424,7 +1165,6 @@ def get_clavicules_coords(image_pil, pose_model, face_mesh, H=None, W=None):
     Détecte les clavicules avec Pose (prioritaire) + fallback FaceMesh.
     Version optimisée tracking (aucune re-init).
     """
-    import numpy as np
 
     image = np.array(image_pil.convert("RGB"))
     h, w, _ = image.shape
@@ -1506,72 +1246,6 @@ def get_clavicules_coords(image_pil, pose_model, face_mesh, H=None, W=None):
     return None
 
 
-def get_shoulders_coords_safe_1(image_pil, H=None, W=None):
-    """
-    Détecte les coordonnées des épaules de manière sécurisée.
-    Renvoie None si aucun visage n'est détecté ou en cas d'erreur.
-    """
-    try:
-        coords = get_shoulders_coords(image_pil)
-        if coords is None:
-            print("⚠️ Aucun visage détecté ou épaules non détectées")
-            return None
-        print(f"🦾 Shoulders detected: {coords}")
-        return coords
-    except Exception as e:
-        print(f"[Shoulder detection ERROR] {e}")
-        return None
-
-
-def get_shoulders_coords_1(image_pil):
-    """
-    Détecte les coordonnées approximatives des épaules avec MediaPipe FaceMesh.
-
-    Args:
-        image_pil (PIL.Image): image d'entrée
-
-    Returns:
-        list[(x, y)]: gauche et droite des épaules en coordonnées image
-    """
-
-
-    mp_pose = mp.solutions.pose
-    mp_face_mesh = mp.solutions.face_mesh
-
-    image = np.array(image_pil.convert("RGB"))
-    h, w, _ = image.shape
-
-    # Utiliser MediaPipe Pose pour les épaules si disponible
-    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
-        results = pose.process(image)
-        if results.pose_landmarks:
-            # Indices MediaPipe Pose pour les épaules
-            LEFT_SHOULDER = 11
-            RIGHT_SHOULDER = 12
-            left = results.pose_landmarks.landmark[LEFT_SHOULDER]
-            right = results.pose_landmarks.landmark[RIGHT_SHOULDER]
-            left_coords = (int(left.x * w), int(left.y * h))
-            right_coords = (int(right.x * w), int(right.y * h))
-            return [left_coords, right_coords]
-
-    # Sinon fallback approximatif sur le visage avec FaceMesh
-    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) as face_mesh:
-        results = face_mesh.process(image)
-        if not results.multi_face_landmarks:
-            return None
-        face_landmarks = results.multi_face_landmarks[0]
-
-        # Indices approximatifs pour les coins de la mâchoire (proche épaules)
-        LEFT_JAW = 234  # côté gauche du visage
-        RIGHT_JAW = 454  # côté droit du visage
-
-        def get_coords(idx):
-            lm = face_landmarks.landmark[idx]
-            return int(lm.x * w), int(lm.y * h)
-
-        left_coords = get_coords(LEFT_JAW)
-        right_coords = get_coords(RIGHT_JAW)
-        return [left_coords, right_coords]
 
 def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=0.25, blur_kernel=5):
     """
@@ -1714,7 +1388,7 @@ def apply_glow_froid_iris(latents, eye_coords, iris_radius_ratio=0.08, strength=
 
 
 
-import matplotlib.pyplot as plt
+
 #----------- Rendu HD ------------------------------
 # version optimized
 #--------------------------------------------------
@@ -1761,7 +1435,7 @@ def apply_pro_net_volumetrique(
     # 3️⃣ Volume (relief global, sans bruit)
     volume = (latents_prot - smooth) * volume_strength
 
-    # 4️⃣ Ombres (important pour effet 3D anime)
+    # 4️⃣ Ombres (effet 3D anime)
     shadows = torch.relu(smooth - latents_prot) * shadow_strength
 
     # 5️⃣ Lumière douce (jamais cramée)
@@ -1896,7 +1570,6 @@ def apply_pro_net_volumetrique_high(
     latents_out = latents_3D.clamp(-1.0,1.0)
 
     if debug:
-        import matplotlib.pyplot as plt
         plt.figure(figsize=(12,4))
         plt.subplot(1,3,1); plt.imshow(latents_prot[0,0].detach().cpu(), cmap='gray'); plt.title("ProNet")
         plt.subplot(1,3,2); plt.imshow(high_freq[0,0].detach().cpu(), cmap='gray'); plt.title("High-Freq / Relief")
@@ -1985,7 +1658,6 @@ def apply_pro_net_volumetrique_natural(
     latents_out = latents_out.clamp(-1.0,1.0)
 
     if debug:
-        import matplotlib.pyplot as plt
         plt.figure(figsize=(12,4))
         plt.subplot(1,3,1); plt.imshow(latents_prot[0,0].detach().cpu(), cmap='gray'); plt.title("ProNet")
         plt.subplot(1,3,2); plt.imshow(high_freq[0,0].detach().cpu(), cmap='gray'); plt.title("High-Freq")
@@ -2079,7 +1751,6 @@ def apply_pro_net_volumetrique_clean(
 
     # 8️⃣ Debug
     if debug:
-        import matplotlib.pyplot as plt
         plt.figure(figsize=(12,4))
         plt.subplot(1,3,1); plt.imshow(latents_prot[0,0].detach().cpu(), cmap='gray'); plt.title("ProNet")
         plt.subplot(1,3,2); plt.imshow(high_freq[0,0].detach().cpu(), cmap='gray'); plt.title("High-Freq")
@@ -2162,7 +1833,6 @@ def apply_pro_net_volumetrique_ice(
 
     # 6️⃣ Debug
     if debug:
-        import matplotlib.pyplot as plt
         plt.figure(figsize=(12,4))
         plt.subplot(1,3,1); plt.imshow(latents_prot[0,0].detach().cpu(), cmap='gray'); plt.title("ProNet")
         plt.subplot(1,3,2); plt.imshow(high_freq[0,0].detach().cpu(), cmap='gray'); plt.title("High-Freq")
@@ -2242,7 +1912,6 @@ def apply_pro_net_volumetrique_glow(
 
     # 6️⃣ Debug
     if debug:
-        import matplotlib.pyplot as plt
         plt.figure(figsize=(12,4))
         plt.subplot(1,3,1); plt.imshow(latents_prot[0,0].detach().cpu(), cmap='gray'); plt.title("ProNet")
         plt.subplot(1,3,2); plt.imshow(high_freq[0,0].detach().cpu(), cmap='gray'); plt.title("High-Freq")
@@ -2458,7 +2127,7 @@ def apply_pro_net_with_eyes_v2(
     iris_effect = torch.tanh(iris_effect * 2.0) * 0.5
 
     # =========================================================
-    # 🔹 6. Detail preservation (important for eyes realism)
+    # 🔹 6. Detail preservation (eyes realism)
     # =========================================================
     high_freq = latents_base - smooth
     iris_effect = (
@@ -2528,7 +2197,6 @@ def apply_pro_net_with_eyes(
     preserve_detail=0.5         # 🔥 nouveau
 ):
 
-    import torch.nn.functional as F
 
     B, C, H, W = latents.shape
     device, dtype = latents.device, latents.dtype
@@ -2675,7 +2343,7 @@ def apply_pro_net_with_eyes_boost(
 
     iris_mask = iris_mask.clamp(0,1)
 
-    # 3️⃣ Flou très large → style anime (hyper important)
+    # 3️⃣ Flou très large → style anime
     if mask_blur_kernel > 1:
         iris_mask = F.avg_pool2d(
             iris_mask,
@@ -2774,7 +2442,7 @@ def apply_pro_net_with_mouth(
     details = torch.tanh(details * 2.0) * 0.5
 
     # =========================================================
-    # 🔹 4. GATE ADAPTATIF (super important)
+    # 🔹 4. GATE ADAPTATIF
     # =========================================================
     detail_energy = details.abs().mean(dim=1, keepdim=True)
     gate = torch.sigmoid(detail_energy * 10.0)  # focus zones utiles
@@ -3228,8 +2896,7 @@ def tensor_to_pil(tensor):
     return to_pil_image(tensor.cpu())
 
 try:
-    import mediapipe as mp
-    from mediapipe.python.solutions import face_mesh as mp_face_mesh
+
     MP_FACE_MESH = mp_face_mesh
 except Exception:
     MP_FACE_MESH = None
@@ -3296,9 +2963,6 @@ def get_coords(image):
 # --------------------------------------------------
 # 🔥 Création mask yeux (latents)
 # --------------------------------------------------
-
-import matplotlib.pyplot as plt
-
 
 def create_volumetrique_mask(latents, coords, radius_ratio=0.15, only=False, in_radius_ratio=0.08, debug=False):
     """
@@ -3469,9 +3133,6 @@ optimizer_style = torch.optim.Adam(
     weight_decay=weight_decay
 )
 
-import torch
-import torch.nn.functional as F
-import os
 
 def apply_style_injection(
     latents,
@@ -3552,8 +3213,8 @@ def apply_style_injection(
     # =====================================================
     # ADAPTIVE TEMPORAL BLENDING (REMPLACE EMA BRUTE)
     # =====================================================
-    if ema_prev_latents is not None:
-
+    if ema_prev_latents is not None and new_image == False:
+        print(f"🔥 [apply_style_injection] EMA.")
         if ema_prev_latents.device != stylized_latents.device:
             ema_prev_latents = ema_prev_latents.to(stylized_latents.device)
         # -------------------------------------------------
@@ -3565,16 +3226,6 @@ def apply_style_injection(
         # -------------------------------------------------
         # NEW IMAGE HANDLING (doit être traité AVANT motion)
         # -------------------------------------------------
-        """"
-        if new_image:
-            print("🟢 démarrer propre (reset latents + EMA)")
-
-            stylized_latents = latents.clone()
-            ema_prev_latents = latents.clone()
-
-            # skip blending cette frame
-            return stylized_latents
-        """
 
         # alpha adaptatif :
         # - peu de mouvement → plus stable
@@ -3618,6 +3269,7 @@ def apply_temporal_consistency(
     optimizer=None,
     criterion=None,
     train=False,
+    new_image=False,
     frame_counter=0,
     max_epochs_up=10,
     model_path="models/temporal_latest.pt",
@@ -3924,7 +3576,8 @@ def apply_temporal_consistency(
     # EMA SMOOTHING
     # =====================================================
 
-    if ema_prev_latents is not None:
+    if ema_prev_latents is not None and new_image == False:
+        print(f"🔥 [Temporal] EMA.")
 
         if ema_prev_latents.device != temporal_latents.device:
 
@@ -3971,7 +3624,6 @@ def apply_temporal_consistency(
 # “Video diffusion system with controllable temporal motion + adaptive denoising + prompt-driven stylistic rendering”
 # ton style model doit être un “injecteur léger”, pas un second générateur
 # ************************************************************************************************************************
-from collections import deque
 
 class EMADeltaRebound:
     """
@@ -4291,7 +3943,9 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     if new_image:
         print(f"🔥 [decode_latents_ultrasafe] Nouvelle image. réinitialisation de ema_prev_latents.")
-        ema_prev_latents = None   # IMPORTANT: reset total
+        raw_latents = latents.clone()
+        ema_prev_latents = raw_latents.clone()
+        latents_out = raw_latents.clone()
 
 
     if denoise and ema_prev_latents is not None:
@@ -4328,15 +3982,20 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
         # Temporal class
         latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
-        train=True, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
+        train=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
 
 
     # -------------------------
     # UPDATE EMA (CRUCIAL)
     # -------------------------
-    if train == False: # On traite l'EMA uniquement dans le cas on est pas en train'
+    if train == False and ema_prev_latents is not None: # On traite l'EMA uniquement dans le cas on est pas en train'
+        print(f"🔥 [decode_latents_ultrasafe] EMA.")
         ema_prev_latents = get_ema_style_prev(latents, train_on_image, ema_prev_latents=ema_prev_latents, debug=True)
         ema_prev_latents = update_ema( latents, ema_prev_latents, alpha=0.5, device=device )
+    else:
+        print(f"🔥 [decode_latents_ultrasafe] EMA None .")
+        print(f"[decode_latents_ultrasafe]video → using train {train} 🔥 → using new_image {new_image} 🔥")
+        ema_prev_latents = None
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
@@ -4433,7 +4092,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # ---------------- Conversion PIL ----------------
     frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
-    return frames[0] if B == 1 else frames
+    return frames[0] if B == 1 else frames, ema_prev_latents
 
 
 
@@ -5528,67 +5187,6 @@ def kelvin_to_rgb(temp):
         max(0, min(255, g)) / 255.0,
         max(0, min(255, b)) / 255.0
     )
-
-def adjust_color_temperature_v1(
-    image,
-    target_temp=7800,
-    reference_temp=6500,
-    strength=0.5,
-    adaptive=True,
-    max_gain=2.0,
-    debug=False
-):
-    import numpy as np
-
-    img = np.array(image).astype(np.float32) / 255.0
-
-    # --- 1. Gains température (comme ton code)
-    r1, g1, b1 = kelvin_to_rgb(reference_temp)
-    r2, g2, b2 = kelvin_to_rgb(target_temp)
-
-    base_gain = np.array([
-        r2 / r1,
-        g2 / g1,
-        b2 / b1
-    ])
-
-    # --- 2. Estimation rapide du WB actuel (gray-world simplifié)
-    if adaptive:
-        mean_rgb = img.reshape(-1, 3).mean(axis=0)
-        mean_rgb = np.maximum(mean_rgb, 1e-6)
-
-        # normalisation sur G
-        wb_ratio = mean_rgb / mean_rgb[1]
-
-        # mesure du déséquilibre
-        imbalance = np.std(wb_ratio)
-
-        # facteur adaptatif doux (évite overcorrection)
-        adaptive_factor = 1.0 + min(1.0, imbalance * 2.0)
-    else:
-        adaptive_factor = 1.0
-
-    # --- 3. Interpolation (ta logique conservée 💡)
-    final_gain = (1 - strength) + strength * base_gain * adaptive_factor
-
-    # --- 4. Clamp sécurité (très important en pratique)
-    final_gain = np.clip(final_gain, 1 / max_gain, max_gain)
-
-    # --- 5. Application
-    img *= final_gain
-
-    img = np.clip(img, 0, 1)
-
-    if debug:
-        print("=== DEBUG TEMP ===")
-        print(f"mean_rgb: {mean_rgb if adaptive else 'disabled'}")
-        print(f"base_gain: {base_gain}")
-        print(f"adaptive_factor: {adaptive_factor}")
-        print(f"final_gain: {final_gain}")
-        print("==================")
-
-    return Image.fromarray((img * 255).astype(np.uint8))
-
 
 
 from PIL import Image

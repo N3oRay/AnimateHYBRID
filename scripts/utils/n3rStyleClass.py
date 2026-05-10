@@ -1,6 +1,5 @@
 import os
 import datetime
-
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -214,12 +213,165 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         return x + self.block(x)
+# =========================================================
+# CHANNEL ATTENTION (VRAM SAFE)
+# =========================================================
+class ChannelAttention(nn.Module):
+    """
+    Attention légère sur les canaux, VRAM-friendly.
+    """
 
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.SiLU(),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        x: (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        y = self.avg_pool(x).view(B, C)       # (B, C)
+        y = self.fc(y).view(B, C, 1, 1)       # (B, C, 1, 1)
+        return x * y
+
+
+# =========================================================
+# STYLE INJECTOR AVEC ATTENTION CANAUX
+# =========================================================
+class StyleInjector(nn.Module):
+    """
+    Injecteur de style latent avec option attention VRAM-friendly.
+    """
+
+    def __init__(
+        self,
+        latent_channels=4,
+        hidden=64,
+        num_blocks=4,
+        prompt_dim=768,
+        use_attention=True,   # <-- option pour activer/désactiver
+    ):
+        super().__init__()
+
+        self.config = {
+            "latent_channels": latent_channels,
+            "hidden": hidden,
+            "num_blocks": num_blocks,
+            "prompt_dim": prompt_dim,
+            "use_attention": use_attention
+        }
+
+        self.latent_channels = latent_channels
+        self.hidden = hidden
+        self.prompt_dim = prompt_dim
+        self.num_blocks = num_blocks
+        self.use_attention = use_attention
+
+        # =====================================================
+        # Prompt projection
+        # =====================================================
+        self.prompt_proj = nn.Sequential(
+            nn.Linear(prompt_dim, hidden),
+            nn.SiLU()
+        )
+
+        # =====================================================
+        # Input projection
+        # =====================================================
+        self.input_proj = nn.Sequential(
+            nn.Conv2d(
+                latent_channels + hidden,
+                hidden,
+                kernel_size=3,
+                padding=1
+            ),
+            nn.GroupNorm(8, hidden),
+            nn.SiLU()
+        )
+
+        # =====================================================
+        # Attention canaux optionnelle
+        # =====================================================
+        if self.use_attention:
+            self.attn = ChannelAttention(hidden)
+
+        # =====================================================
+        # Residual backbone
+        # =====================================================
+        self.resblocks = nn.Sequential(
+            *[ResidualBlock(hidden) for _ in range(num_blocks)]
+        )
+
+        # =====================================================
+        # Output projection
+        # =====================================================
+        self.output_proj = nn.Sequential(
+            nn.GroupNorm(8, hidden),
+            nn.SiLU(),
+            nn.Conv2d(
+                hidden,
+                latent_channels,
+                kernel_size=3,
+                padding=1
+            )
+        )
+
+    def forward(self, latents, style_prompt_embedding):
+        """
+        Args:
+            latents: (B, C, H, W)
+            style_prompt_embedding: (B, prompt_dim)
+        Returns:
+            latents stylisés
+        """
+        B, C, H, W = latents.shape
+
+        # -----------------------------------------------------
+        # Prompt -> feature map
+        # -----------------------------------------------------
+        style_feat = self.prompt_proj(style_prompt_embedding)
+        style_feat = style_feat.view(B, self.hidden, 1, 1)
+        style_feat = style_feat.expand(-1, -1, H, W)
+
+        # -----------------------------------------------------
+        # Concat latent + style
+        # -----------------------------------------------------
+        x = torch.cat([latents, style_feat], dim=1)
+
+        # -----------------------------------------------------
+        # Input projection
+        # -----------------------------------------------------
+        x = self.input_proj(x)
+
+        # -----------------------------------------------------
+        # Attention canaux optionnelle
+        # -----------------------------------------------------
+        if self.use_attention:
+            x = self.attn(x)
+
+        # -----------------------------------------------------
+        # Backbone résiduel
+        # -----------------------------------------------------
+        x = self.resblocks(x)
+
+        # -----------------------------------------------------
+        # Output projection + injection résiduelle
+        # -----------------------------------------------------
+        delta = self.output_proj(x)
+        out_latents = latents + delta
+
+        return out_latents
 # =========================================================
 # STYLE INJECTOR
 # =========================================================
 
-class StyleInjector(nn.Module):
+class StyleInjector_v1(nn.Module):
     """
     Injecteur de style latent.
     """
