@@ -3787,55 +3787,65 @@ def apply_denoising(
     model_exists = os.path.exists(model_path)
 
     # ----- Entraînement -----
-    #if train and frame_counter % 2 == 0:
     if train:
         print(f"Mode Denoise - Entraînement dynamique")
         denoising_model.train()
         denoising_model.to("cuda")
 
+        # Ajustement du nombre d'epochs selon bruit
         if is_noisy:
-            if frame_counter==0:
-                # Apprentissage normal pour la frame init
+            if frame_counter == 0:
                 max_epochs = max_epochs_up
             else:
-                # On augmente l'apprentissage en cas de pics !'
-                max_epochs = max_epochs_up +20
+                max_epochs = max_epochs_up + 20
         else:
             min_epochs = 1
-            max_epochs_cap = max_epochs_up  # pour éviter des epochs trop longues
-            # max_epochs (int): Nombre d'epochs pour l'entraînement.
+            max_epochs_cap = max_epochs_up
             max_epochs = int(min_epochs + (max_epochs_cap - min_epochs) * noise_level / 2.0)
 
-        if max_epochs ==1:
-            # Ne pas entrainé dans ce cas ! 🔥
-            train=False
+        if max_epochs == 1:
+            # Pas d'entraînement si très peu d'epochs
+            train = False
 
+        # Activation du gradient
         for param in denoising_model.parameters():
             param.requires_grad = True
-        """
-        Trainning !
-        """
 
-        with torch.enable_grad():
-            print(f"[AUTOCLAVE] grad enabled = {torch.is_grad_enabled()}")
-            denoising_model, latents_out, loss = train_denoiser(
-                                                    latents=latents_train,
-                                                    model=denoising_model,
-                                                    optimizer=optimizer,
-                                                    criterion=criterion,
-                                                    max_epochs=max_epochs,
-                                                    device="cuda"
-                                                )
+        # Early stop threshold (à ajuster selon ton dataset)
+        early_stop_threshold = 0.23
+
+        epoch = 0  # <-- initialisation
+        loss = None
+        latents_out = latents_train.clone()  # valeur par défaut : rien n'est modifié
+
+        if train:
+            for epoch in range(max_epochs):
+                optimizer.zero_grad()
+                with torch.enable_grad():
+                    latents_out = denoising_model(latents_train)
+                    loss = criterion(latents_out, latents_train)
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(denoising_model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                print(f"[DENoise] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}")
+
+                # 🔥 Early stop
+                if loss.item() < early_stop_threshold:
+                    print(f"🟢 Early stop triggered at epoch {epoch+1} (loss={loss.item():.4f})")
+                    break
 
         save_denoising_model(
             denoising_model,
             optimizer=optimizer,
-            epoch=max_epochs,
+            epoch=epoch + 1,  # pour refléter la dernière epoch réelle
             loss=loss.item() if loss is not None else 0.0
         )
 
     # ----- Évaluation / Chargement -----
     else:
+        latents_out = latents_train.clone()  # valeur par défaut : rien n'est modifié
         print(f"Mode simple - Denoise sans Entraînement")
         if model_exists:
             denoising_model, checkpoint = load_denoising_model(
@@ -3965,6 +3975,16 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     # =====================================================
     # MODEL AND TRAINNIG
     # =====================================================
+
+    #Rendu perceptuel (ce qui manque)
+
+    #C’est là que vivent :
+
+    #lighting
+    #volumetrics
+    #cinematic feel
+    #texture richness
+    #atmospheric depth
 
 
     if denoise and ema_prev_latents is not None:
