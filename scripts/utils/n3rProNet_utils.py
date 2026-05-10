@@ -3930,16 +3930,34 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     vae.eval()  # pas besoin de caster tout le VAE
     B, C, H, W = latents.shape
 
-    latents_out = latents.clone()
-    raw_latents = latents_out
+    # 1. Cloner les latents pour traitement
+    raw_latents = latents.clone()
+    latents_out = raw_latents.clone()
 
+    # 2. NEW_IMAGE reset
+    if new_image:
+        print("🔥 NEW IMAGE RESET EMA")
+        ema_prev_latents = raw_latents.clone().to(device).detach()
+
+    # 3. EMA / Scene Change
+    if ema_prev_latents is not None:
+        ema_prev_latents = ema_prev_latents.to(device)
+        scene_delta = (raw_latents - ema_prev_latents).abs().mean().item()
+        is_scene_change = scene_delta > 0.45
+        if is_scene_change:
+            print(f"🟠 Scene change (delta={scene_delta:.4f}) → EMA RESET")
+            ema_prev_latents = raw_latents.clone().to(device).detach()
+    else:
+        is_scene_change = False
+
+    # 4. Calcul motion_noise
     low = F.avg_pool2d(raw_latents, 3, 1, 1)
     high_freq = raw_latents - low
-
     motion_noise = high_freq.abs().mean() / (raw_latents.abs().mean() + 1e-6)
 
-    if ema_prev_latents is None:
-        ema_prev_latents = latents_out
+    # =====================================================
+    # MODEL AND TRAINNIG
+    # =====================================================
 
     if new_image:
         print(f"🔥 [decode_latents_ultrasafe] Nouvelle image. réinitialisation de ema_prev_latents.")
@@ -3950,7 +3968,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     if denoise and ema_prev_latents is not None:
         # Créer un latents indépendant pour l'entraînement
-        latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=True, frame_counter=frame_counter,
+        latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=train, frame_counter=frame_counter,
                             max_epochs_up=10, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
 
     if style_injection and ema_prev_latents is not None:
@@ -3966,7 +3984,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
                 style_model=style_model,
                 optimizer=optimizer_style,  # optionnel si fine-tuning dynamique
                 criterion=criterion_style,  # StyleLoss
-                train=True,  # si tu veux fine-tuner à la volée
+                train=train,  # si tu veux fine-tuner à la volée
                 new_image=new_image,
                 frame_counter=frame_counter,
                 max_epochs_up=5,
@@ -3982,20 +4000,23 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
         # Temporal class
         latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
-        train=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
+        train=train, new_image=new_image, frame_counter=frame_counter, max_epochs_up=10, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
 
 
     # -------------------------
     # UPDATE EMA (CRUCIAL)
     # -------------------------
-    if train == False and ema_prev_latents is not None: # On traite l'EMA uniquement dans le cas on est pas en train'
-        print(f"🔥 [decode_latents_ultrasafe] EMA.")
-        ema_prev_latents = get_ema_style_prev(latents, train_on_image, ema_prev_latents=ema_prev_latents, debug=True)
-        ema_prev_latents = update_ema( latents, ema_prev_latents, alpha=0.5, device=device )
+
+    # 6. EMA update
+    if ema_prev_latents is not None and not train:
+        alpha = 0.5 * (1.0 - motion_noise)
+        print(f"🔥 [decode_latents_ultrasafe] EMA update, alpha={alpha:.3f}")
+        ema_prev_latents = get_ema_style_prev(latents, train_on_image, ema_prev_latents=ema_prev_latents, debug=debug)
+        ema_prev_latents = update_ema(latents, ema_prev_latents, alpha=alpha, device=device)
     else:
         print(f"🔥 [decode_latents_ultrasafe] EMA None .")
         print(f"[decode_latents_ultrasafe]video → using train {train} 🔥 → using new_image {new_image} 🔥")
-        ema_prev_latents = None
+
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
@@ -4092,6 +4113,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # ---------------- Conversion PIL ----------------
     frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
+
     return frames[0] if B == 1 else frames, ema_prev_latents
 
 
