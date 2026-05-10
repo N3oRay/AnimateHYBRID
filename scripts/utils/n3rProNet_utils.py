@@ -4,6 +4,8 @@ from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
 from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, save_denoising_model, load_denoising_model, debug_tensor, train_denoiser
 from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_model, weights_temporal_init
 from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_model
+from .n3rApparenceModel import  apply_appearance, appearance_model
+
 from torch.optim import Adam
 import torch
 import math
@@ -3917,9 +3919,6 @@ def get_ema_style_prev(latents, train_on_image, ema_prev_latents=None, debug=Fal
         print("[StyleEMA] video → fallback to latents 🔥")
     return latents
 
-
-
-
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
     block_size=32, overlap=16,
@@ -3936,6 +3935,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     denoise=True,
     temporal_consistency=True,
     style_injection=True,
+    appearance=False,
     pos_embeds_list=None,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
     train_on_image=True,
@@ -3985,6 +3985,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     #cinematic feel
     #texture richness
     #atmospheric depth
+    # 🔥 Appearance model (créativité visuelle)
 
 
     if denoise and ema_prev_latents is not None:
@@ -4038,6 +4039,10 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     else:
         print(f"🔥 [decode_latents_ultrasafe] EMA None .")
         print(f"[decode_latents_ultrasafe]video → using train {train} 🔥 → using new_image {new_image} 🔥")
+
+    # New Fonction : in DEV
+    if appearance:
+        latents = apply_appearance(latents, appearance_model, strength=0.1, debug=True)
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
