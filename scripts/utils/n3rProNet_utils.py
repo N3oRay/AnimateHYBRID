@@ -3959,12 +3959,6 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     # MODEL AND TRAINNIG
     # =====================================================
 
-    if new_image:
-        print(f"🔥 [decode_latents_ultrasafe] Nouvelle image. réinitialisation de ema_prev_latents.")
-        raw_latents = latents.clone()
-        ema_prev_latents = raw_latents.clone()
-        latents_out = raw_latents.clone()
-
 
     if denoise and ema_prev_latents is not None:
         # Créer un latents indépendant pour l'entraînement
@@ -4009,7 +4003,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # 6. EMA update
     if ema_prev_latents is not None and not train:
-        alpha = 0.5 * (1.0 - motion_noise)
+        alpha = 0.02 + 0.10 * (1.0 - motion_noise)
+        alpha = float(torch.clamp(torch.tensor(alpha), 0.02, 0.12))
         print(f"🔥 [decode_latents_ultrasafe] EMA update, alpha={alpha:.3f}")
         ema_prev_latents = get_ema_style_prev(latents, train_on_image, ema_prev_latents=ema_prev_latents, debug=debug)
         ema_prev_latents = update_ema(latents, ema_prev_latents, alpha=alpha, device=device)
