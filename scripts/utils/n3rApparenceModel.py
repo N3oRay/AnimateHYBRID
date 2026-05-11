@@ -337,8 +337,6 @@ def apply_appearance(
             )
 
 
-    if ema_prev_latents is not None and not new_image:
-        x = 0.15 * x + 0.85 * ema_prev_latents
     # =====================================================
     # INFERENCE
     # =====================================================
@@ -346,12 +344,18 @@ def apply_appearance(
 
         pred = appearance_model(x, style_prompt_embedding)
 
-        exposure = 0.15 * torch.tanh(pred["exposure"])
-        gamma    = 0.10 * torch.tanh(pred["gamma"])
-        contrast = 0.12 * torch.tanh(pred["contrast"])
-        micro    = 0.08 * torch.tanh(pred["micro"])
+        exposure = torch.tanh(pred["exposure"])
+        gamma = torch.tanh(pred["gamma"])
+        contrast = torch.tanh(pred["contrast"])
+        micro = torch.tanh(pred["micro"])
 
-        print(f"[Appearance V2] exposure={exposure} | gamma={gamma} | contrast={contrast} | micro={micro}")
+        print(
+            f"[Appearance V2] "
+            f"exp={exposure.mean().item():.4f} | "
+            f"gamma={gamma.mean().item():.4f} | "
+            f"contrast={contrast.mean().item():.4f} | "
+            f"micro={micro.mean().item():.4f}"
+        )
 
         out = x
 
@@ -376,6 +380,7 @@ def apply_appearance(
     # =====================================================
     # EMA
     # =====================================================
+
     if ema_prev_latents is not None and not new_image:
 
         alpha = ema_alpha * (1.0 - 0.2 * hf.mean())
@@ -383,7 +388,7 @@ def apply_appearance(
 
         out = alpha * out + (1.0 - alpha) * ema_prev_latents
 
-    return torch.clamp(out, -3.0, 3.0)
+    return out
 
 
 
