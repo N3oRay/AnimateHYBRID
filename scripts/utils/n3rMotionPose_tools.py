@@ -833,8 +833,8 @@ def apply_breathing_soft(
     mask_torso,
     frame_counter,
     breathing=True,
-    amplitude=1.0,
-    heartbeat_strength=0.25,
+    amplitude=2.0,
+    heartbeat_strength=0.6,
     inertia=0.85,
     face_sync=0.35,
     debug=False,
@@ -852,13 +852,12 @@ def apply_breathing_soft(
     t = frame_counter * 0.1
 
     # respiration (slow)
-    breath = amplitude * 0.05 * (
+    breath = amplitude * 0.18 * (
         0.65 * math.sin(t) +
         0.35 * math.sin(t * 0.5 + 1.7)
     )
-
     # heartbeat (fast micro jitter)
-    heartbeat = heartbeat_strength * 0.01 * math.sin(t * 6.0)
+    heartbeat = heartbeat_strength * 0.06 * math.sin(t * 6.0)
 
     # combined chest signal
     chest_signal = breath + heartbeat
@@ -992,9 +991,9 @@ def apply_breathing_real(
     mask_torso,
     frame_counter,
     breathing=True,
-    amplitude=2.0,
-    asymmetry=0.08,   # 🔥 micro naturel gauche/droite
-    vertical_bias=0.15, # 🔥 respiration légèrement plus verticale
+    amplitude=4.5,
+    asymmetry=0.12,   # 🔥 micro naturel gauche/droite
+    vertical_bias=0.20, # 🔥 respiration légèrement plus verticale
     debug=False,
     debug_dir=None,
 ):
@@ -1111,7 +1110,7 @@ def apply_breathing_simple_anime(
     mask_torso,
     frame_counter,
     breathing=True,
-    amplitude=1.2, # 1.5
+    amplitude=1.5, # 1.5
     debug=False,
     debug_dir=None,
 ):

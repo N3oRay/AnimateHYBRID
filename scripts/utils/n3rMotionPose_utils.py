@@ -2258,9 +2258,9 @@ def should_freeze(frame_idx, frame_pause):
 
 def get_breathing_mode(frame_counter, freeze):
     if freeze:
-        return "soft", 0.7
+        return "soft", 0.9
     else:
-        return "real", 1.0
+        return "real", 1.2
 
 
 def time_sin(frame_counter, freq=2.0, device="cuda"):

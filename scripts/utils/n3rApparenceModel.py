@@ -287,16 +287,22 @@ def apply_appearance(
                 #loss = F.l1_loss(out, x0) + 0.01 * out.pow(2).mean()
                 # preserve identity
                 #loss_id = F.l1_loss(out, x0) #
-                loss_id = 0.15 * F.l1_loss(out, x0)
+                #loss_id = 0.15 * F.l1_loss(out, x0)
+                loss_id = 0.08 * F.l1_loss(out, x0)
 
 
                 # encourage local contrast
                 detail_out = out - F.avg_pool2d(out, 3, 1, 1)
                 detail_in  = x0 - F.avg_pool2d(x0, 3, 1, 1)
-
+                """
                 loss_detail = -0.15 * (
                     detail_out.abs().mean()
                     - detail_in.abs().mean()
+                )
+                """
+                loss_detail = 0.05 * F.l1_loss(
+                    compute_high_freq_energy(out),
+                    compute_high_freq_energy(x0)
                 )
 
                 # prevent explosion

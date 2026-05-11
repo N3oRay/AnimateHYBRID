@@ -3541,9 +3541,7 @@ def apply_temporal_consistency(
     # =====================================================
 
     pred_next = torch.tanh(pred_next)
-
     pred_next = pred_next.clamp(-1.0, 1.0)
-
     pred_next = sanitize_latents(pred_next)
 
     # =====================================================
@@ -3864,9 +3862,9 @@ def apply_denoising(
     if isinstance(latents_out, tuple):
         latents_out = latents_out[0]
 
-    # 🔹 Limiter les valeurs extrêmes et sanitize
-    latents_out = torch.tanh(latents_out).clamp(-1.0, 1.0)
-    latents_out = sanitize_latents(latents_out)
+    # 🔹 Limiter les valeurs extrêmes et sanitize il n'est utils ici'
+    #latents_out = torch.tanh(latents_out).clamp(-1.0, 1.0)
+    #latents_out = sanitize_latents(latents_out)
 
     # 🔹 Injection douce adaptative
     if loss is not None:
@@ -3924,7 +3922,7 @@ stage	          rôle
 Denoise	          nettoyer image brute
 Temporal	      stabiliser vidéo
 Style	          définir identité
-Appearance	      éclairage / finition render
+Appearance	      éclairage / finition render (appearance = correction photométrique + micro-contrast + tone mapping) -> Appearance (photometric refinement ONLY)
 """
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
@@ -3946,7 +3944,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     pos_embeds_list=None,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
     train_on_image=True,
-    max_epochs_up=5,
+    max_epochs_up=10,
     ema_prev_latents=None,
     debug=False
 ):
@@ -3978,7 +3976,10 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     low = F.avg_pool2d(raw_latents, 3, 1, 1)
     high_freq = raw_latents - low
     motion_noise = high_freq.abs().mean() / (raw_latents.abs().mean() + 1e-6)
-
+    print(f"🔥 [decode_latents_ultrasafe] motion_noise={motion_noise:.3f}")
+    ema_alpha = 0.001 + 0.005 * (1.0 - motion_noise)
+    ema_alpha = ema_alpha.clamp(0.005, 0.01)
+    print(f"🔥 [decode_latents_ultrasafe] EMA ema_alpha={ema_alpha:.3f}")
     # =====================================================
     # MODEL AND TRAINNIG
     # =====================================================
@@ -4020,16 +4021,14 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
                 model_path="models/style_injector_latest.pt",
                 debug=True,
                 ema_prev_latents=ema_prev_latents,
-                ema_alpha=0.2
-                #ema_alpha=0.2 + 0.3 * motion_noise  # tu peux adapter la force EMA
+                ema_alpha=ema_alpha #ema_alpha=0.2 + 0.3 * motion_noise  # tu peux adapter la force EMA
         )
 
 
     if temporal_consistency and ema_prev_latents is not None:
 
-        # Temporal class
         latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
-        train=train, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = 0.2 + 0.3 * motion_noise)
+        train=train, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = ema_alpha)
 
 
     # -------------------------
@@ -4038,8 +4037,10 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # 6. EMA update
     if ema_prev_latents is not None and not train:
-        alpha = 0.02 + 0.10 * (1.0 - motion_noise)
-        alpha = float(torch.clamp(torch.tensor(alpha), 0.02, 0.12))
+        #alpha = 0.01 + 0.05 * (1.0 - motion_noise)
+        #alpha = float(torch.clamp(torch.tensor(alpha), 0.02, 0.18))
+        alpha = 0.03 + 0.12 * (motion_noise)
+        alpha = float(torch.clamp(torch.tensor(alpha), 0.03, 0.25))
         print(f"🔥 [decode_latents_ultrasafe] EMA update, alpha={alpha:.3f}")
         ema_prev_latents = get_ema_style_prev(latents, train_on_image, ema_prev_latents=ema_prev_latents, debug=debug)
         ema_prev_latents = update_ema(latents, ema_prev_latents, alpha=alpha, device=device)
@@ -4049,11 +4050,9 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # New Fonction : in DEV
     if appearance:
-        #latents = apply_appearance_simple(latents, appearance_model, strength=0.1, debug=True)
-
         latents = apply_appearance(
             latents=latents,
-            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=train, device="cuda", strength=0.1, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=0.3)
+            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=train, device="cuda", strength=0.1, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
