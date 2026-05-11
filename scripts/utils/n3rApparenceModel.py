@@ -201,7 +201,7 @@ appearance_model = AppearanceModel().cuda()
 
 optimizer_apparence = optim.AdamW(
     appearance_model.parameters(),
-    lr=1e-4,
+    lr=5e-4,
     betas=(0.9, 0.99),
     weight_decay=1e-5
 )
@@ -222,7 +222,7 @@ def apply_appearance(
     strength=0.1,
     device="cuda",
     frame_counter=0,
-    max_epochs_up=3,
+    max_epochs_up=12,
     model_path="models/appearance_model_latest.pt",
     ema_prev_latents=None,
     ema_alpha=0.3,
@@ -286,14 +286,18 @@ def apply_appearance(
                 # loss
                 #loss = F.l1_loss(out, x0) + 0.01 * out.pow(2).mean()
                 # preserve identity
-                loss_id = F.l1_loss(out, x0) # loss_id = 0.15 * F.l1_loss(out, x0)
+                #loss_id = F.l1_loss(out, x0) #
+                loss_id = 0.15 * F.l1_loss(out, x0)
 
 
                 # encourage local contrast
-                sharp_out = compute_high_freq_energy(out).mean()
-                sharp_in  = compute_high_freq_energy(x0).mean()
+                detail_out = out - F.avg_pool2d(out, 3, 1, 1)
+                detail_in  = x0 - F.avg_pool2d(x0, 3, 1, 1)
 
-                loss_detail = -0.05 * (sharp_out - sharp_in)
+                loss_detail = -0.15 * (
+                    detail_out.abs().mean()
+                    - detail_in.abs().mean()
+                )
 
                 # prevent explosion
                 loss_energy = 0.005 * out.pow(2).mean()
@@ -343,7 +347,7 @@ def apply_appearance(
         exposure = 0.25 * torch.tanh(pred["exposure"])
         gamma    = 0.15 * torch.tanh(pred["gamma"])
         contrast = 0.20 * torch.tanh(pred["contrast"])
-        micro    = 0.10 * torch.tanh(pred["micro"])
+        micro    = 0.35 * torch.tanh(pred["micro"])
 
         print(
             f"[Appearance V2] "
