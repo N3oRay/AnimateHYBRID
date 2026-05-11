@@ -77,6 +77,8 @@ def stabilize_latents(latents, target_std=1.0):
 # SAVE / LOAD
 # =========================================================
 
+
+
 def save_appearance_model(
     model,
     optimizer=None,
@@ -173,6 +175,7 @@ appearance_model = AppearanceModel().cuda()
 # =========================================================
 # APPLY FUNCTION
 # =========================================================
+
 def apply_appearance(
     latents,
     appearance_model,
@@ -180,16 +183,6 @@ def apply_appearance(
     device="cuda",
     debug=False
 ):
-    """
-    Injection esthétique stable pour latents vidéo.
-
-    Objectifs :
-    - zéro dérive couleur (brun/orange supprimé)
-    - stabilité temporelle
-    - pas de saturation progressive
-    - injection contrôlée adaptative
-    """
-
     appearance_model.to(device).eval()
     latents = latents.to(device)
 
@@ -200,90 +193,54 @@ def apply_appearance(
         # =========================================================
         delta = appearance_model(latents)
 
-        # =========================================================
-        # 2. NEUTRALISATION COULEUR (CRUCIAL)
-        # =========================================================
-
-        # suppression biais spatial global
-        delta = delta - delta.mean(dim=(2, 3), keepdim=True)
-
-        # suppression biais inter-canaux (anti "warm tint")
+        # neutralité couleur minimale
         delta = delta - delta.mean(dim=1, keepdim=True)
 
         # =========================================================
-        # 3. NETTOYAGE HAUTES FRÉQUENCES
+        # 2. NORMALISATION LÉGÈRE (PAS DE WHITENING)
         # =========================================================
-
-        blur = F.avg_pool2d(delta, kernel_size=3, stride=1, padding=1)
-        delta = delta - blur
-
-        # =========================================================
-        # 4. NORMALISATION ÉNERGIE STABLE
-        # =========================================================
-
-        delta_std = delta.std(dim=(2, 3), keepdim=True)
-        delta = delta / (delta_std + 1e-6)
-
-        # amplitude contrôlée (important pour éviter saturation)
-        delta = delta * 0.01
+        delta = delta / (delta.std(dim=(1,2,3), keepdim=True) + 1e-6)
+        delta = delta * 0.02
 
         # =========================================================
-        # 5. STRENGTH DYNAMIQUE (ANTI SUR-EXCITATION)
+        # 3. STRENGTH DYNAMIQUE
         # =========================================================
-
         hf = compute_high_freq_energy(latents)
 
-        k = 1.5
-        dynamic_strength = strength * torch.exp(-k * hf)
-
-        dynamic_strength = torch.clamp(
-            dynamic_strength,
-            min=0.005,
-            max=strength
-        )
+        dynamic_strength = strength * torch.exp(-1.2 * hf)
+        dynamic_strength = torch.clamp(dynamic_strength, 0.01, strength)
 
         # =========================================================
-        # 6. INJECTION
+        # 4. INJECTION
         # =========================================================
-
         out = latents + dynamic_strength * delta
 
-        # clamp doux (évite explosion sans détruire distribution)
-        out = torch.clamp(out, -4.0, 4.0)
+        # =========================================================
+        # 5. CORRECTION GAMMA-SAFE (IMPORTANT)
+        # =========================================================
 
-        # stabilisation finale (non destructive)
-        latents = stabilize_latents(out)
+        # on préserve la moyenne originale
+        orig_mean = latents.mean(dim=(2,3), keepdim=True)
 
-    # =========================================================
-    # DEBUG
-    # =========================================================
+        out_mean = out.mean(dim=(2,3), keepdim=True)
+
+        out = out - (out_mean - orig_mean)
+
+        # clamp doux (évite explosion sans écraser dynamique)
+        out = torch.clamp(out, -3.0, 3.0)
+
+        # stabilisation douce (évite gamma shift)
+        latents = stabilize_latents(out, target_std=latents.std(dim=(2,3), keepdim=True).mean())
+
     if debug:
         print(
             f"[Appearance] "
             f"delta_std={delta.std().item():.4f} | "
-            f"hf={hf.mean().item():.4f} | "
-            f"strength={dynamic_strength.mean().item():.4f}"
+            f"hf={hf.mean().item():.4f}"
         )
 
     return latents
 
 
-def apply_appearance_simple(latents, appearance_model, strength=0.1, device="cuda", debug=False):
-    appearance_model.to(device).eval()
-    latents = latents.to(device)
 
-    with torch.no_grad():
-        delta = appearance_model(latents)
-        # centrer par canal
-        delta = delta - delta.mean(dim=(2,3), keepdim=True)
-        # high-pass pour ne garder que les détails fins
-        delta = delta - F.avg_pool2d(delta, kernel_size=3, stride=1, padding=1)
 
-    out = latents + strength * delta
-    out = torch.clamp(out, -1.0, 1.0)
-    latents = sanitize_latents(out).to(device)
-
-    if debug:
-        print(f"[Appearance] delta_std={delta.std().item():.4f} | strength={strength}")
-
-    return latents
