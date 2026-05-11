@@ -7,7 +7,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
 
-
 # =========================================================
 # Compute high freq
 # =========================================================
@@ -199,26 +198,7 @@ class AppearanceModel(nn.Module):
 # instance par défaut pour ton pipeline
 appearance_model = AppearanceModel().cuda()
 
-# séparer scale (très lent) et reste du réseau
-"""
-scale_params = []
-other_params = []
 
-for name, p in appearance_model.named_parameters():
-    if "scale" in name:
-        scale_params.append(p)
-    else:
-        other_params.append(p)
-
-optimizer_apparence = optim.AdamW(
-    [
-        {"params": other_params, "lr": 1e-4},
-        {"params": scale_params, "lr": 3e-5},  # très stable, très lent
-    ],
-    betas=(0.9, 0.99),
-    weight_decay=1e-5
-)
-"""
 optimizer_apparence = optim.AdamW(
     appearance_model.parameters(),
     lr=1e-4,
