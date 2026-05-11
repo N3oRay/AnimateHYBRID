@@ -3935,7 +3935,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     denoise=True,
     temporal_consistency=True,
     style_injection=True,
-    appearance=False,
+    appearance=True,
     pos_embeds_list=None,
     train=True,                       # Paramètre ajouté pour gérer l'entraînement
     train_on_image=True,

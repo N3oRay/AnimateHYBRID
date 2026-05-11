@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import datetime
+from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
 
 
 # =========================================================
@@ -90,7 +91,7 @@ class AppearanceModel(nn.Module):
         )
 
         # contrôle global (important pour éviter explosion esthétique)
-        self.scale = nn.Parameter(torch.tensor(0.05))
+        self.scale = nn.Parameter(torch.tensor(0.01)) # 0.01 ou 0.005
 
     def forward(self, x):
         h = self.encoder(x)
@@ -102,24 +103,6 @@ class AppearanceModel(nn.Module):
 # instance par défaut pour ton pipeline
 appearance_model = AppearanceModel().cuda()
 
-# =========================================================
-# LATENT SANITIZE
-# =========================================================
-
-def sanitize_latents(latents):
-    """
-    Normalisation par sample.
-    """
-
-    latents = latents.float()
-
-    mean = latents.mean(dim=(1, 2, 3), keepdim=True)
-    std = latents.std(dim=(1, 2, 3), keepdim=True)
-
-    latents = (latents - mean) / (std + 1e-6)
-    latents = latents.clamp(-4.0, 4.0)
-
-    return latents
 
 # =========================================================
 # APPLY FUNCTION
@@ -134,29 +117,32 @@ def apply_appearance(latents, appearance_model, strength=0.1, device="cuda", deb
     latents = latents.to(device)
 
     with torch.no_grad():
+
         delta = appearance_model(latents)
 
-        # --- 1️⃣ centrer par canal ---
-        delta = delta - delta.mean(dim=(2, 3), keepdim=True)
+        # centrer par canal
+        delta = delta - delta.mean(dim=(2,3), keepdim=True)
 
-        # --- 2️⃣ high-pass : garder seulement les détails fins ---
-        delta = delta - F.avg_pool2d(delta, kernel_size=3, stride=1, padding=1)
+        # high-pass
+        blur = F.avg_pool2d(delta, 3, stride=1, padding=1)
+        delta = delta - blur
 
-        # --- 3️⃣ ajustement automatique de la force ---
-        # limiter la std du delta pour qu'elle reste proportionnelle à strength
-        delta_std = delta.std(dim=(1,2,3), keepdim=True)
-        max_std = 0.1  # valeur sécurisée pour ne pas saturer
-        scale_factor = torch.clamp(max_std / (delta_std + 1e-6), max=1.0)
+        # contrôle énergie PAR CANAL
+        delta_std = delta.std(dim=(2,3), keepdim=True)
+
+        max_std = 0.03
+
+        scale_factor = torch.clamp(
+            max_std / (delta_std + 1e-6),
+            max=1.0
+        )
+
         delta = delta * scale_factor
 
-    # injection résiduelle contrôlée
     out = latents + strength * delta
 
-    # bornage
-    out = torch.clamp(out, -1.0, 1.0)
-
-    # sanitize pour stabiliser la distribution des latents
-    latents = sanitize_latents(out).to(device)
+    # surtout PAS de tanh ici
+    out = torch.clamp(out, -4.0, 4.0)
 
     if debug:
         print(f"[Appearance AUTO] delta_std={delta.std().item():.4f} | strength={strength}")
