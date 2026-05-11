@@ -3919,6 +3919,13 @@ def get_ema_style_prev(latents, train_on_image, ema_prev_latents=None, debug=Fal
         print("[StyleEMA] video → fallback to latents 🔥")
     return latents
 
+"""
+stage	          rôle
+Denoise	          nettoyer image brute
+Temporal	      stabiliser vidéo
+Style	          définir identité
+Appearance	      éclairage / finition render
+"""
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
     block_size=32, overlap=16,
@@ -3975,6 +3982,10 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     # =====================================================
     # MODEL AND TRAINNIG
     # =====================================================
+    style_prompt_embedding = torch.randn(B, prompt_dim, device=device, dtype=latents.dtype)
+    # Exemple avec le premier prompt positif
+    if pos_embeds_list is not None:
+        style_prompt_embedding = pos_embeds_list[0].to(device).to(dtype=latents.dtype)  # forme [B, prompt_dim]
 
     #Rendu perceptuel (ce qui manque)
 
@@ -3994,10 +4005,6 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
                             max_epochs_up=max_epochs_up, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
 
     if style_injection and ema_prev_latents is not None:
-        style_prompt_embedding = torch.randn(B, prompt_dim, device=device, dtype=latents.dtype)
-        # Exemple avec le premier prompt positif
-        if pos_embeds_list is not None:
-            style_prompt_embedding = pos_embeds_list[0].to(device).to(dtype=latents.dtype)  # forme [B, prompt_dim]
 
         # Appliquer le StyleInjector
         latents = apply_style_injection(
@@ -4044,7 +4051,9 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     if appearance:
         #latents = apply_appearance_simple(latents, appearance_model, strength=0.1, debug=True)
 
-        latents = apply_appearance( latents, appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=train, device="cuda", strength=0.1, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=0.3 )
+        latents = apply_appearance(
+            latents=latents,
+            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=train, device="cuda", strength=0.1, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=0.3)
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
