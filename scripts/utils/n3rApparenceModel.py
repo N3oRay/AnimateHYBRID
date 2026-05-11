@@ -4,8 +4,74 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import datetime
-from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
+from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
 
+
+
+
+def compute_high_freq_energy(
+    latents,
+    kernel_size=3,
+    normalize=True,
+    per_channel=False
+):
+    """
+    Mesure l'énergie haute fréquence des latents.
+
+    Args:
+        latents: Tensor [B,C,H,W]
+        kernel_size: taille du blur
+        normalize: normalise par l'énergie globale
+        per_channel: retourne une mesure par canal
+
+    Returns:
+        Tensor shape:
+            [B]              si per_channel=False
+            [B,C]            si per_channel=True
+    """
+
+    latents = latents.float()
+
+    # blur basse fréquence
+    blur = F.avg_pool2d(
+        latents,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2
+    )
+
+    # composante haute fréquence
+    high_freq = latents - blur
+
+    # énergie RMS
+    hf_energy = torch.sqrt(
+        high_freq.pow(2).mean(dim=(2, 3)) + 1e-8
+    )
+
+    if normalize:
+        base_energy = torch.sqrt(
+            latents.pow(2).mean(dim=(2, 3)) + 1e-8
+        )
+
+        hf_energy = hf_energy / (base_energy + 1e-6)
+
+    if per_channel:
+        return hf_energy
+
+    # moyenne sur canaux
+    return hf_energy.mean(dim=1)
+
+def stabilize_latents(latents, target_std=1.0):
+
+    current_std = latents.std(dim=(1,2,3), keepdim=True)
+
+    scale = target_std / (current_std + 1e-6)
+
+    scale = torch.clamp(scale, 0.7, 1.3)
+
+    latents = latents * scale
+
+    return latents
 
 # =========================================================
 # SAVE / LOAD
@@ -107,10 +173,21 @@ appearance_model = AppearanceModel().cuda()
 # =========================================================
 # APPLY FUNCTION
 # =========================================================
-def apply_appearance(latents, appearance_model, strength=0.1, device="cuda", debug=False):
+def apply_appearance(
+    latents,
+    appearance_model,
+    strength=0.1,
+    device="cuda",
+    debug=False
+):
     """
-    Injection esthétique contrôlée avec stabilisation automatique.
-    Évite toute teinte globale ou dérive de couleur.
+    Injection esthétique stable pour latents vidéo.
+
+    Objectifs :
+    - zéro dérive couleur (brun/orange supprimé)
+    - stabilité temporelle
+    - pas de saturation progressive
+    - injection contrôlée adaptative
     """
 
     appearance_model.to(device).eval()
@@ -118,34 +195,75 @@ def apply_appearance(latents, appearance_model, strength=0.1, device="cuda", deb
 
     with torch.no_grad():
 
+        # =========================================================
+        # 1. DELTA BRUT
+        # =========================================================
         delta = appearance_model(latents)
 
-        # centrer par canal
-        delta = delta - delta.mean(dim=(2,3), keepdim=True)
+        # =========================================================
+        # 2. NEUTRALISATION COULEUR (CRUCIAL)
+        # =========================================================
 
-        # high-pass
-        blur = F.avg_pool2d(delta, 3, stride=1, padding=1)
+        # suppression biais spatial global
+        delta = delta - delta.mean(dim=(2, 3), keepdim=True)
+
+        # suppression biais inter-canaux (anti "warm tint")
+        delta = delta - delta.mean(dim=1, keepdim=True)
+
+        # =========================================================
+        # 3. NETTOYAGE HAUTES FRÉQUENCES
+        # =========================================================
+
+        blur = F.avg_pool2d(delta, kernel_size=3, stride=1, padding=1)
         delta = delta - blur
 
-        # contrôle énergie PAR CANAL
-        delta_std = delta.std(dim=(2,3), keepdim=True)
+        # =========================================================
+        # 4. NORMALISATION ÉNERGIE STABLE
+        # =========================================================
 
-        max_std = 0.03
+        delta_std = delta.std(dim=(2, 3), keepdim=True)
+        delta = delta / (delta_std + 1e-6)
 
-        scale_factor = torch.clamp(
-            max_std / (delta_std + 1e-6),
-            max=1.0
+        # amplitude contrôlée (important pour éviter saturation)
+        delta = delta * 0.01
+
+        # =========================================================
+        # 5. STRENGTH DYNAMIQUE (ANTI SUR-EXCITATION)
+        # =========================================================
+
+        hf = compute_high_freq_energy(latents)
+
+        k = 1.5
+        dynamic_strength = strength * torch.exp(-k * hf)
+
+        dynamic_strength = torch.clamp(
+            dynamic_strength,
+            min=0.005,
+            max=strength
         )
 
-        delta = delta * scale_factor
+        # =========================================================
+        # 6. INJECTION
+        # =========================================================
 
-    out = latents + strength * delta
+        out = latents + dynamic_strength * delta
 
-    # surtout PAS de tanh ici
-    out = torch.clamp(out, -4.0, 4.0)
+        # clamp doux (évite explosion sans détruire distribution)
+        out = torch.clamp(out, -4.0, 4.0)
 
+        # stabilisation finale (non destructive)
+        latents = stabilize_latents(out)
+
+    # =========================================================
+    # DEBUG
+    # =========================================================
     if debug:
-        print(f"[Appearance AUTO] delta_std={delta.std().item():.4f} | strength={strength}")
+        print(
+            f"[Appearance] "
+            f"delta_std={delta.std().item():.4f} | "
+            f"hf={hf.mean().item():.4f} | "
+            f"strength={dynamic_strength.mean().item():.4f}"
+        )
 
     return latents
 
