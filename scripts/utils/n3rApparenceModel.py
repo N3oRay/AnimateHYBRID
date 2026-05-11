@@ -162,11 +162,15 @@ class AppearanceModel(nn.Module):
         # contrôle global (important pour éviter explosion esthétique)
         self.scale = nn.Parameter(torch.tensor(0.01)) # 0.01 ou 0.005
 
-    def forward(self, x):
+    def forward(self, x, use_scale=True):
         h = self.encoder(x)
         delta = self.decoder(h)
-        delta = torch.tanh(delta)  # bornage esthétique
-        return self.scale * delta
+        delta = torch.tanh(delta)
+
+        if use_scale:
+            return self.scale * delta
+        else:
+            return delta
 
 
 # instance par défaut pour ton pipeline
@@ -188,9 +192,7 @@ criterion_apparence = torch.nn.MSELoss()
 # =========================================================
 # APPLY FUNCTION
 # =========================================================
-import torch
-import torch.nn.functional as F
-import os
+
 
 
 def apply_appearance(
@@ -231,13 +233,13 @@ def apply_appearance(
     latents = latents.to(device)
 
     # =====================================================
-    # FEATURE ANALYSIS (style complexity)
+    # FEATURE ANALYSIS
     # =====================================================
     latents_fp = latents.float()
 
     hf = compute_high_freq_energy(latents_fp)
 
-    texture_complexity = hf  # simple but stable proxy
+    texture_complexity = hf
 
     print(f"[Appearance] hf={hf.mean().item():.4f}")
 
@@ -245,7 +247,6 @@ def apply_appearance(
     # PREP LATENTS
     # =====================================================
     latents_train = latents.clone().detach()
-    latents_train.requires_grad_(False)
 
     model_exists = os.path.exists(model_path)
 
@@ -259,7 +260,7 @@ def apply_appearance(
         appearance_model.train()
 
         # -------------------------------------------------
-        # DYNAMIC EPOCHS (like temporal)
+        # DYNAMIC EPOCHS
         # -------------------------------------------------
         if frame_counter == 0:
             max_epochs = max_epochs_up
@@ -287,17 +288,16 @@ def apply_appearance(
 
             with torch.enable_grad():
 
-                delta = appearance_model(latents_train)
+                # 🔥 FIX 1 : pas de scale interne en training
+                delta = appearance_model(latents_train, use_scale=False)
 
-                # anti global drift (safe)
+                # stabilisation légère (OK)
                 delta = delta - delta.mean(dim=(2,3), keepdim=True)
 
-                # prediction
-                pred = latents_train + strength * delta
+                # 🔥 FIX 2 : target correct (résidu réel)
+                target_delta = (latents - latents_train)
 
-                target = latents
-
-                loss = criterion(pred, target)
+                loss = criterion(delta, target_delta)
 
             loss.backward()
 
@@ -314,7 +314,7 @@ def apply_appearance(
             )
 
             if debug:
-                print(f"[Appearance DEBUG] pred_std={pred.std().item():.4f}")
+                print(f"[Appearance DEBUG] delta_std={delta.std().item():.4f}")
 
         # -------------------------------------------------
         # SAVE MODEL
@@ -351,20 +351,13 @@ def apply_appearance(
     # =====================================================
     with torch.no_grad():
 
-        delta = appearance_model(latents)
-
-        # -------------------------------------------------
-        # STABLE NORMALIZATION (non destructive)
-        # -------------------------------------------------
-        delta = delta - delta.mean(dim=(2,3), keepdim=True)
-
-        delta_std = delta.std(dim=(2,3), keepdim=True)
-        delta = delta / (delta_std + 1e-6)
+        # 🔥 FIX 3 : pas de normalization destructive
+        delta = appearance_model(latents, use_scale=True)
 
         delta = torch.tanh(delta)
 
     # =====================================================
-    # DYNAMIC STRENGTH (HF aware)
+    # DYNAMIC STRENGTH
     # =====================================================
     hf = compute_high_freq_energy(latents)
 
@@ -381,7 +374,7 @@ def apply_appearance(
     # =====================================================
     # INJECTION
     # =====================================================
-    out = latents + dynamic_strength * appearance_model.scale * delta
+    out = latents + dynamic_strength * delta
 
     # =====================================================
     # EMA SMOOTHING
