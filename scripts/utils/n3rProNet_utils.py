@@ -2,8 +2,8 @@
 #-------------------------------------------------------------------------------
 from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
 from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, save_denoising_model, load_denoising_model, debug_tensor, train_denoiser
-from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_model, weights_temporal_init
-from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_model
+from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_model, weights_temporal_init, load_temporal_model
+from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_model, load_style_model
 from .n3rApparenceModel import  apply_appearance, appearance_model, optimizer_apparence, criterion_apparence
 
 from torch.optim import Adam
@@ -3942,10 +3942,12 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     style_injection=True,
     appearance=True,
     pos_embeds_list=None,
-    train=True,                       # Paramètre ajouté pour gérer l'entraînement
+    train=False,                       # Paramètre ajouté pour gérer l'entraînement
     train_on_image=True,
     max_epochs_up=10,
     ema_prev_latents=None,
+    ema_global=None,
+    ema_micro=None,
     debug=False
 ):
 
@@ -4037,16 +4039,45 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # 6. EMA update
     if ema_prev_latents is not None and not train:
-        #alpha = 0.01 + 0.05 * (1.0 - motion_noise)
-        #alpha = float(torch.clamp(torch.tensor(alpha), 0.02, 0.18))
-        alpha = 0.03 + 0.12 * (motion_noise)
-        alpha = float(torch.clamp(torch.tensor(alpha), 0.03, 0.25))
-        print(f"🔥 [decode_latents_ultrasafe] EMA update, alpha={alpha:.3f}")
-        ema_prev_latents = get_ema_style_prev(latents, train_on_image, ema_prev_latents=ema_prev_latents, debug=debug)
-        ema_prev_latents = update_ema(latents, ema_prev_latents, alpha=alpha, device=device)
+
+        # -------------------------
+        # motion-adaptive split
+        # -------------------------
+        alpha_global = 0.02 + 0.06 * motion_noise
+        alpha_global = float(torch.clamp(torch.tensor(alpha_global), 0.02, 0.08))
+
+        alpha_micro = 0.10 + 0.25 * (1.0 - motion_noise)
+        alpha_micro = float(torch.clamp(torch.tensor(alpha_micro), 0.10, 0.35))
+
+        print(f"🔥 EMA global={alpha_global:.3f} | micro={alpha_micro:.3f}")
+
+        # -------------------------
+        # frequency split
+        # -------------------------
+        global_component = F.avg_pool2d(latents, kernel_size=5, stride=1, padding=2)
+        micro_component  = latents - global_component
+
+        # -------------------------
+        # init safety (VERY IMPORTANT)
+        # -------------------------
+        if ema_global is None:
+            ema_global = global_component.clone()
+        if ema_micro is None:
+            ema_micro = micro_component.clone()
+
+        # -------------------------
+        # EMA updates
+        # -------------------------
+        ema_global = alpha_global * global_component + (1.0 - alpha_global) * ema_global
+        ema_micro  = alpha_micro  * micro_component  + (1.0 - alpha_micro)  * ema_micro
+
+        # -------------------------
+        # recombination
+        # -------------------------
+        ema_prev_latents = ema_global + ema_micro
+
     else:
-        print(f"🔥 [decode_latents_ultrasafe] EMA None .")
-        print(f"[decode_latents_ultrasafe]video → using train {train} 🔥 → using new_image {new_image} 🔥")
+        print(f"🔥 [decode_latents_ultrasafe] EMA None")
 
     # New Fonction : in DEV
     if appearance:

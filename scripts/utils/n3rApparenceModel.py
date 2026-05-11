@@ -7,6 +7,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
 
+# ===============================================================================
+# pipeline de rendu temporel + style + régularisation perceptuelle + feedback EMA
+# ===============================================================================
+
 # =========================================================
 # Compute high freq
 # =========================================================
@@ -284,10 +288,6 @@ def apply_appearance(
                 out = out + torch.tanh(micro) * detail
 
                 # loss
-                #loss = F.l1_loss(out, x0) + 0.01 * out.pow(2).mean()
-                # preserve identity
-                #loss_id = F.l1_loss(out, x0) #
-                #loss_id = 0.15 * F.l1_loss(out, x0)
                 loss_id = 0.08 * F.l1_loss(out, x0)
 
 
@@ -295,10 +295,7 @@ def apply_appearance(
                 detail_out = out - F.avg_pool2d(out, 3, 1, 1)
                 detail_in  = x0 - F.avg_pool2d(x0, 3, 1, 1)
                 """
-                loss_detail = -0.15 * (
-                    detail_out.abs().mean()
-                    - detail_in.abs().mean()
-                )
+                loss_detail
                 """
                 loss_detail = 0.05 * F.l1_loss(
                     compute_high_freq_energy(out),
@@ -385,15 +382,37 @@ def apply_appearance(
     out = x + strength_map * (out - x)
 
     # =====================================================
-    # EMA
+    # EMA MULTI-BANDE (structure + détail)
     # =====================================================
 
-    if ema_prev_latents is not None and not new_image:
+    if ema_prev_latents is not None and not train:
 
-        alpha = ema_alpha * (1.0 - 0.2 * hf.mean())
-        alpha = alpha.clamp(0.05, 0.3)
+        prev = ema_prev_latents.to(out.device)
 
-        out = alpha * out + (1.0 - alpha) * ema_prev_latents
+        # --- split structure / detail ---
+        out_low  = F.avg_pool2d(out, 3, 1, 1)
+        prev_low = F.avg_pool2d(prev, 3, 1, 1)
+
+        out_high  = out - out_low
+        prev_high = prev - prev_low
+
+        # --- dynamic alphas ---
+        motion_factor = float(hf.mean().item())
+
+        alpha_low  = 0.08 + 0.10 * motion_factor   # structure stable
+        alpha_high = 0.35 + 0.25 * motion_factor   # détail plus libre
+
+        alpha_low  = float(torch.clamp(torch.tensor(alpha_low), 0.05, 0.18))
+        alpha_high = float(torch.clamp(torch.tensor(alpha_high), 0.25, 0.65))
+
+        # --- EMA structure (important) ---
+        low_ema = alpha_low * out_low + (1.0 - alpha_low) * prev_low
+
+        # --- EMA detail (léger, pour éviter flicker) ---
+        high_ema = alpha_high * out_high + (1.0 - alpha_high) * prev_high
+
+        # --- recomposition ---
+        out = low_ema + high_ema
 
     return out
 
