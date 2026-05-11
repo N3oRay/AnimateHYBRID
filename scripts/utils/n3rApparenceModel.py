@@ -8,7 +8,9 @@ import torch.optim as optim
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
 
 
-
+# =========================================================
+# Compute high freq
+# =========================================================
 
 def compute_high_freq_energy(latents, kernel_size=3, normalize=True, per_channel=False):
 
@@ -198,6 +200,7 @@ class AppearanceModel(nn.Module):
 appearance_model = AppearanceModel().cuda()
 
 # séparer scale (très lent) et reste du réseau
+"""
 scale_params = []
 other_params = []
 
@@ -212,6 +215,13 @@ optimizer_apparence = optim.AdamW(
         {"params": other_params, "lr": 1e-4},
         {"params": scale_params, "lr": 3e-5},  # très stable, très lent
     ],
+    betas=(0.9, 0.99),
+    weight_decay=1e-5
+)
+"""
+optimizer_apparence = optim.AdamW(
+    appearance_model.parameters(),
+    lr=1e-4,
     betas=(0.9, 0.99),
     weight_decay=1e-5
 )
@@ -326,6 +336,9 @@ def apply_appearance(
                 device=device
             )
 
+
+    if ema_prev_latents is not None and not new_image:
+        x = 0.15 * x + 0.85 * ema_prev_latents
     # =====================================================
     # INFERENCE
     # =====================================================
@@ -333,10 +346,12 @@ def apply_appearance(
 
         pred = appearance_model(x, style_prompt_embedding)
 
-        exposure = torch.tanh(pred["exposure"])
-        gamma    = torch.tanh(pred["gamma"])
-        contrast = torch.tanh(pred["contrast"])
-        micro    = torch.tanh(pred["micro"])
+        exposure = 0.15 * torch.tanh(pred["exposure"])
+        gamma    = 0.10 * torch.tanh(pred["gamma"])
+        contrast = 0.12 * torch.tanh(pred["contrast"])
+        micro    = 0.08 * torch.tanh(pred["micro"])
+
+        print(f"[Appearance V2] exposure={exposure} | gamma={gamma} | contrast={contrast} | micro={micro}")
 
         out = x
 
