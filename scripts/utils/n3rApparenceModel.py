@@ -279,10 +279,26 @@ def apply_appearance(
                 out = (out - m) * (1.0 + torch.tanh(contrast)) + m
 
                 # micro
-                out = out + 0.05 * torch.tanh(micro)
+                #out = out + 0.05 * torch.tanh(micro)
+                detail = out - F.avg_pool2d(out, 3, 1, 1)
+                out = out + torch.tanh(micro) * detail
 
                 # loss
-                loss = F.l1_loss(out, x0) + 0.01 * out.pow(2).mean()
+                #loss = F.l1_loss(out, x0) + 0.01 * out.pow(2).mean()
+                # preserve identity
+                loss_id = F.l1_loss(out, x0) # loss_id = 0.15 * F.l1_loss(out, x0)
+
+
+                # encourage local contrast
+                sharp_out = compute_high_freq_energy(out).mean()
+                sharp_in  = compute_high_freq_energy(x0).mean()
+
+                loss_detail = -0.05 * (sharp_out - sharp_in)
+
+                # prevent explosion
+                loss_energy = 0.005 * out.pow(2).mean()
+
+                loss = loss_id + loss_energy + loss_detail
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(appearance_model.parameters(), 1.0)
@@ -324,10 +340,10 @@ def apply_appearance(
 
         pred = appearance_model(x, style_prompt_embedding)
 
-        exposure = torch.tanh(pred["exposure"])
-        gamma = torch.tanh(pred["gamma"])
-        contrast = torch.tanh(pred["contrast"])
-        micro = torch.tanh(pred["micro"])
+        exposure = 0.25 * torch.tanh(pred["exposure"])
+        gamma    = 0.15 * torch.tanh(pred["gamma"])
+        contrast = 0.20 * torch.tanh(pred["contrast"])
+        micro    = 0.10 * torch.tanh(pred["micro"])
 
         print(
             f"[Appearance V2] "
@@ -346,7 +362,8 @@ def apply_appearance(
         m = out.mean(dim=(2,3), keepdim=True)
         out = (out - m) * (1.0 + contrast) + m
 
-        out = out + 0.05 * micro
+        detail = out - F.avg_pool2d(out, 3, 1, 1)
+        out = out + micro * detail
 
     # =====================================================
     # STRENGTH
