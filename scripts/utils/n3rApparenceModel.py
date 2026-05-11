@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import datetime
+import torch.optim as optim
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
 
 
@@ -171,18 +172,268 @@ class AppearanceModel(nn.Module):
 # instance par défaut pour ton pipeline
 appearance_model = AppearanceModel().cuda()
 
+scale_params = [appearance_model.scale]
+other_params = [p for n, p in appearance_model.named_parameters() if n != "scale"]
+
+optimizer_apparence = optim.AdamW([
+    {"params": other_params, "lr": 1e-4},
+    {"params": scale_params, "lr": 5e-5}  # très important: plus lent
+],
+betas=(0.9, 0.99),
+weight_decay=1e-5)
+
+criterion_apparence = torch.nn.MSELoss()
+
 
 # =========================================================
 # APPLY FUNCTION
 # =========================================================
+import torch
+import torch.nn.functional as F
+import os
+
 
 def apply_appearance(
     latents,
     appearance_model,
+    optimizer=None,
+    criterion=None,
+    train=False,
+    device="cuda",
+    strength=0.1,
+    debug=False,
+    new_image=False,
+    frame_counter=0,
+    max_epochs_up=5,
+    model_path="models/appearance_model_latest.pt",
+    ema_prev_latents=None,
+    ema_alpha=0.3
+):
+    """
+    Appearance consistency system (temporal-style architecture)
+
+    Features:
+    - Train / Eval modes
+    - Dynamic training schedule
+    - EMA smoothing
+    - Residual latent injection
+    - Stable HF-aware modulation
+    """
+
+    # =====================================================
+    # DEVICE
+    # =====================================================
+    device = latents.device
+    appearance_model.to(device)
+
+    print(f"[Appearance] device={device}")
+
+    latents = latents.to(device)
+
+    # =====================================================
+    # FEATURE ANALYSIS (style complexity)
+    # =====================================================
+    latents_fp = latents.float()
+
+    hf = compute_high_freq_energy(latents_fp)
+
+    texture_complexity = hf  # simple but stable proxy
+
+    print(f"[Appearance] hf={hf.mean().item():.4f}")
+
+    # =====================================================
+    # PREP LATENTS
+    # =====================================================
+    latents_train = latents.clone().detach()
+    latents_train.requires_grad_(False)
+
+    model_exists = os.path.exists(model_path)
+
+    # =====================================================
+    # TRAIN MODE
+    # =====================================================
+    if train:
+
+        print("[Appearance] Dynamic training mode")
+
+        appearance_model.train()
+
+        # -------------------------------------------------
+        # DYNAMIC EPOCHS (like temporal)
+        # -------------------------------------------------
+        if frame_counter == 0:
+            max_epochs = max_epochs_up
+        else:
+            max_epochs = int(
+                max_epochs_up * (0.5 + 0.5 * texture_complexity.mean().item())
+            )
+
+        max_epochs = max(1, max_epochs)
+
+        print(f"[Appearance] max_epochs={max_epochs}")
+
+        # -------------------------------------------------
+        # ENABLE GRAD
+        # -------------------------------------------------
+        for p in appearance_model.parameters():
+            p.requires_grad = True
+
+        # -------------------------------------------------
+        # TRAIN LOOP
+        # -------------------------------------------------
+        for epoch in range(max_epochs):
+
+            optimizer.zero_grad()
+
+            with torch.enable_grad():
+
+                delta = appearance_model(latents_train)
+
+                # anti global drift (safe)
+                delta = delta - delta.mean(dim=(2,3), keepdim=True)
+
+                # prediction
+                pred = latents_train + strength * delta
+
+                target = latents
+
+                loss = criterion(pred, target)
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                appearance_model.parameters(),
+                max_norm=1.0
+            )
+
+            optimizer.step()
+
+            print(
+                f"[Appearance] Epoch [{epoch+1}/{max_epochs}] "
+                f"Loss={loss.item():.6f}"
+            )
+
+            if debug:
+                print(f"[Appearance DEBUG] pred_std={pred.std().item():.4f}")
+
+        # -------------------------------------------------
+        # SAVE MODEL
+        # -------------------------------------------------
+        save_appearance_model(
+            appearance_model,
+            optimizer=optimizer,
+            epoch=epoch + 1,
+            loss=loss.item(),
+            path=model_path
+        )
+
+    # =====================================================
+    # EVAL MODE
+    # =====================================================
+    else:
+
+        print("[Appearance] Eval mode")
+
+        if model_exists:
+            appearance_model, checkpoint = load_appearance_model(
+                type(appearance_model),
+                path=model_path,
+                optimizer=optimizer,
+                device=device
+            )
+        else:
+            print("[WARN] No appearance model found")
+
+        appearance_model.eval()
+
+    # =====================================================
+    # INFERENCE
+    # =====================================================
+    with torch.no_grad():
+
+        delta = appearance_model(latents)
+
+        # -------------------------------------------------
+        # STABLE NORMALIZATION (non destructive)
+        # -------------------------------------------------
+        delta = delta - delta.mean(dim=(2,3), keepdim=True)
+
+        delta_std = delta.std(dim=(2,3), keepdim=True)
+        delta = delta / (delta_std + 1e-6)
+
+        delta = torch.tanh(delta)
+
+    # =====================================================
+    # DYNAMIC STRENGTH (HF aware)
+    # =====================================================
+    hf = compute_high_freq_energy(latents)
+
+    dynamic_strength = strength / (1.0 + 1.5 * hf)
+
+    dynamic_strength = torch.clamp(
+        dynamic_strength,
+        min=0.02,
+        max=strength
+    )
+
+    print(f"[Appearance] strength={dynamic_strength.mean().item():.4f}")
+
+    # =====================================================
+    # INJECTION
+    # =====================================================
+    out = latents + dynamic_strength * appearance_model.scale * delta
+
+    # =====================================================
+    # EMA SMOOTHING
+    # =====================================================
+    if ema_prev_latents is not None and new_image is False:
+
+        print("[Appearance] EMA applied")
+
+        if ema_prev_latents.device != out.device:
+            ema_prev_latents = ema_prev_latents.to(out.device)
+
+        out = (
+            ema_alpha * out +
+            (1.0 - ema_alpha) * ema_prev_latents
+        )
+
+    # =====================================================
+    # FINAL SAFETY CLAMP
+    # =====================================================
+    out = torch.clamp(out, -3.0, 3.0)
+
+    # =====================================================
+    # DEBUG
+    # =====================================================
+    if debug:
+        print(
+            f"[Appearance FINAL] "
+            f"hf={hf.mean().item():.4f} | "
+            f"delta_std={delta.std().item():.4f}"
+        )
+
+    return out
+
+
+
+def apply_appearance_simple(
+    latents,
+    appearance_model,
     strength=0.1,
     device="cuda",
-    debug=False
+    debug=True
 ):
+    """
+    Stable appearance injection (diffusion-grade)
+
+    Principes :
+    - pas de re-normalisation globale
+    - pas de whitening destructif
+    - correction uniquement directionnelle
+    - conservation du manifold latent
+    """
+
     appearance_model.to(device).eval()
     latents = latents.to(device)
 
@@ -193,53 +444,64 @@ def apply_appearance(
         # =========================================================
         delta = appearance_model(latents)
 
-        # neutralité couleur minimale
+        # =========================================================
+        # 2. ANTI COLOR DRIFT (minimal, safe)
+        # =========================================================
+        # suppression biais couleur global uniquement
         delta = delta - delta.mean(dim=1, keepdim=True)
 
         # =========================================================
-        # 2. NORMALISATION LÉGÈRE (PAS DE WHITENING)
+        # 3. NORMALISATION "SOFT" (PAS DE WHITENING)
         # =========================================================
-        delta = delta / (delta.std(dim=(1,2,3), keepdim=True) + 1e-6)
-        delta = delta * 0.02
+        delta_std = delta.std(dim=(1,2,3), keepdim=True)
+
+        delta = delta / (delta_std + 1e-6)
+
+        # gain contrôlé (important pour préserver contraste)
+        delta = delta * 0.03
 
         # =========================================================
-        # 3. STRENGTH DYNAMIQUE
+        # 4. STRENGTH DYNAMIQUE STABLE
         # =========================================================
         hf = compute_high_freq_energy(latents)
 
-        dynamic_strength = strength * torch.exp(-1.2 * hf)
-        dynamic_strength = torch.clamp(dynamic_strength, 0.01, strength)
+        # courbe douce (évite instabilité exponentielle)
+        dynamic_strength = strength / (1.0 + 1.5 * hf)
+
+        dynamic_strength = torch.clamp(
+            dynamic_strength,
+            min=0.02,
+            max=strength
+        )
 
         # =========================================================
-        # 4. INJECTION
+        # 5. INJECTION (SANS POST-PROCESS GLOBAL)
         # =========================================================
         out = latents + dynamic_strength * delta
 
-        # =========================================================
-        # 5. CORRECTION GAMMA-SAFE (IMPORTANT)
-        # =========================================================
-
-        # on préserve la moyenne originale
-        orig_mean = latents.mean(dim=(2,3), keepdim=True)
-
-        out_mean = out.mean(dim=(2,3), keepdim=True)
-
-        out = out - (out_mean - orig_mean)
-
-        # clamp doux (évite explosion sans écraser dynamique)
+        # clamp léger uniquement pour sécurité numérique
         out = torch.clamp(out, -3.0, 3.0)
 
-        # stabilisation douce (évite gamma shift)
-        latents = stabilize_latents(out, target_std=latents.std(dim=(2,3), keepdim=True).mean())
+    # =========================================================
+    # 6. STABILISATION ULTRA LIGHT (OPTIONNEL)
+    # =========================================================
+    # uniquement si dérive longue durée
+    latents = out  # PAS de stabilize_latents ici
 
+    # =========================================================
+    # DEBUG
+    # =========================================================
     if debug:
         print(
-            f"[Appearance] "
+            f"[Appearance PRO] "
             f"delta_std={delta.std().item():.4f} | "
-            f"hf={hf.mean().item():.4f}"
+            f"hf={hf.mean().item():.4f} | "
+            f"strength={dynamic_strength.mean().item():.4f}"
         )
 
     return latents
+
+
 
 
 

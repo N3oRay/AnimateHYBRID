@@ -4,7 +4,7 @@ from .tools_utils import ensure_4_channels, sanitize_latents, log_debug
 from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criterion, show_latents, save_denoising_model, load_denoising_model, debug_tensor, train_denoiser
 from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_model, weights_temporal_init
 from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_model
-from .n3rApparenceModel import  apply_appearance, appearance_model
+from .n3rApparenceModel import  apply_appearance, appearance_model, optimizer_apparence, criterion_apparence
 
 from torch.optim import Adam
 import torch
@@ -4042,7 +4042,9 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # New Fonction : in DEV
     if appearance:
-        latents = apply_appearance(latents, appearance_model, strength=0.1, debug=True)
+        #latents = apply_appearance_simple(latents, appearance_model, strength=0.1, debug=True)
+
+        latents = apply_appearance( latents, appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=train, device="cuda", strength=0.1, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=0.3 )
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
