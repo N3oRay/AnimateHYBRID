@@ -3995,20 +3995,32 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     #Rendu perceptuel (ce qui manque)
 
     #C’est là que vivent :
-
-    #lighting
-    #volumetrics
-    #cinematic feel
-    #texture richness
-    #atmospheric depth
+    #lighting #volumetrics #cinematic feel #texture richness #atmospheric depth
     # 🔥 Appearance model (créativité visuelle)
 
-
+    # =====================================================
+    # 1. DENOISE (optionnel, propre input cleanup)
+    # =====================================================
     if denoise and ema_prev_latents is not None:
         # Créer un latents indépendant pour l'entraînement
         latents = apply_denoising( latents=latents_out, denoising_model=denoising_model, optimizer=optimizer, criterion=criterion, train=train, frame_counter=frame_counter,
                             max_epochs_up=max_epochs_up, model_path="models/denoise_latest.pt", debug=False, ema_prev_latents=ema_prev_latents)
 
+    # =====================================================
+    # 2. CREATIVE (STRUCTURE / TEXTURE / STOCHASTIC FIELD)
+    # =====================================================
+    # New Fonction : in DEV
+    if creative:
+        # ⚠️ IMPORTANT: creative DOIT être déterministe en inference
+        # train_creative = train and train_on_image
+        #structure / texture / chaos / rhythm injection de déformation latente agit comme un semantic + stochastic modulator
+        latents = apply_creative(
+            latents=latents,
+            style_prompt_embedding=style_prompt_embedding, creative_model=creative_model, optimizer=optimizer_creative, criterion=criterion_creative, train=True, device="cuda", strength=0.12, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/creative_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+
+    # =====================================================
+    # 3. STYLE INJECTION (OPTIONNEL middle layer)
+    # =====================================================
     if style_injection and ema_prev_latents is not None:
 
         # Appliquer le StyleInjector
@@ -4028,18 +4040,28 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
                 ema_alpha=ema_alpha #ema_alpha=0.2 + 0.3 * motion_noise  # tu peux adapter la force EMA
         )
 
+    # =====================================================
+    # 4. APPEARANCE (PHOTOMETRIC RENDERING LAYER)
+    # =====================================================
 
+    if appearance:
+        #photométrie contraste / gamma / exposure micro-structure visuelle agit comme un rendering layer
+        latents = apply_appearance(
+            latents=latents,
+            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=train, device="cuda", strength=0.1, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+
+
+    # =====================================================
+    # 5. TEMPORAL CONSISTENCY (OPTIONAL smoothing layer)
+    # =====================================================
     if temporal_consistency and ema_prev_latents is not None:
 
         latents = apply_temporal_consistency( prev_latents=ema_prev_latents, current_latents=latents, temporal_model=temporal_model, optimizer=optimizer_temporal, criterion=criterion_temporal,
         train=train, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/temporal_latest.pt", debug=False, ema_prev_latents=ema_prev_latents, ema_alpha = ema_alpha)
 
-
     # -------------------------
-    # UPDATE EMA (CRUCIAL)
+    # 6. UPDATE EMA (CRUCIAL)
     # -------------------------
-
-    # 6. EMA update
     if ema_prev_latents is not None and not train:
 
         # -------------------------
@@ -4080,17 +4102,6 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     else:
         print(f"🔥 [decode_latents_ultrasafe] EMA None")
-
-    # New Fonction : in DEV
-    if appearance:
-        latents = apply_appearance(
-            latents=latents,
-            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=train, device="cuda", strength=0.1, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
-
-    if creative:
-        latents = apply_creative(
-            latents=latents,
-            style_prompt_embedding=style_prompt_embedding, creative_model=creative_model, optimizer=optimizer_creative, criterion=criterion_creative, train=True, device="cuda", strength=0.12, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/creative_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
