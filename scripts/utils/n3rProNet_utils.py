@@ -6,6 +6,7 @@ from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_mod
 from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_model, load_style_model
 from .n3rApparenceModel import  apply_appearance, appearance_model, optimizer_apparence, criterion_apparence
 from .n3rCreativeModel import  apply_creative, creative_model, optimizer_creative, criterion_creative
+from .n3r_EMA import motion_aware_ema_fusion
 
 from torch.optim import Adam
 import torch

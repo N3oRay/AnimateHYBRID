@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import math
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
+from .n3r_EMA import motion_aware_ema_fusion, compute_high_freq_energy
 
 # =========================================================
 # Compute high freq
@@ -1345,75 +1346,11 @@ def apply_creative(
     # =====================================================
 
     if ema_prev_latents is not None and not train:
-
-        prev = ema_prev_latents.to(out.device)
-
-        out_low = F.avg_pool2d(
-            out,
-            3,
-            1,
-            1
-        )
-
-        prev_low = F.avg_pool2d(
-            prev,
-            3,
-            1,
-            1
-        )
-
-        out_high = out - out_low
-        prev_high = prev - prev_low
-
-        motion = float(
-            hf.mean().item()
-        )
-
-        alpha_low = min(
-            max(
-                0.05 + 0.05 * motion,
-                0.05
-            ),
-            0.12
-        )
-
-        alpha_high = min(
-            max(
-                0.20 + 0.10 * motion,
-                0.20
-            ),
-            0.40
-        )
-
-        # ================================================
-        # DETAIL PROTECTION
-        # ================================================
-
-        detail_mask = (
-            torch.abs(out_high) >
-            out_high.abs().mean(
-                dim=(2,3),
-                keepdim=True
-            )
-        ).float()
-
-        alpha_high = (
-            alpha_high *
-            (1.0 - 0.5 * detail_mask)
-        )
-
-        out = (
-            alpha_low * out_low +
-            (1 - alpha_low) * prev_low +
-
-            alpha_high * out_high +
-            (1 - alpha_high) * prev_high
-        )
-
-        print(
-            f"[Creative STABLE] "
-            f"EMA low={alpha_low:.4f} | "
-            f"EMA high={float(alpha_high.mean()):.4f}"
+        out = motion_aware_ema_fusion(
+            out=out,
+            ema_prev_latents=ema_prev_latents,
+            hf=hf,
+            debug=True
         )
 
     return out
@@ -1644,22 +1581,11 @@ def apply_creative_v1(
 
     if ema_prev_latents is not None and not train:
 
-        prev = ema_prev_latents.to(out.device)
-
-        out_low  = F.avg_pool2d(out, 3, 1, 1)
-        prev_low = F.avg_pool2d(prev, 3, 1, 1)
-
-        out_high  = out - out_low
-        prev_high = prev - prev_low
-
-        motion = float(hf.mean().item())
-
-        alpha_low  = min(max(0.05 + 0.05 * motion, 0.05), 0.12)
-        alpha_high = min(max(0.20 + 0.10 * motion, 0.20), 0.40)
-
-        out = (
-            alpha_low * out_low + (1 - alpha_low) * prev_low +
-            alpha_high * out_high + (1 - alpha_high) * prev_high
+        out = motion_aware_ema_fusion(
+            out=out,
+            ema_prev_latents=ema_prev_latents,
+            hf=hf,
+            debug=True
         )
 
     return out

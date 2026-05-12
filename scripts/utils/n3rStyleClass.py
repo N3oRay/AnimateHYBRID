@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
+from .n3r_EMA import motion_aware_ema_fusion, compute_high_freq_energy
 
 # =========================================================
 # DEVICE

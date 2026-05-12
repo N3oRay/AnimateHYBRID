@@ -6,38 +6,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
+from .n3r_EMA import motion_aware_ema_fusion, compute_high_freq_energy
+
 
 # ===============================================================================
 # pipeline de rendu temporel + style + régularisation perceptuelle + feedback EMA
 # ===============================================================================
 
-# =========================================================
-# Compute high freq
-# =========================================================
 
-def compute_high_freq_energy(latents, kernel_size=3, normalize=True, per_channel=False):
-
-    latents = latents.float()
-
-    blur = F.avg_pool2d(
-        latents,
-        kernel_size=kernel_size,
-        stride=1,
-        padding=kernel_size // 2
-    )
-
-    high_freq = latents - blur
-
-    hf_energy = torch.sqrt(high_freq.pow(2).mean(dim=(2, 3)) + 1e-8)
-
-    if normalize:
-        base = torch.sqrt(latents.pow(2).mean(dim=(2, 3)) + 1e-8)
-        hf_energy = hf_energy / (base + 1e-6)
-
-    if per_channel:
-        return hf_energy
-
-    return hf_energy.mean(dim=1)
 
 def stabilize_latents(latents, target_std=1.0):
 
@@ -387,32 +363,12 @@ def apply_appearance(
 
     if ema_prev_latents is not None and not train:
 
-        prev = ema_prev_latents.to(out.device)
-
-        # --- split structure / detail ---
-        out_low  = F.avg_pool2d(out, 3, 1, 1)
-        prev_low = F.avg_pool2d(prev, 3, 1, 1)
-
-        out_high  = out - out_low
-        prev_high = prev - prev_low
-
-        # --- dynamic alphas ---
-        motion_factor = float(hf.mean().item())
-
-        alpha_low  = 0.08 + 0.10 * motion_factor   # structure stable
-        alpha_high = 0.35 + 0.25 * motion_factor   # détail plus libre
-
-        alpha_low  = float(torch.clamp(torch.tensor(alpha_low), 0.05, 0.18))
-        alpha_high = float(torch.clamp(torch.tensor(alpha_high), 0.25, 0.65))
-
-        # --- EMA structure (important) ---
-        low_ema = alpha_low * out_low + (1.0 - alpha_low) * prev_low
-
-        # --- EMA detail (léger, pour éviter flicker) ---
-        high_ema = alpha_high * out_high + (1.0 - alpha_high) * prev_high
-
-        # --- recomposition ---
-        out = low_ema + high_ema
+        out = motion_aware_ema_fusion(
+            out=out,
+            ema_prev_latents=ema_prev_latents,
+            hf=hf,
+            debug=True
+        )
 
     return out
 
