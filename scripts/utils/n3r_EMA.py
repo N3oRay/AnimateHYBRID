@@ -228,7 +228,7 @@ def motion_aware_ema_fusion(
 # EMA Globale SAFE
 #-----------------------------------------------------
 
-def motion_aware_ema_low_high(
+def motion_aware_ema_low_high_v1(
     latents,
     ema_prev_latents,
     ema_global,
@@ -293,5 +293,215 @@ def motion_aware_ema_low_high(
     # =====================================================
 
     ema_prev_latents = ema_global + ema_micro
+
+    return ema_prev_latents, ema_global, ema_micro
+
+
+
+#-----------------------------------------------------
+# EMA Globale SAFE (FINAL)
+#-----------------------------------------------------
+
+def motion_aware_ema_low_high_v2(
+    latents,
+    ema_prev_latents,
+    ema_global,
+    ema_micro,
+    motion_noise,
+    train=False,
+    debug=True,
+):
+    """
+    Motion-aware EMA fusion with low/high frequency decomposition.
+    Stable, lightweight, and micro-motion aware (Lite+ final version).
+    """
+
+    # =====================================================
+    # INIT / TRAIN SAFETY
+    # =====================================================
+
+    if ema_prev_latents is None or train:
+        if debug:
+            print("🔥 [EMA SAFE] init / train mode → bypass")
+        return latents, ema_prev_latents, ema_global, ema_micro
+
+    device = latents.device
+    prev = ema_prev_latents.to(device)
+
+    # =====================================================
+    # MOTION ADAPTIVE COEFFICIENTS
+    # =====================================================
+
+    # global stability (low frequency)
+    alpha_global = 0.02 + 0.06 * motion_noise
+    alpha_global = max(0.02, min(alpha_global, 0.08))
+
+    # micro detail retention (high frequency)
+    alpha_micro = 0.10 + 0.25 * (1.0 - motion_noise)
+    alpha_micro = max(0.10, min(alpha_micro, 0.35))
+
+    if debug:
+        print(f"🔥 EMA global={alpha_global:.3f} | micro={alpha_micro:.3f}")
+
+    # =====================================================
+    # FREQUENCY DECOMPOSITION
+    # =====================================================
+
+    global_component = F.avg_pool2d(latents, kernel_size=5, stride=1, padding=2)
+    micro_component  = latents - global_component
+
+    prev_global = F.avg_pool2d(prev, kernel_size=5, stride=1, padding=2)
+    prev_micro  = prev - prev_global
+
+    # =====================================================
+    # INIT SAFETY (EMA STATE)
+    # =====================================================
+
+    if ema_global is None:
+        ema_global = global_component.clone()
+    if ema_micro is None:
+        ema_micro = micro_component.clone()
+
+    # =====================================================
+    # MICRO-MOTION PRESERVATION (IMPORTANT FIX)
+    # =====================================================
+
+    # preserves small motion that was previously flattened
+    motion_boost = 1.0 + (1.2 * (1.0 - motion_noise))
+    motion_boost = max(0.8, min(motion_boost, 1.8))
+
+    residual_motion = (micro_component - prev_micro) * 0.35
+    adapted_micro = micro_component + motion_boost * residual_motion
+
+    # soft stabilization to avoid drift
+    adapted_micro = 0.85 * adapted_micro + 0.15 * prev_micro
+
+    # =====================================================
+    # EMA UPDATE
+    # =====================================================
+
+    ema_global = alpha_global * global_component + (1.0 - alpha_global) * ema_global
+    ema_micro  = alpha_micro  * adapted_micro     + (1.0 - alpha_micro)  * ema_micro
+
+    # =====================================================
+    # RECOMPOSITION
+    # =====================================================
+
+    ema_prev_latents = ema_global + ema_micro
+
+    # =====================================================
+    # DEBUG
+    # =====================================================
+
+    if debug:
+        print(
+            f"[EMA FINAL] "
+            f"low={alpha_global:.3f} | "
+            f"high={alpha_micro:.3f} | "
+            f"motion={motion_noise:.3f}"
+        )
+
+    return ema_prev_latents, ema_global, ema_micro
+
+
+#-----------------------------------------------------
+# EMA Globale SAFE (FINAL VERSION)
+#-----------------------------------------------------
+
+def motion_aware_ema_low_high(
+    latents,
+    ema_prev_latents,
+    ema_global,
+    ema_micro,
+    motion_noise,
+    train=False,
+    debug=True,
+):
+    """
+    Motion-aware EMA fusion with low/high frequency decomposition (FINAL SAFE VERSION)
+
+    - stable first frame
+    - no torch.tensor warnings
+    - consistent low/high decomposition
+    - safe EMA updates for 3–4GB GPU pipelines
+    """
+
+    # =====================================================
+    # INIT / TRAIN SAFETY
+    # =====================================================
+
+    if ema_prev_latents is None or train:
+        if debug:
+            print("🔥 [EMA SAFE] init or train mode → bypass EMA")
+
+        return latents, ema_prev_latents, ema_global, ema_micro
+
+    device = latents.device
+    prev = ema_prev_latents.to(device)
+
+    # =====================================================
+    # MOTION COEFFICIENTS (STABLE SCALING)
+    # =====================================================
+
+    alpha_global = 0.02 + 0.06 * motion_noise
+    alpha_global = max(0.02, min(alpha_global, 0.08))
+
+    alpha_micro = 0.10 + 0.25 * (1.0 - motion_noise)
+    alpha_micro = max(0.10, min(alpha_micro, 0.35))
+
+    if debug:
+        print(f"🔥 EMA global={alpha_global:.3f} | micro={alpha_micro:.3f}")
+
+    # =====================================================
+    # FREQUENCY DECOMPOSITION (CURRENT + PREVIOUS)
+    # =====================================================
+
+    global_component = F.avg_pool2d(latents, kernel_size=5, stride=1, padding=2)
+    micro_component  = latents - global_component
+
+    prev_global = F.avg_pool2d(prev, kernel_size=5, stride=1, padding=2)
+    prev_micro  = prev - prev_global
+
+    # =====================================================
+    # EMA STATE INITIALIZATION (CRITICAL STABILITY FIX)
+    # =====================================================
+
+    if ema_global is None:
+        ema_global = global_component.clone()
+
+    if ema_micro is None:
+        ema_micro = micro_component.clone()
+
+    # =====================================================
+    # EMA UPDATE (SEPARATED FREQUENCIES)
+    # =====================================================
+
+    ema_global = (
+        alpha_global * global_component +
+        (1.0 - alpha_global) * ema_global
+    )
+
+    ema_micro = (
+        alpha_micro * micro_component +
+        (1.0 - alpha_micro) * ema_micro
+    )
+
+    # =====================================================
+    # RECOMPOSITION
+    # =====================================================
+
+    ema_prev_latents = ema_global + ema_micro
+
+    # =====================================================
+    # DEBUG OUTPUT (SAFE)
+    # =====================================================
+
+    if debug:
+        print(
+            f"[EMA FINAL] "
+            f"low={alpha_global:.3f} | "
+            f"high={alpha_micro:.3f} | "
+            f"motion={motion_noise:.3f}"
+        )
 
     return ema_prev_latents, ema_global, ema_micro
