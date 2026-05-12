@@ -10,6 +10,9 @@ from .n3rCreativeModel import  apply_creative, creative_model, optimizer_creativ
 from torch.optim import Adam
 import torch
 import math
+import uuid
+import time
+from datetime import datetime
 import numpy as np
 from PIL import Image, ImageFilter, ImageChops, ImageEnhance
 import torch.nn.functional as F
@@ -3989,17 +3992,18 @@ class LoadMyLatent:
 }
 """
 
-import time
-import uuid
 
-def generate_sequence_id(prefix="ah", frame_counter=0, engine="AnimateHybrid"):
-    ts = int(time.time() * 1000)
-    uid = uuid.uuid4().hex[:8]
-    return f"{prefix}_{engine}_{frame_counter}_{ts}_{uid}"
+
+def generate_sequence_id(prefix="ah"):
+    date_str = datetime.now().strftime("%Y%m%d")
+    short_uuid = uuid.uuid4().hex[:8]
+
+    return f"{prefix}_{date_str}_{short_uuid}"
 
 def build_latent_metadata(
     latents,
     frame_counter=0,
+    sequence_id="AnimateHybrid",
     scale=8,
     fps=24,
 
@@ -4047,6 +4051,7 @@ def build_latent_metadata(
 
         # frame
         "frame_index": frame_counter,
+        "sequence_id": sequence_id,
         "fps": fps,
 
         # dtype/device
@@ -4312,10 +4317,15 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     if export_latents:
         export_latents_file(latents, frame_counter, output_dir)
 
+
+
+
     # Export for ConfyUI
     if export_latents_comfy:
+        sequence_id = generate_sequence_id()
+        print(f"🔥 [decode_latents_ultrasafe] sequence_id={sequence_id} ")
         #save_latents_for_comfy(latents, frame_counter, output_dir)
-        metadata = build_latent_metadata( latents=latents, frame_counter=frame_counter, scale=scale, denoise=denoise, temporal_consistency=temporal_consistency, style_injection=style_injection, appearance=appearance, creative=creative, sharpen_mode=sharpen_mode, gamma_boost=gamma_boost, train=train, ema_prev_latents=ema_prev_latents )
+        metadata = build_latent_metadata( latents=latents, frame_counter=frame_counter, sequence_id=sequence_id, scale=scale, denoise=denoise, temporal_consistency=temporal_consistency, style_injection=style_injection, appearance=appearance, creative=creative, sharpen_mode=sharpen_mode, gamma_boost=gamma_boost, train=train, ema_prev_latents=ema_prev_latents )
 
         export_latents_for_comfy_meta( latents, frame_counter, output_dir, metadata)
 
