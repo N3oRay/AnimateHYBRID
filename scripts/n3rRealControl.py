@@ -368,7 +368,7 @@ def main(args):
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         print(f"Dimention frame inter: Shape de latent_interp :", latent_interp.shape)
 
-                        frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list )
+                        frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list, output_dir=output_dir )
 
                         #Post Traitement
                         frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
@@ -550,7 +550,7 @@ def main(args):
                     print(f"Dimention : Shape de latents :", latents.shape)
 
                     frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device, new_image=new_image,
-                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list
+                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list, output_dir=output_dir
                     )
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
                                                     blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
