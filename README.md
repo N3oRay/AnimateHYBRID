@@ -1,8 +1,8 @@
 
 
-# AnimateHYBRID
+# AnimateHYBRID 
 
-Mini-Guide: AnimateDiff <4 GB VRAM with N3R 
+Mini-Guide: AnimateDiff <4 GB VRAM with N3R  - ComfyUI friendly
 
 # RealControl – Stable Latents Animation Pipeline
 
