@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import math
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
 
 # =========================================================
@@ -365,10 +366,323 @@ def load_creative_model(
 
 
 # =========================================================
-# MODEL
+# MODEL CreativeDecoratorModelLitePlus
 # =========================================================
+class CreativeDecoratorModel_Safe(nn.Module):
+    """
+    SAFE Creative latent decorator
+    - NO attention (OOM-proof)
+    - multi-scale perception via dilated convs
+    - stable for 3–4GB GPUs
+    - compatible diffusion latents pipelines
+    """
+
+    def __init__(
+        self,
+        in_channels=4,
+        base_channels=24,
+        prompt_dim=768
+    ):
+        super().__init__()
+
+        self.version = "v1_creative_safe"
+
+        # =====================================================
+        # LATENT ENCODER
+        # =====================================================
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 3, padding=1),
+            nn.SiLU(),
+
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.SiLU(),
+        )
+
+        # =====================================================
+        # PROMPT PROJECTOR
+        # =====================================================
+        self.prompt_proj = nn.Linear(prompt_dim, base_channels)
+
+        # =====================================================
+        # FUSION LAYER
+        # =====================================================
+        self.fusion = nn.Conv2d(base_channels * 2, base_channels, 1)
+
+        # =====================================================
+        # SAFE MULTI-SCALE CONTEXT (NO ATTENTION)
+        # =====================================================
+
+        # local structure
+        self.context_low = nn.Conv2d(
+            base_channels,
+            base_channels,
+            kernel_size=3,
+            padding=1,
+            groups=base_channels
+        )
+
+        # medium receptive field
+        self.context_mid = nn.Conv2d(
+            base_channels,
+            base_channels,
+            kernel_size=3,
+            padding=2,
+            dilation=2,
+            groups=base_channels
+        )
+
+        # large receptive field
+        self.context_high = nn.Conv2d(
+            base_channels,
+            base_channels,
+            kernel_size=3,
+            padding=3,
+            dilation=3,
+            groups=base_channels
+        )
+
+        # =====================================================
+        # GLOBAL REPRESENTATION
+        # =====================================================
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.head = nn.Sequential(
+            nn.Linear(base_channels, base_channels),
+            nn.SiLU(),
+            nn.Linear(base_channels, base_channels),
+            nn.SiLU(),
+        )
+
+        # =====================================================
+        # CREATIVE OUTPUT HEADS
+        # =====================================================
+        self.structure = nn.Linear(base_channels, 1)
+        self.texture   = nn.Linear(base_channels, 1)
+        self.style     = nn.Linear(base_channels, 1)
+        self.chaos     = nn.Linear(base_channels, 1)
+        self.rhythm    = nn.Linear(base_channels, 1)
+
+    # =====================================================
+    # FORWARD
+    # =====================================================
+    def forward(self, x, prompt_emb):
+
+        # -------------------------------------------------
+        # latent encoding
+        # -------------------------------------------------
+        h = self.encoder(x)
+
+        # -------------------------------------------------
+        # prompt handling (safe reduction)
+        # -------------------------------------------------
+        if prompt_emb.dim() == 3:
+            prompt_emb = prompt_emb.mean(dim=1)
+
+        p = self.prompt_proj(prompt_emb)
+
+        # reshape spatial conditioning
+        p = p[:, :, None, None].expand(-1, -1, h.shape[2], h.shape[3])
+
+        # mild boost (safe)
+        p = p * 1.5
+
+        # -------------------------------------------------
+        # fusion
+        # -------------------------------------------------
+        h = self.fusion(torch.cat([h, p], dim=1))
+
+        # =====================================================
+        # SAFE MULTI-SCALE CONTEXT (NO ATTENTION)
+        # =====================================================
+
+        low  = self.context_low(h)
+        mid  = self.context_mid(h)
+        high = self.context_high(h)
+
+        # weighted residual mixing
+        h = h + 0.06 * low + 0.04 * mid + 0.02 * high
+
+        # =====================================================
+        # GLOBAL POOLING
+        # =====================================================
+        g = self.pool(h).squeeze(-1).squeeze(-1)
+
+        g = self.head(g)
+
+        # =====================================================
+        # CREATIVE OUTPUTS
+        # =====================================================
+        return {
+            "structure": self.structure(g),
+            "texture": self.texture(g),
+            "style": self.style(g),
+            "chaos": self.chaos(g),
+            "rhythm": self.rhythm(g),
+        }
+
 
 class CreativeDecoratorModel(nn.Module):
+    """
+    Creative latent decorator - Lite+ version
+    Balanced for stability + micro-detail enhancement
+    """
+
+    def __init__(
+        self,
+        in_channels=4,
+        base_channels=24,
+        prompt_dim=768
+    ):
+        super().__init__()
+
+        self.config = {
+            "in_channels": in_channels,
+            "base_channels": base_channels,
+            "prompt_dim": prompt_dim
+        }
+
+        self.version = "v1_creative_lite_plus"
+
+        # =====================================================
+        # LATENT ENCODER (stable + normalized)
+        # =====================================================
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 3, padding=1),
+            nn.GroupNorm(8, base_channels),
+            nn.SiLU(),
+
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.GroupNorm(8, base_channels),
+            nn.SiLU(),
+        )
+
+        # =====================================================
+        # PROMPT PROJECTION
+        # =====================================================
+
+        self.prompt_proj = nn.Linear(prompt_dim, base_channels)
+
+        # =====================================================
+        # FUSION (residual-safe)
+        # =====================================================
+
+        self.fusion = nn.Conv2d(base_channels * 2, base_channels, 1)
+
+        # =====================================================
+        # MICRO ATTENTION (cheap spatial gating)
+        # =====================================================
+
+        self.micro_attn = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, 3, padding=1, groups=base_channels),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, 1, 1),
+            nn.Sigmoid()
+        )
+
+        # =====================================================
+        # GLOBAL HEAD
+        # =====================================================
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.head = nn.Sequential(
+            nn.Linear(base_channels, base_channels * 2),
+            nn.SiLU(),
+            nn.Linear(base_channels * 2, base_channels),
+            nn.SiLU(),
+        )
+
+        # =====================================================
+        # CREATIVE OUTPUT HEADS
+        # =====================================================
+
+        self.structure = nn.Linear(base_channels, 1)
+        self.texture   = nn.Linear(base_channels, 1)
+        self.style     = nn.Linear(base_channels, 1)
+        self.chaos     = nn.Linear(base_channels, 1)
+        self.rhythm    = nn.Linear(base_channels, 1)
+
+    # =====================================================
+    # FORWARD
+    # =====================================================
+
+    def forward(self, x, prompt_emb):
+
+        # =====================================================
+        # ENCODING
+        # =====================================================
+
+        h = self.encoder(x)
+
+        # =====================================================
+        # PROMPT NORMALIZATION
+        # =====================================================
+
+        if prompt_emb.dim() == 3:
+            prompt_emb = prompt_emb.mean(dim=1)
+
+        prompt_emb = torch.tanh(prompt_emb)
+        prompt_emb = prompt_emb / (prompt_emb.std(dim=-1, keepdim=True) + 1e-6)
+
+        # =====================================================
+        # PROMPT PROJECT
+        # =====================================================
+
+        p = self.prompt_proj(prompt_emb)
+
+        p = p[:, :, None, None].expand(
+            -1, -1, h.shape[2], h.shape[3]
+        )
+
+        # léger boost signal
+        p = p * 1.5
+
+        # =====================================================
+        # FUSION (RESIDUAL SAFE)
+        # =====================================================
+
+        fused = self.fusion(torch.cat([h, p], dim=1))
+        h = h + 0.5 * fused
+
+        # =====================================================
+        # MICRO ATTENTION (VERY IMPORTANT)
+        # =====================================================
+
+        attn = self.micro_attn(h)
+        h = h * (0.75 + 0.25 * attn)
+
+        # =====================================================
+        # EDGE ENHANCEMENT (LOW COST)
+        # =====================================================
+
+        edges = h - F.avg_pool2d(h, 3, 1, 1)
+        edge_strength = edges.abs().mean(dim=1, keepdim=True)
+
+        h = h + 0.05 * edge_strength * edges
+
+        # =====================================================
+        # GLOBAL REPRESENTATION
+        # =====================================================
+
+        g = self.pool(h).squeeze(-1).squeeze(-1)
+        g = self.head(g)
+
+        # =====================================================
+        # CREATIVE OUTPUT
+        # =====================================================
+
+        return {
+            "structure": self.structure(g),
+            "texture": self.texture(g),
+            "style": self.style(g),
+            "chaos": self.chaos(g),
+            "rhythm": self.rhythm(g)
+        }
+# =========================================================
+# MODEL CreativeDecoratorModel
+# =========================================================
+class CreativeDecoratorModel_v1(nn.Module):
     """
     Creative semantic latent decorator
     """
@@ -565,7 +879,546 @@ criterion_creative = torch.nn.L1Loss()
 # =========================================================
 # APPLY FUNCTION
 # =========================================================*
+
 def apply_creative(
+    latents,
+    style_prompt_embedding,
+    creative_model,
+    optimizer=None,
+    criterion=None,
+    train=False,
+    strength=0.10,
+    device="cuda",
+    frame_counter=0,
+    max_epochs_up=6,
+    model_path="models/creative_model_latest.pt",
+    ema_prev_latents=None,
+    ema_alpha=0.3,
+    new_image=False,
+    debug=False
+):
+
+    import math
+    import os
+    import torch
+    import torch.nn.functional as F
+
+    device = latents.device
+    creative_model.to(device)
+
+    x = latents.to(device)
+    x0 = x.detach()
+
+    print(f"[Creative STABLE] device={device}")
+
+    # =====================================================
+    # SAFE PROMPT NORMALIZATION
+    # =====================================================
+
+    if style_prompt_embedding.dim() == 3:
+        prompt = style_prompt_embedding.mean(dim=1)
+    else:
+        prompt = style_prompt_embedding
+
+    prompt = torch.tanh(prompt)
+    prompt = prompt / (
+        prompt.std(dim=-1, keepdim=True) + 1e-6
+    )
+
+    # =====================================================
+    # HIGH FREQUENCY ENERGY
+    # =====================================================
+
+    hf = compute_high_freq_energy(x0)
+
+    print(
+        f"[Creative STABLE] hf={hf.mean().item():.4f}"
+    )
+
+    model_exists = os.path.exists(model_path)
+
+    # =====================================================
+    # INTERNAL CREATIVE PASS
+    # =====================================================
+
+    def creative_pass(inp, pred_dict):
+
+        out = inp
+
+        # =================================================
+        # SAFE PARAMS
+        # =================================================
+
+        structure = torch.tanh(
+            pred_dict["structure"]
+        ).view(-1,1,1,1)
+
+        texture = torch.tanh(
+            pred_dict["texture"]
+        ).view(-1,1,1,1)
+
+        style = torch.tanh(
+            pred_dict["style"]
+        ).view(-1,1,1,1)
+
+        chaos = torch.tanh(
+            pred_dict["chaos"]
+        ).view(-1,1,1,1)
+
+        rhythm = torch.tanh(
+            pred_dict["rhythm"]
+        ).view(-1,1,1,1)
+
+        # =================================================
+        # SPATIAL ATTENTION MAP
+        # =================================================
+
+        attention = torch.mean(
+            torch.abs(out),
+            dim=1,
+            keepdim=True
+        )
+
+        attention = attention / (
+            attention.amax(
+                dim=(2,3),
+                keepdim=True
+            ) + 1e-6
+        )
+
+        attention = torch.pow(attention, 0.7)
+
+        # =================================================
+        # STRUCTURE
+        # =================================================
+
+        low = F.avg_pool2d(out, 5, 1, 2)
+
+        out = out + 0.06 * structure * (low - out)
+
+        # =================================================
+        # MULTI SCALE DETAIL
+        # =================================================
+
+        blur3 = F.avg_pool2d(out, 3, 1, 1)
+        blur5 = F.avg_pool2d(out, 5, 1, 2)
+
+        detail_small = out - blur3
+        detail_large = blur3 - blur5
+
+        detail = (
+            0.7 * detail_small +
+            0.3 * detail_large
+        )
+
+        # =================================================
+        # EDGE MASK
+        # =================================================
+
+        edge_energy = torch.abs(detail)
+
+        edge_mask = (
+            edge_energy >
+            edge_energy.mean(
+                dim=(2,3),
+                keepdim=True
+            )
+        ).float()
+
+        edge_mask = F.avg_pool2d(
+            edge_mask,
+            3,
+            1,
+            1
+        )
+
+        # =================================================
+        # TEXTURE INJECTION
+        # =================================================
+
+        out = (
+            out +
+            0.08 *
+            texture *
+            detail *
+            attention
+        )
+
+        # =================================================
+        # EDGE PRESERVATION
+        # =================================================
+
+        out = (
+            out +
+            0.03 *
+            edge_mask *
+            detail
+        )
+
+        # =================================================
+        # MICRO CONTRAST
+        # =================================================
+
+        micro = (
+            out -
+            F.avg_pool2d(out, 7, 1, 3)
+        )
+
+        out = (
+            out +
+            0.015 *
+            micro *
+            attention
+        )
+
+        # =================================================
+        # STYLE MAP
+        # =================================================
+
+        style_map = torch.sin(out * math.pi)
+
+        out = (
+            out +
+            0.04 *
+            style *
+            style_map *
+            attention
+        )
+
+        # =================================================
+        # CHAOS (ATTENTION GUIDED)
+        # =================================================
+
+        noise = torch.randn_like(out)
+
+        noise = F.avg_pool2d(
+            noise,
+            3,
+            1,
+            1
+        )
+
+        out = (
+            out +
+            0.01 *
+            chaos *
+            noise *
+            attention *
+            0.5
+        )
+
+        # =================================================
+        # RHYTHM
+        # =================================================
+
+        wave = torch.sin(out * 4.0)
+
+        out = (
+            out +
+            0.02 *
+            rhythm *
+            wave *
+            attention
+        )
+
+        return (
+            out,
+            structure,
+            texture,
+            style,
+            chaos,
+            rhythm,
+            attention,
+            detail,
+            edge_mask
+        )
+
+    # =====================================================
+    # TRAIN
+    # =====================================================
+
+    if train and optimizer and criterion:
+
+        creative_model.train()
+
+        max_epochs = max(
+            1,
+            max_epochs_up
+        )
+
+        print("[Creative STABLE] Training")
+
+        for epoch in range(max_epochs):
+
+            optimizer.zero_grad()
+
+            with torch.enable_grad():
+
+                pred = creative_model(
+                    x0,
+                    prompt
+                )
+
+                (
+                    out,
+                    structure,
+                    texture,
+                    style,
+                    chaos,
+                    rhythm,
+                    attention,
+                    detail,
+                    edge_mask
+                ) = creative_pass(x0, pred)
+
+                # =========================================
+                # LOSSES
+                # =========================================
+
+                loss_id = (
+                    0.05 *
+                    F.l1_loss(out, x0)
+                )
+
+                loss_detail = (
+                    0.02 *
+                    F.l1_loss(
+                        compute_high_freq_energy(out),
+                        compute_high_freq_energy(x0)
+                    )
+                )
+
+                loss_energy = (
+                    0.001 *
+                    out.pow(2).mean()
+                )
+
+                loss_stability = (
+                    0.01 *
+                    (out - x0).pow(2).mean()
+                )
+
+                # edge preservation loss
+                edge_out = (
+                    out -
+                    F.avg_pool2d(out, 3, 1, 1)
+                )
+
+                edge_x0 = (
+                    x0 -
+                    F.avg_pool2d(x0, 3, 1, 1)
+                )
+
+                loss_edges = (
+                    0.01 *
+                    F.l1_loss(
+                        edge_out,
+                        edge_x0
+                    )
+                )
+
+                loss = (
+                    loss_id +
+                    loss_detail +
+                    loss_energy +
+                    loss_stability +
+                    loss_edges
+                )
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                creative_model.parameters(),
+                0.8
+            )
+
+            optimizer.step()
+
+            print(
+                f"[Creative STABLE] "
+                f"Epoch {epoch+1}/{max_epochs} | "
+                f"Loss={loss.item():.6f}"
+            )
+
+            if (
+                frame_counter % 10 == 0
+            ) and (
+                epoch == max_epochs - 1
+            ):
+
+                save_creative_model(
+                    creative_model,
+                    optimizer=optimizer,
+                    epoch=frame_counter,
+                    loss=loss.item(),
+                    path=model_path
+                )
+
+    # =====================================================
+    # LOAD
+    # =====================================================
+
+    else:
+
+        creative_model.eval()
+
+        if model_exists:
+
+            creative_model, _ = load_creative_model(
+                type(creative_model),
+                path=model_path,
+                optimizer=optimizer,
+                device=device
+            )
+
+    # =====================================================
+    # INFERENCE
+    # =====================================================
+
+    with torch.no_grad():
+
+        pred = creative_model(x, prompt)
+
+        (
+            out,
+            structure,
+            texture,
+            style,
+            chaos,
+            rhythm,
+            attention,
+            detail,
+            edge_mask
+        ) = creative_pass(x, pred)
+
+        print(
+            f"[Creative STABLE] "
+            f"struct={structure.mean().item():.4f} | "
+            f"texture={texture.mean().item():.4f} | "
+            f"style={style.mean().item():.4f} | "
+            f"chaos={chaos.mean().item():.4f} | "
+            f"rhythm={rhythm.mean().item():.4f}"
+        )
+
+        print(
+            f"[Creative STABLE] "
+            f"attention={attention.mean().item():.4f} | "
+            f"detail={detail.abs().mean().item():.4f} | "
+            f"edge={edge_mask.mean().item():.4f}"
+        )
+
+    # =====================================================
+    # STRENGTH CONTROL
+    # =====================================================
+
+    hf = compute_high_freq_energy(x)
+
+    strength_map = (
+        strength /
+        (1.0 + 4.0 * hf)
+    )
+
+    strength_map = strength_map.clamp(
+        0.01,
+        strength
+    )
+
+    out = (
+        x +
+        strength_map *
+        (out - x)
+    )
+
+    # =====================================================
+    # FINAL STABILIZATION
+    # =====================================================
+
+    out = torch.nan_to_num(
+        out,
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0
+    )
+
+    # =====================================================
+    # EMA TEMPORAL
+    # =====================================================
+
+    if ema_prev_latents is not None and not train:
+
+        prev = ema_prev_latents.to(out.device)
+
+        out_low = F.avg_pool2d(
+            out,
+            3,
+            1,
+            1
+        )
+
+        prev_low = F.avg_pool2d(
+            prev,
+            3,
+            1,
+            1
+        )
+
+        out_high = out - out_low
+        prev_high = prev - prev_low
+
+        motion = float(
+            hf.mean().item()
+        )
+
+        alpha_low = min(
+            max(
+                0.05 + 0.05 * motion,
+                0.05
+            ),
+            0.12
+        )
+
+        alpha_high = min(
+            max(
+                0.20 + 0.10 * motion,
+                0.20
+            ),
+            0.40
+        )
+
+        # ================================================
+        # DETAIL PROTECTION
+        # ================================================
+
+        detail_mask = (
+            torch.abs(out_high) >
+            out_high.abs().mean(
+                dim=(2,3),
+                keepdim=True
+            )
+        ).float()
+
+        alpha_high = (
+            alpha_high *
+            (1.0 - 0.5 * detail_mask)
+        )
+
+        out = (
+            alpha_low * out_low +
+            (1 - alpha_low) * prev_low +
+
+            alpha_high * out_high +
+            (1 - alpha_high) * prev_high
+        )
+
+        print(
+            f"[Creative STABLE] "
+            f"EMA low={alpha_low:.4f} | "
+            f"EMA high={float(alpha_high.mean()):.4f}"
+        )
+
+    return out
+
+def apply_creative_v1(
     latents,
     style_prompt_embedding,
     creative_model,
