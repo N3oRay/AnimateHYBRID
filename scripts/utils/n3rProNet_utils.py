@@ -3944,6 +3944,22 @@ def export_latents_file(latents, frame_counter, output_dir="exports"):
 
     print(f"💾 Latents exported: {save_path}")
 
+
+
+def save_latents_for_comfy(latents, frame_counter, output_dir="exports"):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "samples": latents.detach().float().cpu(),
+    }
+
+    path = output_dir / f"latent_{frame_counter:05d}.latent.pt"
+
+    torch.save(data, path)
+
+    print(f"💾 Comfy Latent exported: {path}")
+
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
     block_size=32, overlap=16,
@@ -3962,7 +3978,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     style_injection=True,
     appearance=True,
     creative=True,
-    export_latents=True,
+    export_latents=False,
+    export_latents_comfy=True,
     output_dir: Path = None,
     pos_embeds_list=None,
     train=False,                       # Paramètre ajouté pour gérer l'entraînement
@@ -4124,9 +4141,13 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     else:
         print(f"🔥 [decode_latents_ultrasafe] EMA None")
 
-
+    # Export Standard
     if export_latents:
         export_latents_file(latents, frame_counter, output_dir)
+
+    # Export for ConfyUI
+    if export_latents_comfy:
+        save_latents_for_comfy(latents, frame_counter, output_dir)
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
