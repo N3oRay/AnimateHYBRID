@@ -3990,6 +3990,12 @@ class LoadMyLatent:
 """
 
 import time
+import uuid
+
+def generate_sequence_id(prefix="ah", frame_counter=0, engine="AnimateHybrid"):
+    ts = int(time.time() * 1000)
+    uid = uuid.uuid4().hex[:8]
+    return f"{prefix}_{engine}_{frame_counter}_{ts}_{uid}"
 
 def build_latent_metadata(
     latents,
@@ -4032,8 +4038,15 @@ def build_latent_metadata(
         "height": H * scale,
         "latent_scale_factor": scale,
 
+        "latent_mean": float(latents.mean().item()),
+        "latent_std": float(latents.std().item()),
+        "is_video": True,
+
+
+        "format_version": 1,
+
         # frame
-        "frame": frame_counter,
+        "frame_index": frame_counter,
         "fps": fps,
 
         # dtype/device
@@ -4069,6 +4082,9 @@ def build_latent_metadata(
         # engine
         # ------------------------------------------------
         "engine": engine,
+
+        "vae_scaling_factor": 0.18215,
+        "base_model": "SD1.5",
 
         # ------------------------------------------------
         # timestamp
