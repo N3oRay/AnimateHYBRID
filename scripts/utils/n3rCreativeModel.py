@@ -499,7 +499,7 @@ criterion_creative = torch.nn.L1Loss()
 # =========================================================
 # APPLY FUNCTION
 # =========================================================
-def apply_creative_decoration(
+def apply_creative(
     latents,
     style_prompt_embedding,
     creative_model,
@@ -658,7 +658,7 @@ def apply_creative_decoration(
 
             if should_save:
 
-                save_appearance_model(
+                save_creative_model(
                     creative_model,
                     optimizer=optimizer,
                     epoch=frame_counter,
@@ -676,7 +676,7 @@ def apply_creative_decoration(
 
         if model_exists:
 
-            creative_model, _ = load_appearance_model(
+            creative_model, _ = load_creative_model(
                 type(creative_model),
                 path=model_path,
                 optimizer=optimizer,

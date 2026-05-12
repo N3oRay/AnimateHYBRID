@@ -5,6 +5,7 @@ from .n3rProDenoising import denoise_latents, denoising_model, optimizer, criter
 from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_model, weights_temporal_init, load_temporal_model
 from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_model, load_style_model
 from .n3rApparenceModel import  apply_appearance, appearance_model, optimizer_apparence, criterion_apparence
+from .n3rCreativeModel import  apply_creative, creative_model, optimizer_creative, criterion_creative
 
 from torch.optim import Adam
 import torch
@@ -3941,6 +3942,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     temporal_consistency=True,
     style_injection=True,
     appearance=True,
+    creative=True,
     pos_embeds_list=None,
     train=False,                       # Paramètre ajouté pour gérer l'entraînement
     train_on_image=True,
@@ -4084,6 +4086,11 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         latents = apply_appearance(
             latents=latents,
             style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=train, device="cuda", strength=0.1, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+
+    if creative:
+        latents = apply_creative(
+            latents=latents,
+            style_prompt_embedding=style_prompt_embedding, creative_model=creative_model, optimizer=optimizer_creative, criterion=criterion_creative, train=True, device="cuda", strength=0.12, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/creative_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
