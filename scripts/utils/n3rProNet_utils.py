@@ -3944,11 +3944,137 @@ def export_latents_file(latents, frame_counter, output_dir="exports"):
 
     print(f"💾 Latents exported: {save_path}")
 
-
+#mini node custom ComfyUI :
 class LoadMyLatent:
     def load(self, path):
         latent = torch.load(path)["samples"]
         return {"samples": latent}
+
+"""
+
+{
+    "samples": latents,
+
+    # dimensions image réelles
+    "width": 896,
+    "height": 1280,
+
+    # infos latent
+    "latent_shape": [1,4,160,112],
+    "latent_scale_factor": 8,
+
+    # modèle
+    "model": "SDXL",
+    "vae": "sdxl_vae",
+    "dtype": "float32",
+
+    # génération
+    "seed": seed,
+    "steps": steps,
+    "cfg": cfg,
+    "sampler": sampler_name,
+    "scheduler": scheduler_name,
+
+    # animation
+    "frame": frame_counter,
+    "fps": 24,
+
+    # ton moteur
+    "engine": "AnimateHybrid",
+    "motion_noise": float(motion_noise),
+    "temporal_strength": float(temporal_strength),
+
+    # debug
+    "timestamp": time.time(),
+}
+"""
+
+import time
+
+def build_latent_metadata(
+    latents,
+    frame_counter=0,
+    scale=8,
+    fps=24,
+
+    # pipeline
+    denoise=True,
+    temporal_consistency=True,
+    style_injection=True,
+    appearance=True,
+    creative=True,
+
+    # render
+    sharpen_mode="both",
+    gamma_boost=1.0,
+
+    # training
+    train=False,
+
+    # temporal
+    ema_prev_latents=None,
+
+    # misc
+    engine="AnimateHybrid",
+):
+    B, C, H, W = latents.shape
+
+    return {
+
+        # ------------------------------------------------
+        # latent info
+        # ------------------------------------------------
+        "latent_shape": [B, C, H, W],
+        "channels": C,
+
+        # image size
+        "width": W * scale,
+        "height": H * scale,
+        "latent_scale_factor": scale,
+
+        # frame
+        "frame": frame_counter,
+        "fps": fps,
+
+        # dtype/device
+        "dtype": str(latents.dtype),
+        "device": str(latents.device),
+
+        # ------------------------------------------------
+        # pipeline modules
+        # ------------------------------------------------
+        "denoise": denoise,
+        "temporal_consistency": temporal_consistency,
+        "style_injection": style_injection,
+        "appearance": appearance,
+        "creative": creative,
+
+        # ------------------------------------------------
+        # render settings
+        # ------------------------------------------------
+        "sharpen_mode": sharpen_mode,
+        "gamma_boost": gamma_boost,
+
+        # ------------------------------------------------
+        # temporal
+        # ------------------------------------------------
+        "has_ema": ema_prev_latents is not None,
+
+        # ------------------------------------------------
+        # train/debug
+        # ------------------------------------------------
+        "train": train,
+
+        # ------------------------------------------------
+        # engine
+        # ------------------------------------------------
+        "engine": engine,
+
+        # ------------------------------------------------
+        # timestamp
+        # ------------------------------------------------
+        "timestamp": time.time(),
+    }
 
 def save_latents_for_comfy(latents, frame_counter, output_dir="exports"):
     output_dir = Path(output_dir)
@@ -3964,6 +4090,27 @@ def save_latents_for_comfy(latents, frame_counter, output_dir="exports"):
 
     print(f"💾 Comfy Latent exported: {path}")
 
+def export_latents_for_comfy_meta(
+    latents,
+    frame_counter,
+    output_dir="exports",
+    metadata=None,
+):
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "samples": latents.detach().float().cpu(),
+        "metadata": metadata or {},
+    }
+
+    path = output_dir / f"latent_{frame_counter:05d}.latent.pt"
+
+    torch.save(data, path)
+
+    print(f"💾 Latents exported: {path}")
+
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
     block_size=32, overlap=16,
@@ -3976,7 +4123,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     sharpen_strength=0.015,
     sharpen_edges_strength=0.02,
     gamma_boost=1.00,                  # légèrement plus de punch naturel
-    scale=4,
+    scale=8,
     denoise=True,
     temporal_consistency=True,
     style_injection=True,
@@ -4151,13 +4298,16 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # Export for ConfyUI
     if export_latents_comfy:
-        save_latents_for_comfy(latents, frame_counter, output_dir)
+        #save_latents_for_comfy(latents, frame_counter, output_dir)
+        metadata = build_latent_metadata( latents=latents, frame_counter=frame_counter, scale=scale, denoise=denoise, temporal_consistency=temporal_consistency, style_injection=style_injection, appearance=appearance, creative=creative, sharpen_mode=sharpen_mode, gamma_boost=gamma_boost, train=train, ema_prev_latents=ema_prev_latents )
+
+        export_latents_for_comfy_meta( latents, frame_counter, output_dir, metadata)
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale
     latents = latents.to(device=device, dtype=torch.float16) * latent_scale_boost
 
-    out_H, out_W = H * 8, W * 8
+    out_H, out_W = H * scale, W * scale
     output_rgb = torch.zeros(B, 3, out_H, out_W, device=device, dtype=torch.float32)
     weight = torch.zeros_like(output_rgb)
 
@@ -4195,7 +4345,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
             fh, fw = decoded.shape[2], decoded.shape[3]
             feather = create_feather(fh, fw).unsqueeze(0).unsqueeze(0)
 
-            iy0, ix0 = y*8, x*8
+            iy0, ix0 = y*scale, x*scale
             iy1, ix1 = iy0 + fh, ix0 + fw
 
             output_rgb[:, :, iy0:iy1, ix0:ix1] += decoded * feather
