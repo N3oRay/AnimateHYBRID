@@ -3945,6 +3945,10 @@ def export_latents_file(latents, frame_counter, output_dir="exports"):
     print(f"💾 Latents exported: {save_path}")
 
 
+class LoadMyLatent:
+    def load(self, path):
+        latent = torch.load(path)["samples"]
+        return {"samples": latent}
 
 def save_latents_for_comfy(latents, frame_counter, output_dir="exports"):
     output_dir = Path(output_dir)
