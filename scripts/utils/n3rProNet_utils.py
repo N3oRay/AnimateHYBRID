@@ -6,7 +6,7 @@ from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_mod
 from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_model, load_style_model
 from .n3rApparenceModel import  apply_appearance, appearance_model, optimizer_apparence, criterion_apparence
 from .n3rCreativeModel import  apply_creative, creative_model, optimizer_creative, criterion_creative
-from .n3r_EMA import motion_aware_ema_fusion
+from .n3r_EMA import motion_aware_ema_fusion, motion_aware_ema_low_high
 
 from torch.optim import Adam
 import torch
@@ -4273,46 +4273,15 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     # -------------------------
     # 6. UPDATE EMA (CRUCIAL)
     # -------------------------
-    if ema_prev_latents is not None and not train:
-
-        # -------------------------
-        # motion-adaptive split
-        # -------------------------
-        alpha_global = 0.02 + 0.06 * motion_noise
-        alpha_global = float(torch.clamp(torch.tensor(alpha_global), 0.02, 0.08))
-
-        alpha_micro = 0.10 + 0.25 * (1.0 - motion_noise)
-        alpha_micro = float(torch.clamp(torch.tensor(alpha_micro), 0.10, 0.35))
-
-        print(f"🔥 EMA global={alpha_global:.3f} | micro={alpha_micro:.3f}")
-
-        # -------------------------
-        # frequency split
-        # -------------------------
-        global_component = F.avg_pool2d(latents, kernel_size=5, stride=1, padding=2)
-        micro_component  = latents - global_component
-
-        # -------------------------
-        # init safety (VERY IMPORTANT)
-        # -------------------------
-        if ema_global is None:
-            ema_global = global_component.clone()
-        if ema_micro is None:
-            ema_micro = micro_component.clone()
-
-        # -------------------------
-        # EMA updates
-        # -------------------------
-        ema_global = alpha_global * global_component + (1.0 - alpha_global) * ema_global
-        ema_micro  = alpha_micro  * micro_component  + (1.0 - alpha_micro)  * ema_micro
-
-        # -------------------------
-        # recombination
-        # -------------------------
-        ema_prev_latents = ema_global + ema_micro
-
-    else:
-        print(f"🔥 [decode_latents_ultrasafe] EMA None")
+    ema_prev_latents, ema_global, ema_micro = motion_aware_ema_low_high(
+            latents=latents,
+            ema_prev_latents=ema_prev_latents,
+            ema_global=ema_global,
+            ema_micro=ema_micro,
+            motion_noise=motion_noise,
+            train=train,
+            debug=True,
+        )
 
     # Export Standard
     if export_latents:
