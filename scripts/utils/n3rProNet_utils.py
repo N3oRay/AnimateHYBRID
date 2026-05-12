@@ -3925,6 +3925,25 @@ Temporal	      stabiliser vidéo
 Style	          définir identité
 Appearance	      éclairage / finition render (appearance = correction photométrique + micro-contrast + tone mapping) -> Appearance (photometric refinement ONLY)
 """
+
+def export_latents_file(latents, frame_counter, output_dir="exports"):
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    save_path = output_dir / f"latents_{frame_counter:05d}.pt"
+
+    torch.save(
+        {
+            "latents": latents.detach().float().cpu(),
+            "frame": frame_counter,
+            "shape": list(latents.shape),
+        },
+        save_path
+    )
+
+    print(f"💾 Latents exported: {save_path}")
+
 def decode_latents_ultrasafe_blockwise_ultranatural(
     latents, vae,
     block_size=32, overlap=16,
@@ -3943,6 +3962,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     style_injection=True,
     appearance=True,
     creative=True,
+    export_latents=True,
+    output_dir: Path = None,
     pos_embeds_list=None,
     train=False,                       # Paramètre ajouté pour gérer l'entraînement
     train_on_image=True,
@@ -4102,6 +4123,10 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     else:
         print(f"🔥 [decode_latents_ultrasafe] EMA None")
+
+
+    if export_latents:
+        export_latents_file(latents, frame_counter, output_dir)
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale

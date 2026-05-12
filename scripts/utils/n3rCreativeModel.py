@@ -7,8 +7,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
 
-
-
 # =========================================================
 # Compute high freq
 # =========================================================
@@ -564,10 +562,9 @@ optimizer_creative = optim.AdamW(
 
 criterion_creative = torch.nn.L1Loss()
 
-
 # =========================================================
 # APPLY FUNCTION
-# =========================================================
+# =========================================================*
 def apply_creative(
     latents,
     style_prompt_embedding,
@@ -575,10 +572,10 @@ def apply_creative(
     optimizer=None,
     criterion=None,
     train=False,
-    strength=0.12,
+    strength=0.10,
     device="cuda",
     frame_counter=0,
-    max_epochs_up=8,
+    max_epochs_up=6,
     model_path="models/creative_model_latest.pt",
     ema_prev_latents=None,
     ema_alpha=0.3,
@@ -592,10 +589,23 @@ def apply_creative(
     x = latents.to(device)
     x0 = x.detach()
 
-    print(f"[Creative V2] device={device}")
+    print(f"[Creative STABLE] device={device}")
+
+    # =====================================================
+    # SAFE PROMPT NORMALIZATION (IMPORTANT FIX)
+    # =====================================================
+
+    if style_prompt_embedding.dim() == 3:
+        prompt = style_prompt_embedding.mean(dim=1)
+    else:
+        prompt = style_prompt_embedding
+
+    # 🔥 critical fix: stop exploding norm
+    prompt = torch.tanh(prompt)
+    prompt = prompt / (prompt.std(dim=-1, keepdim=True) + 1e-6)
 
     hf = compute_high_freq_energy(x0)
-    print(f"[Creative V2] hf={hf.mean().item():.4f}")
+    print(f"[Creative STABLE] hf={hf.mean().item():.4f}")
 
     model_exists = os.path.exists(model_path)
 
@@ -608,7 +618,7 @@ def apply_creative(
         creative_model.train()
         max_epochs = max(1, max_epochs_up)
 
-        print("[Creative V2] Training semantic decorator")
+        print("[Creative STABLE] Training")
 
         for epoch in range(max_epochs):
 
@@ -616,7 +626,11 @@ def apply_creative(
 
             with torch.enable_grad():
 
-                pred = creative_model(x0, style_prompt_embedding)
+                pred = creative_model(x0, prompt)
+
+                # ============================
+                # SAFE ACTIVATIONS
+                # ============================
 
                 structure = torch.tanh(pred["structure"]).view(-1,1,1,1)
                 texture   = torch.tanh(pred["texture"]).view(-1,1,1,1)
@@ -626,87 +640,71 @@ def apply_creative(
 
                 out = x0
 
-                # =================================================
-                # STRUCTURE (stabilisé)
-                # =================================================
-
+                # ============================
+                # STRUCTURE (low-pass stable)
+                # ============================
                 low = F.avg_pool2d(out, 5, 1, 2)
-                out = out + 0.08 * structure * (low - out)
+                out = out + 0.06 * structure * (low - out)
 
-                # =================================================
-                # TEXTURE (renforcé mais borné)
-                # =================================================
-
+                # ============================
+                # TEXTURE (band-limited)
+                # ============================
                 detail = out - F.avg_pool2d(out, 3, 1, 1)
-                out = out + 0.12 * texture * detail
+                out = out + 0.08 * texture * detail
 
-                # =================================================
-                # STYLE (normalisé)
-                # =================================================
-
+                # ============================
+                # STYLE (bounded nonlinearity)
+                # ============================
                 style_map = torch.sin(out * 3.1415)
-                out = out + 0.05 * style * style_map
+                out = out + 0.04 * style * style_map
 
-                # =================================================
-                # CHAOS (réduit pour stabilité)
-                # =================================================
+                # ============================
+                # CHAOS (very controlled)
+                # ============================
+                noise = torch.randn_like(out) * 0.5
+                out = out + 0.01 * chaos * noise
 
-                noise = torch.randn_like(out)
-                out = out + 0.015 * chaos * noise
+                # ============================
+                # RHYTHM (reduced frequency)
+                # ============================
+                wave = torch.sin(out * 4.0)
+                out = out + 0.02 * rhythm * wave
 
-                # =================================================
-                # RHYTHM (léger + cohérent)
-                # =================================================
+                # ============================
+                # LOSSES (FIXED SCALE)
+                # ============================
 
-                wave = torch.sin(out * 6.0)
-                out = out + 0.03 * rhythm * wave
+                loss_id = 0.05 * F.l1_loss(out, x0)
 
-                # =================================================
-                # LOSSES (CORRIGÉES IMPORTANT)
-                # =================================================
-
-                # identity (réduit fortement)
-                loss_id = 0.01 * F.l1_loss(out, x0)
-
-                # structure perceptuelle
-                loss_detail = 0.03 * F.l1_loss(
+                loss_detail = 0.02 * F.l1_loss(
                     compute_high_freq_energy(out),
                     compute_high_freq_energy(x0)
                 )
 
-                # energy stabilisation
-                loss_energy = 0.002 * out.pow(2).mean()
+                loss_energy = 0.001 * out.pow(2).mean()
 
-                # diversity (IMPORTANT pour éviter collapse)
-                loss_diversity = -0.02 * (out - x0).abs().mean()
+                # stability constraint (VERY IMPORTANT)
+                loss_stability = 0.01 * (out - x0).pow(2).mean()
 
                 loss = (
-                    loss_id
-                    + loss_detail
-                    + loss_energy
-                    + loss_diversity
+                    loss_id +
+                    loss_detail +
+                    loss_energy +
+                    loss_stability
                 )
 
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
                 creative_model.parameters(),
-                1.0
+                0.8
             )
 
             optimizer.step()
 
-            print(
-                f"[Creative V2] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}"
-            )
+            print(f"[Creative STABLE] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}")
 
-            should_save = (
-                (frame_counter % 10 == 0)
-                and
-                (epoch == max_epochs - 1)
-            )
-
-            if should_save:
+            if (frame_counter % 10 == 0) and (epoch == max_epochs - 1):
                 save_creative_model(
                     creative_model,
                     optimizer=optimizer,
@@ -736,16 +734,16 @@ def apply_creative(
 
     with torch.no_grad():
 
-        pred = creative_model(x, style_prompt_embedding)
+        pred = creative_model(x, prompt)
 
-        structure = 0.15 * torch.tanh(pred["structure"])
-        texture   = 0.20 * torch.tanh(pred["texture"])
-        style     = 0.12 * torch.tanh(pred["style"])
-        chaos     = 0.05 * torch.tanh(pred["chaos"])
-        rhythm    = 0.07 * torch.tanh(pred["rhythm"])
+        structure = 0.10 * torch.tanh(pred["structure"])
+        texture   = 0.12 * torch.tanh(pred["texture"])
+        style     = 0.08 * torch.tanh(pred["style"])
+        chaos     = 0.03 * torch.tanh(pred["chaos"])
+        rhythm    = 0.05 * torch.tanh(pred["rhythm"])
 
         print(
-            f"[Creative V2] "
+            f"[Creative STABLE] "
             f"struct={structure.mean().item():.4f} | "
             f"texture={texture.mean().item():.4f} | "
             f"style={style.mean().item():.4f} | "
@@ -755,60 +753,40 @@ def apply_creative(
 
         out = x
 
-        # =================================================
-        # STRUCTURE
-        # =================================================
-
         low = F.avg_pool2d(out, 5, 1, 2)
         out = out + structure * (low - out)
-
-        # =================================================
-        # TEXTURE
-        # =================================================
 
         detail = out - F.avg_pool2d(out, 3, 1, 1)
         out = out + texture * detail
 
-        # =================================================
-        # STYLE
-        # =================================================
-
         style_map = torch.sin(out * 3.1415)
         out = out + style * style_map
 
-        # =================================================
-        # CHAOS
-        # =================================================
-
-        noise = torch.randn_like(out)
+        noise = torch.randn_like(out) * 0.5
         out = out + chaos * noise
 
-        # =================================================
-        # RHYTHM
-        # =================================================
-
-        wave = torch.sin(out * 6.0)
+        wave = torch.sin(out * 4.0)
         out = out + rhythm * wave
 
     # =====================================================
-    # ADAPTIVE STRENGTH (STABILISÉ)
+    # STRENGTH CONTROL (STABLE VERSION)
     # =====================================================
 
     hf = compute_high_freq_energy(x)
 
-    strength_map = strength / (1.0 + 3.0 * hf)
+    strength_map = strength / (1.0 + 4.0 * hf)
     strength_map = strength_map.clamp(0.01, strength)
 
     out = x + strength_map * (out - x)
 
     # =====================================================
-    # STABILIZATION
+    # FINAL STABILIZATION (IMPORTANT)
     # =====================================================
 
-    #out = stabilize_latents(out)
+    #out = stabilize_latents(out, target_std=1.0)
 
     # =====================================================
-    # EMA TEMPORAL (UNCHANGED BUT SAFE)
+    # EMA TEMPORAL (SAFE)
     # =====================================================
 
     if ema_prev_latents is not None and not train:
@@ -821,16 +799,14 @@ def apply_creative(
         out_high  = out - out_low
         prev_high = prev - prev_low
 
-        motion_factor = float(hf.mean().item())
+        motion = float(hf.mean().item())
 
-        alpha_low  = torch.clamp(torch.tensor(0.06 + 0.06 * motion_factor), 0.05, 0.15)
-        alpha_high = torch.clamp(torch.tensor(0.25 + 0.15 * motion_factor), 0.20, 0.50)
+        alpha_low  = min(max(0.05 + 0.05 * motion, 0.05), 0.12)
+        alpha_high = min(max(0.20 + 0.10 * motion, 0.20), 0.40)
 
-        low_ema = alpha_low * out_low + (1 - alpha_low) * prev_low
-        high_ema = alpha_high * out_high + (1 - alpha_high) * prev_high
-
-        out = low_ema + high_ema
+        out = (
+            alpha_low * out_low + (1 - alpha_low) * prev_low +
+            alpha_high * out_high + (1 - alpha_high) * prev_high
+        )
 
     return out
-
-
