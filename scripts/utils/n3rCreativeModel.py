@@ -425,10 +425,22 @@ class CreativeDecoratorModel(nn.Module):
         # -------------------------------------------------
 
         self.pool = nn.AdaptiveAvgPool2d(1)
-
+        """
         self.head = nn.Sequential(
             nn.Linear(base_channels, base_channels),
             nn.SiLU()
+        )
+        """
+        self.head = nn.Sequential(
+
+            nn.Linear(base_channels, base_channels * 4),
+            nn.SiLU(),
+
+            nn.Linear(base_channels * 4, base_channels * 2),
+            nn.SiLU(),
+
+            nn.Linear(base_channels * 2, base_channels),
+            nn.SiLU(),
         )
 
         # -------------------------------------------------
@@ -447,13 +459,36 @@ class CreativeDecoratorModel(nn.Module):
 
     def forward(self, x, prompt_emb):
 
+        # =====================================================
+        # LATENT ENCODER
+        # =====================================================
+
         h = self.encoder(x)
 
+        # =====================================================
+        # PROMPT PROCESSING (IMPORTANT FIX)
+        # =====================================================
+
         if prompt_emb.dim() == 3:
-            prompt_emb = prompt_emb[:, 0, :]
+
+            # SAFE + INFORMATIVE POOLING
+            prompt_emb = prompt_emb.mean(dim=1)
+
+            print(
+                "[Prompt pooled]",
+                prompt_emb.mean().item(),
+                prompt_emb.std().item(),
+                prompt_emb.min().item(),
+                prompt_emb.max().item()
+            )
+
+        # =====================================================
+        # PROMPT PROJECTION
+        # =====================================================
 
         p = self.prompt_proj(prompt_emb)
 
+        # reshape spatial conditioning
         p = p[:, :, None, None].expand(
             -1,
             -1,
@@ -461,11 +496,45 @@ class CreativeDecoratorModel(nn.Module):
             h.shape[3]
         )
 
+        # =====================================================
+        # STRENGTHEN PROMPT SIGNAL (CRITICAL)
+        # =====================================================
+
+        p = p * 2.0  # boost signal (important for non-collapse)
+
+        # optional light stochasticity (helps avoid dead fusion)
+        p = p * (1.0 + 0.05 * torch.randn_like(p))
+
+        # =====================================================
+        # FUSION
+        # =====================================================
+
         h = self.fusion(torch.cat([h, p], dim=1))
+
+        # =====================================================
+        # DEBUG (SAFE, INFORMATIVE)
+        # =====================================================
+
+        print(
+            "p_norm:", p.norm().item(),
+            "h_std:", h.std().item()
+        )
+
+        # =====================================================
+        # GLOBAL POOLING
+        # =====================================================
 
         g = self.pool(h).squeeze(-1).squeeze(-1)
 
+        # =====================================================
+        # SHARED REPRESENTATION HEAD
+        # =====================================================
+
         g = self.head(g)
+
+        # =====================================================
+        # CREATIVE HEADS OUTPUT
+        # =====================================================
 
         return {
             "structure": self.structure(g),
@@ -518,17 +587,15 @@ def apply_creative(
 ):
 
     device = latents.device
-
     creative_model.to(device)
 
     x = latents.to(device)
     x0 = x.detach()
 
-    print(f"[Creative V1] device={device}")
+    print(f"[Creative V2] device={device}")
 
     hf = compute_high_freq_energy(x0)
-
-    print(f"[Creative V1] hf={hf.mean().item():.4f}")
+    print(f"[Creative V2] hf={hf.mean().item():.4f}")
 
     model_exists = os.path.exists(model_path)
 
@@ -539,10 +606,9 @@ def apply_creative(
     if train and optimizer and criterion:
 
         creative_model.train()
-
         max_epochs = max(1, max_epochs_up)
 
-        print("[Creative V1] Training semantic decorator")
+        print("[Creative V2] Training semantic decorator")
 
         for epoch in range(max_epochs):
 
@@ -550,89 +616,75 @@ def apply_creative(
 
             with torch.enable_grad():
 
-                pred = creative_model(
-                    x0,
-                    style_prompt_embedding
-                )
+                pred = creative_model(x0, style_prompt_embedding)
 
-                structure = pred["structure"].view(-1,1,1,1)
-                texture   = pred["texture"].view(-1,1,1,1)
-                style     = pred["style"].view(-1,1,1,1)
-                chaos     = pred["chaos"].view(-1,1,1,1)
-                rhythm    = pred["rhythm"].view(-1,1,1,1)
+                structure = torch.tanh(pred["structure"]).view(-1,1,1,1)
+                texture   = torch.tanh(pred["texture"]).view(-1,1,1,1)
+                style     = torch.tanh(pred["style"]).view(-1,1,1,1)
+                chaos     = torch.tanh(pred["chaos"]).view(-1,1,1,1)
+                rhythm    = torch.tanh(pred["rhythm"]).view(-1,1,1,1)
 
                 out = x0
 
                 # =================================================
-                # STRUCTURE
+                # STRUCTURE (stabilisé)
                 # =================================================
 
                 low = F.avg_pool2d(out, 5, 1, 2)
-
-                out = out + 0.12 * torch.tanh(structure) * (low - out)
+                out = out + 0.08 * structure * (low - out)
 
                 # =================================================
-                # TEXTURE
+                # TEXTURE (renforcé mais borné)
                 # =================================================
 
                 detail = out - F.avg_pool2d(out, 3, 1, 1)
-
-                out = out + 0.18 * torch.tanh(texture) * detail
+                out = out + 0.12 * texture * detail
 
                 # =================================================
-                # STYLE
+                # STYLE (normalisé)
                 # =================================================
 
                 style_map = torch.sin(out * 3.1415)
-
-                out = out + 0.06 * torch.tanh(style) * style_map
+                out = out + 0.05 * style * style_map
 
                 # =================================================
-                # CHAOS
+                # CHAOS (réduit pour stabilité)
                 # =================================================
 
                 noise = torch.randn_like(out)
-
-                out = out + 0.025 * torch.tanh(chaos) * noise
+                out = out + 0.015 * chaos * noise
 
                 # =================================================
-                # RHYTHM
+                # RHYTHM (léger + cohérent)
                 # =================================================
 
                 wave = torch.sin(out * 6.0)
-
-                out = out + 0.04 * torch.tanh(rhythm) * wave
+                out = out + 0.03 * rhythm * wave
 
                 # =================================================
-                # LOSSES
+                # LOSSES (CORRIGÉES IMPORTANT)
                 # =================================================
 
-                # preserve identity
-                loss_id = 0.08 * F.l1_loss(out, x0)
+                # identity (réduit fortement)
+                loss_id = 0.01 * F.l1_loss(out, x0)
 
-                # preserve high frequency structure
-                loss_detail = 0.05 * F.l1_loss(
+                # structure perceptuelle
+                loss_detail = 0.03 * F.l1_loss(
                     compute_high_freq_energy(out),
                     compute_high_freq_energy(x0)
                 )
 
-                # avoid latent explosion
-                loss_energy = 0.005 * out.pow(2).mean()
+                # energy stabilisation
+                loss_energy = 0.002 * out.pow(2).mean()
 
-                # stylistic coherence
-                out_mean = out.mean(dim=(2,3))
-                in_mean  = x0.mean(dim=(2,3))
-
-                loss_style = 0.02 * F.l1_loss(
-                    out_mean,
-                    in_mean
-                )
+                # diversity (IMPORTANT pour éviter collapse)
+                loss_diversity = -0.02 * (out - x0).abs().mean()
 
                 loss = (
                     loss_id
                     + loss_detail
                     + loss_energy
-                    + loss_style
+                    + loss_diversity
                 )
 
             loss.backward()
@@ -645,9 +697,7 @@ def apply_creative(
             optimizer.step()
 
             print(
-                f"[Creative V1] "
-                f"Epoch {epoch+1}/{max_epochs} | "
-                f"Loss={loss.item():.6f}"
+                f"[Creative V2] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}"
             )
 
             should_save = (
@@ -657,7 +707,6 @@ def apply_creative(
             )
 
             if should_save:
-
                 save_creative_model(
                     creative_model,
                     optimizer=optimizer,
@@ -671,11 +720,9 @@ def apply_creative(
     # =====================================================
 
     else:
-
         creative_model.eval()
 
         if model_exists:
-
             creative_model, _ = load_creative_model(
                 type(creative_model),
                 path=model_path,
@@ -689,19 +736,16 @@ def apply_creative(
 
     with torch.no_grad():
 
-        pred = creative_model(
-            x,
-            style_prompt_embedding
-        )
+        pred = creative_model(x, style_prompt_embedding)
 
-        structure = 0.20 * torch.tanh(pred["structure"])
-        texture   = 0.25 * torch.tanh(pred["texture"])
-        style     = 0.15 * torch.tanh(pred["style"])
-        chaos     = 0.08 * torch.tanh(pred["chaos"])
-        rhythm    = 0.10 * torch.tanh(pred["rhythm"])
+        structure = 0.15 * torch.tanh(pred["structure"])
+        texture   = 0.20 * torch.tanh(pred["texture"])
+        style     = 0.12 * torch.tanh(pred["style"])
+        chaos     = 0.05 * torch.tanh(pred["chaos"])
+        rhythm    = 0.07 * torch.tanh(pred["rhythm"])
 
         print(
-            f"[Creative V1] "
+            f"[Creative V2] "
             f"struct={structure.mean().item():.4f} | "
             f"texture={texture.mean().item():.4f} | "
             f"style={style.mean().item():.4f} | "
@@ -716,7 +760,6 @@ def apply_creative(
         # =================================================
 
         low = F.avg_pool2d(out, 5, 1, 2)
-
         out = out + structure * (low - out)
 
         # =================================================
@@ -724,7 +767,6 @@ def apply_creative(
         # =================================================
 
         detail = out - F.avg_pool2d(out, 3, 1, 1)
-
         out = out + texture * detail
 
         # =================================================
@@ -732,7 +774,6 @@ def apply_creative(
         # =================================================
 
         style_map = torch.sin(out * 3.1415)
-
         out = out + style * style_map
 
         # =================================================
@@ -740,7 +781,6 @@ def apply_creative(
         # =================================================
 
         noise = torch.randn_like(out)
-
         out = out + chaos * noise
 
         # =================================================
@@ -748,21 +788,16 @@ def apply_creative(
         # =================================================
 
         wave = torch.sin(out * 6.0)
-
         out = out + rhythm * wave
 
     # =====================================================
-    # ADAPTIVE STRENGTH
+    # ADAPTIVE STRENGTH (STABILISÉ)
     # =====================================================
 
     hf = compute_high_freq_energy(x)
 
-    strength_map = strength / (1.0 + 2.0 * hf)
-
-    strength_map = strength_map.clamp(
-        0.02,
-        strength
-    )
+    strength_map = strength / (1.0 + 3.0 * hf)
+    strength_map = strength_map.clamp(0.01, strength)
 
     out = x + strength_map * (out - x)
 
@@ -770,10 +805,10 @@ def apply_creative(
     # STABILIZATION
     # =====================================================
 
-    out = stabilize_latents(out)
+    #out = stabilize_latents(out)
 
     # =====================================================
-    # EMA TEMPORAL
+    # EMA TEMPORAL (UNCHANGED BUT SAFE)
     # =====================================================
 
     if ema_prev_latents is not None and not train:
@@ -788,33 +823,14 @@ def apply_creative(
 
         motion_factor = float(hf.mean().item())
 
-        alpha_low  = 0.07 + 0.08 * motion_factor
-        alpha_high = 0.30 + 0.20 * motion_factor
+        alpha_low  = torch.clamp(torch.tensor(0.06 + 0.06 * motion_factor), 0.05, 0.15)
+        alpha_high = torch.clamp(torch.tensor(0.25 + 0.15 * motion_factor), 0.20, 0.50)
 
-        alpha_low  = float(torch.clamp(
-            torch.tensor(alpha_low),
-            0.05,
-            0.16
-        ))
-
-        alpha_high = float(torch.clamp(
-            torch.tensor(alpha_high),
-            0.20,
-            0.55
-        ))
-
-        low_ema = (
-            alpha_low * out_low
-            +
-            (1.0 - alpha_low) * prev_low
-        )
-
-        high_ema = (
-            alpha_high * out_high
-            +
-            (1.0 - alpha_high) * prev_high
-        )
+        low_ema = alpha_low * out_low + (1 - alpha_low) * prev_low
+        high_ema = alpha_high * out_high + (1 - alpha_high) * prev_high
 
         out = low_ema + high_ema
 
     return out
+
+
