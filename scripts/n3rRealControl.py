@@ -30,6 +30,7 @@ from scripts.utils.n3rModelUtils import generate_n3r_coords, process_n3r_latents
 from scripts.utils.tools_utils import ensure_4_channels, print_generation_params, sanitize_latents, stabilize_latents_advanced, log_debug, compute_overlap, get_interpolated_embeddings, save_memory, load_memory, load_external_embedding_as_latent, inject_external_embeddings, update_n3r_memory, compute_weighted_params, adapt_embeddings_to_unet, get_dynamic_latent_injection, save_input_frame, apply_motion_safe, encode_prompts_batch
 from scripts.utils.config_loader import load_config
 from scripts.utils.motion_utils import load_motion_module
+from scripts.utils.n3r_latent_utils import export_latents_for_comfy_meta, export_latents_file, build_latent_metadata, load_latent
 from scripts.utils.n3r_utils import load_images_test, generate_latents_mini_gpu_320, run_diffusion_pipeline, generate_latents_robuste_4D
 from scripts.utils.fx_utils import encode_images_to_latents_nuanced, adaptive_post_process, save_frames_as_video_from_folder, encode_images_to_latents_safe, encode_images_to_latents_hybrid, interpolate_param_fast, fuse_n3r_latents_adaptive, adaptive_post_process, remove_white_noise, encode_images_to_latents_hybrid_pro
 
@@ -158,6 +159,9 @@ def main(args):
 
     # ---------- Input image -----------------------------------
     input_paths = cfg.get("input_images") or [cfg.get("input_image")]
+    # Sample latent file
+    latent_paths = cfg.get("input_latents") or [cfg.get("input_latent")]
+
     #total_frames = len(input_paths) * num_fraps_per_image * max(len(prompts), 1)
     total_frames = len(input_paths) * num_fraps_per_image
 
@@ -226,6 +230,11 @@ def main(args):
     external_latent = load_external_embedding_as_latent( external_path, (1, 4, cfg["H"]//facteur, cfg["W"]//facteur) ).to(device)
 
     pose_model, face_mesh = init_mediapipe_models() # initialisation
+    # Load latent sample:
+    if latent_paths is not None:
+        for latent_idx, latent_path in enumerate(latent_paths):
+            latents_sample = load_latent(latent_path)
+
     for img_idx, img_path in enumerate(input_paths):
         if stop_generation: break
         try:
@@ -368,7 +377,7 @@ def main(args):
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
                         print(f"Dimention frame inter: Shape de latent_interp :", latent_interp.shape)
 
-                        frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list, output_dir=output_dir )
+                        frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single, latents_sample=latents_sample,pos_embeds_list=pos_embeds_list, output_dir=output_dir )
 
                         #Post Traitement
                         frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
@@ -550,7 +559,7 @@ def main(args):
                     print(f"Dimention : Shape de latents :", latents.shape)
 
                     frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device, new_image=new_image,
-                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single, pos_embeds_list=pos_embeds_list, output_dir=output_dir
+                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single, latents_sample=latents_sample, pos_embeds_list=pos_embeds_list, output_dir=output_dir
                     )
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
                                                     blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
