@@ -5297,6 +5297,9 @@ def load_images_all(paths, W, H, device, dtype):
             all_tensors.append(t)
     return torch.stack(all_tensors, dim=0)
 
+
+
+
 # -------------------------
 # Save video
 # -------------------------
@@ -5832,3 +5835,5 @@ def encode_images_to_latents_safe(images, vae, device="cuda", epsilon=1e-5):
 
     print(f"[DEBUG encode] shape finale latents: {latents.shape}, min/max: {latents.min().item():.6f}/{latents.max().item():.6f}")
     return latents
+
+
