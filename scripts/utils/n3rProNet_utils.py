@@ -6,6 +6,7 @@ from .n3rProTemporal import TemporalResidualNet, TemporalLoss, save_temporal_mod
 from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_model, load_style_model
 from .n3rApparenceModel import  apply_appearance, appearance_model, optimizer_apparence, criterion_apparence
 from .n3rCreativeModel import  apply_creative, creative_model, optimizer_creative, criterion_creative
+from .n3rArtModel import  apply_art, art_model, optimizer_art, criterion_art
 from .n3r_EMA import motion_aware_ema_fusion, motion_aware_ema_low_high
 from .n3r_latent_utils import export_latents_for_comfy_meta, export_latents_file, build_latent_metadata, load_latent, generate_sequence_id
 
@@ -3934,7 +3935,8 @@ Appearance	      éclairage / finition render (appearance = correction photomét
 
 
 def decode_latents_ultrasafe_blockwise_ultranatural(
-    latents, vae,
+    latents,
+    vae,
     block_size=32, overlap=16,
     device="cuda",
     new_image=False,
@@ -3951,6 +3953,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     style_injection=True,
     appearance=True,
     creative=True,
+    art=True,
     export_latents=False,
     export_latents_comfy=True,
     output_dir: Path = None,
@@ -3959,6 +3962,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     train_on_image=True,
     max_epochs_up=10,
     ema_prev_latents=None,
+    latents_sample=None,
     ema_global=None,
     ema_micro=None,
     debug=False
@@ -4022,12 +4026,18 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     # =====================================================
     # New Fonction : in DEV
     if creative:
-        # ⚠️ IMPORTANT: creative DOIT être déterministe en inference
-        # train_creative = train and train_on_image
-        #structure / texture / chaos / rhythm injection de déformation latente agit comme un semantic + stochastic modulator
+        #apprend une représentation de style stable en training compact (style_score + embedding) sert de “cerveau de style”
         latents = apply_creative(
-            latents=latents,
+            latents=latents, latents_sample=latents_sample,
             style_prompt_embedding=style_prompt_embedding, creative_model=creative_model, optimizer=optimizer_creative, criterion=criterion_creative, train=True, device="cuda", strength=0.12, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/creative_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+
+    if art:
+        # ⚠️ IMPORTANT: art DOIT être déterministe en inference
+        # train_art = train and train_on_image
+        #applique des transformations locales contrôle texture / structure / détails effets artistiques explicites sert de “renderer créatif”
+        latents = apply_art(
+            latents=latents,
+            style_prompt_embedding=style_prompt_embedding, art_model=art_model, optimizer=optimizer_art, criterion=criterion_art, train=True, device="cuda", strength=0.12, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/art_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
 
     # =====================================================
     # 3. STYLE INJECTION (OPTIONNEL middle layer)
