@@ -317,8 +317,6 @@ def main(args):
             # 🔥 FIX NaN / stabilité
             current_latent_single = sanitize_latents(current_latent_single)
 
-
-
             # Génération initiale robuste :
             pos_embeds, neg_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device, debug=False)
             try:
@@ -349,9 +347,6 @@ def main(args):
             #------------------------
 
             current_latent_single = current_latent_single.to('cpu')
-
-
-
 
             del input_image
             torch.cuda.empty_cache()
