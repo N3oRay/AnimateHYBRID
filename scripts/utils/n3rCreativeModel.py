@@ -687,9 +687,8 @@ ema_decay = 0.999
 
 # =========================================================
 # APPLY FUNCTION
-# =========================================================*
-
-def apply_creative(
+# =========================================================
+def apply_creative_v1(
     latents,
     latents_sample,
     style_prompt_embedding,
@@ -705,7 +704,8 @@ def apply_creative(
     ema_prev_latents=None,
     ema_alpha=0.3,
     new_image=False,
-    debug=False
+    debug=True,
+    stable=False #Stable ou Créatif
 ):
 
     import os
@@ -799,7 +799,14 @@ def apply_creative(
 
                 # simple reconstruction-style constraint
                 # (stable latent regularization)
-                loss_recon = F.l1_loss(style_score, torch.zeros_like(style_score))
+                if stable:
+                    loss_recon = F.l1_loss(style_score, torch.zeros_like(style_score))
+                else:
+                    #Creatif
+                    loss_recon = F.l1_loss(
+                        style_score,
+                        style_latent.mean(dim=(2,3), keepdim=True)
+                    )
 
                 loss_detail = 0.02 * F.l1_loss(
                     compute_high_freq_energy(x0),
@@ -853,17 +860,266 @@ def apply_creative(
     # =====================================================
     # STYLE GUIDED LATENT MODIFICATION
     # =====================================================
+    if stable:
+        style_strength = torch.tanh(pred["style_score"])
+    else:
+        style_strength = torch.sigmoid(pred["style_score"] * 3.0)
+        style_strength = style_strength * 2.5
+        style_strength = torch.clamp(style_strength, -2.0, 2.0)
 
-    style_strength = torch.tanh(pred["style_score"])
     style_strength = style_strength.view(-1, 1, 1, 1)
 
     # normalize HF adaptive strength
     hf_map = compute_high_freq_energy(x)
-    strength_map = strength / (1.0 + 4.0 * hf_map)
-    strength_map = strength_map.clamp(0.01, strength)
+    if stable:
+        strength_map = strength / (1.0 + 4.0 * hf_map)
+        strength_map = strength_map.clamp(0.01, strength)
+    else:
+        hf_map = hf_map ** 1.3
+        strength_map = strength * (0.4 + 1.2 * hf_map)
+        strength_map = strength_map.clamp(0.05, strength * 1.5)
 
     # style injection
     out = x + strength_map * style_strength * (x - x0)
+
+
+    # =====================================================
+    # CLEAN STABILITY
+    # =====================================================
+
+    out = torch.nan_to_num(
+        out,
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0
+    )
+
+    # =====================================================
+    # EMA TEMPORAL (optional video stability)
+    # =====================================================
+
+    if ema_prev_latents is not None and not train:
+
+        out = motion_aware_ema_fusion(
+            out=out,
+            ema_prev_latents=ema_prev_latents,
+            hf=hf,
+            debug=debug
+        )
+
+    return out
+
+
+def apply_creative(
+    latents,
+    latents_sample,
+    style_prompt_embedding,
+    creative_model,
+    optimizer=None,
+    criterion=None,
+    train=False,
+    strength=0.10,
+    device="cuda",
+    frame_counter=0,
+    max_epochs_up=6,
+    model_path="models/creative_model_latest.pt",
+    ema_prev_latents=None,
+    ema_alpha=0.3,
+    new_image=False,
+    debug=True,
+    stable=False #Stable ou Créatif
+):
+
+    import os
+    import torch
+    import torch.nn.functional as F
+
+    device = latents.device
+    creative_model.to(device)
+
+    x = latents.to(device)
+    x0 = x.detach()
+
+    print(f"[Creative FINAL] device={device}")
+
+    # =====================================================
+    # STYLE LATENT
+    # =====================================================
+
+    style_latent = None
+    if latents_sample is not None:
+
+        style_latent = (
+            latents_sample["samples"]
+            if isinstance(latents_sample, dict)
+            else latents_sample
+        ).to(device)
+
+        if debug:
+            print(f"[Creative FINAL] style shape={tuple(style_latent.shape)}")
+            print(f"[Creative FINAL] mean={style_latent.mean().item():.4f} std={style_latent.std().item():.4f}")
+
+    # =====================================================
+    # PROMPT CLEANING
+    # =====================================================
+
+    if style_prompt_embedding.dim() == 3:
+        prompt = style_prompt_embedding.mean(dim=1)
+    else:
+        prompt = style_prompt_embedding
+
+    prompt = torch.tanh(prompt)
+    prompt = prompt / (prompt.std(dim=-1, keepdim=True) + 1e-6)
+
+    # =====================================================
+    # HIGH FREQUENCY ENERGY
+    # =====================================================
+
+    hf = compute_high_freq_energy(x0)
+
+    if debug:
+        print(f"[Creative FINAL] hf={hf.mean().item():.4f}")
+
+    model_exists = os.path.exists(model_path)
+
+    # =====================================================
+    # MODEL LOAD (if inference)
+    # =====================================================
+
+    if (not train) and model_exists:
+        creative_model, _ = load_creative_model(
+            type(creative_model),
+            path=model_path,
+            optimizer=optimizer,
+            device=device
+        )
+
+    # =====================================================
+    # TRAINING
+    # =====================================================
+
+    if train and optimizer and criterion:
+
+        creative_model.train()
+
+        for epoch in range(max_epochs_up):
+
+            optimizer.zero_grad()
+            with torch.enable_grad():
+
+                pred = creative_model(
+                    x0,
+                    prompt,
+                    style_latent=style_latent
+                )
+
+                style_score = pred["style_score"]
+
+                # -----------------------------
+                # SAFE STYLE TARGET
+                # -----------------------------
+                if style_latent is not None:
+                    target_style = style_latent.mean(dim=(2,3))
+                    target_style = target_style.mean(dim=1, keepdim=True)
+                    target_style = torch.tanh(target_style)
+                else:
+                    target_style = torch.zeros_like(style_score)
+
+                loss_recon = F.l1_loss(style_score, target_style)
+
+                loss_detail = 0.02 * F.l1_loss(
+                    compute_high_freq_energy(x0),
+                    compute_high_freq_energy(x0)
+                )
+
+                loss = loss_recon + loss_detail
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                creative_model.parameters(),
+                0.8
+            )
+
+            optimizer.step()
+
+            print(f"[Creative FINAL] Epoch {epoch+1}/{max_epochs_up} | Loss={loss.item():.6f}")
+
+        save_creative_model(
+            creative_model,
+            optimizer=optimizer,
+            epoch=frame_counter,
+            loss=loss.item(),
+            path=model_path
+        )
+
+    # =====================================================
+    # INFERENCE
+    # =====================================================
+
+    creative_model.eval()
+
+    with torch.no_grad():
+
+        pred = creative_model(
+            x,
+            prompt,
+            style_latent=style_latent
+        )
+
+        if debug:
+            print(
+                f"[Creative FINAL] style_score={pred['style_score'].mean().item():.4f}"
+            )
+
+    # =====================================================
+    # STYLE GUIDED LATENT MODIFICATION
+    # =====================================================
+    # -----------------------------
+    # STYLE STRENGTH
+    # -----------------------------
+    style_strength = torch.sigmoid(pred["style_score"] * 3.0)
+    style_strength = (style_strength - 0.5) * 2.0
+    style_strength = style_strength * 2.5
+    style_strength = torch.clamp(style_strength, -2.0, 2.0)
+
+    # -----------------------------
+    # HF MAP
+    # -----------------------------
+    hf_map = compute_high_freq_energy(x)
+    hf_map = hf_map / (hf_map.mean() + 1e-6)
+    hf_map = hf_map ** 1.3
+
+    strength_map = strength * (0.4 + 1.2 * hf_map)
+
+    # -----------------------------
+    # IMPORTANT FIX: better direction
+    # -----------------------------
+    with torch.no_grad():
+
+        # feature space (24 channels)
+        features = creative_model.encoder(x)
+        features = torch.tanh(features)
+
+        # compress spatially but keep structure
+        spatial = F.avg_pool2d(features, kernel_size=3, stride=1, padding=1)
+
+        # high frequency emphasis
+        hf = features - spatial
+
+        # merge features (keep channel diversity!)
+        direction_24 = 0.6 * features + 0.4 * hf
+
+        # project 24 -> 4 WITHOUT destroying structure
+        direction = torch.zeros_like(x)
+
+        for i in range(4):
+            direction[:, i:i+1] = direction_24[:, i::4].mean(dim=1, keepdim=True)
+
+
+    alpha = strength_map * torch.sigmoid(style_strength)
+    out = x + alpha * (direction - x)
+
 
     # =====================================================
     # CLEAN STABILITY

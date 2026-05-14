@@ -4029,7 +4029,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         #apprend une représentation de style stable en training compact (style_score + embedding) sert de “cerveau de style”
         latents = apply_creative(
             latents=latents, latents_sample=latents_sample,
-            style_prompt_embedding=style_prompt_embedding, creative_model=creative_model, optimizer=optimizer_creative, criterion=criterion_creative, train=True, device="cuda", strength=0.12, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/creative_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+            style_prompt_embedding=style_prompt_embedding, creative_model=creative_model, optimizer=optimizer_creative, criterion=criterion_creative, train=True, device="cuda", strength=1.00, debug=True,
+            new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/creative_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
 
     if art:
         # ⚠️ IMPORTANT: art DOIT être déterministe en inference
@@ -4037,7 +4038,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         #applique des transformations locales contrôle texture / structure / détails effets artistiques explicites sert de “renderer créatif”
         latents = apply_art(
             latents=latents,
-            style_prompt_embedding=style_prompt_embedding, art_model=art_model, optimizer=optimizer_art, criterion=criterion_art, train=True, device="cuda", strength=0.12, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/art_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+            style_prompt_embedding=style_prompt_embedding, art_model=art_model, optimizer=optimizer_art, criterion=criterion_art, train=True, device="cuda", strength=0.50, debug=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/art_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
 
     # =====================================================
     # 3. STYLE INJECTION (OPTIONNEL middle layer)
