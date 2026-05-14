@@ -5359,6 +5359,96 @@ def adjust_color_temperature(
     max_gain=2.0,
     debug=False
 ):
+
+    img = np.array(image).astype(np.float32) / 255.0
+
+    r1, g1, b1 = kelvin_to_rgb(reference_temp)
+    r2, g2, b2 = kelvin_to_rgb(target_temp)
+
+    base_gain = np.array([r2 / r1, g2 / g1, b2 / b1])
+
+    mean_rgb = img.reshape(-1, 3).mean(axis=0)
+    mean_rgb = np.maximum(mean_rgb, 1e-6)
+
+    wb_ratio = mean_rgb / mean_rgb.mean()
+
+    # =====================================================
+    # improved temperature direction detection
+    # =====================================================
+
+    warmth_score = (mean_rgb[0] * 0.6 + mean_rgb[1] * 0.3) / (mean_rgb[2] + 1e-6)
+
+    # cold image (needs warm correction)
+    if warmth_score < 0.95:
+        direction = "cold_to_warm"
+    else:
+        direction = "warm_to_cold"
+
+    # =====================================================
+    # adaptive factor (ASYMMETRIC FIX)
+    # =====================================================
+
+    imbalance = np.std(wb_ratio)
+
+    if adaptive:
+        if direction == "cold_to_warm":
+            # doux + progressif
+            print("Image trop froide, ajustement vers une température plus chaude.")
+            adaptive_factor = 1.0 + 0.6 * imbalance
+            strength_local = strength * 0.7
+        else:
+            print("Image trop chaude, ajustement vers une température plus froide.")
+            # plus agressif mais clampé
+            adaptive_factor = 1.0 + 1.2 * imbalance
+            strength_local = strength * 1.3
+    else:
+        adaptive_factor = 1.0
+        strength_local = strength
+
+    # =====================================================
+    # gain interpolation (stable)
+    # =====================================================
+
+    final_gain = (1 - strength_local) + strength_local * base_gain * adaptive_factor
+
+    # =====================================================
+    # asymmetric clamp (IMPORTANT FIX)
+    # =====================================================
+
+    if direction == "cold_to_warm":
+        # éviter surchauffe
+        final_gain = np.clip(final_gain, 0.85, max_gain)
+    else:
+        # éviter washout froid
+        final_gain = np.clip(final_gain, 1 / max_gain, 1.15)
+
+    # =====================================================
+    # apply
+    # =====================================================
+
+    img *= final_gain
+    img = np.clip(img, 0, 1)
+
+    if debug:
+        print("=== TEMP DEBUG ===")
+        print("direction:", direction)
+        print("warmth_score:", warmth_score)
+        print("adaptive_factor:", adaptive_factor)
+        print("strength_local:", strength_local)
+        print("final_gain:", final_gain)
+        print("==================")
+
+    return Image.fromarray((img * 255).astype(np.uint8))
+
+def adjust_color_temperature_v1(
+    image,
+    target_temp=7800,
+    reference_temp=6500,
+    strength=0.5,
+    adaptive=True,
+    max_gain=2.0,
+    debug=False
+):
     img = np.array(image).astype(np.float32) / 255.0
 
     # --- 1. Gains température (comme ton code)
@@ -5390,10 +5480,14 @@ def adjust_color_temperature(
             # Image plus froide, vers plus de chaleur
             print("Image trop froide, ajustement vers une température plus chaude.")
             target_temp = min(target_temp * (1 + strength), 10000)
+            print(f"Image target_temp:  {target_temp} ")
+            print("==============================================================")
         elif np.mean(wb_ratio[0]) > 1:
             # Image plus chaude, vers plus de froid
             print("Image trop chaude, ajustement vers une température plus froide.")
             target_temp = max(target_temp * (1 - strength), 3000)
+            print(f"Image target_temp:  {target_temp} ")
+            print("==============================================================")
 
     else:
         adaptive_factor = 1.0
@@ -5811,7 +5905,7 @@ def full_frame_postprocess(
     frame_counter: int,
     target_temp: int = 7800,
     reference_temp: int = 6500,
-    temp_strength: float = 0.20,   # 🔥 légèrement réduit (moins bleu)
+    temp_strength: float = 0.15,   # 🔥 légèrement réduit (moins bleu)
     blur_radius: float = 0.025,    # 🔥 un peu moins de blur global
     contrast: float = 1.08,        # 🔥 évite sur-contraste cumulé
     sharpen_percent: int = 90,
