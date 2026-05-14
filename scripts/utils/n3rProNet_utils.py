@@ -3954,6 +3954,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     appearance=True,
     creative=True,
     art=True,
+    suffix="00",
     export_latents=False,
     export_latents_comfy=True,
     output_dir: Path = None,
@@ -4096,7 +4097,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # Export Standard
     if export_latents:
-        export_latents_file(latents, frame_counter, output_dir)
+        export_latents_file(latents, suffix, frame_counter, output_dir)
 
     # Export for ConfyUI
     if export_latents_comfy:
@@ -4105,7 +4106,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         #save_latents_for_comfy(latents, frame_counter, output_dir)
         metadata = build_latent_metadata( latents=latents, frame_counter=frame_counter, sequence_id=sequence_id, scale=scale, denoise=denoise, temporal_consistency=temporal_consistency, style_injection=style_injection, appearance=appearance, creative=creative, sharpen_mode=sharpen_mode, gamma_boost=gamma_boost, train=train, ema_prev_latents=ema_prev_latents )
 
-        export_latents_for_comfy_meta( latents, frame_counter, output_dir, metadata)
+        export_latents_for_comfy_meta( latents, suffix, frame_counter, output_dir, metadata)
 
 
     # ⚡ latents en float16 pour réduire VRAM, multiplication par scale

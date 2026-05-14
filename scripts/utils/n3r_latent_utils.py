@@ -40,12 +40,12 @@ def load_latent(path, map_location="cpu", debug=True):
     }
 
 
-def export_latents_file(latents, frame_counter, output_dir="exports"):
+def export_latents_file(latents, suffix, frame_counter, output_dir="exports"):
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    save_path = output_dir / f"latents_{frame_counter:05d}.pt"
+    save_path = output_dir / f"latents_{frame_counter:05d}_{suffix}.pt"
 
     torch.save(
         {
@@ -204,7 +204,7 @@ def build_latent_metadata(
         "timestamp": time.time(),
     }
 
-def save_latents_for_comfy(latents, frame_counter, output_dir="exports"):
+def save_latents_for_comfy(latents, suffix, frame_counter, output_dir="exports"):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -212,14 +212,14 @@ def save_latents_for_comfy(latents, frame_counter, output_dir="exports"):
         "samples": latents.detach().float().cpu(),
     }
 
-    path = output_dir / f"latent_{frame_counter:05d}.latent.pt"
+    path = output_dir / f"latent_{frame_counter:05d}_{suffix}.latent.pt"
 
     torch.save(data, path)
 
     print(f"💾 Comfy Latent exported: {path}")
 
 def export_latents_for_comfy_meta(
-    latents,
+    latents, suffix,
     frame_counter,
     output_dir="exports",
     metadata=None,
@@ -233,7 +233,7 @@ def export_latents_for_comfy_meta(
         "metadata": metadata or {},
     }
 
-    path = output_dir / f"latent_{frame_counter:05d}.latent.pt"
+    path = output_dir / f"latent_{frame_counter:05d}_{suffix}.latent.pt"
 
     torch.save(data, path)
 
