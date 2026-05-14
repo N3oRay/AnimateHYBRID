@@ -688,7 +688,7 @@ ema_decay = 0.999
 # =========================================================
 # APPLY FUNCTION
 # =========================================================
-def apply_creative_v1(
+def apply_creative_stable(
     latents,
     latents_sample,
     style_prompt_embedding,
@@ -1107,18 +1107,18 @@ def apply_creative(
         # high frequency emphasis
         hf = features - spatial
 
-        # merge features (keep channel diversity!)
-        direction_24 = 0.6 * features + 0.4 * hf
-
-        # project 24 -> 4 WITHOUT destroying structure
         direction = torch.zeros_like(x)
 
-        for i in range(4):
-            direction[:, i:i+1] = direction_24[:, i::4].mean(dim=1, keepdim=True)
+        direction = F.conv2d(
+            features,
+            weight=torch.ones(4, features.shape[1], 1, 1, device=x.device) / features.shape[1],
+            bias=None
+        )
 
 
     alpha = strength_map * torch.sigmoid(style_strength)
-    out = x + alpha * (direction - x)
+    style_map = torch.tanh(direction)
+    out = x * (1.0 - alpha) + style_map * alpha
 
 
     # =====================================================
