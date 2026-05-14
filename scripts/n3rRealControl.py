@@ -355,7 +355,7 @@ def main(args):
             if previous_latent_single is not None and transition_frames > 0:
 
                 previous_latent_inter = previous_latent_single * LATENT_SCALE  # “rescale obligatoire ”
-
+                frame_inter = 0
                 for t in range(transition_frames):
                     if stop_generation: break
                     alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
@@ -395,12 +395,13 @@ def main(args):
                         latent_interp = latent_interp / LATENT_SCALE  # “rescale obligatoire avant decode”
                         print(f"Dimention frame inter: Shape de latent_interp :", latent_interp.shape)
 
-                        frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_inter, latents_sample=latents_sample,pos_embeds_list=pos_embeds_list, output_dir=output_dir, suffix="0i" )
+                        suffix = f"{frame_inter}i"
+                        frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_inter, latents_sample=latents_sample,pos_embeds_list=pos_embeds_list, output_dir=output_dir, suffix=suffix )
 
                         #Post Traitement
                         frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
-                        save_frame_verbose(frame_pil, output_dir, frame_counter-1, suffix="0i", psave=True)
-                        frame_counter += 1
+                        save_frame_verbose(frame_pil, output_dir, frame_counter-1, suffix=suffix, psave=True)
+                        frame_inter += 1
                         pbar.update(1)
 
                     del latent_interp
