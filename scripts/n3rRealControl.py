@@ -311,11 +311,14 @@ def main(args):
                 current_latent_single, size=(cfg["H"]//facteur, cfg["W"]//facteur),
                 mode='bilinear', align_corners=False
             )
+
             # --- Debug final ---
             print("✅ Latents shape:", current_latent_single.shape)
-
             # 🔥 FIX NaN / stabilité
             current_latent_single = sanitize_latents(current_latent_single)
+
+
+
             # Génération initiale robuste :
             pos_embeds, neg_embeds = get_interpolated_embeddings( frame_counter, frames_per_prompt, pos_embeds_list, neg_embeds_list, device, debug=False)
             try:
@@ -332,12 +335,31 @@ def main(args):
                 print(f"[Robuste INIT ERROR] {e}")
 
             current_latent_single = ensure_4_channels(current_latent_single)
+
+            #------- TEST ----
+            master_latent_single = current_latent_single / LATENT_SCALE
+            print("✅ Latents master_latent_single shape:", master_latent_single.shape)
+            frame_pil, master_latent_single = decode_latents_ultrasafe_blockwise_ultranatural(master_latent_single, vae, block_size=block_size, overlap=overlap, device=device, new_image=new_image,
+                            frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=master_latent_single, latents_sample=latents_sample, pos_embeds_list=pos_embeds_list, output_dir=output_dir, suffix="0a"
+                        )
+            frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
+                                                        blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
+            save_frame_verbose(frame_pil, output_dir, frame_counter, suffix="0a", psave=True)
+            #------ TEST -----
+
             current_latent_single = current_latent_single.to('cpu')
+
+
+
+
             del input_image
             torch.cuda.empty_cache()
 
             # ---------------- Transition frames ----------------
             if previous_latent_single is not None and transition_frames > 0:
+
+                #current_latent_single = current_latent_single / LATENT_SCALE  # “rescale obligatoire avant decode”
+
                 for t in range(transition_frames):
                     if stop_generation: break
                     alpha = 0.5 - 0.5*math.cos(math.pi*t/max(transition_frames-1,1))
@@ -374,10 +396,10 @@ def main(args):
                                 latents = apply_pro_net_with_mouth(latents, mouth_coords_latent, n3r_pro_net, n3r_pro_strength, sanitize_fn=sanitize_latents)
 
                         # Décodage streaming
-                        latent_interp = latent_interp / LATENT_SCALE  # “rescale” avant décodage
+                        latent_interp = latent_interp / LATENT_SCALE  # “rescale obligatoire avant decode”
                         print(f"Dimention frame inter: Shape de latent_interp :", latent_interp.shape)
 
-                        frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single, latents_sample=latents_sample,pos_embeds_list=pos_embeds_list, output_dir=output_dir )
+                        frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural( latent_interp, vae, block_size=block_size, overlap=overlap, device=device, frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, ema_prev_latents=previous_latent_single, latents_sample=latents_sample,pos_embeds_list=pos_embeds_list, output_dir=output_dir, suffix="0i" )
 
                         #Post Traitement
                         frame_pil = full_frame_postprocess( frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp, blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave )
@@ -559,7 +581,7 @@ def main(args):
                     print(f"Dimention : Shape de latents :", latents.shape)
 
                     frame_pil, previous_latent_single = decode_latents_ultrasafe_blockwise_ultranatural(latents, vae, block_size=block_size, overlap=overlap, device=device, new_image=new_image,
-                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single, latents_sample=latents_sample, pos_embeds_list=pos_embeds_list, output_dir=output_dir
+                        frame_counter=frame_counter, latent_scale_boost=latent_scale_boost, scale=facteur, ema_prev_latents=previous_latent_single, latents_sample=latents_sample, pos_embeds_list=pos_embeds_list, output_dir=output_dir, suffix="0f"
                     )
                     frame_pil = full_frame_postprocess(frame_pil, output_dir, frame_counter, target_temp=target_temp, reference_temp=reference_temp,
                                                     blur_radius=blur_radius, contrast=contrast, sharpen_percent=sharpen_percent, psave=psave)
