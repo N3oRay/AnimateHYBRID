@@ -1078,7 +1078,8 @@ def apply_creative(
     # -----------------------------
     # STYLE STRENGTH
     # -----------------------------
-    style_strength = torch.sigmoid(pred["style_score"] * 3.0)
+    style_strength = torch.tanh(pred["style_score"] * 1.5)
+    style_strength = style_strength * 2.0
     style_strength = (style_strength - 0.5) * 2.0
     style_strength = style_strength * 2.5
     style_strength = torch.clamp(style_strength, -2.0, 2.0)
@@ -1090,7 +1091,9 @@ def apply_creative(
     hf_map = hf_map / (hf_map.mean() + 1e-6)
     hf_map = hf_map ** 1.3
 
-    strength_map = strength * (0.4 + 1.2 * hf_map)
+    #strength_map = strength * (0.4 + 1.2 * hf_map)
+    strength_map = strength * (0.8 - 0.6 * hf_map)
+    strength_map = strength_map.clamp(0.2 * strength, strength)
 
     # -----------------------------
     # IMPORTANT FIX: better direction
