@@ -3963,7 +3963,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     train_on_image=True,
     max_epochs_up=10,
     ema_prev_latents=None,
-    latents_sample=None,
+    latents_sample=None, # Sample exemple
     ema_global=None,
     ema_micro=None,
     debug=False
@@ -4071,7 +4071,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         #photométrie contraste / gamma / exposure micro-structure visuelle agit comme un rendering layer
         latents = apply_appearance(
             latents=latents,
-            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=train, device="cuda", strength=0.1, debug=debug, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=True, device="cuda", strength=0.1, debug=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", latents_sample=latents_sample, ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
 
 
     # =====================================================

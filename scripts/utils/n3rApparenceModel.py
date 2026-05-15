@@ -1,4 +1,6 @@
 # n3rApparenceModel.py
+#petit renderer photométrique différentiable + module de style conditionné texte + adaptation temporelle EMA
+# exposure → gain global # gamma → non-linéarité luminance # contrast → variance locale # micro → détail haute fréquence
 import os
 import datetime
 import torch
@@ -188,10 +190,39 @@ optimizer_apparence = optim.AdamW(
 
 criterion_apparence = torch.nn.MSELoss()
 
-
 # =========================================================
 # APPLY FUNCTION
 # =========================================================
+def extract_latents(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        if "latents" in x:
+            return x["latents"]
+        return next(iter(x.values()))
+    return x
+
+def appearance_debug(pred, x, out, hf=None, prefix="[Appearance DEBUG]"):
+    exposure = torch.tanh(pred["exposure"]).mean().item()
+    gamma    = torch.tanh(pred["gamma"]).mean().item()
+    contrast = torch.tanh(pred["contrast"]).mean().item()
+    micro    = torch.tanh(pred["micro"]).mean().item()
+
+    print(f"\n{prefix}")
+    print(f"params:")
+    print(f"  exposure : {exposure:.4f}")
+    print(f"  gamma    : {gamma:.4f}")
+    print(f"  contrast : {contrast:.4f}")
+    print(f"  micro    : {micro:.4f}")
+
+    print(f"image stats:")
+    print(f"  mean     : {out.mean().item():.4f}")
+    print(f"  std      : {out.std().item():.4f}")
+    print(f"  min/max  : {out.min().item():.4f} / {out.max().item():.4f}")
+
+    if hf is not None:
+        print(f"  hf energy : {hf.mean().item():.6f}")
+
 def apply_appearance(
     latents,
     style_prompt_embedding,
@@ -204,6 +235,217 @@ def apply_appearance(
     frame_counter=0,
     max_epochs_up=12,
     model_path="models/appearance_model_latest.pt",
+    latents_sample=None,
+    ema_prev_latents=None,
+    ema_alpha=0.3,
+    new_image=False,
+    debug=False
+):
+
+    device = latents.device
+    appearance_model.to(device)
+
+    x = latents.to(device)
+    x0 = x.detach()
+
+    model_exists = os.path.exists(model_path)
+
+    hf = compute_high_freq_energy(x0)
+
+    # =====================================================
+    # TRAIN
+    # =====================================================
+    if train and optimizer is not None and criterion is not None:
+
+        appearance_model.train()
+        max_epochs = max(1, max_epochs_up)
+
+        for epoch in range(max_epochs):
+
+            optimizer.zero_grad()
+
+            with torch.enable_grad():
+
+                # -----------------------------
+                # forward current
+                # -----------------------------
+                pred = appearance_model(x0, style_prompt_embedding)
+
+                exposure = pred["exposure"].view(-1,1,1,1)
+                gamma    = pred["gamma"].view(-1,1,1,1)
+                contrast = pred["contrast"].view(-1,1,1,1)
+                micro    = pred["micro"].view(-1,1,1,1)
+
+                out = x0
+
+                # exposure
+                out = out * (1.0 + 0.5 * torch.tanh(exposure))
+
+                # gamma (stable version)
+                out = torch.sign(out) * (torch.abs(out) ** (1.0 + 0.3 * torch.tanh(gamma) + 1e-6))
+
+                # contrast
+                m = out.mean(dim=(2,3), keepdim=True)
+                out = (out - m) * (1.0 + torch.tanh(contrast)) + m
+
+                # micro detail
+                detail = out - F.avg_pool2d(out, 3, 1, 1)
+                out = out + torch.tanh(micro) * detail
+
+                # -----------------------------
+                # reconstruction loss
+                # -----------------------------
+                loss_id = 0.08 * F.l1_loss(out, x0)
+
+                # high frequency consistency
+                loss_detail = 0.05 * F.l1_loss(
+                    compute_high_freq_energy(out),
+                    compute_high_freq_energy(x0)
+                )
+
+                # energy regularization
+                loss_energy = 0.005 * out.pow(2).mean()
+
+                # -----------------------------
+                # consistency with latents_sample
+                # -----------------------------
+                loss_consistency = 0.0
+
+                if latents_sample is not None:
+
+                    #ref = latents_sample.to(device).detach()
+
+                    ref = extract_latents(latents_sample)
+                    if ref is not None:
+                        ref = ref.to(device).detach()
+
+                    ref_pred = appearance_model(ref, style_prompt_embedding)
+
+                    loss_consistency = (
+                        F.l1_loss(pred["exposure"], ref_pred["exposure"]) +
+                        F.l1_loss(pred["gamma"], ref_pred["gamma"]) +
+                        F.l1_loss(pred["contrast"], ref_pred["contrast"]) +
+                        F.l1_loss(pred["micro"], ref_pred["micro"])
+                    )
+
+                # -----------------------------
+                # total loss
+                # -----------------------------
+                loss = (
+                    loss_id +
+                    loss_energy +
+                    loss_detail +
+                    0.1 * loss_consistency
+                )
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(appearance_model.parameters(), 1.0)
+            optimizer.step()
+
+            if debug:
+                print(f"[Appearance TRAIN] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}")
+
+            # save
+            should_save = (frame_counter % 10 == 0) and (epoch == max_epochs - 1)
+
+            if should_save:
+                save_appearance_model(
+                    appearance_model,
+                    optimizer=optimizer,
+                    epoch=frame_counter,
+                    loss=loss.item(),
+                    path=model_path
+                )
+
+    # =====================================================
+    # LOAD (if needed)
+    # =====================================================
+    else:
+
+        appearance_model.eval()
+
+        if model_exists:
+            appearance_model, _ = load_appearance_model(
+                type(appearance_model),
+                path=model_path,
+                optimizer=optimizer,
+                device=device
+            )
+
+    # =====================================================
+    # INFERENCE
+    # =====================================================
+    with torch.no_grad():
+
+        pred = appearance_model(x, style_prompt_embedding)
+
+        exposure = 0.25 * torch.tanh(pred["exposure"])
+        gamma    = 0.15 * torch.tanh(pred["gamma"])
+        contrast = 0.20 * torch.tanh(pred["contrast"])
+        micro    = 0.35 * torch.tanh(pred["micro"])
+
+        out = x
+
+        # exposure
+        out = out * (1.0 + 0.4 * exposure)
+
+        # gamma stable
+        out = torch.sign(out) * (torch.abs(out) ** (1.0 + 0.25 * gamma + 1e-6))
+
+        # contrast
+        m = out.mean(dim=(2,3), keepdim=True)
+        out = (out - m) * (1.0 + contrast) + m
+
+        # micro detail
+        detail = out - F.avg_pool2d(out, 3, 1, 1)
+        out = out + micro * detail
+
+
+    # =====================================================
+    # STRENGTH BLENDING
+    # =====================================================
+    hf = compute_high_freq_energy(x)
+
+    strength_map = strength / (1.0 + 2.5 * hf)
+    strength_map = strength_map.clamp(0.01, strength)
+
+    out = x + strength_map * (out - x)
+
+    if debug:
+        appearance_debug( pred=pred, x=x, out=out, hf=hf )
+
+    # =====================================================
+    # EMA FUSION
+    # =====================================================
+    if ema_prev_latents is not None and not train:
+
+        out = motion_aware_ema_fusion(
+            out=out,
+            ema_prev_latents=ema_prev_latents,
+            hf=hf,
+            debug=debug
+        )
+
+        diff = (out - ema_prev_latents).abs().mean().item()
+        print(f"[Appearance EMA drift] {diff:.6f}")
+
+    return out
+
+
+
+def apply_appearance_v1(
+    latents,
+    style_prompt_embedding,
+    appearance_model,
+    optimizer=None,
+    criterion=None,
+    train=False,
+    strength=0.1,
+    device="cuda",
+    frame_counter=0,
+    max_epochs_up=12,
+    model_path="models/appearance_model_latest.pt",
+    latents_sample=None, # Sample exemple
     ema_prev_latents=None,
     ema_alpha=0.3,
     new_image=False,
@@ -371,6 +613,9 @@ def apply_appearance(
         )
 
     return out
+
+
+
 
 
 
