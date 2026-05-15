@@ -223,6 +223,56 @@ def appearance_debug(pred, x, out, hf=None, prefix="[Appearance DEBUG]"):
     if hf is not None:
         print(f"  hf energy : {hf.mean().item():.6f}")
 
+
+
+def stabilize_latents(latents, target_std=1.0, clamp_value=3.0, eps=1e-6, mode="adaptive"):
+    """
+    Stabilisation des latents pour renderers photométriques.
+
+    Args:
+        latents: Tensor [B, C, H, W]
+        target_std: cible de variance globale
+        clamp_value: limite pour éviter explosion dynamique
+        eps: stabilité numérique
+        mode:
+            - "adaptive" (recommandé)
+            - "hard"
+            - "tanh"
+    """
+
+    x = latents
+
+    if mode == "tanh":
+        # ultra stable mais plus "compressif"
+        return torch.tanh(x)
+
+    # =====================================================
+    # 1. normalisation globale
+    # =====================================================
+    mean = x.mean(dim=(1,2,3), keepdim=True)
+    std  = x.std(dim=(1,2,3), keepdim=True)
+
+    x = (x - mean) / (std + eps)
+
+    # =====================================================
+    # 2. re-scaling contrôlé
+    # =====================================================
+    if mode == "adaptive":
+        # préserve un peu de dynamique originale
+        scale = target_std
+        x = x * scale
+
+    elif mode == "hard":
+        # force stricte stabilité
+        x = x * target_std
+
+    # =====================================================
+    # 3. clamp sécurité (anti explosion HF)
+    # =====================================================
+    x = torch.clamp(x, -clamp_value, clamp_value)
+
+    return x
+
 def apply_appearance(
     latents,
     style_prompt_embedding,
@@ -248,6 +298,17 @@ def apply_appearance(
     x = latents.to(device)
     x0 = x.detach()
 
+    # =====================================================
+    # LATENT STABILIZATION (CRITICAL FIX)
+    # =====================================================
+    print("[LATENT CHECK]")
+    print("before std:", x.std().item())
+
+    #x0 = stabilize_latents(x0).detach()
+    x0 = x0 * (3.0 / (x0.std() + 1e-6))
+
+    print("after std :", x0.std().item())
+
     model_exists = os.path.exists(model_path)
 
     hf = compute_high_freq_energy(x0)
@@ -262,9 +323,9 @@ def apply_appearance(
 
         for epoch in range(max_epochs):
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            with torch.enable_grad():
+            with torch.set_grad_enabled(True):
 
                 # -----------------------------
                 # forward current
@@ -279,63 +340,81 @@ def apply_appearance(
                 out = x0
 
                 # exposure
-                out = out * (1.0 + 0.5 * torch.tanh(exposure))
+                out = out * (1.0 + 0.4 * torch.tanh(exposure))
 
-                # gamma (stable version)
-                out = torch.sign(out) * (torch.abs(out) ** (1.0 + 0.3 * torch.tanh(gamma) + 1e-6))
+                # gamma stable
+                out = torch.sign(out) * (torch.abs(out) ** (1.0 + 0.25 * torch.tanh(gamma) + 1e-6))
 
-                # contrast
+                # contrast (soft)
                 m = out.mean(dim=(2,3), keepdim=True)
-                out = (out - m) * (1.0 + torch.tanh(contrast)) + m
+                out = (out - m) * (1.0 + 0.6 * torch.tanh(contrast)) + m
 
-                # micro detail
+                # micro detail (LIMITED)
                 detail = out - F.avg_pool2d(out, 3, 1, 1)
-                out = out + torch.tanh(micro) * detail
+                detail = torch.clamp(detail, -2.0, 2.0)
+                out = out + 0.15 * torch.tanh(micro) * detail
 
                 # -----------------------------
-                # reconstruction loss
+                # LOSS (STABILIZED)
                 # -----------------------------
-                loss_id = 0.08 * F.l1_loss(out, x0)
 
-                # high frequency consistency
-                loss_detail = 0.05 * F.l1_loss(
-                    compute_high_freq_energy(out),
-                    compute_high_freq_energy(x0)
+                target = x0.detach()
+
+                loss_id = 0.06 * F.l1_loss(out, target)
+
+                loss_struct = 0.03 * F.l1_loss(
+                    out - F.avg_pool2d(out, 3, 1, 1),
+                    target - F.avg_pool2d(target, 3, 1, 1)
                 )
 
-                # energy regularization
-                loss_energy = 0.005 * out.pow(2).mean()
+                loss_detail = 0.03 * F.l1_loss(
+                    compute_high_freq_energy(out),
+                    compute_high_freq_energy(target)
+                )
+
+                loss_energy = 0.002 * out.pow(2).mean()
+
+                # IMPORTANT: prevents drift / saturation collapse
+                loss_identity_anchor = 0.02 * F.l1_loss(
+                    pred["exposure"].detach(),
+                    torch.zeros_like(pred["exposure"])
+                )
 
                 # -----------------------------
-                # consistency with latents_sample
+                # consistency (SAFE VERSION)
                 # -----------------------------
                 loss_consistency = 0.0
 
                 if latents_sample is not None:
 
-                    #ref = latents_sample.to(device).detach()
-
                     ref = extract_latents(latents_sample)
+
                     if ref is not None:
                         ref = ref.to(device).detach()
 
-                    ref_pred = appearance_model(ref, style_prompt_embedding)
+                        ref_pred = appearance_model(ref, style_prompt_embedding)
 
-                    loss_consistency = (
-                        F.l1_loss(pred["exposure"], ref_pred["exposure"]) +
-                        F.l1_loss(pred["gamma"], ref_pred["gamma"]) +
-                        F.l1_loss(pred["contrast"], ref_pred["contrast"]) +
-                        F.l1_loss(pred["micro"], ref_pred["micro"])
-                    )
-
-                # -----------------------------
-                # total loss
-                # -----------------------------
+                        loss_consistency = (
+                            F.l1_loss(pred["exposure"], ref_pred["exposure"].detach()) +
+                            F.l1_loss(pred["gamma"], ref_pred["gamma"].detach()) +
+                            F.l1_loss(pred["contrast"], ref_pred["contrast"].detach()) +
+                            F.l1_loss(pred["micro"], ref_pred["micro"].detach())
+                        )
+                """
                 loss = (
                     loss_id +
-                    loss_energy +
+                    loss_struct +
                     loss_detail +
-                    0.1 * loss_consistency
+                    loss_energy +
+                    loss_identity_anchor +
+                    0.05 * loss_consistency
+                )
+                """
+                loss = (
+                    0.12 * loss_id +
+                    0.08 * loss_struct +
+                    0.10 * loss_detail +
+                    0.01 * loss_energy
                 )
 
             loss.backward()
@@ -345,7 +424,6 @@ def apply_appearance(
             if debug:
                 print(f"[Appearance TRAIN] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}")
 
-            # save
             should_save = (frame_counter % 10 == 0) and (epoch == max_epochs - 1)
 
             if should_save:
@@ -358,7 +436,7 @@ def apply_appearance(
                 )
 
     # =====================================================
-    # LOAD (if needed)
+    # LOAD
     # =====================================================
     else:
 
@@ -377,42 +455,41 @@ def apply_appearance(
     # =====================================================
     with torch.no_grad():
 
-        pred = appearance_model(x, style_prompt_embedding)
+        pred = appearance_model(x0, style_prompt_embedding)
 
-        exposure = 0.25 * torch.tanh(pred["exposure"])
-        gamma    = 0.15 * torch.tanh(pred["gamma"])
-        contrast = 0.20 * torch.tanh(pred["contrast"])
-        micro    = 0.35 * torch.tanh(pred["micro"])
+        exposure = 0.12 * torch.tanh(pred["exposure"])
+        gamma    = 0.10 * torch.tanh(pred["gamma"])
+        #contrast = 0.15 * torch.tanh(pred["contrast"])
+        contrast = 0.25 * torch.tanh(pred["contrast"])
+        contrast = torch.where(contrast > 0, contrast * 1.2, contrast * 0.7)
+        micro    = 0.20 * torch.tanh(pred["micro"])
 
-        out = x
+        out = x0
 
-        # exposure
-        out = out * (1.0 + 0.4 * exposure)
+        out = out * (1.0 + exposure)
 
-        # gamma stable
-        out = torch.sign(out) * (torch.abs(out) ** (1.0 + 0.25 * gamma + 1e-6))
+        out = torch.sign(out) * (torch.abs(out) ** (1.0 + gamma + 1e-6))
 
-        # contrast
         m = out.mean(dim=(2,3), keepdim=True)
-        out = (out - m) * (1.0 + contrast) + m
+        #out = (out - m) * (1.0 + contrast) + m
+        out = (out - m) * (1.0 + 1.5 * contrast) + m
 
-        # micro detail
         detail = out - F.avg_pool2d(out, 3, 1, 1)
-        out = out + micro * detail
-
+        detail = torch.clamp(detail, -1.5, 1.5)
+        out = out + 0.2 * torch.tanh(micro) * detail
 
     # =====================================================
     # STRENGTH BLENDING
     # =====================================================
-    hf = compute_high_freq_energy(x)
+    hf = compute_high_freq_energy(x0)
 
     strength_map = strength / (1.0 + 2.5 * hf)
     strength_map = strength_map.clamp(0.01, strength)
 
-    out = x + strength_map * (out - x)
+    out = x0 + strength_map * (out - x0)
 
     if debug:
-        appearance_debug( pred=pred, x=x, out=out, hf=hf )
+        appearance_debug(pred=pred, x=x0, out=out, hf=hf)
 
     # =====================================================
     # EMA FUSION
@@ -515,9 +592,9 @@ def apply_appearance_v1(
                 """
                 loss_detail
                 """
-                loss_detail = 0.05 * F.l1_loss(
+                loss_detail = 0.04 * F.l1_loss(
                     compute_high_freq_energy(out),
-                    compute_high_freq_energy(x0)
+                    compute_high_freq_energy(target)
                 )
 
                 # prevent explosion
