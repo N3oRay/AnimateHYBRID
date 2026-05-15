@@ -302,12 +302,7 @@ def apply_appearance(
     # LATENT STABILIZATION (CRITICAL FIX)
     # =====================================================
     print("[LATENT CHECK]")
-    print("before std:", x.std().item())
-
-    #x0 = stabilize_latents(x0).detach()
-    x0 = x0 * (3.0 / (x0.std() + 1e-6))
-
-    print("after std :", x0.std().item())
+    print("std :", x0.std().item())
 
     model_exists = os.path.exists(model_path)
 
@@ -344,6 +339,9 @@ def apply_appearance(
 
                 # gamma stable
                 out = torch.sign(out) * (torch.abs(out) ** (1.0 + 0.25 * torch.tanh(gamma) + 1e-6))
+                # new code -------------------------------------------------------------------------------------
+                gamma_scale = torch.exp(0.2 * torch.tanh(gamma))  # stable version
+                out = out * gamma_scale
 
                 # contrast (soft)
                 m = out.mean(dim=(2,3), keepdim=True)
@@ -362,7 +360,7 @@ def apply_appearance(
 
                 loss_id = 0.06 * F.l1_loss(out, target)
 
-                loss_struct = 0.03 * F.l1_loss(
+                loss_struct = 0.01 * F.l1_loss(
                     out - F.avg_pool2d(out, 3, 1, 1),
                     target - F.avg_pool2d(target, 3, 1, 1)
                 )
@@ -373,6 +371,10 @@ def apply_appearance(
                 )
 
                 loss_energy = 0.002 * out.pow(2).mean()
+
+                #loss_contrast = -0.02 * out.std(dim=(2,3)).mean()
+
+                loss_contrast = -0.03 * (out - F.avg_pool2d(out, 3, 1, 1)).abs().mean()
 
                 # IMPORTANT: prevents drift / saturation collapse
                 loss_identity_anchor = 0.02 * F.l1_loss(
@@ -414,7 +416,7 @@ def apply_appearance(
                     0.12 * loss_id +
                     0.08 * loss_struct +
                     0.10 * loss_detail +
-                    0.01 * loss_energy
+                    0.01 * loss_energy + loss_contrast
                 )
 
             loss.backward()
@@ -461,7 +463,8 @@ def apply_appearance(
         gamma    = 0.10 * torch.tanh(pred["gamma"])
         #contrast = 0.15 * torch.tanh(pred["contrast"])
         contrast = 0.25 * torch.tanh(pred["contrast"])
-        contrast = torch.where(contrast > 0, contrast * 1.2, contrast * 0.7)
+        #contrast = torch.where(contrast > 0, contrast * 1.2, contrast * 0.7)
+        contrast = contrast * 1.0
         micro    = 0.20 * torch.tanh(pred["micro"])
 
         out = x0
@@ -476,7 +479,8 @@ def apply_appearance(
 
         detail = out - F.avg_pool2d(out, 3, 1, 1)
         detail = torch.clamp(detail, -1.5, 1.5)
-        out = out + 0.2 * torch.tanh(micro) * detail
+        #out = out + 0.2 * torch.tanh(micro) * detail
+        out = out + 0.35 * torch.tanh(micro) * detail
 
     # =====================================================
     # STRENGTH BLENDING
@@ -507,199 +511,4 @@ def apply_appearance(
         print(f"[Appearance EMA drift] {diff:.6f}")
 
     return out
-
-
-
-def apply_appearance_v1(
-    latents,
-    style_prompt_embedding,
-    appearance_model,
-    optimizer=None,
-    criterion=None,
-    train=False,
-    strength=0.1,
-    device="cuda",
-    frame_counter=0,
-    max_epochs_up=12,
-    model_path="models/appearance_model_latest.pt",
-    latents_sample=None, # Sample exemple
-    ema_prev_latents=None,
-    ema_alpha=0.3,
-    new_image=False,
-    debug=False
-):
-
-    device = latents.device
-    appearance_model.to(device)
-
-    x = latents.to(device)
-    x0 = x.detach()
-
-    print(f"[Appearance V2] device={device}")
-
-    hf = compute_high_freq_energy(x0)
-    print(f"[Appearance V2] hf={hf.mean().item():.4f}")
-
-    model_exists = os.path.exists(model_path)
-
-    # =====================================================
-    # TRAIN
-    # =====================================================
-    if train and optimizer and criterion:
-
-        appearance_model.train()
-
-        max_epochs = max(1, max_epochs_up)
-
-        print("[Appearance V2] Training photometric renderer")
-
-        for epoch in range(max_epochs):
-
-            optimizer.zero_grad()
-            with torch.enable_grad():
-
-                pred = appearance_model(x0, style_prompt_embedding)
-
-                exposure = pred["exposure"].view(-1,1,1,1)
-                gamma    = pred["gamma"].view(-1,1,1,1)
-                contrast = pred["contrast"].view(-1,1,1,1)
-                micro    = pred["micro"].view(-1,1,1,1)
-
-                out = x0
-
-                # exposure
-                out = out * (1.0 + 0.5 * torch.tanh(exposure))
-
-                # gamma
-                out = torch.sign(out) * (torch.abs(out) ** (1.0 + 0.3 * torch.tanh(gamma)))
-
-                # contrast
-                m = out.mean(dim=(2,3), keepdim=True)
-                out = (out - m) * (1.0 + torch.tanh(contrast)) + m
-
-                # micro
-                #out = out + 0.05 * torch.tanh(micro)
-                detail = out - F.avg_pool2d(out, 3, 1, 1)
-                out = out + torch.tanh(micro) * detail
-
-                # loss
-                loss_id = 0.08 * F.l1_loss(out, x0)
-
-
-                # encourage local contrast
-                detail_out = out - F.avg_pool2d(out, 3, 1, 1)
-                detail_in  = x0 - F.avg_pool2d(x0, 3, 1, 1)
-                """
-                loss_detail
-                """
-                loss_detail = 0.04 * F.l1_loss(
-                    compute_high_freq_energy(out),
-                    compute_high_freq_energy(target)
-                )
-
-                # prevent explosion
-                loss_energy = 0.005 * out.pow(2).mean()
-
-                loss = loss_id + loss_energy + loss_detail
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(appearance_model.parameters(), 1.0)
-            optimizer.step()
-
-            print(f"[Appearance V2] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}")
-
-            should_save = (frame_counter % 10 == 0) and (epoch == max_epochs - 1)
-
-            if should_save:
-                save_appearance_model(
-                    appearance_model,
-                    optimizer=optimizer,
-                    epoch=frame_counter,
-                    loss=loss.item(),
-                    path=model_path
-                )
-
-    # =====================================================
-    # LOAD
-    # =====================================================
-    else:
-
-        appearance_model.eval()
-
-        if model_exists:
-            appearance_model, _ = load_appearance_model(
-                type(appearance_model),
-                path=model_path,
-                optimizer=optimizer,
-                device=device
-            )
-
-
-    # =====================================================
-    # INFERENCE
-    # =====================================================
-    with torch.no_grad():
-
-        pred = appearance_model(x, style_prompt_embedding)
-
-        exposure = 0.25 * torch.tanh(pred["exposure"])
-        gamma    = 0.15 * torch.tanh(pred["gamma"])
-        contrast = 0.20 * torch.tanh(pred["contrast"])
-        micro    = 0.35 * torch.tanh(pred["micro"])
-
-        print(
-            f"[Appearance V2] "
-            f"exp={exposure.mean().item():.4f} | "
-            f"gamma={gamma.mean().item():.4f} | "
-            f"contrast={contrast.mean().item():.4f} | "
-            f"micro={micro.mean().item():.4f}"
-        )
-
-        out = x
-
-        out = out * (1.0 + 0.4 * exposure)
-
-        out = torch.sign(out) * (torch.abs(out) ** (1.0 + 0.25 * gamma))
-
-        m = out.mean(dim=(2,3), keepdim=True)
-        out = (out - m) * (1.0 + contrast) + m
-
-        detail = out - F.avg_pool2d(out, 3, 1, 1)
-        out = out + micro * detail
-
-    # =====================================================
-    # STRENGTH
-    # =====================================================
-    hf = compute_high_freq_energy(x)
-    strength_map = strength / (1.0 + 2.5 * hf)
-    strength_map = strength_map.clamp(0.01, strength)
-
-    out = x + strength_map * (out - x)
-
-    # =====================================================
-    # EMA MULTI-BANDE (structure + détail)
-    # =====================================================
-
-    if ema_prev_latents is not None and not train:
-
-        out = motion_aware_ema_fusion(
-            out=out,
-            ema_prev_latents=ema_prev_latents,
-            hf=hf,
-            debug=True
-        )
-
-    return out
-
-
-
-
-
-
-
-
-
-
-
-
 
