@@ -273,7 +273,235 @@ def stabilize_latents(latents, target_std=1.0, clamp_value=3.0, eps=1e-6, mode="
 
     return x
 
+
 def apply_appearance(
+    latents,
+    style_prompt_embedding,
+    appearance_model,
+    optimizer=None,
+    criterion=None,
+    train=False,
+    strength=0.1,
+    device="cuda",
+    frame_counter=0,
+    max_epochs_up=12,
+    model_path="models/appearance_model_latest.pt",
+    latents_sample=None,
+    ema_prev_latents=None,
+    ema_alpha=0.3,
+    new_image=False,
+    debug=False
+):
+
+    device = latents.device
+    appearance_model.to(device)
+
+    x = latents.to(device)
+    x0 = x.detach()
+
+    # =====================================================
+    # LATENT CHECK (NO FORCED NORMALIZATION)
+    # =====================================================
+    print("[LATENT CHECK]")
+    print("std :", x0.std().item())
+
+    model_exists = os.path.exists(model_path)
+
+    hf = compute_high_freq_energy(x0)
+
+    # =====================================================
+    # TRAIN
+    # =====================================================
+    if train and optimizer is not None and criterion is not None:
+
+        appearance_model.train()
+        max_epochs = max(1, max_epochs_up)
+
+        for epoch in range(max_epochs):
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.set_grad_enabled(True):
+
+                pred = appearance_model(x0, style_prompt_embedding)
+
+                exposure = pred["exposure"].view(-1,1,1,1)
+                gamma    = pred["gamma"].view(-1,1,1,1)
+                contrast = pred["contrast"].view(-1,1,1,1)
+                micro    = pred["micro"].view(-1,1,1,1)
+
+                # =================================================
+                # FORWARD PIPELINE (STABLE)
+                # =================================================
+
+                out = x0
+
+                # exposure
+                out = out * (1.0 + 0.4 * torch.tanh(exposure))
+
+                # -----------------------------
+                # UNIFIED gamma (FIXED)
+                # -----------------------------
+                g = torch.tanh(gamma)
+                out = torch.sign(out) * (torch.abs(out) ** (1.0 + 0.25 * g))
+                out = out * (1.0 + 0.15 * g)
+
+                # -----------------------------
+                # contrast (safe centering)
+                # -----------------------------
+                m = out.mean(dim=(2,3), keepdim=True)
+                out = (out - m) * (1.0 + 0.6 * torch.tanh(contrast)) + m
+
+                # -----------------------------
+                # micro detail (clamped safe injection)
+                # -----------------------------
+                detail = out - F.avg_pool2d(out, 3, 1, 1)
+                detail = torch.clamp(detail, -1.5, 1.5)
+                out = out + 0.15 * torch.tanh(micro) * detail
+
+                # =================================================
+                # TARGET
+                # =================================================
+                target = x0.detach()
+
+                # =================================================
+                # LOSSES (STABLE + CONSISTENT)
+                # =================================================
+
+                loss_id = F.l1_loss(out, target)
+
+                loss_struct = F.l1_loss(
+                    out - F.avg_pool2d(out, 3, 1, 1),
+                    target - F.avg_pool2d(target, 3, 1, 1)
+                )
+
+                loss_detail = F.l1_loss(
+                    compute_high_freq_energy(out),
+                    compute_high_freq_energy(target)
+                )
+
+                loss_energy = 0.002 * out.pow(2).mean()
+
+                # CONTRAST STABILITY (FIXED VERSION)
+                loss_contrast = F.mse_loss(
+                    out.std(dim=(2,3)),
+                    target.std(dim=(2,3))
+                )
+
+                # =================================================
+                # OPTIONAL PARAM REGULARIZATION
+                # =================================================
+                loss_param_reg = (
+                    pred["exposure"].pow(2).mean() +
+                    pred["gamma"].pow(2).mean() +
+                    pred["contrast"].pow(2).mean() +
+                    pred["micro"].pow(2).mean()
+                ) * 0.01
+
+                # =================================================
+                # FINAL LOSS (BALANCED)
+                # =================================================
+                loss = (
+                    0.25 * loss_id +
+                    0.15 * loss_struct +
+                    0.20 * loss_detail +
+                    0.02 * loss_energy +
+                    0.10 * loss_contrast +
+                    loss_param_reg
+                )
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(appearance_model.parameters(), 1.0)
+            optimizer.step()
+
+            if debug:
+                print(f"[Appearance TRAIN] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}")
+
+            should_save = (frame_counter % 10 == 0) and (epoch == max_epochs - 1)
+
+            if should_save:
+                save_appearance_model(
+                    appearance_model,
+                    optimizer=optimizer,
+                    epoch=frame_counter,
+                    loss=loss.item(),
+                    path=model_path
+                )
+
+    # =====================================================
+    # LOAD
+    # =====================================================
+    else:
+
+        appearance_model.eval()
+
+        if model_exists:
+            appearance_model, _ = load_appearance_model(
+                type(appearance_model),
+                path=model_path,
+                optimizer=optimizer,
+                device=device
+            )
+
+    # =====================================================
+    # INFERENCE
+    # =====================================================
+    with torch.no_grad():
+
+        pred = appearance_model(x0, style_prompt_embedding)
+
+        exposure = 0.12 * torch.tanh(pred["exposure"])
+        gamma    = 0.10 * torch.tanh(pred["gamma"])
+        contrast = 0.25 * torch.tanh(pred["contrast"])
+        micro    = 0.20 * torch.tanh(pred["micro"])
+
+        out = x0
+
+        out = out * (1.0 + exposure)
+
+        # unified gamma (same as train)
+        g = gamma
+        out = torch.sign(out) * (torch.abs(out) ** (1.0 + g))
+        out = out * (1.0 + 0.15 * g)
+
+        m = out.mean(dim=(2,3), keepdim=True)
+        out = (out - m) * (1.0 + 1.5 * contrast) + m
+
+        detail = out - F.avg_pool2d(out, 3, 1, 1)
+        detail = torch.clamp(detail, -1.5, 1.5)
+        out = out + 0.25 * micro * detail
+
+    # =====================================================
+    # STRENGTH BLENDING
+    # =====================================================
+    hf = compute_high_freq_energy(x0)
+
+    strength_map = strength / (1.0 + 2.5 * hf)
+    strength_map = strength_map.clamp(0.01, strength)
+
+    out = x0 + strength_map * (out - x0)
+
+    if debug:
+        appearance_debug(pred=pred, x=x0, out=out, hf=hf)
+
+    # =====================================================
+    # EMA FUSION
+    # =====================================================
+    if ema_prev_latents is not None and not train:
+
+        out = motion_aware_ema_fusion(
+            out=out,
+            ema_prev_latents=ema_prev_latents,
+            hf=hf,
+            debug=debug
+        )
+
+        diff = (out - ema_prev_latents).abs().mean().item()
+        print(f"[Appearance EMA drift] {diff:.6f}")
+
+    return out
+
+def apply_appearance_stable(
     latents,
     style_prompt_embedding,
     appearance_model,
