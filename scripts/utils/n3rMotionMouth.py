@@ -273,18 +273,6 @@ def apply_mouth_smil(
         delta[..., 0] *= W * 0.08
         delta[..., 1] *= H * 0.08
 
-    # =====================================================
-    # TEMPORAL DYNAMICS (REAL FIX)
-    # =====================================================
-    t = torch.tensor(frame_counter / 10.0, device=delta.device, dtype=delta.dtype)
-
-    sin_t = torch.sin(t)
-    cos_t = torch.cos(t * 0.8)
-
-    temporal_vec = torch.stack([
-        torch.full_like(delta[..., 0], sin_t),
-        torch.full_like(delta[..., 1], cos_t)
-    ], dim=-1)
 
     # =====================================================
     # MASK PROCESSING
@@ -310,20 +298,49 @@ def apply_mouth_smil(
     # BCHW -> BHWC
     mask_soft = mask_soft.permute(0, 2, 3, 1).contiguous()
 
+
     # =====================================================
-    # INERTIA (CRITICAL FOR REALISM)
+    # INERTIA
     # =====================================================
     if not hasattr(apply_mouth_smil, "prev_delta"):
         apply_mouth_smil.prev_delta = torch.zeros_like(delta)
 
     delta = 0.85 * delta + 0.15 * apply_mouth_smil.prev_delta
-    apply_mouth_smil.prev_delta = delta.detach()
 
     # =====================================================
-    # APPLY MOTION
+    # TEMPORAL (APPLY BEFORE MASK)
+    # =====================================================
+    t = torch.tensor(frame_counter / 10.0, device=delta.device, dtype=delta.dtype)
+
+    sin_t = torch.sin(t)
+    cos_t = torch.cos(t * 0.8)
+
+    temporal_vec = torch.stack([
+        torch.full_like(delta[..., 0], sin_t),
+        torch.full_like(delta[..., 1], cos_t)
+    ], dim=-1)
+
+    # Occilation constantes
+    #delta = delta + temporal_vec * 0.7
+    # Occilation variables
+    temporal_weight = 0.25 + 0.15 * torch.sin(
+        torch.tensor(frame_counter * 0.2, device=delta.device, dtype=delta.dtype)
+    )
+
+    delta = delta + temporal_vec * temporal_weight
+
+    # =====================================================
+    # CONSTRAINTS (MASK + GATE)
     # =====================================================
     delta = delta * mask_soft * motion_gate
+
+    # =====================================================
+    # SCALING (ONLY ONCE)
+    # =====================================================
     delta = delta * strength
+
+    # update inertia buffer
+    apply_mouth_smil.prev_delta = delta.detach()
 
     # =====================================================
     # GRID WARP
