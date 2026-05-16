@@ -10,10 +10,11 @@ import torch.nn.functional as F
 from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body, reconstruct_hips
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_breathing_real, apply_breathing_soft, apply_breathing_simple_anime, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask
 
 from .n3rMotionMouth import apply_mouth_smil
 from .n3rMotionHair import apply_hair_motion_cycle
+from .n3rMotionBreathing import apply_breathing, apply_breathing_real
 
 from .n3rPoseModule import apply_actor_model, resolve_motion_model
 
@@ -2189,22 +2190,7 @@ def get_time(frame_counter, fps=10.0, device=None):
     return torch.tensor(frame_counter / fps, device=device, dtype=torch.float32)
 
 
-def apply_breathing(
-    latents_world,
-    pose,
-    mask_torso_exp,
-    frame_counter,
-    breathing,
-    debug=False,
-    debug_dir=None,
-):
-    #if mode == "real":
-    if frame_counter % 2 == 0:
-        return apply_breathing_real(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
-    elif frame_counter % 3 == 0:
-        return apply_breathing_simple_anime(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
-    else:
-        return apply_breathing_soft(latents_world, pose, mask_torso_exp, frame_counter, breathing, debug=debug, debug_dir=debug_dir)
+
 
 
 def apply_pose_world(
