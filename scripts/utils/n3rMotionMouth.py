@@ -313,8 +313,6 @@ def apply_mouth_smil(
     # inertia only on BASE motion, NOT after temporal
     base_delta = delta
 
-    #smoothed = 0.80 * base_delta + 0.20 * apply_mouth_smil.prev_delta
-
     alpha = 0.55  # beaucoup plus réactif
     smoothed = alpha * base_delta + (1 - alpha) * apply_mouth_smil.prev_delta
     apply_mouth_smil.prev_delta = base_delta.detach()
@@ -338,12 +336,6 @@ def apply_mouth_smil(
     ], dim=-1)
 
     # Occilation constantes
-    #delta = delta + temporal_vec * 0.7
-    # Occilation variables
-    #temporal_weight = 0.25 + 0.15 * torch.sin(
-    #    torch.tensor(frame_counter * 0.2, device=delta.device, dtype=delta.dtype)
-    #)
-
     temporal_weight = 0.6 + 0.4 * torch.sin(
         torch.tensor(frame_counter * 0.25, device=delta.device, dtype=delta.dtype)
     )
@@ -354,11 +346,36 @@ def apply_mouth_smil(
     # =====================================================
     # TEMPORAL (FIX)
     # =====================================================
-    delta_flow = torch.norm(delta, dim=-1, keepdim=True)
+    #delta_flow = torch.norm(delta, dim=-1, keepdim=True)
 
-    motion_boost = torch.clamp(delta_flow * 2.0, 0.5, 1.5)
+    #motion_boost = torch.clamp(delta_flow * 2.0, 0.5, 1.5)
+
+    #delta = delta * motion_boost
+
+    # =====================================================
+    # TEMPORAL DYNAMICS (SAFE)
+    # =====================================================
+
+    if not hasattr(apply_mouth_smil, "prev_motion"):
+        apply_mouth_smil.prev_motion = torch.zeros_like(delta)
+
+    motion_change = delta - apply_mouth_smil.prev_motion
+
+    motion_energy = torch.norm(
+        motion_change,
+        dim=-1,
+        keepdim=True
+    )
+
+    motion_boost = 1.0 + torch.clamp(
+        motion_energy * 0.15,
+        0.0,
+        0.35
+    )
 
     delta = delta * motion_boost
+
+    apply_mouth_smil.prev_motion = delta.detach()
 
     # =====================================================
     # DEBUG: MOTION ANALYSIS CORE
@@ -481,10 +498,10 @@ def apply_mouth_smil(
     # =====================================================
     #delta = torch.tanh(delta * 0.7) * 0.6
 
-    norm = torch.norm(delta, dim=-1, keepdim=True)
-    scale = torch.tanh(norm * 0.8) / (norm + 1e-6)
+    #norm = torch.norm(delta, dim=-1, keepdim=True)
+    #scale = torch.tanh(norm * 0.8) / (norm + 1e-6)
 
-    delta = delta * scale
+    #delta = delta * scale
 
     # =====================================================
     # UPDATE INERTIA BUFFER
@@ -495,8 +512,8 @@ def apply_mouth_smil(
     # Noise effect anti robot
     # =====================================================
 
-    noise = torch.randn_like(delta) * 0.02
-    delta = delta + noise * mask_soft
+    #noise = torch.randn_like(delta) * 0.02
+    #delta = delta + noise * mask_soft
 
     # =====================================================
     # GRID WARP
@@ -506,6 +523,85 @@ def apply_mouth_smil(
     # ensure grid BHWC
     if base_grid.shape[-1] != 2:
         base_grid = base_grid.permute(0, 2, 3, 1).contiguous()
+
+
+    # =====================================================
+    # LIP ARTICULATION FIELD
+    # =====================================================
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing="ij"
+    )
+
+    yy = yy.unsqueeze(0).unsqueeze(-1)
+    xx = xx.unsqueeze(0).unsqueeze(-1)
+
+    # séparation verticale lèvres
+    upper_field = torch.exp(-((yy + 0.08) ** 2) * 40.0)
+    lower_field = torch.exp(-((yy - 0.08) ** 2) * 40.0)
+
+    # dynamique opposée
+    lip_field_y = (lower_field - upper_field)
+
+    # léger asymétrique horizontal
+    lip_field_x = torch.sin(xx * 3.14) * 0.15
+
+    articulation = torch.cat([
+        lip_field_x,
+        lip_field_y
+    ], dim=-1)
+
+    # modulation temporelle
+    articulation_strength = 0.12 + 0.08 * torch.sin(
+        torch.tensor(frame_counter * 0.25, device=device)
+    )
+
+    delta = delta + articulation * articulation_strength * mask_soft
+
+
+    # =====================================================
+    # RIGIDITY FIELD (CRITICAL FOR SHARPNESS)
+    # =====================================================
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing="ij"
+    )
+
+    yy = yy.unsqueeze(0).unsqueeze(-1)
+    xx = xx.unsqueeze(0).unsqueeze(-1)
+
+    # centre bouche = mobile
+    center_weight = torch.exp(-(xx**2) * 6.0)
+
+    # lèvres hautes plus rigides
+    upper_rigid = torch.exp(-((yy + 0.15) ** 2) * 60.0)
+
+    # lèvres basses mobiles
+    lower_mobile = torch.exp(-((yy - 0.10) ** 2) * 30.0)
+
+    # coins rigides
+    corner_rigid = 1.0 - torch.exp(-(xx**2) * 2.5)
+
+    # rigidité finale
+    rigidity = (
+        0.25
+        + 0.75 * center_weight * lower_mobile
+    )
+
+    rigidity = rigidity * (1.0 - 0.6 * upper_rigid)
+    rigidity = rigidity * (1.0 - 0.5 * corner_rigid)
+
+    rigidity = rigidity.clamp(0.1, 1.0)
+
+    delta = delta * rigidity
+
+    # =====================================================
+    # GRID
+    # =====================================================
 
     grid_mouth = base_grid + delta
 
