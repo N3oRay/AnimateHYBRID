@@ -92,10 +92,128 @@ def load_appearance_model(model_class,
 
 
 # =========================================================
-# MODEL
+# MODEL -on peut rendre ton micro-detail content-aware sans casser la stabilité, sans transformer ton model en usine à features.
 # =========================================================
 
+# upgrades (optionnel)
+# Sans casser ton système, la première amélioration logique serait :
+# 👉 remplacer global pooling par multi-scale pooling
+# Ex :
+# 1x1 (global)
+# 2x2 (semi-local)
+# 4x4 (structure)
+# Et concat → head
+# Mais ça reste une évolution, pas une correction.
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 class AppearanceModel(nn.Module):
+    """
+    V2.1 — Photometric Renderer + Micro Content Gate (lightweight)
+    """
+
+    def __init__(self, in_channels=4, base_channels=32, prompt_dim=768):
+
+        super().__init__()
+
+        self.config = {
+            "in_channels": in_channels,
+            "base_channels": base_channels,
+            "prompt_dim": prompt_dim
+        }
+
+        self.version = "v2.1_micro_gate"
+
+        # -------------------------------------------------
+        # ENCODER
+        # -------------------------------------------------
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.SiLU(),
+        )
+
+        # -------------------------------------------------
+        # PROMPT
+        # -------------------------------------------------
+        self.prompt_proj = nn.Linear(prompt_dim, base_channels)
+
+        # -------------------------------------------------
+        # FUSION
+        # -------------------------------------------------
+        self.fusion = nn.Conv2d(base_channels * 2, base_channels, 1)
+
+        # -------------------------------------------------
+        # GLOBAL POOLING
+        # -------------------------------------------------
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        hidden = base_channels
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.SiLU()
+        )
+
+        # -------------------------------------------------
+        # GLOBAL RENDER PARAMETERS
+        # -------------------------------------------------
+        self.exposure = nn.Linear(hidden, 1)
+        self.gamma    = nn.Linear(hidden, 1)
+        self.contrast = nn.Linear(hidden, 1)
+        self.micro    = nn.Linear(hidden, 1)
+
+        # -------------------------------------------------
+        # MICRO CONTENT GATE (NEW)
+        # -------------------------------------------------
+        self.micro_gate = nn.Conv2d(base_channels, 1, kernel_size=1)
+
+    def forward(self, x, prompt_emb):
+
+        # -------------------------------------------------
+        # ENCODE
+        # -------------------------------------------------
+        h = self.encoder(x)
+
+        # -------------------------------------------------
+        # PROMPT INJECTION
+        # -------------------------------------------------
+        if prompt_emb.dim() == 3:
+            prompt_emb = prompt_emb[:, 0, :]
+
+        p = self.prompt_proj(prompt_emb)
+        p = p[:, :, None, None].expand(-1, -1, h.shape[2], h.shape[3])
+
+        # fusion
+        h = self.fusion(torch.cat([h, p], dim=1))
+
+        # -------------------------------------------------
+        # GLOBAL FEATURES
+        # -------------------------------------------------
+        g = self.pool(h).squeeze(-1).squeeze(-1)
+        g = self.head(g)
+
+        # -------------------------------------------------
+        # MICRO GATE (CONTENT-AWARE MAP)
+        # -------------------------------------------------
+        micro_gate = torch.sigmoid(self.micro_gate(h))
+
+        # optional mild smoothing (VERY safe)
+        micro_gate = F.avg_pool2d(micro_gate, kernel_size=3, stride=1, padding=1)
+
+        return {
+            "exposure": self.exposure(g),
+            "gamma": self.gamma(g),
+            "contrast": self.contrast(g),
+            "micro": self.micro(g),
+            "micro_gate": micro_gate
+        }
+
+class AppearanceModel_v1(nn.Module):
     """
     V2 — Photometric Renderer (Exposure / Tone Mapping)
     """
@@ -611,7 +729,11 @@ def apply_appearance_stable(
                 #out = out + 0.15 * torch.tanh(micro) * detail_refined
                 hf = compute_high_freq_energy(out)
                 micro_scale = 0.15 / (1.0 + 2.0 * hf)
-                out = out + micro_scale * torch.tanh(micro) * detail_refined
+                #out = out + micro_scale * torch.tanh(micro) * detail_refined
+
+                gate = pred["micro_gate"]
+
+                out = out + micro_scale * torch.tanh(micro) * detail_refined * gate
 
                 # =================================================
                 # TARGET
@@ -740,7 +862,10 @@ def apply_appearance_stable(
 
         hf = compute_high_freq_energy(out)
         micro_scale = 0.15 / (1.0 + 2.0 * hf)
-        out = out + micro_scale * torch.tanh(micro) * detail_refined
+        #out = out + micro_scale * torch.tanh(micro) * detail_refined
+        gate = pred["micro_gate"]
+
+        out = out + micro_scale * torch.tanh(micro) * detail_refined * gate
 
 
     # =====================================================
