@@ -10,10 +10,10 @@ import torch.nn.functional as F
 from .n3rcoords import pair, safe_xy, safe_update, norm, build_upper_body_inputs, animate_upper_body, reconstruct_hips
 from .n3rControlNet import create_canny_control, control_to_latent, match_latent_size
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
-from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, apply_breathing_simple_anime, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask
+from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_breathing_real, apply_breathing_soft, apply_breathing_simple_anime, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask
 
 from .n3rMotionMouth import apply_mouth_smil
-
+from .n3rMotionHair import apply_hair_motion_cycle
 
 from .n3rPoseModule import apply_actor_model, resolve_motion_model
 
@@ -2611,8 +2611,6 @@ def apply_pose_driven_motion_ultra2(
         t = time_sin(frame_counter, freq=3.0, device=latents_world.device)
         eye_motion = 0.1 * (mask_left_eye_broadcast * t +
                         mask_right_eye_broadcast * time_sin(frame_counter, freq=3.0, device=latents_world.device))
-
-        #eye_motion = 0.1 * (mask_left_eye_broadcast  * torch.sin(t*3.0) + mask_right_eye_broadcast * torch.cos(t*3.0))
 
         eye_motion = eye_motion * mask_face_exp
         latents_local += eye_motion
