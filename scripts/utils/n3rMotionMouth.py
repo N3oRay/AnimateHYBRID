@@ -2,6 +2,7 @@
 import numpy as np
 import os
 import datetime
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -182,8 +183,6 @@ class MouthMotionModel(nn.Module):
 # instance par défaut pour ton pipeline
 mouth_model = MouthMotionModel().cuda()
 
-
-
 def apply_mouth_smil(
     latents,
     pose,
@@ -200,6 +199,8 @@ def apply_mouth_smil(
     strength=2.0,
     npy=False
 ):
+
+
 
     if device is None:
         device = latents.device
@@ -221,7 +222,6 @@ def apply_mouth_smil(
         dim=1
     )
 
-    facial_points = mouth_points
     mouth_center = mouth_points.mean(dim=1)
 
     scale_tensor = torch.tensor(
@@ -230,8 +230,7 @@ def apply_mouth_smil(
         dtype=latents.dtype
     )
 
-    mouth_center_px = mouth_center * scale_tensor
-    mouth_center_px = mouth_center_px.view(B, 1, 1, 2)
+    mouth_center_px = (mouth_center * scale_tensor).view(B, 1, 1, 2)
 
     # =====================================================
     # DELTA
@@ -252,7 +251,11 @@ def apply_mouth_smil(
             debug=debug
         )
 
-        motion_gate = torch.ones((B, 1, H, W), device=device)
+        # assume BCHW -> convert to BHWC
+        if delta.shape[1] == 2:
+            delta = delta.permute(0, 2, 3, 1).contiguous()
+
+        motion_gate = torch.ones((B, H, W, 1), device=device)
 
     else:
 
@@ -262,20 +265,30 @@ def apply_mouth_smil(
 
         pred = mouth_model(latents, landmarks)
 
-        delta = pred["flow"].permute(0, 2, 3, 1).contiguous()  # → BHWC
-        motion_gate = pred["gate"] # [B,1,H,W]
+        # BCHW -> BHWC
+        delta = pred["flow"].permute(0, 2, 3, 1).contiguous()
+        motion_gate = pred["gate"].permute(0, 2, 3, 1).contiguous()
 
-        motion_gate = motion_gate.permute(0, 2, 3, 1).contiguous()
-
-        # scale pour rendre le flow visible
+        # scale flow
         delta[..., 0] *= W * 0.08
         delta[..., 1] *= H * 0.08
 
     # =====================================================
-    # MASK PROCESSING (KEY CHANGE)
+    # TEMPORAL DYNAMICS (REAL FIX)
     # =====================================================
+    t = torch.tensor(frame_counter / 10.0, device=delta.device, dtype=delta.dtype)
 
-    # ensure shape [B,1,H,W]
+    sin_t = torch.sin(t)
+    cos_t = torch.cos(t * 0.8)
+
+    temporal_vec = torch.stack([
+        torch.full_like(delta[..., 0], sin_t),
+        torch.full_like(delta[..., 1], cos_t)
+    ], dim=-1)
+
+    # =====================================================
+    # MASK PROCESSING
+    # =====================================================
     if mask_mouth.dim() == 3:
         mask = mask_mouth.unsqueeze(1)
     else:
@@ -283,31 +296,32 @@ def apply_mouth_smil(
 
     mask = mask.float()
 
-
-    # Dilatation du masque pour : transition peau/lèvres/joues
-    # strong horizontal spread (lip corners)
+    # anisotropic dilation (good mouth behavior)
     mask_h = F.max_pool2d(mask, kernel_size=(5, 13), stride=1, padding=(2, 6))
-    # mild vertical bleed (lip thickness only)
     mask_v = F.avg_pool2d(mask_h, kernel_size=(3, 5), stride=1, padding=(1, 2))
-    mask_soft = mask_v
 
     mask_soft = F.interpolate(
-        mask_soft,
-        size=delta.shape[1:3],
+        mask_v,
+        size=(H, W),
         mode="bilinear",
         align_corners=False
     )
 
-    mask_soft = mask_soft.permute(0, 2, 3, 1)  # BCHW → BHWC
+    # BCHW -> BHWC
+    mask_soft = mask_soft.permute(0, 2, 3, 1).contiguous()
 
     # =====================================================
-    # APPLY MOTION (MASK IS PRIMARY CONSTRAINT)
+    # INERTIA (CRITICAL FOR REALISM)
     # =====================================================
+    if not hasattr(apply_mouth_smil, "prev_delta"):
+        apply_mouth_smil.prev_delta = torch.zeros_like(delta)
 
-    print("delta:", delta.shape)
-    print("mask:", mask.shape)
-    print("mask_soft:", mask_soft.shape)
+    delta = 0.85 * delta + 0.15 * apply_mouth_smil.prev_delta
+    apply_mouth_smil.prev_delta = delta.detach()
 
+    # =====================================================
+    # APPLY MOTION
+    # =====================================================
     delta = delta * mask_soft * motion_gate
     delta = delta * strength
 
@@ -315,13 +329,15 @@ def apply_mouth_smil(
     # GRID WARP
     # =====================================================
     base_grid = grid.clone()
+
+    # ensure grid BHWC
+    if base_grid.shape[-1] != 2:
+        base_grid = base_grid.permute(0, 2, 3, 1).contiguous()
+
     grid_mouth = base_grid + delta
 
-    # =====================================================
-    # NORMALIZE FOR GRID_SAMPLE
-    # =====================================================
+    # normalize
     grid_norm = grid_mouth.clone()
-
     grid_norm[..., 0] = 2.0 * grid_norm[..., 0] / (W - 1) - 1.0
     grid_norm[..., 1] = 2.0 * grid_norm[..., 1] / (H - 1) - 1.0
 
@@ -330,6 +346,10 @@ def apply_mouth_smil(
     # =====================================================
     # GRID SAMPLE
     # =====================================================
+
+    if grid_norm.shape[-1] != 2:
+        grid_norm = grid_norm.permute(0, 2, 3, 1).contiguous()
+
     latents_out = F.grid_sample(
         latents,
         grid_norm,
@@ -337,15 +357,12 @@ def apply_mouth_smil(
         padding_mode='border',
         align_corners=True
     )
-
     # =====================================================
-    # MASK BLENDING (IMPORTANT FIX)
+    # BLENDING (SAFE)
     # =====================================================
-
     blend = mask_soft.permute(0, 3, 1, 2).contiguous()
 
-    if blend.shape != latents.shape:
-        print("[MOTION MOUTH] blend.shape.")
+    if blend.shape[-2:] != latents.shape[-2:]:
         blend = F.interpolate(
             blend,
             size=latents.shape[-2:],
@@ -385,4 +402,5 @@ def apply_mouth_smil(
         except Exception as e:
             print("[WARN] debug failed:", e)
 
-    return latents_out, delta, facial_points
+    return latents_out, delta, mouth_points
+
