@@ -343,12 +343,62 @@ def apply_mouth_smil(
     delta = delta * strength
 
     # =====================================================
+    # REGION MASKS (CORE / CORNER / ANCHOR)
+    # =====================================================
+
+    core_idx = list(range(70, 84))
+    corner_idx = [40, 41]
+    anchor_idx = [38, 39]
+
+    def build_mask(idx_list, base_scale=0.08):
+        pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)
+        pts_px = pts * torch.tensor([W-1, H-1], device=device, dtype=pts.dtype)
+
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij"
+        )
+
+        grid_xy = torch.stack([xx, yy], dim=-1).float().unsqueeze(0)
+
+        dist = torch.norm(
+            grid_xy.unsqueeze(1) - pts_px.view(B, len(idx_list), 1, 1, 2),
+            dim=-1
+        )
+
+        return torch.exp(-dist.min(dim=1).values * base_scale).unsqueeze(-1)
+
+    core_mask   = build_mask(core_idx,   0.10)
+    corner_mask = build_mask(corner_idx, 0.06)
+    anchor_mask = build_mask(anchor_idx, 0.04)
+
+    # =====================================================
+    # COMPUTE DELTA
+    # =====================================================
+    core_delta   = delta * core_mask
+    corner_delta = delta * corner_mask
+    anchor_delta = delta * anchor_mask
+
+    # inertia séparée
+    if not hasattr(apply_mouth_smil, "corner_prev"):
+        apply_mouth_smil.corner_prev = torch.zeros_like(delta)
+    if not hasattr(apply_mouth_smil, "anchor_prev"):
+        apply_mouth_smil.anchor_prev = torch.zeros_like(delta)
+
+    corner_delta = 0.85 * corner_delta + 0.15 * apply_mouth_smil.corner_prev
+    anchor_delta = 0.95 * anchor_delta + 0.05 * apply_mouth_smil.anchor_prev
+
+    apply_mouth_smil.corner_prev = corner_delta.detach()
+    apply_mouth_smil.anchor_prev = anchor_delta.detach()
+
+    # recomposition hiérarchique
+    delta = delta * (1 - core_mask - corner_mask - anchor_mask) + core_delta + corner_delta + anchor_delta
+
+    # =====================================================
     # NEW CODE
     # =====================================================
-    norm = torch.sqrt(delta[..., 0]**2 + delta[..., 1]**2 + 1e-8)
-    scale = torch.tanh(norm * 0.8) / (norm + 1e-8)
-
-    delta = delta * scale.unsqueeze(-1)
+    delta = torch.tanh(delta * 0.7) * 0.6
 
     # =====================================================
     # UPDATE INERTIA BUFFER
