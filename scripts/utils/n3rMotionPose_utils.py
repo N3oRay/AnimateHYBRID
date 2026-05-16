@@ -12,7 +12,7 @@ from .n3rControlNet import create_canny_control, control_to_latent, match_latent
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask
 
-from .n3rMotionMouth import apply_mouth_smil
+from .n3rMotionMouth import apply_mouth_smil, mouth_model
 from .n3rMotionHair import apply_hair_motion_cycle
 from .n3rMotionBreathing import apply_breathing, apply_breathing_real
 
@@ -915,7 +915,6 @@ def update_keypoints_from_pose(
 
         42: ("nose_left", nose_left),
         43: ("nose_right", nose_right),
-
 
 
         52: ("front_left_1", front_left1), #OK
@@ -2436,6 +2435,7 @@ def apply_pose_driven_motion_ultra2(
     device="cuda",
     breathing=True,
     debug=False,
+    mouth=True,
     debug_dir=None
 ):
     timings = {}
@@ -2575,13 +2575,13 @@ def apply_pose_driven_motion_ultra2(
     # ===================================
     # 🔹 Mouth & micro-expressions - OK
     # ==================================
-    if should_freeze(frame_counter, 2): # Pause traitement
+    #if should_freeze(frame_counter, 2): # Pause traitement
+    if mouth:
         start = time.time()
-        latents_local, mouth_delta, _ = apply_mouth_smil(
-            latents_local, pose, mask_mouth, grid, H, W, frame_counter,
-            device=device, debug=debug, debug_dir=debug_dir, smooth=0.85, strength=2.0, npy=False
-        )
-        print("MOUTH DELTA MEAN:", mouth_delta.abs().mean().item())
+        #latents_local, mouth_delta, _ = apply_mouth_smil( latents_local, pose, mask_mouth, grid, H, W, frame_counter, device=device, debug=debug, debug_dir=debug_dir, smooth=0.85, strength=2.0, npy=False )
+
+        latents_local, mouth_delta, _ = apply_mouth_smil( latents, pose, mask_mouth, grid, frame_counter, mouth_model, H=None, W=None, device=device, debug=debug, debug_dir=debug_dir, smooth=0.85, strength=2.0, npy=False )
+        print("[MOUTH DELTA MEAN]:", mouth_delta.abs().mean().item())
 
         # Broadcasting correct pour la bouche
         mask_mouth_corners_broadcast = mask_mouth_corners.repeat(1, C, 1, 1)

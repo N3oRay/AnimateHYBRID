@@ -188,10 +188,10 @@ def apply_mouth_smil(
     pose,
     mask_mouth,
     grid,
+    frame_counter,
     mouth_model,
     H=None,
     W=None,
-    frame_counter=0,
     device=None,
     debug=False,
     debug_dir=None,
@@ -299,13 +299,30 @@ def apply_mouth_smil(
     mask_soft = mask_soft.permute(0, 2, 3, 1).contiguous()
 
 
+    # BOOST STRUCTURE (important)
+    mask_soft = torch.pow(mask_soft, 0.7)
+    mask_soft = torch.clamp(mask_soft * 2.5, 0.0, 1.0)
+
+
     # =====================================================
     # INERTIA
     # =====================================================
     if not hasattr(apply_mouth_smil, "prev_delta"):
         apply_mouth_smil.prev_delta = torch.zeros_like(delta)
 
-    delta = 0.85 * delta + 0.15 * apply_mouth_smil.prev_delta
+    # inertia only on BASE motion, NOT after temporal
+    base_delta = delta
+
+    #smoothed = 0.80 * base_delta + 0.20 * apply_mouth_smil.prev_delta
+
+    alpha = 0.55  # beaucoup plus réactif
+    smoothed = alpha * base_delta + (1 - alpha) * apply_mouth_smil.prev_delta
+    apply_mouth_smil.prev_delta = base_delta.detach()
+
+
+    apply_mouth_smil.prev_delta = smoothed.detach()
+
+    delta = smoothed
 
     # =====================================================
     # TEMPORAL (APPLY BEFORE MASK)
@@ -323,11 +340,65 @@ def apply_mouth_smil(
     # Occilation constantes
     #delta = delta + temporal_vec * 0.7
     # Occilation variables
-    temporal_weight = 0.25 + 0.15 * torch.sin(
-        torch.tensor(frame_counter * 0.2, device=delta.device, dtype=delta.dtype)
+    #temporal_weight = 0.25 + 0.15 * torch.sin(
+    #    torch.tensor(frame_counter * 0.2, device=delta.device, dtype=delta.dtype)
+    #)
+
+    temporal_weight = 0.6 + 0.4 * torch.sin(
+        torch.tensor(frame_counter * 0.25, device=delta.device, dtype=delta.dtype)
     )
 
-    delta = delta + temporal_vec * temporal_weight
+    #delta = delta + temporal_vec * temporal_weight
+    delta = delta + (temporal_vec * temporal_weight * (1.0 + 0.5 * torch.tanh(delta.abs())))
+
+    # =====================================================
+    # TEMPORAL (FIX)
+    # =====================================================
+    delta_flow = torch.norm(delta, dim=-1, keepdim=True)
+
+    motion_boost = torch.clamp(delta_flow * 2.0, 0.5, 1.5)
+
+    delta = delta * motion_boost
+
+    # =====================================================
+    # DEBUG: MOTION ANALYSIS CORE
+    # =====================================================
+
+    if not hasattr(apply_mouth_smil, "debug_prev"):
+        apply_mouth_smil.debug_prev = torch.zeros_like(delta)
+
+    delta_change = (delta - apply_mouth_smil.debug_prev).abs().mean().item()
+    delta_norm = torch.norm(delta, dim=-1).mean().item()
+
+    motion_inertia = (apply_mouth_smil.prev_delta - delta).abs().mean().item()
+
+    temporal_energy = (temporal_vec.abs().mean().item() * float(temporal_weight))
+
+    mask_energy = mask_soft.mean().item()
+
+    gate_energy = motion_gate.mean().item() if motion_gate is not None else 0.0
+
+    print(f"""
+    [MOUTH DEBUG]
+    frame: {frame_counter}
+    delta_mean: {delta.abs().mean().item():.6f}
+    delta_max : {delta.abs().max().item():.6f}
+
+    delta_change (t vs t-1): {delta_change:.6f}  <-- IMPORTANT
+    delta_norm: {delta_norm:.6f}
+
+    inertia_effect: {motion_inertia:.6f}
+    temporal_energy: {temporal_energy:.6f}
+
+    mask_energy: {mask_energy:.3f}
+    gate_energy: {gate_energy:.3f}
+    """)
+
+    motion_alive = delta_change / (delta_norm + 1e-6)
+
+    print(f"[MOTION ALIVE SCORE] {motion_alive:.6f}")
+
+    apply_mouth_smil.debug_prev = delta.detach().clone()
 
     # =====================================================
     # CONSTRAINTS (MASK + GATE)
@@ -336,6 +407,9 @@ def apply_mouth_smil(
 
     combined_gate = mask_soft * (0.7 + 0.3 * motion_gate)
     delta = delta * combined_gate
+
+    if delta.abs().mean().item() < 1e-4:
+        print("[WARNING] delta almost zero → motion collapsed by mask/gate/inertia")
 
     # =====================================================
     # SCALING (ONLY ONCE)
@@ -374,6 +448,13 @@ def apply_mouth_smil(
     anchor_mask = build_mask(anchor_idx, 0.04)
 
     # =====================================================
+    # Deblocage des coins
+    # =====================================================
+    corner_mask = corner_mask * (0.9 + 0.1 * torch.sin(
+        torch.tensor(frame_counter * 0.3, device=device, dtype=delta.dtype)
+    ))
+
+    # =====================================================
     # COMPUTE DELTA
     # =====================================================
     core_delta   = delta * core_mask
@@ -398,12 +479,24 @@ def apply_mouth_smil(
     # =====================================================
     # NEW CODE
     # =====================================================
-    delta = torch.tanh(delta * 0.7) * 0.6
+    #delta = torch.tanh(delta * 0.7) * 0.6
+
+    norm = torch.norm(delta, dim=-1, keepdim=True)
+    scale = torch.tanh(norm * 0.8) / (norm + 1e-6)
+
+    delta = delta * scale
 
     # =====================================================
     # UPDATE INERTIA BUFFER
     # =====================================================
     apply_mouth_smil.prev_delta = delta.detach()
+
+    # =====================================================
+    # Noise effect anti robot
+    # =====================================================
+
+    noise = torch.randn_like(delta) * 0.02
+    delta = delta + noise * mask_soft
 
     # =====================================================
     # GRID WARP
@@ -429,6 +522,13 @@ def apply_mouth_smil(
 
     if grid_norm.shape[-1] != 2:
         grid_norm = grid_norm.permute(0, 2, 3, 1).contiguous()
+
+    grid_shift = (grid_mouth - base_grid).abs().mean().item()
+
+    print(f"[GRID DEBUG] shift mean: {grid_shift:.6f}")
+
+    if grid_shift < 1e-4:
+        print("[WARNING] grid is static → no visible deformation")
 
     latents_out = F.grid_sample(
         latents,
