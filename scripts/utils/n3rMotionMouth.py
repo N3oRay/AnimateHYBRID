@@ -332,14 +332,27 @@ def apply_mouth_smil(
     # =====================================================
     # CONSTRAINTS (MASK + GATE)
     # =====================================================
-    delta = delta * mask_soft * motion_gate
+    #delta = delta * mask_soft * motion_gate
+
+    combined_gate = mask_soft * (0.7 + 0.3 * motion_gate)
+    delta = delta * combined_gate
 
     # =====================================================
     # SCALING (ONLY ONCE)
     # =====================================================
     delta = delta * strength
 
-    # update inertia buffer
+    # =====================================================
+    # NEW CODE
+    # =====================================================
+    norm = torch.sqrt(delta[..., 0]**2 + delta[..., 1]**2 + 1e-8)
+    scale = torch.tanh(norm * 0.8) / (norm + 1e-8)
+
+    delta = delta * scale.unsqueeze(-1)
+
+    # =====================================================
+    # UPDATE INERTIA BUFFER
+    # =====================================================
     apply_mouth_smil.prev_delta = delta.detach()
 
     # =====================================================
