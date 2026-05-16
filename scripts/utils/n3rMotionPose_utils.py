@@ -12,6 +12,9 @@ from .n3rControlNet import create_canny_control, control_to_latent, match_latent
 from .tools_utils import ensure_4_channels, print_generation_params, sanitize_latents
 from .n3rMotionPose_tools import gaussian_blur_tensor, debug_draw_openpose_skeleton, rotate_mask_around_torso_simple, rotate_mask_around_visage, save_impact_map, apply_breathing_xy, smooth_noise, feather_dynamic_vectorized, compute_delta, stabilize_latents_motion, save_debug_pose_image_with_skeleton, apply_hair_motion_cycle, apply_breathing_real, apply_breathing_soft, apply_breathing_simple_anime, feather_inside_strict2, feather_outside_only_alpha2, apply_micro_motion, apply_micro_boost, dilate_mask, save_debug_mask_scale, feather_outside_only_stable, save_debug_mask
 
+from .n3rMotionMouth import apply_mouth_smil
+
+
 from .n3rPoseModule import apply_actor_model, resolve_motion_model
 
 from .n3rMotionPoseClass import Pose
@@ -2147,93 +2150,7 @@ def apply_face_warp(
 
 #--------------------------------------------------------------------
 
-def apply_mouth_smil(
-    latents,
-    pose,
-    mask_mouth,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device=None,
-    debug=False,
-    debug_dir=None,
-    smooth=0.85,
-    strength=2.0,
-    npy=False
-):
-    if device is None:
-        device = latents.device
 
-    B, C, H, W = latents.shape
-    latents_in = latents.clone()
-
-    # =========================
-    # 🔥 NEW: compute delta propre
-    # =========================
-    delta, facial_points = Pose.compute_mouth_delta(
-        pose=pose,
-        mask_mouth=mask_mouth,
-        H=H,
-        W=W,
-        frame_counter=frame_counter,
-        device=device,
-        smooth=smooth,
-        strength=strength,
-        debug=debug
-    )
-
-    # =========================
-    # Sélectionner les points de la bouche (exemple d'indices pour les coins de la bouche)
-    # =========================
-    mouth_points_idx = [40, 41, 18]  # Vous pouvez ajuster en fonction des indices exacts de votre modèle.
-
-    # On récupère les points de la bouche et on les empile en un tensor
-    mouth_points = torch.stack([pose.get_point(i) for i in mouth_points_idx], dim=1)  # [B, 4, 2]
-
-    # Calculer le centre de la bouche (moyenne des 4 points)
-    mouth_center = mouth_points.mean(dim=1)  # [B, 2]
-
-    # =========================
-    # Appliquer les déformations en fonction du centre de la bouche
-    # =========================
-    mouth_center_px = mouth_center * torch.tensor([W-1, H-1], device=device)
-    mouth_center_px = mouth_center_px.view(B, 1, 1, 2)
-
-    # Calculer les décalages de la bouche
-    grid_mouth = grid.clone() - mouth_center_px
-    grid_mouth = grid_mouth + delta
-    grid_mouth = grid_mouth + mouth_center_px
-
-    # Normaliser les coordonnées du grid pour grid_sample
-    grid_mouth[..., 0] = 2.0 * grid_mouth[..., 0] / (W-1) - 1.0
-    grid_mouth[..., 1] = 2.0 * grid_mouth[..., 1] / (H-1) - 1.0
-
-    # =========================
-    # 9. SAMPLE (amélioré)
-    # =========================
-    latents_out = F.grid_sample(
-        latents,
-        grid_mouth,
-        mode='bilinear',
-        padding_mode='border',  # 🔥 important
-        align_corners=True
-    )
-
-    # =========================
-    # 10. DEBUG (inchangé)
-    # =========================
-    if debug and debug_dir is not None:
-        try:
-            os.makedirs(debug_dir, exist_ok=True)
-            save_impact_map( latents_out, latents_in, debug_dir, frame_counter, prefix="mouth" )
-            if npy:
-                np.save( os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"), delta.detach().cpu().numpy() )
-            print("[DEBUG] Mouth warp applied OK + delta saved")
-        except Exception as e:
-            print(f"[WARN] mouth debug failed: {e}")
-
-    return latents_out, delta, facial_points
 
 
 #-------------------------------------------------test -----------------------------------------
@@ -2682,7 +2599,6 @@ def apply_pose_driven_motion_ultra2(
 
         # Broadcasting correct pour la bouche
         mask_mouth_corners_broadcast = mask_mouth_corners.repeat(1, C, 1, 1)
-        #latents_local += 0.002 * (mask_mouth_corners_broadcast * torch.sin(t*2.0))
 
         phase = time_sin(frame_counter, device=latents_local.device)
         latents_local += 0.002 * mask_mouth_corners_broadcast * phase
