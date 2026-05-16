@@ -283,8 +283,13 @@ def apply_mouth_smil(
 
     mask = mask.float()
 
-    # soft boundary (important for realism)
-    mask_soft = F.avg_pool2d(mask, 5, 1, 2)
+
+    # Dilatation du masque pour : transition peau/lèvres/joues
+    # strong horizontal spread (lip corners)
+    mask_h = F.max_pool2d(mask, kernel_size=(5, 13), stride=1, padding=(2, 6))
+    # mild vertical bleed (lip thickness only)
+    mask_v = F.avg_pool2d(mask_h, kernel_size=(3, 5), stride=1, padding=(1, 2))
+    mask_soft = mask_v
 
     mask_soft = F.interpolate(
         mask_soft,
