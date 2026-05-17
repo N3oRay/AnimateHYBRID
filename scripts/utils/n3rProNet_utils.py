@@ -3939,17 +3939,14 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     frame_counter=0,
     latent_scale_boost=1.0,
     use_hann=True,
-    sharpen_mode="both",              # None, "tanh", "edges", "both"
+    sharpen_mode="both2",              # None, "tanh", "edges", "both", "both2"
     sharpen_strength=0.015,
     sharpen_edges_strength=0.02,
     gamma_boost=1.00,                  # légèrement plus de punch naturel
     scale=8,
-    denoise=True,
-    temporal_consistency=True,
-    style_injection=True,
-    appearance=True,
-    creative=True,
-    art=True,
+    denoise=True, temporal_consistency=True, style_injection=True, appearance=True, creative=True, art=True,
+    micro_boost=False,
+    filtre_vae=True,
     suffix="00",
     export_latents=False,
     export_latents_comfy=True,
@@ -3999,7 +3996,8 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     # =====================================================
     # MODEL AND TRAINNIG
     # =====================================================
-    style_prompt_embedding = torch.randn(B, prompt_dim, device=device, dtype=latents.dtype)
+    #style_prompt_embedding = torch.randn(B, prompt_dim, device=device, dtype=latents.dtype) # version random
+    style_prompt_embedding = torch.zeros( B, prompt_dim, device=device, dtype=latents.dtype )
     # Exemple avec le premier prompt positif
     if pos_embeds_list is not None:
         style_prompt_embedding = pos_embeds_list[0].to(device).to(dtype=latents.dtype)  # forme [B, prompt_dim]
@@ -4162,7 +4160,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     # ---------------- Sharp adaptatif ----------------
     if sharpen_mode is not None:
-        if sharpen_mode in ["tanh", "both"]:
+        if sharpen_mode in ["tanh", "both", "both2"]:
             mean = output_rgb.mean(dim=[2,3], keepdim=True)
             detail = output_rgb - mean
             local_std = detail.std(dim=[2,3], keepdim=True) + 1e-6
@@ -4183,6 +4181,37 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
             edge_mask = torch.sigmoid(6.0 * (edges - 0.7))
             output_rgb = output_rgb + sharpen_edges_strength * edges * edge_mask
 
+        if sharpen_mode in ["both2"]:
+            B, C, H, W = output_rgb.shape
+
+            kernel_x = torch.tensor( [[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=output_rgb.dtype )
+            kernel_y = torch.tensor( [[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=output_rgb.dtype )
+
+            kernel_x = kernel_x.view(1,1,3,3)
+            kernel_y = kernel_y.view(1,1,3,3)
+
+            # -----------------------------
+            # Luminance-only sharpening
+            # -----------------------------
+            luma = (
+                0.299 * output_rgb[:,0:1] +
+                0.587 * output_rgb[:,1:2] +
+                0.114 * output_rgb[:,2:3]
+            )
+            grad_x = F.conv2d(luma, kernel_x, padding=1)
+            grad_y = F.conv2d(luma, kernel_y, padding=1)
+            edges = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+            # normalize
+            edges = edges / (edges.mean(dim=[2,3], keepdim=True) + 1e-6)
+            # stabilize
+            edges = torch.clamp(edges, 0, 2.5)
+            # soft edge selection
+            edge_mask = torch.sigmoid(4.0 * (edges - 0.5))
+            # final sharpen
+            output_rgb = output_rgb + (
+                sharpen_edges_strength * edges * edge_mask
+            )
+
         output_rgb = output_rgb.clamp(-1.0, 1.0)
 
     # ---------------- Gamma adaptatif ----------------
@@ -4194,9 +4223,19 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         output_rgb = output_rgb_gamma * 2 - 1
 
     # ---------------- Micro-boost couleur ----------------
-    mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
-    color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
-    output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
+    if micro_boost:
+        mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
+        color_boost = torch.sigmoid(5.0*(output_rgb - mean_c)) * 0.03
+        output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
+    else:
+        mean_c = output_rgb.mean(dim=[2,3], keepdim=True)
+        color_delta = output_rgb - mean_c
+        color_boost = torch.tanh(5.0 * color_delta) * 0.015
+        output_rgb = (output_rgb + color_boost).clamp(-1.0, 1.0)
+
+    if filtre_vae:
+        output_rgb[:,0] *= 0.97   # réduire rouge
+        output_rgb[:,2] *= 1.01   # léger boost bleu
 
     # ---------------- Conversion PIL ----------------
     frames = [to_pil_image((output_rgb[i] + 1) / 2) for i in range(B)]
@@ -4317,6 +4356,8 @@ def decode_latents_ultrasafe_blockwise_sharp(
             sign = torch.sign(output_rgb)
 
             output_rgb = output_rgb + sharpen_edges_strength * edge_mask * sign * edges * 0.5
+
+
 
         output_rgb = output_rgb.clamp(-1.0, 1.0)
 
