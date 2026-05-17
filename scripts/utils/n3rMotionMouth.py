@@ -285,6 +285,10 @@ def apply_mouth_smil(
     mask = mask.float()
 
     # anisotropic dilation (good mouth behavior)
+    # =====================================================
+    # WIDE SOFT MOUTH FIELD
+    # =====================================================
+
     mask_h = F.max_pool2d(mask, kernel_size=(5, 13), stride=1, padding=(2, 6))
     mask_v = F.avg_pool2d(mask_h, kernel_size=(3, 5), stride=1, padding=(1, 2))
 
@@ -295,13 +299,19 @@ def apply_mouth_smil(
         align_corners=False
     )
 
-    # BCHW -> BHWC
-    mask_soft = mask_soft.permute(0, 2, 3, 1).contiguous()
-
+    # BOOST STRUCTURE (important)
+    #mask_soft = torch.pow(mask_soft, 0.7)
+    #mask_soft = torch.clamp(mask_soft * 2.5, 0.0, 1.0)
 
     # BOOST STRUCTURE (important)
+    # diffusion douce
     mask_soft = torch.pow(mask_soft, 0.7)
-    mask_soft = torch.clamp(mask_soft * 2.5, 0.0, 1.0)
+
+    # amplification
+    mask_soft = torch.clamp(mask_soft * 4.0, 0.0, 1.0)
+    # =====================================================
+    # BCHW -> BHWC
+    mask_soft = mask_soft.permute(0, 2, 3, 1).contiguous()
 
     print("[MASK MAX]", mask_soft.max().item())
     print("[MASK MEAN]", mask_soft.mean().item())
@@ -615,6 +625,8 @@ def apply_mouth_smil(
         -upper_part * 0.04
         + lower_part * 0.16
     ) * compression
+
+    print( "[COMPRESS_Y]", compress_y.mean().item(), compress_y.min().item(), compress_y.max().item() )
 
     compression_field = torch.cat([
         torch.zeros_like(compress_y),
