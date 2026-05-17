@@ -139,6 +139,57 @@ def apply_mouth_smil_old(
 class MouthMotionModel(nn.Module):
 
     def __init__(self, in_channels=4, hidden=32):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.SiLU(),
+        )
+
+        self.landmark_proj = nn.Linear(32, hidden)
+
+        self.fusion = nn.Conv2d(hidden * 2, hidden, 1)
+
+        # séparation des intentions
+        self.motion_head = nn.Conv2d(hidden, hidden, 3, padding=1)
+        self.flow_head = nn.Conv2d(hidden, 2, 3, padding=1)
+        self.gate_head = nn.Conv2d(hidden, 1, 1)
+
+        self.register_buffer("prev_flow", None)
+
+    def forward(self, x, landmarks):
+
+        h = self.encoder(x)
+
+        l = self.landmark_proj(landmarks)
+        l = l[:, :, None, None].expand(-1, -1, h.shape[2], h.shape[3])
+
+        h = self.fusion(torch.cat([h, l], dim=1))
+
+        motion = self.motion_head(h)
+
+        gate = torch.sigmoid(self.gate_head(motion))
+
+        flow = torch.tanh(self.flow_head(motion))
+
+        flow = flow * gate
+
+        # temporal smoothing inside model
+        if self.prev_flow is not None:
+            flow = 0.7 * flow + 0.3 * self.prev_flow
+
+        self.prev_flow = flow.detach()
+
+        return {
+            "flow": flow,
+            "gate": gate
+        }
+
+class MouthMotionModel_v1(nn.Module):
+
+    def __init__(self, in_channels=4, hidden=32):
 
         super().__init__()
 
@@ -182,6 +233,56 @@ class MouthMotionModel(nn.Module):
 
 # instance par défaut pour ton pipeline
 mouth_model = MouthMotionModel().cuda()
+
+def build_mask_v1(idx_list, base_scale=0.08):
+    pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)
+    pts_px = pts * torch.tensor([W-1, H-1], device=device, dtype=pts.dtype)
+
+    yy, xx = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij"
+    )
+
+    grid_xy = torch.stack([xx, yy], dim=-1).float().unsqueeze(0)
+
+    dist = torch.norm(
+        grid_xy.unsqueeze(1) - pts_px.view(B, len(idx_list), 1, 1, 2),
+        dim=-1
+    )
+
+    return torch.exp(-dist.min(dim=1).values * base_scale).unsqueeze(-1)
+
+
+def build_mask(idx_list, pose, W, H, device, base_scale=0.08):
+
+    pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)  # [B,N,2]
+
+    pts_px = pts * torch.tensor(
+        [W - 1, H - 1],
+        device=device,
+        dtype=pts.dtype
+    )
+
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing="ij"
+    )
+
+    grid_xy = torch.stack([xx, yy], dim=-1).float()  # [H,W,2]
+    grid_xy = grid_xy.unsqueeze(0)  # [1,H,W,2]
+
+    # reshape pour broadcast propre
+    pts_px = pts_px.unsqueeze(2).unsqueeze(2)  # [B,N,1,1,2]
+
+    dist = torch.norm(grid_xy.unsqueeze(1) - pts_px, dim=-1)  # [B,N,H,W]
+
+    min_dist = dist.min(dim=1).values  # [B,H,W]
+
+    mask = torch.exp(-min_dist * base_scale)
+
+    return mask.unsqueeze(-1)
 
 def apply_mouth_smil(
     latents,
@@ -445,28 +546,11 @@ def apply_mouth_smil(
     corner_idx = [40, 41]
     anchor_idx = [38, 39]
 
-    def build_mask(idx_list, base_scale=0.08):
-        pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)
-        pts_px = pts * torch.tensor([W-1, H-1], device=device, dtype=pts.dtype)
 
-        yy, xx = torch.meshgrid(
-            torch.arange(H, device=device),
-            torch.arange(W, device=device),
-            indexing="ij"
-        )
 
-        grid_xy = torch.stack([xx, yy], dim=-1).float().unsqueeze(0)
-
-        dist = torch.norm(
-            grid_xy.unsqueeze(1) - pts_px.view(B, len(idx_list), 1, 1, 2),
-            dim=-1
-        )
-
-        return torch.exp(-dist.min(dim=1).values * base_scale).unsqueeze(-1)
-
-    core_mask   = build_mask(core_idx,   0.10)
-    corner_mask = build_mask(corner_idx, 0.06)
-    anchor_mask = build_mask(anchor_idx, 0.04)
+    core_mask   = build_mask(core_idx, pose, W, H, device,  0.10)
+    corner_mask = build_mask(corner_idx, pose, W, H, device, 0.06)
+    anchor_mask = build_mask(anchor_idx, pose, W, H, device, 0.04)
 
     # =====================================================
     # Deblocage des coins
@@ -505,10 +589,8 @@ def apply_mouth_smil(
     # =====================================================
     # Noise effect anti robot
     # =====================================================
-
     #noise = torch.randn_like(delta) * 0.02
     #delta = delta + noise * mask_soft
-
     # =====================================================
     # GRID WARP
     # =====================================================
@@ -709,19 +791,10 @@ def apply_mouth_smil(
         try:
             os.makedirs(debug_dir, exist_ok=True)
 
-            save_impact_map(
-                latents_out,
-                latents_in,
-                debug_dir,
-                frame_counter,
-                prefix="mouth"
-            )
+            save_impact_map( latents_out, latents_in, debug_dir, frame_counter, prefix="mouth" )
 
             if npy:
-                np.save(
-                    os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"),
-                    delta.detach().cpu().numpy()
-                )
+                np.save( os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"), delta.detach().cpu().numpy() )
 
         except Exception as e:
             print("[WARN] debug failed:", e)
