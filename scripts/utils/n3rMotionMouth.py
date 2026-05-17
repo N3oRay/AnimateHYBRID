@@ -303,6 +303,9 @@ def apply_mouth_smil(
     mask_soft = torch.pow(mask_soft, 0.7)
     mask_soft = torch.clamp(mask_soft * 2.5, 0.0, 1.0)
 
+    print("[MASK MAX]", mask_soft.max().item())
+    print("[MASK MEAN]", mask_soft.mean().item())
+
 
     # =====================================================
     # INERTIA
@@ -342,15 +345,6 @@ def apply_mouth_smil(
 
     #delta = delta + temporal_vec * temporal_weight
     delta = delta + (temporal_vec * temporal_weight * (1.0 + 0.5 * torch.tanh(delta.abs())))
-
-    # =====================================================
-    # TEMPORAL (FIX)
-    # =====================================================
-    #delta_flow = torch.norm(delta, dim=-1, keepdim=True)
-
-    #motion_boost = torch.clamp(delta_flow * 2.0, 0.5, 1.5)
-
-    #delta = delta * motion_boost
 
     # =====================================================
     # TEMPORAL DYNAMICS (SAFE)
@@ -494,16 +488,6 @@ def apply_mouth_smil(
     delta = delta * (1 - core_mask - corner_mask - anchor_mask) + core_delta + corner_delta + anchor_delta
 
     # =====================================================
-    # NEW CODE
-    # =====================================================
-    #delta = torch.tanh(delta * 0.7) * 0.6
-
-    #norm = torch.norm(delta, dim=-1, keepdim=True)
-    #scale = torch.tanh(norm * 0.8) / (norm + 1e-6)
-
-    #delta = delta * scale
-
-    # =====================================================
     # UPDATE INERTIA BUFFER
     # =====================================================
     apply_mouth_smil.prev_delta = delta.detach()
@@ -554,7 +538,7 @@ def apply_mouth_smil(
     ], dim=-1)
 
     # modulation temporelle
-    articulation_strength = 0.12 + 0.08 * torch.sin(
+    articulation_strength = 0.18 + 0.08 * torch.sin(
         torch.tensor(frame_counter * 0.25, device=device)
     )
 
@@ -598,6 +582,58 @@ def apply_mouth_smil(
     rigidity = rigidity.clamp(0.1, 1.0)
 
     delta = delta * rigidity
+
+
+    # =====================================================
+    # LIP COMPRESSION FIELD
+    # =====================================================
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=device),
+        torch.linspace(-1, 1, W, device=device),
+        indexing="ij"
+    )
+
+    yy = yy.unsqueeze(0).unsqueeze(-1)
+    xx = xx.unsqueeze(0).unsqueeze(-1)
+
+    # centre horizontal bouche
+    center_x = torch.exp(-(xx**2) * 10.0)
+
+    # ligne fermeture lèvres
+    lip_line = torch.exp(-(yy**2) * 80.0)
+
+    compression = center_x * lip_line
+
+    # force verticale opposée
+    #compress_y = -yy * compression * 0.12
+
+    upper_part = torch.clamp(-yy, 0.0, 1.0)
+    lower_part = torch.clamp(yy, 0.0, 1.0)
+
+    compress_y = (
+        -upper_part * 0.04
+        + lower_part * 0.16
+    ) * compression
+
+    compression_field = torch.cat([
+        torch.zeros_like(compress_y),
+        compress_y
+    ], dim=-1)
+
+    delta = delta + compression_field * mask_soft
+
+    # =====================================================
+    # LOG
+    # =====================================================
+    lip_opening = delta[...,1].mean().item()
+
+    upper_motion = delta[...,1][yy.squeeze(-1) < 0].abs().mean().item()
+    lower_motion = delta[...,1][yy.squeeze(-1) > 0].abs().mean().item()
+
+    print(f"[LIP OPENING] {lip_opening:.6f}")
+    print(f"[UPPER LIP MOTION] {upper_motion:.6f}")
+    print(f"[LOWER LIP MOTION] {lower_motion:.6f}")
 
     # =====================================================
     # GRID
