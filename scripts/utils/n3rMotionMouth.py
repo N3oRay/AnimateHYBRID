@@ -209,10 +209,10 @@ def apply_mouth_smil(
     debug=False,
     debug_dir=None,
     smooth=0.75,
-    strength=1.0,
-    motion_scale=0.5,
+    strength=0.8,
+    motion_scale=0.4,
     scale_flow=0.035, #0.08
-    speed=0.35,
+    speed=1.0, # 0.45
     npy=False
 ):
 
@@ -391,9 +391,9 @@ def apply_mouth_smil(
     )
 
     motion_boost = 1.0 + torch.clamp(
-        motion_energy * 0.15,
+        motion_energy * 0.05,
         0.0,
-        0.35
+        0.12
     )
 
     delta = delta * motion_boost
@@ -547,12 +547,11 @@ def apply_mouth_smil(
     ], dim=-1)
 
     # modulation temporelle
-    articulation_strength = 0.18 + 0.08 * torch.sin(
+    articulation_strength = 0.06 + 0.03 * torch.sin(
         torch.tensor(time_t * 0.25, device=device)
     )
 
     delta = delta + articulation * articulation_strength * mask_soft
-
 
     # =====================================================
     # RIGIDITY FIELD (CRITICAL FOR SHARPNESS)
