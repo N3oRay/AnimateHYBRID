@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import time
+
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
 from .n3r_EMA import motion_aware_ema_fusion, compute_high_freq_energy
 
@@ -14,96 +16,6 @@ from .n3r_EMA import motion_aware_ema_fusion, compute_high_freq_energy
 from .n3rMotionPose_tools import save_impact_map
 from .n3rMotionPoseClass import Pose
 
-
-def apply_mouth_smil_old(
-    latents,
-    pose,
-    mask_mouth,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device=None,
-    debug=False,
-    debug_dir=None,
-    smooth=0.85,
-    strength=2.0,
-    npy=False
-):
-    if device is None:
-        device = latents.device
-
-    B, C, H, W = latents.shape
-    latents_in = latents.clone()
-
-    # =========================
-    # 🔥 NEW: compute delta propre
-    # =========================
-    delta, facial_points = Pose.compute_mouth_delta(
-            pose=pose,
-            mask_mouth=mask_mouth,
-            H=H,
-            W=W,
-            frame_counter=frame_counter,
-            device=device,
-            smooth=smooth,
-            strength=strength,
-            debug=debug
-    )
-
-
-    mouth_points_idx = [
-            40, 41,
-            70,71,72,73,74,75,76,
-            77,78,79,80,81,82,83
-        ]
-
-    # On récupère les points de la bouche et on les empile en un tensor
-    mouth_points = torch.stack([pose.get_point(i) for i in mouth_points_idx], dim=1)  # [B, 4, 2]
-
-    # Calculer le centre de la bouche (moyenne des 4 points)
-    mouth_center = mouth_points.mean(dim=1)  # [B, 2]
-
-    # =========================
-    # Appliquer les déformations en fonction du centre de la bouche
-    # =========================
-    mouth_center_px = mouth_center * torch.tensor([W-1, H-1], device=device)
-    mouth_center_px = mouth_center_px.view(B, 1, 1, 2)
-
-    # Calculer les décalages de la bouche
-    grid_mouth = grid.clone() - mouth_center_px
-    grid_mouth = grid_mouth + delta
-    grid_mouth = grid_mouth + mouth_center_px
-
-    # Normaliser les coordonnées du grid pour grid_sample
-    grid_mouth[..., 0] = 2.0 * grid_mouth[..., 0] / (W-1) - 1.0
-    grid_mouth[..., 1] = 2.0 * grid_mouth[..., 1] / (H-1) - 1.0
-
-    # =========================
-    # 9. SAMPLE (amélioré)
-    # =========================
-    latents_out = F.grid_sample(
-        latents,
-        grid_mouth,
-        mode='bilinear',
-        padding_mode='border',  # 🔥 important
-        align_corners=True
-    )
-
-    # =========================
-    # 10. DEBUG (inchangé)
-    # =========================
-    if debug and debug_dir is not None:
-        try:
-            os.makedirs(debug_dir, exist_ok=True)
-            save_impact_map( latents_out, latents_in, debug_dir, frame_counter, prefix="mouth" )
-            if npy:
-                np.save( os.path.join(debug_dir, f"mouth_delta_{frame_counter:05d}.npy"), delta.detach().cpu().numpy() )
-            print("[DEBUG] Mouth warp applied OK + delta saved")
-        except Exception as e:
-            print(f"[WARN] mouth debug failed: {e}")
-
-    return latents_out, delta, facial_points
 
 """"
         38: ("mouth_left_ext", mouth_left_ext),
@@ -390,8 +302,8 @@ def apply_mouth_smil(
     # WIDE SOFT MOUTH FIELD
     # =====================================================
 
-    mask_h = F.max_pool2d(mask, kernel_size=(5, 13), stride=1, padding=(2, 6))
-    mask_v = F.avg_pool2d(mask_h, kernel_size=(3, 5), stride=1, padding=(1, 2))
+    mask_h = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+    mask_v = F.avg_pool2d(mask_h, kernel_size=3, stride=1, padding=1)
 
     mask_soft = F.interpolate(
         mask_v,
@@ -399,10 +311,6 @@ def apply_mouth_smil(
         mode="bilinear",
         align_corners=False
     )
-
-    # BOOST STRUCTURE (important)
-    #mask_soft = torch.pow(mask_soft, 0.7)
-    #mask_soft = torch.clamp(mask_soft * 2.5, 0.0, 1.0)
 
     # BOOST STRUCTURE (important)
     # diffusion douce
@@ -454,7 +362,6 @@ def apply_mouth_smil(
         torch.tensor(frame_counter * 0.25, device=delta.device, dtype=delta.dtype)
     )
 
-    #delta = delta + temporal_vec * temporal_weight
     delta = delta + (temporal_vec * temporal_weight * (1.0 + 0.5 * torch.tanh(delta.abs())))
 
     # =====================================================
@@ -546,8 +453,6 @@ def apply_mouth_smil(
     corner_idx = [40, 41]
     anchor_idx = [38, 39]
 
-
-
     core_mask   = build_mask(core_idx, pose, W, H, device,  0.10)
     corner_mask = build_mask(corner_idx, pose, W, H, device, 0.06)
     anchor_mask = build_mask(anchor_idx, pose, W, H, device, 0.04)
@@ -586,11 +491,6 @@ def apply_mouth_smil(
     # =====================================================
     apply_mouth_smil.prev_delta = delta.detach()
 
-    # =====================================================
-    # Noise effect anti robot
-    # =====================================================
-    #noise = torch.randn_like(delta) * 0.02
-    #delta = delta + noise * mask_soft
     # =====================================================
     # GRID WARP
     # =====================================================
@@ -800,4 +700,677 @@ def apply_mouth_smil(
             print("[WARN] debug failed:", e)
 
     return latents_out, delta, mouth_points
+
+
+# =========================================================
+# OPTIONAL DEBUG UTILS
+# =========================================================
+
+def _safe_stat(x):
+    return {
+        "mean": x.mean().item(),
+        "std": x.std().item(),
+        "max": x.max().item(),
+        "min": x.min().item(),
+    }
+
+
+def _log_tensor(name, x):
+    s = _safe_stat(x)
+
+    print(
+        f"[{name}] "
+        f"mean={s['mean']:.6f} "
+        f"std={s['std']:.6f} "
+        f"min={s['min']:.6f} "
+        f"max={s['max']:.6f}"
+    )
+
+
+def reset_mouth_state():
+    """
+    Hard reset persistent temporal states.
+    Useful between videos.
+    """
+
+    attrs = [
+        "velocity",
+        "displacement",
+        "prev_delta",
+        "motion_energy",
+        "frame_index",
+    ]
+
+    for a in attrs:
+        if hasattr(apply_mouth_smil, a):
+            delattr(apply_mouth_smil, a)
+
+    print("[MOUTH] temporal state reset")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def apply_mouth_smil_dev(
+    latents,
+    pose,
+    mask_mouth,
+    grid,
+    frame_counter,
+
+    mouth_model=None,
+
+    H=None,
+    W=None,
+    device=None,
+    smooth=0.90, # old
+    # =====================================================
+    # PHYSICS
+    # =====================================================
+
+    strength=0.30,
+
+    inertia=0.92,
+    spring_k=0.015,
+
+    force_gain=0.035,
+
+    displacement_decay=0.995,
+
+    max_velocity=2.50,
+    max_displacement=12.0,
+
+    # =====================================================
+    # STABILITY
+    # =====================================================
+
+    temporal_smoothing=0.15,
+
+    adaptive_motion=True,
+    adaptive_strength=True,
+
+    velocity_damping_edge=0.85,
+
+    # =====================================================
+    # MASK
+    # =====================================================
+
+    mask_power=0.75,
+    blend_strength=0.35,
+
+    # =====================================================
+    # DEBUG
+    # =====================================================
+
+    debug=False,
+    debug_dir=None,
+    save_npy=False,
+    npy=False
+):
+    """
+    =========================================================
+    STABLE PHYSICS-BASED LATENT MOUTH MOTION
+    =========================================================
+
+    FEATURES
+    --------
+    - physically coherent motion
+    - velocity integration
+    - spring restoration
+    - temporal stability
+    - drift prevention
+    - adaptive motion control
+    - stable long sequence behavior
+    - edge damping
+    - safe latent blending
+
+    DYNAMICS
+    --------
+        force -> velocity -> displacement -> grid
+
+    NO:
+    ----
+    - oscillation hacks
+    - EMA grid drift
+    - fake sinus motion
+    - unstable accumulations
+    """
+
+    # =====================================================
+    # DEVICE
+    # =====================================================
+
+    if device is None:
+        device = latents.device
+
+    B, C, H_lat, W_lat = latents.shape
+
+    if H is None:
+        H = H_lat
+
+    if W is None:
+        W = W_lat
+
+    latents_in = latents.clone()
+
+    # =====================================================
+    # GRID FORMAT
+    # =====================================================
+
+    base_grid = grid.clone()
+
+    if base_grid.shape[-1] != 2:
+        base_grid = (
+            base_grid
+            .permute(0, 2, 3, 1)
+            .contiguous()
+        )
+
+    # =====================================================
+    # LANDMARKS
+    # =====================================================
+
+    mouth_points_idx = [
+        40, 41,
+        70, 71, 72, 73, 74, 75, 76,
+        77, 78, 79, 80, 81, 82, 83
+    ]
+
+    mouth_points = torch.stack(
+        [pose.get_point(i) for i in mouth_points_idx],
+        dim=1
+    )
+
+    # =====================================================
+    # MOTION TARGET
+    # =====================================================
+
+    if mouth_model is None:
+
+        print("[MOUTH] analytic motion")
+
+        target_motion, _ = Pose.compute_mouth_delta(
+            pose=pose,
+            mask_mouth=mask_mouth,
+            H=H,
+            W=W,
+            frame_counter=frame_counter,
+            device=device,
+            smooth=0.90,
+            strength=1.0,
+            debug=debug
+        )
+
+        # BCHW -> BHWC
+        if target_motion.shape[1] == 2:
+            target_motion = (
+                target_motion
+                .permute(0, 2, 3, 1)
+                .contiguous()
+            )
+
+        motion_gate = torch.ones(
+            (B, H, W, 1),
+            device=device,
+            dtype=target_motion.dtype
+        )
+
+    else:
+
+        print("[MOUTH] neural motion")
+
+        landmarks = mouth_points.reshape(B, -1)
+
+        pred = mouth_model(latents, landmarks)
+
+        target_motion = (
+            pred["flow"]
+            .permute(0, 2, 3, 1)
+            .contiguous()
+        )
+
+        motion_gate = (
+            pred["gate"]
+            .permute(0, 2, 3, 1)
+            .contiguous()
+        )
+
+        target_motion[..., 0] *= W * 0.025
+        target_motion[..., 1] *= H * 0.025
+
+    # =====================================================
+    # TEMPORAL SMOOTHING
+    # =====================================================
+
+    if not hasattr(apply_mouth_smil, "prev_delta"):
+
+        apply_mouth_smil.prev_delta = (
+            torch.zeros_like(target_motion)
+        )
+
+    prev_delta = apply_mouth_smil.prev_delta
+
+    target_motion = (
+        prev_delta * temporal_smoothing
+        + target_motion * (1.0 - temporal_smoothing)
+    )
+
+    apply_mouth_smil.prev_delta = (
+        target_motion.detach()
+    )
+
+    # =====================================================
+    # MASK
+    # =====================================================
+
+    if mask_mouth.dim() == 3:
+        mask = mask_mouth.unsqueeze(1)
+    else:
+        mask = mask_mouth
+
+    mask = mask.float()
+
+    # =====================================================
+    # SOFT MOUTH FIELD
+    # =====================================================
+
+    mask_h = F.max_pool2d(
+        mask,
+        kernel_size=(3, 7),
+        stride=1,
+        padding=(1, 3)
+    )
+
+    mask_v = F.avg_pool2d(
+        mask_h,
+        kernel_size=(3, 5),
+        stride=1,
+        padding=(1, 2)
+    )
+
+    mask_soft = F.interpolate(
+        mask_v,
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False
+    )
+
+    mask_soft = torch.pow(mask_soft, mask_power)
+
+    mask_soft = torch.clamp(
+        mask_soft * 1.75,
+        0.0,
+        1.0
+    )
+
+    # =====================================================
+    # EDGE DAMPING
+    # =====================================================
+
+    edge_mask = (
+        1.0 - mask_soft
+    ) * velocity_damping_edge + mask_soft
+
+    # BCHW -> BHWC
+    mask_soft = (
+        mask_soft
+        .permute(0, 2, 3, 1)
+        .contiguous()
+    )
+
+    edge_mask = (
+        edge_mask
+        .permute(0, 2, 3, 1)
+        .contiguous()
+    )
+
+    # =====================================================
+    # MOTION GATE
+    # =====================================================
+
+    combined_gate = (
+        mask_soft
+        * (0.8 + 0.2 * motion_gate)
+    )
+
+    target_motion = (
+        target_motion
+        * combined_gate
+    )
+
+    # =====================================================
+    # TEMPORAL STATE INIT
+    # =====================================================
+
+    if not hasattr(apply_mouth_smil, "velocity"):
+
+        apply_mouth_smil.velocity = (
+            torch.zeros_like(target_motion)
+        )
+
+    if not hasattr(apply_mouth_smil, "displacement"):
+
+        apply_mouth_smil.displacement = (
+            torch.zeros_like(target_motion)
+        )
+
+    velocity = apply_mouth_smil.velocity
+    displacement = apply_mouth_smil.displacement
+
+    # =====================================================
+    # ADAPTIVE MOTION
+    # =====================================================
+
+    motion_energy = (
+        torch.norm(
+            target_motion,
+            dim=-1,
+            keepdim=True
+        )
+    )
+
+    if adaptive_motion:
+
+        adaptive_force = (
+            0.5
+            + torch.clamp(
+                motion_energy * 12.0,
+                0.0,
+                1.5
+            )
+        )
+
+    else:
+
+        adaptive_force = 1.0
+
+    # =====================================================
+    # FORCE
+    # =====================================================
+
+    force = (
+        target_motion
+        * force_gain
+        * adaptive_force
+    )
+
+    # =====================================================
+    # SPRING RESTORATION
+    # =====================================================
+
+    spring_force = (
+        displacement
+        * spring_k
+    )
+
+    force = force - spring_force
+
+    # =====================================================
+    # VELOCITY INTEGRATION
+    # =====================================================
+
+    velocity = (
+        velocity * inertia
+        + force
+    )
+
+    # =====================================================
+    # EDGE DAMPING
+    # =====================================================
+
+    velocity = velocity * edge_mask
+
+    # =====================================================
+    # VELOCITY CLAMP
+    # =====================================================
+
+    velocity = torch.clamp(
+        velocity,
+        -max_velocity,
+        max_velocity
+    )
+
+    # =====================================================
+    # POSITION INTEGRATION
+    # =====================================================
+
+    displacement = (
+        displacement
+        + velocity
+    )
+
+    # =====================================================
+    # DECAY
+    # =====================================================
+
+    displacement = (
+        displacement
+        * displacement_decay
+    )
+
+    # =====================================================
+    # DISPLACEMENT CLAMP
+    # =====================================================
+
+    displacement = torch.clamp(
+        displacement,
+        -max_displacement,
+        max_displacement
+    )
+
+    # =====================================================
+    # ADAPTIVE STRENGTH
+    # =====================================================
+
+    if adaptive_strength:
+
+        local_strength = (
+            strength
+            * (
+                0.75
+                + torch.clamp(
+                    motion_energy * 8.0,
+                    0.0,
+                    0.5
+                )
+            )
+        )
+
+    else:
+
+        local_strength = strength
+
+    displacement = (
+        displacement
+        * local_strength
+    )
+
+    # =====================================================
+    # SAVE STATE
+    # =====================================================
+
+    apply_mouth_smil.velocity = (
+        velocity.detach()
+    )
+
+    apply_mouth_smil.displacement = (
+        displacement.detach()
+    )
+
+    # =====================================================
+    # FINAL GRID
+    # =====================================================
+
+    grid_mouth = (
+        base_grid
+        + displacement
+    )
+
+    # =====================================================
+    # NORMALIZATION
+    # =====================================================
+
+    grid_norm = grid_mouth.clone()
+
+    grid_norm[..., 0] = (
+        2.0 * grid_norm[..., 0] / (W - 1)
+        - 1.0
+    )
+
+    grid_norm[..., 1] = (
+        2.0 * grid_norm[..., 1] / (H - 1)
+        - 1.0
+    )
+
+    grid_norm = torch.clamp(
+        grid_norm,
+        -1.05,
+        1.05
+    )
+
+    # =====================================================
+    # GRID SAMPLE
+    # =====================================================
+
+    latents_warped = F.grid_sample(
+        latents,
+        grid_norm,
+        mode="bicubic",
+        padding_mode="border",
+        align_corners=True
+    )
+
+    # =====================================================
+    # SAFE BLENDING
+    # =====================================================
+
+    blend = (
+        mask_soft
+        .permute(0, 3, 1, 2)
+        .contiguous()
+    )
+
+    if blend.shape[-2:] != latents.shape[-2:]:
+
+        blend = F.interpolate(
+            blend,
+            size=latents.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+
+    blend = blend * blend_strength
+
+    latents_out = (
+        latents * (1.0 - blend)
+        + latents_warped * blend
+    )
+
+    # =====================================================
+    # STABILIZATION PASS
+    # =====================================================
+
+    residual = (
+        latents_out - latents_in
+    )
+
+    residual = torch.clamp(
+        residual,
+        -3.0,
+        3.0
+    )
+
+    latents_out = latents_in + residual
+
+    # =====================================================
+    # DEBUG LOGS
+    # =====================================================
+
+    if debug:
+
+        print("\n=================================================")
+        print(f"[MOUTH FRAME {frame_counter}]")
+        print("=================================================")
+
+        _log_tensor("target_motion", target_motion)
+        _log_tensor("velocity", velocity)
+        _log_tensor("displacement", displacement)
+
+        print(
+            f"[energy] "
+            f"{motion_energy.mean().item():.6f}"
+        )
+
+        print(
+            f"[mask] "
+            f"mean={mask_soft.mean().item():.6f} "
+            f"max={mask_soft.max().item():.6f}"
+        )
+
+        shift = (
+            displacement
+            .abs()
+            .mean()
+            .item()
+        )
+
+        print(f"[grid_shift] {shift:.6f}")
+
+        if shift < 1e-5:
+            print("[WARN] motion nearly frozen")
+
+        print("=================================================\n")
+
+    # =====================================================
+    # DEBUG SAVE
+    # =====================================================
+
+    if debug and debug_dir is not None:
+
+        try:
+
+            os.makedirs(
+                debug_dir,
+                exist_ok=True
+            )
+
+            if save_npy:
+
+                np.save(
+                    os.path.join(
+                        debug_dir,
+                        f"mouth_displacement_{frame_counter:05d}.npy"
+                    ),
+                    displacement
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+
+                np.save(
+                    os.path.join(
+                        debug_dir,
+                        f"mouth_velocity_{frame_counter:05d}.npy"
+                    ),
+                    velocity
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+
+        except Exception as e:
+
+            print("[WARN] debug save failed:", e)
+
+    # =====================================================
+    # RETURN
+    # =====================================================
+
+    return (
+        latents_out,
+        displacement,
+        mouth_points
+    )
+
 
