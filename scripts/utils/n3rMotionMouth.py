@@ -208,8 +208,11 @@ def apply_mouth_smil(
     device=None,
     debug=False,
     debug_dir=None,
-    smooth=0.85,
-    strength=2.0,
+    smooth=0.75,
+    strength=1.0,
+    motion_scale=0.5,
+    scale_flow=0.035, #0.08
+    speed=0.35,
     npy=False
 ):
 
@@ -220,6 +223,12 @@ def apply_mouth_smil(
 
     B, C, H, W = latents.shape
     latents_in = latents.clone()
+
+    # =====================================================
+    # TIME
+    # =====================================================
+
+    time_t = frame_counter * speed
 
     # =====================================================
     # LANDMARKS
@@ -282,9 +291,9 @@ def apply_mouth_smil(
         delta = pred["flow"].permute(0, 2, 3, 1).contiguous()
         motion_gate = pred["gate"].permute(0, 2, 3, 1).contiguous()
 
-        # scale flow
-        delta[..., 0] *= W * 0.08
-        delta[..., 1] *= H * 0.08
+        # scale flow -> scale_flow
+        delta[..., 0] *= W * scale_flow
+        delta[..., 1] *= H * scale_flow
 
 
     # =====================================================
@@ -327,18 +336,20 @@ def apply_mouth_smil(
 
 
     # =====================================================
-    # INERTIA
+    # INERTIA - V2
     # =====================================================
     if not hasattr(apply_mouth_smil, "prev_delta"):
         apply_mouth_smil.prev_delta = torch.zeros_like(delta)
 
-    # inertia only on BASE motion, NOT after temporal
-    base_delta = delta
+    alpha = 0.55 * speed
 
-    alpha = 0.55  # beaucoup plus réactif
-    smoothed = alpha * base_delta + (1 - alpha) * apply_mouth_smil.prev_delta
-    apply_mouth_smil.prev_delta = base_delta.detach()
+    # clamp sécurité
+    alpha = max(0.05, min(alpha, 0.95))
 
+    smoothed = (
+        alpha * delta
+        + (1 - alpha) * apply_mouth_smil.prev_delta
+    )
 
     apply_mouth_smil.prev_delta = smoothed.detach()
 
@@ -347,7 +358,7 @@ def apply_mouth_smil(
     # =====================================================
     # TEMPORAL (APPLY BEFORE MASK)
     # =====================================================
-    t = torch.tensor(frame_counter / 10.0, device=delta.device, dtype=delta.dtype)
+    t = torch.tensor(time_t / 10.0, device=delta.device, dtype=delta.dtype)
 
     sin_t = torch.sin(t)
     cos_t = torch.cos(t * 0.8)
@@ -359,10 +370,10 @@ def apply_mouth_smil(
 
     # Occilation constantes
     temporal_weight = 0.6 + 0.4 * torch.sin(
-        torch.tensor(frame_counter * 0.25, device=delta.device, dtype=delta.dtype)
+        torch.tensor(time_t * 0.25, device=delta.device, dtype=delta.dtype)
     )
 
-    delta = delta + (temporal_vec * temporal_weight * (1.0 + 0.5 * torch.tanh(delta.abs())))
+    delta = delta + ( temporal_vec * temporal_weight * 0.25 * (1.0 + 0.2 * torch.tanh(delta.abs())) )
 
     # =====================================================
     # TEMPORAL DYNAMICS (SAFE)
@@ -410,6 +421,7 @@ def apply_mouth_smil(
     print(f"""
     [MOUTH DEBUG]
     frame: {frame_counter}
+    time: {time_t}
     delta_mean: {delta.abs().mean().item():.6f}
     delta_max : {delta.abs().max().item():.6f}
 
@@ -461,7 +473,7 @@ def apply_mouth_smil(
     # Deblocage des coins
     # =====================================================
     corner_mask = corner_mask * (0.9 + 0.1 * torch.sin(
-        torch.tensor(frame_counter * 0.3, device=device, dtype=delta.dtype)
+        torch.tensor(time_t * 0.3, device=device, dtype=delta.dtype)
     ))
 
     # =====================================================
@@ -490,6 +502,11 @@ def apply_mouth_smil(
     # UPDATE INERTIA BUFFER
     # =====================================================
     apply_mouth_smil.prev_delta = delta.detach()
+
+    # =====================================================
+    # AMPLITUDE DU MOUVEMENT
+    # =====================================================
+    delta = delta * motion_scale
 
     # =====================================================
     # GRID WARP
@@ -531,7 +548,7 @@ def apply_mouth_smil(
 
     # modulation temporelle
     articulation_strength = 0.18 + 0.08 * torch.sin(
-        torch.tensor(frame_counter * 0.25, device=device)
+        torch.tensor(time_t * 0.25, device=device)
     )
 
     delta = delta + articulation * articulation_strength * mask_soft
