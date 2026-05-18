@@ -888,13 +888,14 @@ def apply_art(
     optimizer=None,
     criterion=None,
     train=False,
-    strength=0.10,
+    strength=0.50,
     device="cuda",
     frame_counter=0,
     max_epochs_up=6,
     model_path="models/art_model_latest.pt",
     ema_prev_latents=None,
     ema_alpha=0.3,
+    ema=False,
     new_image=False,
     debug=False
 ):
@@ -1345,7 +1346,7 @@ def apply_art(
     # EMA TEMPORAL
     # =====================================================
 
-    if ema_prev_latents is not None and not train:
+    if ema and ema_prev_latents is not None and not train:
         out = motion_aware_ema_fusion(
             out=out,
             ema_prev_latents=ema_prev_latents,
@@ -1355,237 +1356,3 @@ def apply_art(
 
     return out
 
-def apply_art_v1(
-    latents,
-    style_prompt_embedding,
-    art_model,
-    optimizer=None,
-    criterion=None,
-    train=False,
-    strength=0.10,
-    device="cuda",
-    frame_counter=0,
-    max_epochs_up=6,
-    model_path="models/art_model_latest.pt",
-    ema_prev_latents=None,
-    ema_alpha=0.3,
-    new_image=False,
-    debug=False
-):
-
-    device = latents.device
-    art_model.to(device)
-
-    x = latents.to(device)
-    x0 = x.detach()
-
-    print(f"[Art STABLE] device={device}")
-
-    # =====================================================
-    # SAFE PROMPT NORMALIZATION (IMPORTANT FIX)
-    # =====================================================
-
-    if style_prompt_embedding.dim() == 3:
-        prompt = style_prompt_embedding.mean(dim=1)
-    else:
-        prompt = style_prompt_embedding
-
-    # 🔥 critical fix: stop exploding norm
-    prompt = torch.tanh(prompt)
-    prompt = prompt / (prompt.std(dim=-1, keepdim=True) + 1e-6)
-
-    hf = compute_high_freq_energy(x0)
-    print(f"[Art STABLE] hf={hf.mean().item():.4f}")
-
-    model_exists = os.path.exists(model_path)
-
-    # =====================================================
-    # TRAIN
-    # =====================================================
-
-    if train and optimizer and criterion:
-
-        art_model.train()
-        max_epochs = max(1, max_epochs_up)
-
-        print("[Art STABLE] Training")
-
-        for epoch in range(max_epochs):
-
-            optimizer.zero_grad()
-
-            with torch.enable_grad():
-
-                pred = art_model(x0, prompt)
-
-                # ============================
-                # SAFE ACTIVATIONS
-                # ============================
-
-                structure = torch.tanh(pred["structure"]).view(-1,1,1,1)
-                texture   = torch.tanh(pred["texture"]).view(-1,1,1,1)
-                style     = torch.tanh(pred["style"]).view(-1,1,1,1)
-                chaos     = torch.tanh(pred["chaos"]).view(-1,1,1,1)
-                rhythm    = torch.tanh(pred["rhythm"]).view(-1,1,1,1)
-
-                out = x0
-
-                # ============================
-                # STRUCTURE (low-pass stable)
-                # ============================
-                low = F.avg_pool2d(out, 5, 1, 2)
-                out = out + 0.06 * structure * (low - out)
-
-                # ============================
-                # TEXTURE (band-limited)
-                # ============================
-                detail = out - F.avg_pool2d(out, 3, 1, 1)
-                out = out + 0.08 * texture * detail
-
-                # ============================
-                # STYLE (bounded nonlinearity)
-                # ============================
-                style_map = torch.sin(out * 3.1415)
-                out = out + 0.04 * style * style_map
-
-                # ============================
-                # CHAOS (very controlled)
-                # ============================
-                noise = torch.randn_like(out) * 0.5
-                out = out + 0.01 * chaos * noise
-
-                # ============================
-                # RHYTHM (reduced frequency)
-                # ============================
-                wave = torch.sin(out * 4.0)
-                out = out + 0.02 * rhythm * wave
-
-                # ============================
-                # LOSSES (FIXED SCALE)
-                # ============================
-
-                loss_id = 0.05 * F.l1_loss(out, x0)
-
-                loss_detail = 0.02 * F.l1_loss(
-                    compute_high_freq_energy(out),
-                    compute_high_freq_energy(x0)
-                )
-
-                loss_energy = 0.001 * out.pow(2).mean()
-
-                # stability constraint (VERY IMPORTANT)
-                loss_stability = 0.01 * (out - x0).pow(2).mean()
-
-                loss = (
-                    loss_id +
-                    loss_detail +
-                    loss_energy +
-                    loss_stability
-                )
-
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(
-                art_model.parameters(),
-                0.8
-            )
-
-            optimizer.step()
-
-            print(f"[Art STABLE] Epoch {epoch+1}/{max_epochs} | Loss={loss.item():.6f}")
-
-            if (frame_counter % 10 == 0) and (epoch == max_epochs - 1):
-                save_art_model(
-                    art_model,
-                    optimizer=optimizer,
-                    epoch=frame_counter,
-                    loss=loss.item(),
-                    path=model_path
-                )
-
-    # =====================================================
-    # LOAD
-    # =====================================================
-
-    else:
-        art_model.eval()
-
-        if model_exists:
-            art_model, _ = load_art_model(
-                type(art_model),
-                path=model_path,
-                optimizer=optimizer,
-                device=device
-            )
-
-    # =====================================================
-    # INFERENCE
-    # =====================================================
-
-    with torch.no_grad():
-
-        pred = art_model(x, prompt)
-
-        structure = 0.10 * torch.tanh(pred["structure"])
-        texture   = 0.12 * torch.tanh(pred["texture"])
-        style     = 0.08 * torch.tanh(pred["style"])
-        chaos     = 0.03 * torch.tanh(pred["chaos"])
-        rhythm    = 0.05 * torch.tanh(pred["rhythm"])
-
-        print(
-            f"[Art STABLE] "
-            f"struct={structure.mean().item():.4f} | "
-            f"texture={texture.mean().item():.4f} | "
-            f"style={style.mean().item():.4f} | "
-            f"chaos={chaos.mean().item():.4f} | "
-            f"rhythm={rhythm.mean().item():.4f}"
-        )
-
-        out = x
-
-        low = F.avg_pool2d(out, 5, 1, 2)
-        out = out + structure * (low - out)
-
-        detail = out - F.avg_pool2d(out, 3, 1, 1)
-        out = out + texture * detail
-
-        style_map = torch.sin(out * 3.1415)
-        out = out + style * style_map
-
-        noise = torch.randn_like(out) * 0.5
-        out = out + chaos * noise
-
-        wave = torch.sin(out * 4.0)
-        out = out + rhythm * wave
-
-    # =====================================================
-    # STRENGTH CONTROL (STABLE VERSION)
-    # =====================================================
-
-    hf = compute_high_freq_energy(x)
-
-    strength_map = strength / (1.0 + 4.0 * hf)
-    strength_map = strength_map.clamp(0.01, strength)
-
-    out = x + strength_map * (out - x)
-
-    # =====================================================
-    # FINAL STABILIZATION (IMPORTANT)
-    # =====================================================
-
-    #out = stabilize_latents(out, target_std=1.0)
-
-    # =====================================================
-    # EMA TEMPORAL (SAFE)
-    # =====================================================
-
-    if ema_prev_latents is not None and not train:
-
-        out = motion_aware_ema_fusion(
-            out=out,
-            ema_prev_latents=ema_prev_latents,
-            hf=hf,
-            debug=True
-        )
-
-    return out

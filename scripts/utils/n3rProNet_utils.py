@@ -3294,7 +3294,8 @@ def apply_temporal_consistency(
     model_path="models/temporal_latest.pt",
     debug=False,
     ema_prev_latents=None,
-    ema_alpha=0.3
+    ema_alpha=0.3,
+    ema=False
 ):
     """
     Applique une cohérence temporelle entre prev/current latents.
@@ -3577,7 +3578,7 @@ def apply_temporal_consistency(
     # EMA SMOOTHING
     # =====================================================
 
-    if ema_prev_latents is not None and new_image == False:
+    if ema and ema_prev_latents is not None and new_image == False:
         print(f"🔥 [Temporal] EMA.")
 
         if ema_prev_latents.device != temporal_latents.device:
@@ -3975,10 +3976,10 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         art=True
     else:
         denoise=True #OK
-        temporal_consistency=False #KO
+        temporal_consistency=True #OK
         style_injection=False # A verifier
         appearance=True # OK
-        creative=False # A verifier
+        creative=True # OK
         art=False # A verifier
 
 
@@ -4037,12 +4038,12 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     # 2. CREATIVE (STRUCTURE / TEXTURE / STOCHASTIC FIELD)
     # =====================================================
     # New Fonction : in DEV
-    if creative:
+    if creative and latents_sample is not None:
         #apprend une représentation de style stable en training compact (style_score + embedding) sert de “cerveau de style”
         latents = apply_creative(
             latents=latents, latents_sample=latents_sample,
-            style_prompt_embedding=style_prompt_embedding, creative_model=creative_model, optimizer=optimizer_creative, criterion=criterion_creative, train=False, device="cuda", strength=1.00, debug=True,
-            new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/creative_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+            style_prompt_embedding=style_prompt_embedding, creative_model=creative_model, optimizer=optimizer_creative, criterion=criterion_creative, train=True, device="cuda", strength=1.00, debug=True,
+            new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/creative_model_latest.pt")
 
     if art:
         # ⚠️ IMPORTANT: art DOIT être déterministe en inference
@@ -4078,11 +4079,11 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     # 4. APPEARANCE (PHOTOMETRIC RENDERING LAYER)
     # =====================================================
 
-    if appearance:
+    if appearance and latents_sample is not None:
         #photométrie contraste / gamma / exposure micro-structure visuelle agit comme un rendering layer
         latents = apply_appearance(
             latents=latents,
-            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=True, device="cuda", strength=0.1, debug=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", latents_sample=latents_sample, ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=False, device="cuda", strength=0.1, debug=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", latents_sample=latents_sample, ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
 
 
     # =====================================================
