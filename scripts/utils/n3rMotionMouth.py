@@ -69,7 +69,8 @@ class MouthMotionModel(nn.Module):
         self.flow_head = nn.Conv2d(hidden, 2, 3, padding=1)
         self.gate_head = nn.Conv2d(hidden, 1, 1)
 
-        self.register_buffer("prev_flow", None)
+        #self.register_buffer("prev_flow", None)
+        self.prev_flow = None
 
     def forward(self, x, landmarks):
 
@@ -98,48 +99,6 @@ class MouthMotionModel(nn.Module):
             "flow": flow,
             "gate": gate
         }
-
-class MouthMotionModel_v1(nn.Module):
-
-    def __init__(self, in_channels=4, hidden=32):
-
-        super().__init__()
-
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, hidden, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden, hidden, 3, padding=1),
-            nn.SiLU(),
-        )
-
-        self.landmark_proj = nn.Linear(32, hidden)
-
-        self.fusion = nn.Conv2d(hidden * 2, hidden, 1)
-
-        self.motion_gate = nn.Conv2d(hidden, 1, 1)
-
-        self.flow_head = nn.Conv2d(hidden, 2, 3, padding=1)
-
-    def forward(self, x, landmarks):
-
-        h = self.encoder(x)
-
-        l = self.landmark_proj(landmarks)
-        l = l[:,:,None,None].expand(-1,-1,h.shape[2],h.shape[3])
-
-        h = self.fusion(torch.cat([h,l], dim=1))
-
-        gate = torch.sigmoid(self.motion_gate(h))
-
-        flow = torch.tanh(self.flow_head(h))
-
-        flow = flow * gate
-
-        return {
-            "flow": flow,
-            "gate": gate
-        }
-
 
 
 
