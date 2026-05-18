@@ -3944,7 +3944,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     sharpen_edges_strength=0.02,
     gamma_boost=1.00,                  # légèrement plus de punch naturel
     scale=8,
-    denoise=True, temporal_consistency=True, style_injection=True, appearance=True, creative=True, art=True,
+    denoise=False, temporal_consistency=False, style_injection=False, appearance=False, creative=False, art=False,
     micro_boost=False,
     filtre_vae=True,
     suffix="00",
@@ -3964,6 +3964,23 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
 
     vae.eval()  # pas besoin de caster tout le VAE
     B, C, H, W = latents.shape
+
+
+    if frame_counter == 0:
+        denoise=True
+        temporal_consistency=True
+        style_injection=True
+        appearance=True
+        creative=True
+        art=True
+    else:
+        denoise=True #OK
+        temporal_consistency=False
+        style_injection=False
+        appearance=False
+        creative=False
+        art=False
+
 
     # 1. Cloner les latents pour traitement
     raw_latents = latents.clone()
