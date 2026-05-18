@@ -6,6 +6,7 @@ from PIL import Image, ImageFilter, ImageChops, ImageEnhance
 import numpy as np
 import math
 
+
 # Version de test:
 def apply_post_processing_minimal(
     frame_pil,
@@ -632,7 +633,182 @@ def post_denoise_light(frame_pil: Image.Image, radius: float = 0.5, strength: fl
     frame_pil = ImageChops.blend(frame_pil, blurred, strength)
     return frame_pil
 
+
+
+#--------------------------------------------------------------------------
+# Ajustement des couleurs
+#--------------------------------------------------------------------------
+
 def adjust_color_temperature(
+    image,
+    target_temp=7800,
+    reference_temp=6500,
+    strength=0.5,
+    adaptive=True,
+    max_gain=2.0,
+    neutral_zone=0.08,
+    debug=False
+):
+
+    img = np.array(image).astype(np.float32) / 255.0
+
+    # =====================================================
+    # Kelvin gains
+    # =====================================================
+
+    r1, g1, b1 = kelvin_to_rgb(reference_temp)
+    r2, g2, b2 = kelvin_to_rgb(target_temp)
+
+    base_gain = np.array([
+        r2 / max(r1, 1e-6),
+        g2 / max(g1, 1e-6),
+        b2 / max(b1, 1e-6)
+    ], dtype=np.float32)
+
+    # =====================================================
+    # image statistics
+    # =====================================================
+
+    mean_rgb = img.reshape(-1, 3).mean(axis=0)
+    mean_rgb = np.maximum(mean_rgb, 1e-6)
+
+    r, g, b = mean_rgb
+
+    # =====================================================
+    # continuous warmth estimation
+    # =====================================================
+
+    # score perceptuel plus robuste
+    warmth_score = (
+        (r * 0.67 + g * 0.33) - b
+    )
+
+    # normalisation
+    thermal_bias = np.tanh(warmth_score * 2.5)
+
+    # =====================================================
+    # profile classification
+    # =====================================================
+
+    if thermal_bias < -neutral_zone:
+        profile = "cold"
+
+    elif thermal_bias > neutral_zone:
+        profile = "warm"
+
+    else:
+        profile = "mixed"
+
+    # =====================================================
+    # adaptive modulation
+    # =====================================================
+
+    wb_ratio = mean_rgb / mean_rgb.mean()
+    imbalance = np.std(wb_ratio)
+
+    if adaptive:
+
+        # image mixte → correction plus douce
+        if profile == "mixed":
+
+            adaptive_factor = 1.0 + imbalance * 0.35
+            strength_local = strength * 0.55
+
+        # image froide
+        elif profile == "cold":
+
+            coldness = abs(thermal_bias)
+
+            adaptive_factor = 1.0 + imbalance * (0.5 + coldness)
+            strength_local = strength * (0.7 + coldness * 0.4)
+
+        # image chaude
+        else:
+
+            warmness = abs(thermal_bias)
+
+            adaptive_factor = 1.0 + imbalance * (0.7 + warmness)
+            strength_local = strength * (0.8 + warmness * 0.5)
+
+    else:
+
+        adaptive_factor = 1.0
+        strength_local = strength
+
+    # =====================================================
+    # smooth gain interpolation
+    # =====================================================
+
+    final_gain = (
+        (1.0 - strength_local)
+        + strength_local * base_gain * adaptive_factor
+    )
+
+    # =====================================================
+    # intelligent asymmetric clamp
+    # =====================================================
+
+    if profile == "mixed":
+
+        final_gain = np.clip(final_gain, 0.92, 1.08)
+
+    elif profile == "cold":
+
+        final_gain = np.clip(final_gain, 0.85, max_gain)
+
+    else:
+
+        final_gain = np.clip(final_gain, 1 / max_gain, 1.15)
+
+    # =====================================================
+    # luminance protection
+    # =====================================================
+
+    luminance_before = (
+        img[..., 0] * 0.2126 +
+        img[..., 1] * 0.7152 +
+        img[..., 2] * 0.0722
+    )
+
+    img *= final_gain
+
+    luminance_after = (
+        img[..., 0] * 0.2126 +
+        img[..., 1] * 0.7152 +
+        img[..., 2] * 0.0722
+    )
+
+    # compensation légère d'exposition
+    exposure_fix = (
+        luminance_before.mean() /
+        max(luminance_after.mean(), 1e-6)
+    )
+
+    img *= exposure_fix
+
+    img = np.clip(img, 0, 1)
+
+    # =====================================================
+    # debug
+    # =====================================================
+
+    if debug:
+
+        print("\n=== TEMP DEBUG V2 ===")
+        print("profile:", profile)
+        print("thermal_bias:", round(float(thermal_bias), 4))
+        print("warmth_score:", round(float(warmth_score), 4))
+        print("imbalance:", round(float(imbalance), 4))
+        print("adaptive_factor:", round(float(adaptive_factor), 4))
+        print("strength_local:", round(float(strength_local), 4))
+        print("final_gain:", final_gain)
+        print("=====================\n")
+
+    return Image.fromarray(
+        (img * 255).astype(np.uint8)
+    )
+
+def adjust_color_temperature_v2(
     image,
     target_temp=7800,
     reference_temp=6500,
