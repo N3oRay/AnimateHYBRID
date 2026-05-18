@@ -196,6 +196,25 @@ def build_mask(idx_list, pose, W, H, device, base_scale=0.08):
 
     return mask.unsqueeze(-1)
 
+#==================================================================================================================
+"""
+strength=0.82
+motion_scale=0.32
+scale_flow=0.028
+speed=0.42
+naturel=True
+"""
+#sourire humain subtil lèvres crédibles presque zéro jitter stabilité inter-frame élevée très peu d’artefacts de warp
+
+#ou ----------------------------------------------------------------------------------------------------------------
+"""
+naturel=False
+motion_scale=0.55
+speed=0.7
+"""
+#animation stylisée streamer/avatar rendu plus expressif
+#=====================================================================================================================
+
 def apply_mouth_smil(
     latents,
     pose,
@@ -513,11 +532,6 @@ def apply_mouth_smil(
     if base_grid.shape[-1] != 2:
         base_grid = base_grid.permute(0, 2, 3, 1).contiguous()
 
-
-    # =====================================================
-    # LIP ARTICULATION FIELD
-    # =====================================================
-
     yy, xx = torch.meshgrid(
         torch.linspace(-1, 1, H, device=device),
         torch.linspace(-1, 1, W, device=device),
@@ -526,6 +540,11 @@ def apply_mouth_smil(
 
     yy = yy.unsqueeze(0).unsqueeze(-1)
     xx = xx.unsqueeze(0).unsqueeze(-1)
+
+
+    # =====================================================
+    # LIP ARTICULATION FIELD
+    # =====================================================
 
     # séparation verticale lèvres
     upper_field = torch.exp(-((yy + 0.08) ** 2) * 40.0)
@@ -552,15 +571,6 @@ def apply_mouth_smil(
     # =====================================================
     # RIGIDITY FIELD (CRITICAL FOR SHARPNESS)
     # =====================================================
-
-    yy, xx = torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device),
-        torch.linspace(-1, 1, W, device=device),
-        indexing="ij"
-    )
-
-    yy = yy.unsqueeze(0).unsqueeze(-1)
-    xx = xx.unsqueeze(0).unsqueeze(-1)
 
     # centre bouche = mobile
     center_weight = torch.exp(-(xx**2) * 6.0)
@@ -592,15 +602,6 @@ def apply_mouth_smil(
     # LIP COMPRESSION FIELD
     # =====================================================
 
-    yy, xx = torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device),
-        torch.linspace(-1, 1, W, device=device),
-        indexing="ij"
-    )
-
-    yy = yy.unsqueeze(0).unsqueeze(-1)
-    xx = xx.unsqueeze(0).unsqueeze(-1)
-
     # centre horizontal bouche
     center_x = torch.exp(-(xx**2) * 10.0)
 
@@ -625,9 +626,6 @@ def apply_mouth_smil(
             -upper_part * 0.04
             + lower_part * 0.16
         ) * compression
-
-
-
 
     print( "[COMPRESS_Y]", compress_y.mean().item(), compress_y.min().item(), compress_y.max().item() )
 
