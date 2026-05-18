@@ -6,8 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import math
+
 from .tools_utils import ensure_4_channels, log_debug, sanitize_latents
-from .n3r_EMA import motion_aware_ema_fusion, compute_high_freq_energy
+from .n3r_EMA import compute_high_freq_energy
 
 # =========================================================
 # Compute high freq
@@ -893,17 +894,10 @@ def apply_art(
     frame_counter=0,
     max_epochs_up=6,
     model_path="models/art_model_latest.pt",
-    ema_prev_latents=None,
-    ema_alpha=0.3,
-    ema=False,
     new_image=False,
     debug=False
 ):
 
-    import math
-    import os
-    import torch
-    import torch.nn.functional as F
 
     device = latents.device
     art_model.to(device)
@@ -1236,11 +1230,7 @@ def apply_art(
 
             optimizer.step()
 
-            print(
-                f"[Art STABLE] "
-                f"Epoch {epoch+1}/{max_epochs} | "
-                f"Loss={loss.item():.6f}"
-            )
+            print( f"[Art STABLE] " f"Epoch {epoch+1}/{max_epochs} | " f"Loss={loss.item():.6f}" )
 
             if (
                 frame_counter % 10 == 0
@@ -1248,13 +1238,7 @@ def apply_art(
                 epoch == max_epochs - 1
             ):
 
-                save_art_model(
-                    art_model,
-                    optimizer=optimizer,
-                    epoch=frame_counter,
-                    loss=loss.item(),
-                    path=model_path
-                )
+                save_art_model( art_model, optimizer=optimizer, epoch=frame_counter, loss=loss.item(), path=model_path )
 
     # =====================================================
     # LOAD
@@ -1342,17 +1326,6 @@ def apply_art(
         neginf=-1.0
     )
 
-    # =====================================================
-    # EMA TEMPORAL
-    # =====================================================
-
-    if ema and ema_prev_latents is not None and not train:
-        out = motion_aware_ema_fusion(
-            out=out,
-            ema_prev_latents=ema_prev_latents,
-            hf=hf,
-            debug=True
-        )
 
     return out
 

@@ -209,7 +209,7 @@ def apply_mouth_smil(
     debug=False,
     debug_dir=None,
     smooth=0.75,
-    strength=0.8,
+    strength=0.85,
     motion_scale=0.4,
     scale_flow=0.035, #0.08
     speed=1.0, # 0.45

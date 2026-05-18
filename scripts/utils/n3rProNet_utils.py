@@ -8,7 +8,7 @@ from .n3rStyleClass import  weights_init, StyleInjector, StyleLoss, save_style_m
 from .n3rApparenceModel import  apply_appearance, appearance_model, optimizer_apparence, criterion_apparence
 from .n3rCreativeModel import  apply_creative, creative_model, optimizer_creative, criterion_creative
 from .n3rArtModel import  apply_art, art_model, optimizer_art, criterion_art
-from .n3r_EMA import motion_aware_ema_fusion, motion_aware_ema_low_high
+from .n3r_EMA import motion_aware_ema_fusion, motion_aware_ema_low_high, compute_high_freq_energy
 from .n3r_latent_utils import export_latents_for_comfy_meta, export_latents_file, build_latent_metadata, load_latent, generate_sequence_id
 
 from torch.optim import Adam
@@ -3255,7 +3255,17 @@ def apply_style_injection(
         # -----------------------------
         # Blend
         # -----------------------------
-        stylized_latents = ema_prev_latents + alpha * (stylized_latents - ema_prev_latents)
+        hf = compute_high_freq_energy(latents_train)
+
+        stylized_latents = motion_aware_ema_fusion(
+            out=stylized_latents,
+            ema_prev_latents=ema_prev_latents,
+            hf=hf,
+            debug=True
+        )
+
+        diff = (stylized_latents - ema_prev_latents).abs().mean().item()
+        print(f"[StyleInjection EMA drift] {diff:.6f}")
 
         # -----------------------------
         # Logs (debug only)
@@ -3977,10 +3987,10 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
     else:
         denoise=True #OK
         temporal_consistency=True #OK
-        style_injection=False # A verifier
-        appearance=True # OK
-        creative=True # OK
-        art=False # A verifier
+        style_injection=True # A verifier (motion_aware_ema_fusion) ema=False by Default
+        appearance=True # OK (Pas de EMA)
+        creative=True # OK (Pas de EMA)
+        art=True # OK (Pas de EMA)
 
 
     # 1. Cloner les latents pour traitement
@@ -4051,7 +4061,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         #applique des transformations locales contrôle texture / structure / détails effets artistiques explicites sert de “renderer créatif”
         latents = apply_art(
             latents=latents,
-            style_prompt_embedding=style_prompt_embedding, art_model=art_model, optimizer=optimizer_art, criterion=criterion_art, train=False, device="cuda", strength=0.50, debug=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/art_model_latest.pt", ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+            style_prompt_embedding=style_prompt_embedding, art_model=art_model, optimizer=optimizer_art, criterion=criterion_art, train=False, device="cuda", strength=0.50, debug=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/art_model_latest.pt")
 
     # =====================================================
     # 3. STYLE INJECTION (OPTIONNEL middle layer)
@@ -4083,7 +4093,7 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         #photométrie contraste / gamma / exposure micro-structure visuelle agit comme un rendering layer
         latents = apply_appearance(
             latents=latents,
-            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=False, device="cuda", strength=0.1, debug=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", latents_sample=latents_sample, ema_prev_latents=ema_prev_latents, ema_alpha=ema_alpha)
+            style_prompt_embedding=style_prompt_embedding, appearance_model=appearance_model, optimizer=optimizer_apparence, criterion=criterion_apparence, train=False, device="cuda", strength=0.1, debug=True, new_image=new_image, frame_counter=frame_counter, max_epochs_up=max_epochs_up, model_path="models/appearance_model_latest.pt", latents_sample=latents_sample)
 
 
     # =====================================================

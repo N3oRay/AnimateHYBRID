@@ -325,8 +325,6 @@ def apply_appearance(
     max_epochs_up=12,
     model_path="models/appearance_model_latest.pt",
     latents_sample=None,
-    ema_prev_latents=None,
-    ema_alpha=0.3,
     new_image=False,
     debug=False
 ):
@@ -532,21 +530,6 @@ def apply_appearance(
 
     if debug:
         appearance_debug(pred=pred, x=x0, out=out, hf=hf)
-
-    # =====================================================
-    # EMA FUSION
-    # =====================================================
-    if ema_prev_latents is not None and not train:
-
-        out = motion_aware_ema_fusion(
-            out=out,
-            ema_prev_latents=ema_prev_latents,
-            hf=hf,
-            debug=debug
-        )
-
-        diff = (out - ema_prev_latents).abs().mean().item()
-        print(f"[Appearance EMA drift] {diff:.6f}")
 
     return out
 
