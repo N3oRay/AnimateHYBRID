@@ -213,6 +213,7 @@ def apply_mouth_smil(
     motion_scale=0.4,
     scale_flow=0.035, #0.08
     speed=1.0, # 0.45
+    naturel=True,
     npy=False
 ):
 
@@ -504,11 +505,6 @@ def apply_mouth_smil(
     apply_mouth_smil.prev_delta = delta.detach()
 
     # =====================================================
-    # AMPLITUDE DU MOUVEMENT
-    # =====================================================
-    delta = delta * motion_scale
-
-    # =====================================================
     # GRID WARP
     # =====================================================
     base_grid = grid.clone()
@@ -619,10 +615,19 @@ def apply_mouth_smil(
     upper_part = torch.clamp(-yy, 0.0, 1.0)
     lower_part = torch.clamp(yy, 0.0, 1.0)
 
-    compress_y = (
-        -upper_part * 0.04
-        + lower_part * 0.16
-    ) * compression
+    if naturel:
+        compress_y = (
+            -upper_part * 0.015
+            + lower_part * 0.05
+        ) * compression
+    else:
+        compress_y = (
+            -upper_part * 0.04
+            + lower_part * 0.16
+        ) * compression
+
+
+
 
     print( "[COMPRESS_Y]", compress_y.mean().item(), compress_y.min().item(), compress_y.max().item() )
 
@@ -645,6 +650,11 @@ def apply_mouth_smil(
     print(f"[UPPER LIP MOTION] {upper_motion:.6f}")
     print(f"[LOWER LIP MOTION] {lower_motion:.6f}")
 
+
+    # =====================================================
+    # AMPLITUDE DU MOUVEMENT
+    # =====================================================
+    delta = delta * motion_scale
     # =====================================================
     # GRID
     # =====================================================
