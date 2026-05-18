@@ -3975,11 +3975,11 @@ def decode_latents_ultrasafe_blockwise_ultranatural(
         art=True
     else:
         denoise=True #OK
-        temporal_consistency=False
-        style_injection=False
-        appearance=False
-        creative=False
-        art=False
+        temporal_consistency=False #KO
+        style_injection=False # A verifier
+        appearance=True # OK
+        creative=False # A verifier
+        art=False # A verifier
 
 
     # 1. Cloner les latents pour traitement
