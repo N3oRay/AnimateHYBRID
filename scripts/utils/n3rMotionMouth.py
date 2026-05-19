@@ -137,6 +137,37 @@ def build_mask(idx_list, pose, W, H, device, base_scale=0.08):
 
     return mask.unsqueeze(-1)
 
+
+
+def apply_mouth_smil_dev_test(
+    latents,
+    pose,
+    mask_mouth,
+    grid,
+    frame_counter,
+    mouth_model,
+    H=None,
+    W=None,
+    device=None,
+    debug=False,
+    debug_dir=None,
+    smooth=0.75,
+    strength=2.0,
+    motion_scale=0.4,
+    speed=1.0,
+    naturel=True,
+    npy=False
+):
+    if (frame_counter < 20):
+        #sourire humain subtil lèvres crédibles presque zéro jitter stabilité inter-frame élevée très peu d’artefacts de warp
+        latents_local, mouth_delta, mouth_points = apply_mouth_smil_pro( latents, pose, mask_mouth, grid, frame_counter, mouth_model, device=device, debug=debug,
+                                                                    debug_dir=debug_dir, smooth=smooth, strength=strength, motion_scale=0.4, speed=1.0, naturel=True, npy=False)
+    else:
+        #animation stylisée streamer/avatar rendu plus expressif
+        latents_local, mouth_delta, mouth_points = apply_mouth_smil_pro( latents, pose, mask_mouth, grid, frame_counter, mouth_model, device=device, debug=debug,
+                                                                    debug_dir=debug_dir, smooth=smooth, strength=strength, motion_scale=0.55, speed=0.7, naturel=False, npy=False)
+    return latents_local, mouth_delta, mouth_points
+
 #==================================================================================================================
 """
 strength=0.82
@@ -156,6 +187,7 @@ speed=0.7
 #animation stylisée streamer/avatar rendu plus expressif
 #=====================================================================================================================
 
+
 def apply_mouth_smil(
     latents,
     pose,
@@ -169,16 +201,161 @@ def apply_mouth_smil(
     debug=False,
     debug_dir=None,
     smooth=0.75,
+    strength=2.0,
+    motion_scale=0.4,
+    speed=1.0,
+    naturel=True,
+    npy=False
+):
+    """
+    Wrapper dynamique autour de apply_mouth_smil_pro()
+
+    PHASES:
+    0-20   : sourire naturel stable
+    20-45  : transition progressive
+    45+    : version expressive / streamer
+
+    Plug & Play:
+    - même signature
+    - mêmes outputs
+    - aucun changement requis ailleurs
+    """
+
+
+
+    # =====================================================
+    # INIT
+    # =====================================================
+
+    if device is None:
+        device = latents.device
+
+    # =====================================================
+    # PHASE BLEND
+    # =====================================================
+
+    # 0 -> naturel
+    # 1 -> stylized
+
+    transition_start = 20
+    transition_end   = 45
+
+    if frame_counter <= transition_start:
+        style_blend = 0.0
+
+    elif frame_counter >= transition_end:
+        style_blend = 1.0
+
+    else:
+        t = (
+            (frame_counter - transition_start)
+            / float(transition_end - transition_start)
+        )
+
+        # smoothstep
+        style_blend = t * t * (3.0 - 2.0 * t)
+
+    # =====================================================
+    # INTERPOLATION PARAMS
+    # =====================================================
+
+    # Naturel -> Stylized
+
+    motion_scale_dyn = (
+        0.40 * (1.0 - style_blend)
+        + 0.55 * style_blend
+    )
+
+    speed_dyn = (
+        1.00 * (1.0 - style_blend)
+        + 0.70 * style_blend
+    )
+
+    strength_dyn = (
+        1.40 * (1.0 - style_blend)
+        + 2.00 * style_blend
+    )
+
+    # naturel devient False progressivement
+    naturel_dyn = style_blend < 0.55
+
+    # =====================================================
+    # OPTIONAL MICRO OSCILLATION
+    # =====================================================
+
+    # ajoute vie subtile sans casser stabilité
+    micro_motion = 1.0 + 0.04 * math.sin(frame_counter * 0.12)
+
+    motion_scale_dyn *= micro_motion
+
+    # =====================================================
+    # DEBUG
+    # =====================================================
+
+    print(f"""
+    [MOUTH WRAPPER]
+    frame            : {frame_counter}
+    style_blend      : {style_blend:.3f}
+
+    motion_scale_dyn : {motion_scale_dyn:.3f}
+    speed_dyn        : {speed_dyn:.3f}
+    strength_dyn     : {strength_dyn:.3f}
+
+    naturel_dyn      : {naturel_dyn}
+    """)
+
+    # =====================================================
+    # APPLY
+    # =====================================================
+
+    latents_local, mouth_delta, mouth_points = apply_mouth_smil_pro(
+        latents=latents,
+        pose=pose,
+        mask_mouth=mask_mouth,
+        grid=grid,
+        frame_counter=frame_counter,
+        mouth_model=mouth_model,
+
+        device=device,
+
+        debug=debug,
+        debug_dir=debug_dir,
+
+        smooth=smooth,
+
+        strength=strength_dyn,
+        motion_scale=motion_scale_dyn,
+        speed=speed_dyn,
+
+        naturel=naturel_dyn,
+
+        npy=npy
+    )
+
+    return latents_local, mouth_delta, mouth_points
+
+
+
+
+def apply_mouth_smil_pro(
+    latents,
+    pose,
+    mask_mouth,
+    grid,
+    frame_counter,
+    mouth_model,
+    device=None,
+    debug=False,
+    debug_dir=None,
+    smooth=0.75,
     strength=0.85,
     motion_scale=0.4,
-    scale_flow=0.035, #0.08
-    speed=1.0, # 0.45
+    scale_flow=0.035,
+    speed=1.0,
     naturel=True,
     mouth_scale=True, # Réduction du bruit sur image bouche grand format
     npy=False
 ):
-
-
 
     if device is None:
         device = latents.device
@@ -189,17 +366,12 @@ def apply_mouth_smil(
     # =====================================================
     # TIME
     # =====================================================
-
     time_t = frame_counter * speed
 
     # =====================================================
     # LANDMARKS
     # =====================================================
-    mouth_points_idx = [
-        40, 41,
-        70,71,72,73,74,75,76,
-        77,78,79,80,81,82,83
-    ]
+    mouth_points_idx = [ 40, 41, 70,71,72,73,74,75,76, 77,78,79,80,81,82,83 ]
 
     mouth_points = torch.stack(
         [pose.get_point(i) for i in mouth_points_idx],
@@ -222,17 +394,7 @@ def apply_mouth_smil(
     if mouth_model is None:
         print("[MOTION MOUTH] ANALYTIC DELTA ✅")
 
-        delta, _ = Pose.compute_mouth_delta(
-            pose=pose,
-            mask_mouth=mask_mouth,
-            H=H,
-            W=W,
-            frame_counter=frame_counter,
-            device=device,
-            smooth=smooth,
-            strength=strength,
-            debug=debug
-        )
+        delta, _ = Pose.compute_mouth_delta( pose=pose, mask_mouth=mask_mouth, H=H, W=W, frame_counter=frame_counter, device=device, smooth=smooth, strength=strength, debug=debug )
 
         # assume BCHW -> convert to BHWC
         if delta.shape[1] == 2:
@@ -297,8 +459,8 @@ def apply_mouth_smil(
     # =====================================================
     # INERTIA - V2
     # =====================================================
-    if not hasattr(apply_mouth_smil, "prev_delta"):
-        apply_mouth_smil.prev_delta = torch.zeros_like(delta)
+    if not hasattr(apply_mouth_smil_pro, "prev_delta"):
+        apply_mouth_smil_pro.prev_delta = torch.zeros_like(delta)
 
     alpha = 0.55 * speed
 
@@ -307,10 +469,10 @@ def apply_mouth_smil(
 
     smoothed = (
         alpha * delta
-        + (1 - alpha) * apply_mouth_smil.prev_delta
+        + (1 - alpha) * apply_mouth_smil_pro.prev_delta
     )
 
-    apply_mouth_smil.prev_delta = smoothed.detach()
+    apply_mouth_smil_pro.prev_delta = smoothed.detach()
 
     delta = smoothed
 
@@ -365,45 +527,33 @@ def apply_mouth_smil(
     # TEMPORAL DYNAMICS (SAFE)
     # =====================================================
 
-    if not hasattr(apply_mouth_smil, "prev_motion"):
-        apply_mouth_smil.prev_motion = torch.zeros_like(delta)
+    if not hasattr(apply_mouth_smil_pro, "prev_motion"):
+        apply_mouth_smil_pro.prev_motion = torch.zeros_like(delta)
 
-    motion_change = delta - apply_mouth_smil.prev_motion
+    motion_change = delta - apply_mouth_smil_pro.prev_motion
 
-    motion_energy = torch.norm(
-        motion_change,
-        dim=-1,
-        keepdim=True
-    )
+    motion_energy = torch.norm( motion_change, dim=-1, keepdim=True )
 
     if mouth_scale:
         # grandes bouches => moins de turbulence
-        motion_boost = 1.0 + torch.clamp(
-            motion_energy * 0.02 * mouth_scale_norm,
-            0.0,
-            0.04
-        )
+        motion_boost = 1.0 + torch.clamp( motion_energy * 0.02 * mouth_scale_norm, 0.0, 0.04 )
     else:
-        motion_boost = 1.0 + torch.clamp(
-            motion_energy * 0.05,
-            0.0,
-            0.12
-        )
+        motion_boost = 1.0 + torch.clamp( motion_energy * 0.05, 0.0, 0.12 )
 
     delta = delta * motion_boost
 
-    apply_mouth_smil.prev_motion = delta.detach()
+    apply_mouth_smil_pro.prev_motion = delta.detach()
 
     # =====================================================
     # DEBUG: MOTION ANALYSIS CORE
     # =====================================================
 
-    if not hasattr(apply_mouth_smil, "debug_prev"):
-        apply_mouth_smil.debug_prev = torch.zeros_like(delta)
+    if not hasattr(apply_mouth_smil_pro, "debug_prev"):
+        apply_mouth_smil_pro.debug_prev = torch.zeros_like(delta)
 
-    delta_change = (delta - apply_mouth_smil.debug_prev).abs().mean().item()
+    delta_change = (delta - apply_mouth_smil_pro.debug_prev).abs().mean().item()
     delta_norm = torch.norm(delta, dim=-1).mean().item()
-    motion_inertia = (apply_mouth_smil.prev_delta - delta).abs().mean().item()
+    motion_inertia = (apply_mouth_smil_pro.prev_delta - delta).abs().mean().item()
     temporal_energy = (temporal_vec.abs().mean().item() * float(temporal_weight))
     mask_energy = mask_soft.mean().item()
     gate_energy = motion_gate.mean().item() if motion_gate is not None else 0.0
@@ -429,7 +579,7 @@ def apply_mouth_smil(
 
     print(f"[MOTION ALIVE SCORE] {motion_alive:.6f}")
 
-    apply_mouth_smil.debug_prev = delta.detach().clone()
+    apply_mouth_smil_pro.debug_prev = delta.detach().clone()
 
     # =====================================================
     # CONSTRAINTS (MASK + GATE)
@@ -474,16 +624,16 @@ def apply_mouth_smil(
     anchor_delta = delta * anchor_mask
 
     # inertia séparée
-    if not hasattr(apply_mouth_smil, "corner_prev"):
-        apply_mouth_smil.corner_prev = torch.zeros_like(delta)
-    if not hasattr(apply_mouth_smil, "anchor_prev"):
-        apply_mouth_smil.anchor_prev = torch.zeros_like(delta)
+    if not hasattr(apply_mouth_smil_pro, "corner_prev"):
+        apply_mouth_smil_pro.corner_prev = torch.zeros_like(delta)
+    if not hasattr(apply_mouth_smil_pro, "anchor_prev"):
+        apply_mouth_smil_pro.anchor_prev = torch.zeros_like(delta)
 
-    corner_delta = 0.85 * corner_delta + 0.15 * apply_mouth_smil.corner_prev
-    anchor_delta = 0.95 * anchor_delta + 0.05 * apply_mouth_smil.anchor_prev
+    corner_delta = 0.85 * corner_delta + 0.15 * apply_mouth_smil_pro.corner_prev
+    anchor_delta = 0.95 * anchor_delta + 0.05 * apply_mouth_smil_pro.anchor_prev
 
-    apply_mouth_smil.corner_prev = corner_delta.detach()
-    apply_mouth_smil.anchor_prev = anchor_delta.detach()
+    apply_mouth_smil_pro.corner_prev = corner_delta.detach()
+    apply_mouth_smil_pro.anchor_prev = anchor_delta.detach()
 
     # recomposition hiérarchique
     delta = delta * (1 - core_mask - corner_mask - anchor_mask) + core_delta + corner_delta + anchor_delta
@@ -491,7 +641,7 @@ def apply_mouth_smil(
     # =====================================================
     # UPDATE INERTIA BUFFER
     # =====================================================
-    apply_mouth_smil.prev_delta = delta.detach()
+    apply_mouth_smil_pro.prev_delta = delta.detach()
 
     # =====================================================
     # GRID WARP
@@ -544,13 +694,10 @@ def apply_mouth_smil(
 
     # centre bouche = mobile
     center_weight = torch.exp(-(xx**2) * 6.0)
-
     # lèvres hautes plus rigides
     upper_rigid = torch.exp(-((yy + 0.15) ** 2) * 60.0)
-
     # lèvres basses mobiles
     lower_mobile = torch.exp(-((yy - 0.10) ** 2) * 30.0)
-
     # coins rigides
     corner_rigid = 1.0 - torch.exp(-(xx**2) * 2.5)
 
@@ -567,11 +714,9 @@ def apply_mouth_smil(
 
     delta = delta * rigidity
 
-
     # =====================================================
     # LIP COMPRESSION FIELD
     # =====================================================
-
     # centre horizontal bouche
     center_x = torch.exp(-(xx**2) * 10.0)
 
@@ -584,15 +729,9 @@ def apply_mouth_smil(
     lower_part = torch.clamp(yy, 0.0, 1.0)
 
     if naturel:
-        compress_y = (
-            -upper_part * 0.015
-            + lower_part * 0.05
-        ) * compression
+        compress_y = ( -upper_part * 0.015 + lower_part * 0.05 ) * compression
     else:
-        compress_y = (
-            -upper_part * 0.04
-            + lower_part * 0.16
-        ) * compression
+        compress_y = ( -upper_part * 0.04 + lower_part * 0.16 ) * compression
 
     print( "[COMPRESS_Y]", compress_y.mean().item(), compress_y.min().item(), compress_y.max().item() )
 
@@ -604,15 +743,15 @@ def apply_mouth_smil(
     # =====================================================
     # Prev Compression - New code
     # =====================================================
-    if not hasattr(apply_mouth_smil, "prev_compression"):
-        apply_mouth_smil.prev_compression = compression_field
+    if not hasattr(apply_mouth_smil_pro, "prev_compression"):
+        apply_mouth_smil_pro.prev_compression = compression_field
 
     compression_field = (
-        0.92 * apply_mouth_smil.prev_compression
+        0.92 * apply_mouth_smil_pro.prev_compression
         + 0.08 * compression_field
     )
 
-    apply_mouth_smil.prev_compression = compression_field.detach()
+    apply_mouth_smil_pro.prev_compression = compression_field.detach()
 
     # APPLY AFTER SMOOTHING
     delta = delta + compression_field * mask_soft
@@ -675,14 +814,7 @@ def apply_mouth_smil(
     if grid_shift < 1e-4:
         print("[WARNING] grid is static → no visible deformation")
 
-    latents_out = F.grid_sample(
-        latents,
-        grid_norm,
-        mode='bilinear',
-        #padding_mode='border',
-        padding_mode='reflection',
-        align_corners=True
-    )
+    latents_out = F.grid_sample( latents, grid_norm, mode='bilinear', padding_mode='reflection', align_corners=True )
     # =====================================================
     # BLENDING (SAFE)
     # =====================================================

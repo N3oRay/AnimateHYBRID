@@ -3,7 +3,9 @@ import torch
 import torch.nn.functional as F
 import os
 import numpy as np
-from .n3rMotionPose_tools import save_impact_map
+
+from .n3rMotionPose_tools import save_impact_map, smooth_noise, dilate_mask, save_debug_mask_scale, save_debug_mask, debug_save_mask_and_wind
+
 from .n3rMotionPoseClass import Pose
 
 
