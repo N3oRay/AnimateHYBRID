@@ -403,13 +403,9 @@ def apply_mouth_smil(
 
     delta_change = (delta - apply_mouth_smil.debug_prev).abs().mean().item()
     delta_norm = torch.norm(delta, dim=-1).mean().item()
-
     motion_inertia = (apply_mouth_smil.prev_delta - delta).abs().mean().item()
-
     temporal_energy = (temporal_vec.abs().mean().item() * float(temporal_weight))
-
     mask_energy = mask_soft.mean().item()
-
     gate_energy = motion_gate.mean().item() if motion_gate is not None else 0.0
 
     print(f"""
@@ -584,9 +580,6 @@ def apply_mouth_smil(
 
     compression = center_x * lip_line
 
-    # force verticale opposée
-    #compress_y = -yy * compression * 0.12
-
     upper_part = torch.clamp(-yy, 0.0, 1.0)
     lower_part = torch.clamp(yy, 0.0, 1.0)
 
@@ -608,8 +601,6 @@ def apply_mouth_smil(
         compress_y
     ], dim=-1)
 
-    delta = delta + compression_field * mask_soft
-
     # =====================================================
     # Prev Compression - New code
     # =====================================================
@@ -623,6 +614,8 @@ def apply_mouth_smil(
 
     apply_mouth_smil.prev_compression = compression_field.detach()
 
+    # APPLY AFTER SMOOTHING
+    delta = delta + compression_field * mask_soft
     # =====================================================
     # LOG
     # =====================================================
@@ -640,8 +633,6 @@ def apply_mouth_smil(
     # =====================================================
     delta = delta * motion_scale
 
-
-
     # =====================================================
     # FLOW LIMITER - new code ! (Optionnelle !)
     # =====================================================
@@ -658,11 +649,9 @@ def apply_mouth_smil(
     delta[..., 0] = delta[..., 0].clamp( -flow_limit_x, flow_limit_x )
     delta[..., 1] = delta[..., 1].clamp( -flow_limit_y, flow_limit_y )
 
-
     # =====================================================
     # GRID
     # =====================================================
-
     grid_mouth = base_grid + delta
 
     # normalize
