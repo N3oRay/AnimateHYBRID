@@ -611,6 +611,19 @@ def apply_mouth_smil(
     delta = delta + compression_field * mask_soft
 
     # =====================================================
+    # Prev Compression - New code
+    # =====================================================
+    if not hasattr(apply_mouth_smil, "prev_compression"):
+        apply_mouth_smil.prev_compression = compression_field
+
+    compression_field = (
+        0.92 * apply_mouth_smil.prev_compression
+        + 0.08 * compression_field
+    )
+
+    apply_mouth_smil.prev_compression = compression_field.detach()
+
+    # =====================================================
     # LOG
     # =====================================================
     lip_opening = delta[...,1].mean().item()
@@ -626,6 +639,26 @@ def apply_mouth_smil(
     # AMPLITUDE DU MOUVEMENT
     # =====================================================
     delta = delta * motion_scale
+
+
+
+    # =====================================================
+    # FLOW LIMITER - new code ! (Optionnelle !)
+    # =====================================================
+
+    if mouth_scale:
+        mouth_factor = (1.0 / mouth_scale_norm).clamp(1.0, 1.5)
+        flow_limit_x = W * 0.020 * mouth_factor
+        flow_limit_y = H * 0.020 * mouth_factor
+
+    else:
+        flow_limit_x = W * 0.028
+        flow_limit_y = H * 0.028
+
+    delta[..., 0] = delta[..., 0].clamp( -flow_limit_x, flow_limit_x )
+    delta[..., 1] = delta[..., 1].clamp( -flow_limit_y, flow_limit_y )
+
+
     # =====================================================
     # GRID
     # =====================================================
@@ -657,7 +690,8 @@ def apply_mouth_smil(
         latents,
         grid_norm,
         mode='bilinear',
-        padding_mode='border',
+        #padding_mode='border',
+        padding_mode='reflection',
         align_corners=True
     )
     # =====================================================
