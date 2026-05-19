@@ -2,7 +2,7 @@
 
 # AnimateHYBRID 
 
-Video diffusion control system design
+Video diffusion control system design - Research prototype engineer
 
 Mini-Guide: AnimateDiff <4 GB VRAM with N3R  - ComfyUI friendly
 
