@@ -105,24 +105,6 @@ class MouthMotionModel(nn.Module):
 # instance par défaut pour ton pipeline
 mouth_model = MouthMotionModel().cuda()
 
-def build_mask_v1(idx_list, base_scale=0.08):
-    pts = torch.stack([pose.get_point(i) for i in idx_list], dim=1)
-    pts_px = pts * torch.tensor([W-1, H-1], device=device, dtype=pts.dtype)
-
-    yy, xx = torch.meshgrid(
-            torch.arange(H, device=device),
-            torch.arange(W, device=device),
-            indexing="ij"
-    )
-
-    grid_xy = torch.stack([xx, yy], dim=-1).float().unsqueeze(0)
-
-    dist = torch.norm(
-        grid_xy.unsqueeze(1) - pts_px.view(B, len(idx_list), 1, 1, 2),
-        dim=-1
-    )
-
-    return torch.exp(-dist.min(dim=1).values * base_scale).unsqueeze(-1)
 
 
 def build_mask(idx_list, pose, W, H, device, base_scale=0.08):
@@ -192,6 +174,7 @@ def apply_mouth_smil(
     scale_flow=0.035, #0.08
     speed=1.0, # 0.45
     naturel=True,
+    mouth_scale=True, # Réduction du bruit sur image bouche grand format
     npy=False
 ):
 
@@ -237,7 +220,6 @@ def apply_mouth_smil(
     # DELTA
     # =====================================================
     if mouth_model is None:
-
         print("[MOTION MOUTH] ANALYTIC DELTA ✅")
 
         delta, _ = Pose.compute_mouth_delta(
@@ -259,7 +241,6 @@ def apply_mouth_smil(
         motion_gate = torch.ones((B, H, W, 1), device=device)
 
     else:
-
         print("[MOTION MOUTH] NEURAL DELTA ✅")
 
         landmarks = mouth_points.reshape(B, -1)
@@ -313,7 +294,6 @@ def apply_mouth_smil(
     print("[MASK MAX]", mask_soft.max().item())
     print("[MASK MEAN]", mask_soft.mean().item())
 
-
     # =====================================================
     # INERTIA - V2
     # =====================================================
@@ -334,6 +314,21 @@ def apply_mouth_smil(
 
     delta = smoothed
 
+    # =======================================================================================
+    # MOUTH SCALE NORMALIZATION ( reduction du bruit sur zone important exemple grande bouche)
+    # =======================================================================================
+    if mouth_scale:
+        mouth_min = mouth_points.min(dim=1).values
+        mouth_max = mouth_points.max(dim=1).values
+        mouth_size = torch.norm(mouth_max - mouth_min, dim=-1, keepdim=True)
+        # valeur de référence
+        ref_size = 0.18
+        # normalisation
+        mouth_scale_norm = ref_size / (mouth_size + 1e-6)
+        # clamp sécurité
+        mouth_scale_norm = mouth_scale_norm.clamp(0.65, 1.35)
+        mouth_scale_norm = mouth_scale_norm.view(B, 1, 1, 1)
+
     # =====================================================
     # TEMPORAL (APPLY BEFORE MASK)
     # =====================================================
@@ -352,7 +347,19 @@ def apply_mouth_smil(
         torch.tensor(time_t * 0.25, device=delta.device, dtype=delta.dtype)
     )
 
-    delta = delta + ( temporal_vec * temporal_weight * 0.25 * (1.0 + 0.2 * torch.tanh(delta.abs())) )
+    if mouth_scale:
+        # grandes bouches => moins de turbulence
+        noise_scale = mouth_scale_norm.view(B,1,1,1)
+
+        delta = delta + (
+            temporal_vec
+            * temporal_weight
+            * 0.08
+            * noise_scale
+            * (1.0 + 0.08 * torch.tanh(delta.abs()))
+        )
+    else:
+        delta = delta + ( temporal_vec * temporal_weight * 0.25 * (1.0 + 0.2 * torch.tanh(delta.abs())) )
 
     # =====================================================
     # TEMPORAL DYNAMICS (SAFE)
@@ -369,11 +376,19 @@ def apply_mouth_smil(
         keepdim=True
     )
 
-    motion_boost = 1.0 + torch.clamp(
-        motion_energy * 0.05,
-        0.0,
-        0.12
-    )
+    if mouth_scale:
+        # grandes bouches => moins de turbulence
+        motion_boost = 1.0 + torch.clamp(
+            motion_energy * 0.02 * mouth_scale_norm,
+            0.0,
+            0.04
+        )
+    else:
+        motion_boost = 1.0 + torch.clamp(
+            motion_energy * 0.05,
+            0.0,
+            0.12
+        )
 
     delta = delta * motion_boost
 
@@ -606,7 +621,6 @@ def apply_mouth_smil(
     print(f"[LIP OPENING] {lip_opening:.6f}")
     print(f"[UPPER LIP MOTION] {upper_motion:.6f}")
     print(f"[LOWER LIP MOTION] {lower_motion:.6f}")
-
 
     # =====================================================
     # AMPLITUDE DU MOUVEMENT
