@@ -39,12 +39,7 @@ from .n3rMotionPoseClass import Pose
         82: ("mouth_bot_mid_l2", mouth_bot_mid_l2), #OK
         83: ("mouth_bot_mid_l3", mouth_bot_mid_l3), #OK
 
-
-        mouth_points_idx = [
-            40, 41,
-            70,71,72,73,74,75,76,
-            77,78,79,80,81,82,83
-        ]
+        mouth_points_idx = [ 40, 41, 70,71,72,73,74,75,76, 77,78,79,80,81,82,83 ]
 
 """
 

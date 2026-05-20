@@ -1,23 +1,15 @@
 # n3rMotionHair_refactored.py
-
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
-
-from .n3rMotionPose_tools import (
-    smooth_noise,
-    debug_save_mask_and_wind
-)
+from .n3rMotionPose_tools import ( smooth_noise, debug_save_mask_and_wind )
 
 # ============================================================
 # CACHE GLOBAL
 # ============================================================
-
 _FALLOFF_CACHE = {}
-
-
 # ============================================================
 # PROFILS
 # ============================================================
@@ -58,113 +50,17 @@ class HairMotionProfile:
 
 HAIR_PROFILES = {
 
-    "cinema": HairMotionProfile(
-        name="cinema",
+    "cinema": HairMotionProfile( name="cinema", noise_x_amp=0.03, noise_y_amp=0.05, wind_base=0.02, wind_var1=0.01, wind_var2=0.005, wind_var3=0.0, gravity=0.004, inertia=0.85, spring_amp=0.003, spring_freq=3.0, micro_noise=0.0005, torso_motion_amp=0.10, torso_wind_amp=0.15, torso_gravity_amp=0.05, falloff_power=2.0 ),
 
-        noise_x_amp=0.03,
-        noise_y_amp=0.05,
+    "3d": HairMotionProfile( name="3d", noise_x_amp=0.06, noise_y_amp=0.10, wind_base=0.04, wind_var1=0.02, wind_var2=0.01, wind_var3=0.0, gravity=0.008, inertia=0.7, spring_amp=0.006, spring_freq=0.005, micro_noise=0.001, torso_motion_amp=0.0012, torso_wind_amp=0.1, torso_gravity_amp=0.05, falloff_power=2.5 ),
 
-        wind_base=0.02,
-        wind_var1=0.01,
-        wind_var2=0.005,
-        wind_var3=0.0,
+    "vent": HairMotionProfile( name="vent", noise_x_amp=0.10, noise_y_amp=0.14, wind_base=0.08, wind_var1=0.04, wind_var2=0.02, wind_var3=0.03, gravity=0.012, inertia=0.6, spring_amp=0.010, spring_freq=0.05, micro_noise=0.001, torso_motion_amp=0.14, torso_wind_amp=0.10, torso_gravity_amp=0.02, falloff_power=2.8 ),
 
-        gravity=0.004,
+    "tornade": HairMotionProfile( name="tornade", noise_x_amp=0.12, noise_y_amp=0.16, wind_base=0.10, wind_var1=0.06, wind_var2=0.03, wind_var3=0.02, gravity=0.015, inertia=0.5, spring_amp=0.010, spring_freq=5.0, micro_noise=0.0015, torso_motion_amp=0.2, torso_wind_amp=0.3, torso_gravity_amp=0.15, falloff_power=3.0 ),
 
-        inertia=0.85,
+    "extreme": HairMotionProfile( name="extreme", noise_x_amp=0.05, noise_y_amp=0.08, wind_base=0.04, wind_var1=0.025, wind_var2=0.012, wind_var3=0.008, gravity=0.006, inertia=0.55, spring_amp=0.004, spring_freq=4.0, micro_noise=0.0007, torso_motion_amp=0.18, torso_wind_amp=0.12, torso_gravity_amp=0.05, falloff_power=3.0 ),
 
-        spring_amp=0.003,
-        spring_freq=3.0,
-
-        micro_noise=0.0005,
-
-        torso_motion_amp=0.25,
-        torso_wind_amp=0.15,
-        torso_gravity_amp=0.05,
-
-        falloff_power=2.0
-    ),
-
-    "3d": HairMotionProfile(
-        name="3d",
-
-        noise_x_amp=0.06,
-        noise_y_amp=0.10,
-
-        wind_base=0.04,
-        wind_var1=0.02,
-        wind_var2=0.01,
-        wind_var3=0.0,
-
-        gravity=0.008,
-
-        inertia=0.7,
-
-        spring_amp=0.006,
-        spring_freq=3.0,
-
-        micro_noise=0.001,
-
-        torso_motion_amp=0.35,
-        torso_wind_amp=0.2,
-        torso_gravity_amp=0.08,
-
-        falloff_power=2.5
-    ),
-
-    "vent": HairMotionProfile(
-        name="vent",
-
-        noise_x_amp=0.10,
-        noise_y_amp=0.14,
-
-        wind_base=0.08,
-        wind_var1=0.04,
-        wind_var2=0.02,
-        wind_var3=0.03,
-
-        gravity=0.012,
-
-        inertia=0.6,
-
-        spring_amp=0.010,
-        spring_freq=0.05,
-
-        micro_noise=0.001,
-
-        torso_motion_amp=0.4,
-        torso_wind_amp=0.25,
-        torso_gravity_amp=0.12,
-
-        falloff_power=2.8
-    ),
-
-    "extreme": HairMotionProfile(
-        name="extreme",
-
-        noise_x_amp=0.12,
-        noise_y_amp=0.18,
-
-        wind_base=0.12,
-        wind_var1=0.06,
-        wind_var2=0.03,
-        wind_var3=0.02,
-
-        gravity=0.015,
-
-        inertia=0.5,
-
-        spring_amp=0.010,
-        spring_freq=5.0,
-
-        micro_noise=0.0015,
-
-        torso_motion_amp=0.5,
-        torso_wind_amp=0.3,
-        torso_gravity_amp=0.15,
-
-        falloff_power=3.0
-    )
+    "decor": HairMotionProfile( name="decor", noise_x_amp=0.015, noise_y_amp=0.025, wind_base=0.010, wind_var1=0.005, wind_var2=0.003, wind_var3=0.0, gravity=0.002, inertia=0.92, spring_amp=0.001, spring_freq=2.0, micro_noise=0.0002, torso_motion_amp=0.08, torso_wind_amp=0.04, torso_gravity_amp=0.02, falloff_power=2.0 )
 }
 
 
@@ -292,21 +188,7 @@ def temporal_micro_noise(
 # MOTEUR PRINCIPAL
 # ============================================================
 
-def apply_hair_motion(
-    latents,
-    mask_hair,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device,
-    profile: HairMotionProfile,
-    delta_px=None,
-    prev_hair_field=None,
-    strength=1.0,
-    debug=False,
-    debug_dir=None
-):
+def apply_hair_motion( latents, mask_hair, grid, H, W, frame_counter, device, profile: HairMotionProfile, delta_px=None, prev_hair_field=None, strength=1.0, debug=False, debug_dir=None ):
 
     B = latents.shape[0]
 
@@ -368,16 +250,7 @@ def apply_hair_motion(
     # WIND
     # ========================================================
 
-    wind_delta = build_dynamic_wind(
-        profile,
-        t1,
-        t2,
-        B,
-        H,
-        W,
-        device,
-        strength
-    )
+    wind_delta = build_dynamic_wind( profile, t1, t2, B, H, W, device, strength )
 
     # ========================================================
     # GRAVITY
@@ -468,18 +341,9 @@ def apply_hair_motion(
     # FALLOFF
     # ========================================================
 
-    mask_hair_expand = mask_hair.permute(
-        0,
-        2,
-        3,
-        1
-    )
+    mask_hair_expand = mask_hair.permute( 0, 2, 3, 1 )
 
-    falloff = get_falloff(
-        H,
-        profile.falloff_power,
-        device
-    )
+    falloff = get_falloff( H, profile.falloff_power, device )
 
     mask_hair_expand *= falloff
 
@@ -523,12 +387,7 @@ def apply_hair_motion(
     # ========================================================
     # CLAMP SECURITE
     # ========================================================
-
-    grid_hair = torch.clamp(
-        grid_hair,
-        -1.2,
-        1.2
-    )
+    grid_hair = torch.clamp( grid_hair, -1.2, 1.2 )
 
     # ========================================================
     # GRID SAMPLE
@@ -538,7 +397,8 @@ def apply_hair_motion(
         latents,
         grid_hair,
         align_corners=True,
-        padding_mode='border'
+        #padding_mode='border'
+        padding_mode='reflection'
     )
 
     # ========================================================
@@ -547,32 +407,19 @@ def apply_hair_motion(
 
     if debug:
 
-        print(
-            f"[DEBUG] Hair motion: "
-            f"{profile.name} | "
-            f"strength={strength:.2f}"
-        )
+        mean_delta = hair_delta_field.abs().mean().item()
+        max_delta = hair_delta_field.abs().max().item()
 
         print(
-            "  mean delta:",
-            hair_delta_field.abs().mean().item()
+            f"[DEBUG][HAIR] "
+            f"profile={profile.name} | "
+            f"strength={strength:.2f} | "
+            f"mean_delta={mean_delta:.6f} | "
+            f"max_delta={max_delta:.6f}"
         )
 
-        print(
-            "  max delta:",
-            hair_delta_field.abs().max().item()
-        )
-
-        if debug_dir is not None:
-
-            debug_save_mask_and_wind(
-                mask=mask_hair,
-                wind_delta=wind_delta,
-                H=H,
-                W=W,
-                debug_dir=debug_dir,
-                frame_counter=frame_counter
-            )
+        if debug_dir is not None and frame_counter % 5:
+            debug_save_mask_and_wind( mask=mask_hair, wind_delta=wind_delta, H=H, W=W, debug_dir=debug_dir, frame_counter=frame_counter )
 
     return latents_out, hair_delta_field
 
@@ -582,66 +429,49 @@ def apply_hair_motion(
 # ============================================================
 
 def apply_hair_motion_cinema(*args, **kwargs):
-    return apply_hair_motion(
-        *args,
-        profile=HAIR_PROFILES["cinema"],
-        **kwargs
-    )
+    return apply_hair_motion( *args, profile=HAIR_PROFILES["cinema"], **kwargs )
 
 
 def apply_hair_motion_3D(*args, **kwargs):
-    return apply_hair_motion(
-        *args,
-        profile=HAIR_PROFILES["3d"],
-        **kwargs
-    )
+    return apply_hair_motion( *args, profile=HAIR_PROFILES["3d"], **kwargs )
 
 
 def apply_hair_motion_vent(*args, **kwargs):
-    return apply_hair_motion(
-        *args,
-        profile=HAIR_PROFILES["vent"],
-        **kwargs
-    )
+    return apply_hair_motion( *args, profile=HAIR_PROFILES["vent"], **kwargs )
 
 
 def apply_hair_motion_extreme(*args, **kwargs):
-    return apply_hair_motion(
-        *args,
-        profile=HAIR_PROFILES["extreme"],
-        **kwargs
-    )
+    return apply_hair_motion( *args, profile=HAIR_PROFILES["extreme"], **kwargs )
 
 
 # ============================================================
 # CYCLE
 # ============================================================
 
-def apply_hair_motion_cycle(
-    latents,
-    mask_hair,
-    grid,
-    H,
-    W,
-    frame_counter,
-    device,
-    delta_px=None,
-    prev_hair_field=None,
-    strength=1.5,
-    debug=False,
-    debug_dir=None
-):
+def apply_hair_motion_cycle( latents, mask_hair, grid, H, W, frame_counter, device, delta_px=None, prev_hair_field=None, target="hair", debug=False, debug_dir=None ):
 
-    profiles = [
-        HAIR_PROFILES["vent"],
-        HAIR_PROFILES["3d"],
-        HAIR_PROFILES["cinema"],
-        HAIR_PROFILES["extreme"]
-    ]
+    if target == "hair":
+        profiles = [ HAIR_PROFILES["vent"], HAIR_PROFILES["3d"], HAIR_PROFILES["cinema"], HAIR_PROFILES["extreme"] ]
+    else:
+        profiles = [ HAIR_PROFILES["decor"]]
 
-    profile = profiles[
-        frame_counter % len(profiles)
-    ]
+    profile = profiles[ frame_counter % len(profiles) ]
+
+
+    strength = 1.5
+    TARGET_STRENGTH = {
+        "hair": 1.5,
+        "decor": 0.35,
+    }
+
+    strength *= TARGET_STRENGTH[target]
+
+    print(
+        f"[DEBUG][HAIR] "
+        f"target={target} | "
+        f"profile={profile.name} | "
+        f"strength={strength:.2f}"
+    )
 
     return apply_hair_motion(
         latents=latents,

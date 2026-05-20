@@ -2436,6 +2436,7 @@ def apply_pose_driven_motion_ultra2(
     breathing=True,
     debug=False,
     mouth=True,
+    hair=True,
     debug_dir=None
 ):
     timings = {}
@@ -2607,14 +2608,15 @@ def apply_pose_driven_motion_ultra2(
     # 🔹 Hair motion cycle - OK
     # ==============================
     #if should_freeze(frame_counter, 2): # Pause traitement
-    if frame_counter > 10:
+    #if frame_counter > 10:
+    if hair:
         if not hasattr(apply_pose_driven_motion_ultra2,"prev_hair_fields"):
             apply_pose_driven_motion_ultra2.prev_hair_fields = [None]*B
         start = time.time()
         latents_before = latents_local.clone()
         latents_hair, hair_delta = apply_hair_motion_cycle(
             latents_local, mask_hair, grid, H, W, frame_counter, device, delta_px,
-            prev_hair_field=apply_pose_driven_motion_ultra2.prev_hair_fields[0] if B==1 else None,
+            prev_hair_field=apply_pose_driven_motion_ultra2.prev_hair_fields[0] if B==1 else None, target="hair",
             debug=debug, debug_dir=debug_dir
         )
         latents_local = latents_hair * mask_hair_exp + latents_before * (1.0 - mask_hair_exp)
@@ -2635,7 +2637,7 @@ def apply_pose_driven_motion_ultra2(
 
         latents_decor, decor_delta = apply_hair_motion_cycle(
             latents_local, mask_decor, grid, H, W, frame_counter, device, delta_px,
-            prev_hair_field=apply_pose_driven_motion_ultra2.prev_decor_fields[0] if B==1 else None,
+            prev_hair_field=apply_pose_driven_motion_ultra2.prev_decor_fields[0] if B==1 else None, target="decor",
             debug=debug, debug_dir=debug_dir
         )
         latents_local = latents_decor * mask_decor + latents_before * (1.0 - mask_decor)
