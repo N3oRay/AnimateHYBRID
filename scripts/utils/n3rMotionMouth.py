@@ -200,6 +200,7 @@ def apply_mouth_smil(
     device=None,
     debug=False,
     debug_dir=None,
+    naturel_dyn=False,
     smooth=0.75,
     strength=2.0,
     motion_scale=0.4,
@@ -220,8 +221,6 @@ def apply_mouth_smil(
     - mêmes outputs
     - aucun changement requis ailleurs
     """
-
-
 
     # =====================================================
     # INIT
@@ -271,13 +270,11 @@ def apply_mouth_smil(
         + 0.70 * style_blend
     )
 
-    strength_dyn = (
-        1.40 * (1.0 - style_blend)
-        + 2.00 * style_blend
-    )
-
     # naturel devient False progressivement
-    naturel_dyn = style_blend < 0.55
+    if frame_counter <= transition_start:
+        naturel_dyn = True
+    elif frame_counter >= transition_end:
+        naturel_dyn = False
 
     # =====================================================
     # OPTIONAL MICRO OSCILLATION
@@ -299,7 +296,7 @@ def apply_mouth_smil(
 
     motion_scale_dyn : {motion_scale_dyn:.3f}
     speed_dyn        : {speed_dyn:.3f}
-    strength_dyn     : {strength_dyn:.3f}
+    strength         : {strength:.3f}
 
     naturel_dyn      : {naturel_dyn}
     """)
@@ -315,20 +312,14 @@ def apply_mouth_smil(
         grid=grid,
         frame_counter=frame_counter,
         mouth_model=mouth_model,
-
         device=device,
-
         debug=debug,
         debug_dir=debug_dir,
-
         smooth=smooth,
-
-        strength=strength_dyn,
+        strength=strength,
         motion_scale=motion_scale_dyn,
         speed=speed_dyn,
-
         naturel=naturel_dyn,
-
         npy=npy
     )
 
